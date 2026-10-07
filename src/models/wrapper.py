@@ -189,8 +189,11 @@ class Phi2WithRSC(nn.Module):
         if mode is None:
             self._routing_override = None
             return
+        if mode == "all":
+            mode = "only"
+            layers = list(self.target_layers)
         if mode not in {"only", "exclude", "none", "force", "matrix"}:
-            raise ValueError("routing override must be one of: only, exclude, none, force, matrix")
+            raise ValueError("routing override must be one of: only, exclude, none, force, matrix, all")
         if mode == "matrix":
             if not torch.is_tensor(layers) or layers.dtype != torch.bool or layers.dim() != 2:
                 raise ValueError("matrix override requires a (B, n_candidates) bool tensor")

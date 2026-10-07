@@ -76,5 +76,25 @@ class TestARSModules(unittest.TestCase):
         for attr in required_attrs:
             self.assertTrue(hasattr(cfg, attr), f"Missing config attribute: {attr}")
 
+    def test_routing_override_modes(self):
+        class DummyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": 64})()
+                self.model = type("Model", (), {"layers": nn.ModuleList([nn.Linear(64, 64) for _ in range(10)])})()
+            def forward(self, *args, **kwargs):
+                return None
+        from src.models.wrapper import Phi2WithRSC
+        dummy = DummyModel()
+        cfg = RSCConfig()
+        wrapper = Phi2WithRSC(dummy, cfg, device=torch.device("cpu"))
+        wrapper.set_routing_override("all")
+        self.assertEqual(wrapper._routing_override[0], "only")
+        self.assertEqual(wrapper._routing_override[1], set(wrapper.target_layers))
+        wrapper.set_routing_override("none")
+        self.assertEqual(wrapper._routing_override[0], "none")
+        wrapper.set_routing_override(None)
+        self.assertIsNone(wrapper._routing_override)
+
 if __name__ == "__main__":
     unittest.main()
