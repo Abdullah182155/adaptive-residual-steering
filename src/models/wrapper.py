@@ -90,6 +90,10 @@ class Phi2WithRSC(nn.Module):
                     if wrapper is None:
                         return output
                     h = output[0]
+                    orig_2d = False
+                    if h.ndim == 2:
+                        orig_2d = True
+                        h = h.unsqueeze(0)  # Convert (T, d) to (1, T, d)
                     with torch.autocast(device_type="cuda", enabled=False):
                         h_fp = h.float()
                         mask = wrapper._valid_mask_for(h_fp)
@@ -105,7 +109,10 @@ class Phi2WithRSC(nn.Module):
                         route_st = route
                         k_scale = wrapper._active_k_realized.to(dtype=alpha.dtype).sqrt().view(-1, 1, 1)
                         h_new = h_fp + route_st * alpha.detach() * delta * mask.to(alpha.dtype).unsqueeze(-1) / k_scale
-                    return (h_new.to(h.dtype),) + output[1:]
+                    h_out = h_new.to(h.dtype)
+                    if orig_2d:
+                        h_out = h_out.squeeze(0)
+                    return (h_out,) + output[1:]
 
                 return hook_fn
 
