@@ -9,6 +9,49 @@ import torch
 import numpy as np
 from transformers import StoppingCriteria, StoppingCriteriaList
 
+GSM8K_8SHOT_EXEMPLARS = [
+    {
+        "q": "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
+        "a": "Step 1: There are 15 trees originally.\nStep 2: Then there were 21 trees after some more were planted.\nStep 3: So there must have been 21 - 15 = 6 trees planted.\nFinal answer: 6",
+    },
+    {
+        "q": "If there are 3 cars in the parking lot and 2 more cars arrive, how many cars are in the parking lot?",
+        "a": "Step 1: There are originally 3 cars.\nStep 2: 2 more cars arrive.\nStep 3: 3 + 2 = 5 cars.\nFinal answer: 5",
+    },
+    {
+        "q": "Leah had 32 chocolates and her sister had 42. If they ate 35, how many pieces do they have left in total?",
+        "a": "Step 1: Originally, Leah had 32 chocolates.\nStep 2: Her sister had 42.\nStep 3: So in total they had 32 + 42 = 74.\nStep 4: After eating 35, they had 74 - 35 = 39.\nFinal answer: 39",
+    },
+    {
+        "q": "Jason had 20 lollipops. He gave Denny some lollipops. Now Jason has 12 lollipops. How many lollipops did Jason give to Denny?",
+        "a": "Step 1: Jason started with 20 lollipops.\nStep 2: Then he had 12 after giving some to Denny.\nStep 3: So he gave Denny 20 - 12 = 8 lollipops.\nFinal answer: 8",
+    },
+    {
+        "q": "Shawn has five toys. For Christmas, he got two toys each from his mom and dad. How many toys does he have now?",
+        "a": "Step 1: Shawn started with 5 toys.\nStep 2: He got 2 toys from his mom.\nStep 3: He got 2 toys from his dad.\nStep 4: 5 + 2 + 2 = 9 toys.\nFinal answer: 9",
+    },
+    {
+        "q": "There were nine computers in the server room. Five more computers were installed each day, from monday to thursday. How many computers are now in the server room?",
+        "a": "Step 1: There were originally 9 computers.\nStep 2: 5 more computers were added each day.\nStep 3: From Monday to Thursday is 4 days.\nStep 4: So 5 * 4 = 20 computers were added.\nStep 5: 9 + 20 = 29 computers.\nFinal answer: 29",
+    },
+    {
+        "q": "Michael had 58 golf balls. On tuesday, he lost 23 golf balls. On wednesday, he lost 2 more. How many golf balls did he have at the end of wednesday?",
+        "a": "Step 1: Michael started with 58 golf balls.\nStep 2: After losing 23 on Tuesday, he had 58 - 23 = 35.\nStep 3: After losing 2 more on Wednesday, he had 35 - 2 = 33.\nFinal answer: 33",
+    },
+    {
+        "q": "Olivia has $23. She bought five bagels for $3 each. How much money does she have left?",
+        "a": "Step 1: Olivia started with $23.\nStep 2: She bought 5 bagels for $3 each.\nStep 3: 5 bagels cost 5 * 3 = 15 dollars.\nStep 4: 23 - 15 = 8 dollars.\nFinal answer: 8",
+    },
+]
+
+def build_prompt(question: str, n_shot: int = 0) -> str:
+    prompt = ""
+    for i in range(min(n_shot, len(GSM8K_8SHOT_EXEMPLARS))):
+        ex = GSM8K_8SHOT_EXEMPLARS[i]
+        prompt += f"Question: {ex['q']}\nAnswer: Let's think step by step.\n{ex['a']}\n\n"
+    prompt += f"Question: {question}\nAnswer: Let's think step by step.\n"
+    return prompt
+
 def extract_and_verify_equations(text: str) -> Tuple[int, int, List[Tuple[str, bool]]]:
     """Enhanced equation verifier: handles standard and reversed equations."""
     pattern = (
@@ -89,6 +132,26 @@ def extract_final_answer(text: str) -> Optional[float]:
         return safe_float(matches[-1].group(1))
 
     return None
+
+def evaluate_response(response: str, expected: Optional[float], min_steps: int = 1) -> Dict[str, Any]:
+    extracted = extract_final_answer(response)
+    tolerance = 0.01
+    correct = (extracted is not None and expected is not None and abs(extracted - expected) <= tolerance)
+    step_count = max(
+        len(re.findall(r"Step \d+", response, re.IGNORECASE)),
+        len(re.findall(r"\n\d+[\.\)]\s", response)),
+        len(re.findall(r"=\s*\$?-?\d", response)),
+    )
+    has_answer = extracted is not None
+    valid = has_answer and step_count >= min_steps
+    quality = "valid" if valid else ("incomplete" if step_count > 0 else "invalid")
+    return {
+        "correct": correct,
+        "extracted": extracted,
+        "steps": step_count,
+        "has_answer": has_answer,
+        "quality": quality,
+    }
 
 class AnswerStoppingCriteria(StoppingCriteria):
     """Stops generation with a grace period once an answer marker is emitted."""
