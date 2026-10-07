@@ -96,5 +96,22 @@ class TestARSModules(unittest.TestCase):
         wrapper.set_routing_override(None)
         self.assertIsNone(wrapper._routing_override)
 
+    def test_cooperative_synergy(self):
+        target_layers = [9, 11, 13, 15]
+        router = JointLayerRouter(target_layers, hidden_dim=self.hidden_dim, n_layers=20, max_active_layers=4)
+        h = torch.randn(self.batch_size, self.seq_len, self.hidden_dim)
+        mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.bool)
+        u, k_logits = router(h, mask)
+        self.assertIsNotNone(router._last_synergy_matrix)
+        self.assertEqual(router._last_synergy_matrix.shape, (self.batch_size, 4, 4))
+        # Diagonal must be 0 (no self-synergy)
+        diag = torch.diagonal(router._last_synergy_matrix, dim1=1, dim2=2)
+        self.assertTrue((diag == 0.0).all())
+        # Test subset sampling with synergy
+        k = torch.tensor([2, 3])
+        subset, logp = sample_subset_plackett_luce(u, k, synergy_matrix=router._last_synergy_matrix)
+        self.assertEqual(subset.shape, (self.batch_size, 4))
+        self.assertEqual(subset.sum(dim=-1).tolist(), [2, 3])
+
 if __name__ == "__main__":
     unittest.main()

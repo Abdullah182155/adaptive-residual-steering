@@ -270,23 +270,33 @@ class Phi2WithRSC(nn.Module):
             self._warmup_cursor += 1
             self._desired_k = selected_matrix.long().sum(dim=-1).clamp(min=1, max=K_max)
         elif self._routing_override is None:
+            synergy = getattr(self.router, "_last_synergy_matrix", None)
             if self.training:
                 with torch.no_grad():
                     k_real, _ = sample_k(k_logits)
-                    selected_matrix, _ = sample_subset_plackett_luce(u, k_real)
+                    selected_matrix, _ = sample_subset_plackett_luce(u, k_real, synergy_matrix=synergy)
                 self._desired_k = k_real
             else:
                 if self._router_inference_mode == "sample":
                     with torch.no_grad():
                         k_real, _ = sample_k(k_logits)
+                        selected_matrix, _ = sample_subset_plackett_luce(u, k_real, synergy_matrix=synergy)
                     k_real = k_real.clamp(min=1, max=K_max)
                 else:
                     k_real = (k_logits.argmax(dim=-1) + 1).clamp(min=1, max=K_max)
-                ranks = u.argsort(dim=-1, descending=True)
-                selected_matrix = torch.zeros(h.shape[0], n_candidates, dtype=torch.bool, device=h.device)
-                for b in range(h.shape[0]):
-                    kb = int(k_real[b].item())
-                    selected_matrix[b, ranks[b, :kb]] = True
+                    selected_matrix = torch.zeros(h.shape[0], n_candidates, dtype=torch.bool, device=h.device)
+                    for b in range(h.shape[0]):
+                        kb = int(k_real[b].item())
+                        cur_u = u[b].clone()
+                        sel_idx = []
+                        for _ in range(min(kb, n_candidates)):
+                            for prev in sel_idx:
+                                cur_u[prev] = float("-inf")
+                            best = cur_u.argmax().item()
+                            sel_idx.append(best)
+                            if synergy is not None:
+                                cur_u = cur_u + synergy[b, best]
+                        selected_matrix[b, sel_idx] = True
                 self._desired_k = k_real
             self.router.observe(u, selected_matrix)
             any_selected_this_fwd = selected_matrix.any(dim=0)

@@ -1,6 +1,6 @@
 import torch
 import torch.nn.functional as F
-from typing import Tuple, Dict, Any
+from typing import Tuple, Dict, Any, Optional
 
 def per_example_answer_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     """Mean next-token NLL for each example, excluding masked prompt tokens."""
@@ -12,8 +12,12 @@ def per_example_answer_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.
     valid = shift_labels.ne(-100)
     return (token_nll * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
 
-def sample_subset_plackett_luce(logits: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sample without replacement a size-k[b] subset using Plackett-Luce Gumbel-max draws."""
+def sample_subset_plackett_luce(
+    logits: torch.Tensor,
+    k: torch.Tensor,
+    synergy_matrix: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample without replacement a size-k[b] subset using Cooperative Plackett-Luce Gumbel-max draws."""
     B, N = logits.shape
     device = logits.device
     K_max = int(k.max().item()) if k.numel() else 0
@@ -23,9 +27,18 @@ def sample_subset_plackett_luce(logits: torch.Tensor, k: torch.Tensor) -> Tuple[
     det_logits = logits.detach()
     for step in range(K_max):
         active = k > step
-        log_p_grad = F.log_softmax(logits.masked_fill(~remaining, float("-inf")), dim=-1)
+        # Dynamically modulate logits with cross-layer synergy from previously selected layers
+        if step > 0 and synergy_matrix is not None:
+            syn_boost = torch.bmm(selected.float().unsqueeze(1), synergy_matrix).squeeze(1)
+            step_logits = logits + syn_boost
+            step_det_logits = det_logits + syn_boost.detach()
+        else:
+            step_logits = logits
+            step_det_logits = det_logits
+
+        log_p_grad = F.log_softmax(step_logits.masked_fill(~remaining, float("-inf")), dim=-1)
         with torch.no_grad():
-            log_p_det = F.log_softmax(det_logits.masked_fill(~remaining, float("-inf")), dim=-1)
+            log_p_det = F.log_softmax(step_det_logits.masked_fill(~remaining, float("-inf")), dim=-1)
             u_noise = torch.rand(B, N, device=device).clamp(min=1e-20, max=1 - 1e-20)
             gumbel = -torch.log(-torch.log(u_noise))
             perturbed = torch.where(remaining, log_p_det + gumbel, torch.full_like(log_p_det, float("-inf")))
@@ -75,7 +88,7 @@ def policy_entropy_bonus(logits: torch.Tensor, k_logits: torch.Tensor, k_max: in
 
 def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
                               labels: torch.Tensor, cfg, prompt_mask: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """RLOO subset selection loss for training router policy with leave-one-out advantage."""
+    """RLOO subset selection loss for training cooperative router policy with leave-one-out advantage."""
     if prompt_mask is None:
         prompt_mask = mask.bool() & labels.eq(-100)
     model.set_router_context_mask(prompt_mask)
@@ -83,12 +96,13 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         return torch.zeros((), device=ids.device), {}
 
     u_fresh, k_logits_fresh = model.router.recompute_from_cache()
+    synergy = getattr(model.router, "_last_synergy_matrix", None)
     K_max = model.cfg.max_active_layers
 
     k_a, logprob_k_a = sample_k(k_logits_fresh)
     k_b, logprob_k_b = sample_k(k_logits_fresh)
-    subset_a_mask, logprob_subset_a = sample_subset_plackett_luce(u_fresh, k_a)
-    subset_b_mask, logprob_subset_b = sample_subset_plackett_luce(u_fresh, k_b)
+    subset_a_mask, logprob_subset_a = sample_subset_plackett_luce(u_fresh, k_a, synergy_matrix=synergy)
+    subset_b_mask, logprob_subset_b = sample_subset_plackett_luce(u_fresh, k_b, synergy_matrix=synergy)
     logprob_a = logprob_k_a + logprob_subset_a
     logprob_b = logprob_k_b + logprob_subset_b
 
@@ -110,17 +124,24 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         else:
             model.set_routing_override(old_override[0], old_override[1])
 
-    lambda_cost = getattr(cfg, "lambda_cost", 0.05)
-    reward_a = (-nll_a - lambda_cost * k_a.float()).detach()
-    reward_b = (-nll_b - lambda_cost * k_b.float()).detach()
+    lambda_cost = getattr(cfg, "lambda_cost", 0.005)
+    reward_a = (-nll_a - lambda_cost * (k_a.float() - 1.0)).detach()
+    reward_b = (-nll_b - lambda_cost * (k_b.float() - 1.0)).detach()
     advantage_a = reward_a - reward_b
 
     policy_loss = -((logprob_a - logprob_b) * advantage_a).mean()
     h_k, h_subset = policy_entropy_bonus(u_fresh, k_logits_fresh, K_max)
-    
-    beta_k = getattr(cfg, "beta_entropy_k", 0.1)
-    beta_subset = getattr(cfg, "beta_entropy_subset", 0.1)
-    loss = policy_loss - beta_k * h_k - beta_subset * h_subset
+
+    beta_k = getattr(cfg, "beta_entropy_k", 0.15)
+    beta_subset = getattr(cfg, "beta_entropy_subset", 0.15)
+
+    # Anti-monopoly balance loss: prevents single-layer monopoly
+    mean_selected = (subset_a_mask.float() + subset_b_mask.float()).mean(dim=0) / 2.0
+    target_sel = (k_a.float() + k_b.float()).mean() / (2.0 * model.router.n_candidates)
+    balance_loss = F.mse_loss(mean_selected, target_sel.expand_as(mean_selected))
+    lambda_balance = getattr(cfg, "router_balance_weight", 0.10)
+
+    loss = policy_loss - beta_k * h_k - beta_subset * h_subset + lambda_balance * balance_loss
 
     diag = {
         "policy_loss": float(policy_loss.detach().item()),

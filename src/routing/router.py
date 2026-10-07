@@ -51,6 +51,11 @@ class JointLayerRouter(nn.Module):
         )
         self.utility_head_refine = nn.Linear(d_model, 1)
         self.k_head = nn.Linear(d_model, max_active_layers)
+        self.d_model = d_model
+
+        # Cross-layer cooperation & synergy projection
+        self.synergy_proj = nn.Linear(d_model, d_model, bias=False)
+        nn.init.orthogonal_(self.synergy_proj.weight, gain=0.1)
 
         # Initialize final decision heads near zero for conservative initial boundaries
         nn.init.zeros_(self.utility_head.weight)
@@ -95,7 +100,7 @@ class JointLayerRouter(nn.Module):
         per_candidate_semantic = self._semantic_from_pooled(pooled)
         return self._last_scalars, per_candidate_semantic
 
-    def _score_from_base(self, scalars: torch.Tensor, per_candidate_semantic: torch.Tensor):
+    def _score_from_base(self, scalars: torch.Tensor, per_candidate_semantic: torch.Tensor, return_synergy: bool = False):
         B = scalars.shape[0]
         N = self.n_candidates
         depth = self.depths.view(1, N, 1).expand(B, -1, -1)
@@ -114,17 +119,28 @@ class JointLayerRouter(nn.Module):
         u_final = self.utility_head_refine(attended_2).squeeze(-1)
         pooled_2 = attended_2.mean(dim=1)
         k_logits = self.k_head(pooled_2)
+
+        # Cross-layer cooperation & synergy matrix: S_ij = (e_i W_syn e_j^T) / sqrt(d)
+        query = self.synergy_proj(attended_2)
+        synergy = torch.bmm(query, attended_2.transpose(1, 2)) / (self.d_model ** 0.5)
+        synergy = 0.5 * (synergy + synergy.transpose(1, 2))
+        eye = torch.eye(N, device=tokens.device, dtype=torch.bool).unsqueeze(0)
+        synergy = synergy.masked_fill(eye, 0.0)
+        self._last_synergy_matrix = synergy
+
+        if return_synergy:
+            return u_final, k_logits, synergy
         return u_final, k_logits
 
-    def forward(self, h: torch.Tensor, valid_mask: torch.Tensor):
+    def forward(self, h: torch.Tensor, valid_mask: torch.Tensor, return_synergy: bool = False):
         scalars, per_candidate_semantic = self._base_features(h, valid_mask)
-        return self._score_from_base(scalars, per_candidate_semantic)
+        return self._score_from_base(scalars, per_candidate_semantic, return_synergy=return_synergy)
 
-    def recompute_from_cache(self):
+    def recompute_from_cache(self, return_synergy: bool = False):
         if self._last_pooled is None:
             raise RuntimeError("JointLayerRouter.recompute_from_cache called before any forward()")
         per_candidate_semantic = self._semantic_from_pooled(self._last_pooled)
-        return self._score_from_base(self._last_scalars, per_candidate_semantic)
+        return self._score_from_base(self._last_scalars, per_candidate_semantic, return_synergy=return_synergy)
 
     def observe(self, u: torch.Tensor, selected_matrix: torch.Tensor):
         if not self.training:
