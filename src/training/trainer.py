@@ -83,6 +83,7 @@ def _evaluate_and_maybe_checkpoint(
     val_loss = evaluate_loss(model, eval_data, cfg, device)
     acc = epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=cfg.accuracy_eval_n, seed=cfg.seed)
     improved = acc > best_acc + 0.005
+    note = ""
     if train_router:
         diag = model.routing_diagnostics()
         n_candidates = max(1, len(diag))
@@ -90,7 +91,7 @@ def _evaluate_and_maybe_checkpoint(
         k_dist = model.routing_k_distribution()
         k_str = ", ".join(f"K={k}:{v:.2f}" for k, v in k_dist.items() if v > 0.01)
         note = f"  (active layers: {n_candidates - dead}/{n_candidates} | {k_str})"
-    print(f"    [checkpoint check] {label}: val={val_loss:.4f}  acc={acc:.3f}  {'✅ saved' if improved else ''}{note}")
+    print(f"    [checkpoint check] {label}: val={val_loss:.4f}  acc={acc:.3f}  {'[SAVED]' if improved else ''}{note}")
     if train_router and hasattr(model, "router_k_cap_gap_summary"):
         print(model.router_k_cap_gap_summary())
     best_state = None
