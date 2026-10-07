@@ -89,7 +89,8 @@ class Phi2WithRSC(nn.Module):
                     wrapper = self_ref()
                     if wrapper is None:
                         return output
-                    h = output[0]
+                    is_tuple = isinstance(output, tuple)
+                    h = output[0] if is_tuple else output
                     orig_2d = False
                     if h.ndim == 2:
                         orig_2d = True
@@ -112,7 +113,9 @@ class Phi2WithRSC(nn.Module):
                     h_out = h_new.to(h.dtype)
                     if orig_2d:
                         h_out = h_out.squeeze(0)
-                    return (h_out,) + output[1:]
+                    if is_tuple:
+                        return (h_out,) + output[1:]
+                    return h_out
 
                 return hook_fn
 
