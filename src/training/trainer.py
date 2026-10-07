@@ -83,13 +83,13 @@ def _evaluate_and_maybe_checkpoint(
     val_loss = evaluate_loss(model, eval_data, cfg, device)
     acc = epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=cfg.accuracy_eval_n, seed=cfg.seed)
     improved = acc > best_acc + 0.005
-    note = ""
     if train_router:
         diag = model.routing_diagnostics()
         n_candidates = max(1, len(diag))
         dead = sum(1 for s in diag.values() if s["selected_forwards"] / max(1, s["seen_forwards"]) < 0.02)
-        if dead > 0:
-            note = f"  (router active layers: {n_candidates - dead}/{n_candidates})"
+        k_dist = model.routing_k_distribution()
+        k_str = ", ".join(f"K={k}:{v:.2f}" for k, v in k_dist.items() if v > 0.01)
+        note = f"  (active layers: {n_candidates - dead}/{n_candidates} | {k_str})"
     print(f"    [checkpoint check] {label}: val={val_loss:.4f}  acc={acc:.3f}  {'✅ saved' if improved else ''}{note}")
     if train_router and hasattr(model, "router_k_cap_gap_summary"):
         print(model.router_k_cap_gap_summary())
@@ -307,9 +307,16 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
 
             running += loss.item()
             n_steps += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            postfix_dict = {"loss": f"{loss.item():.4f}"}
+            if rloo_diag:
+                postfix_dict["mean_k"] = f"{rloo_diag.get('mean_k_sampled', 0.0):.2f}"
+            pbar.set_postfix(**postfix_dict)
 
         avg_loss = running / max(1, n_steps)
+        k_dist = model.routing_k_distribution()
+        diag = model.routing_diagnostics()
+        active_cnt = sum(1 for s in diag.values() if s["selected_forwards"] > 0)
+        print(f"  RouterBootstrap Epoch {epoch+1}: loss={avg_loss:.4f} | active layers={active_cnt}/{len(diag)} | K-dist={k_dist}")
         if avg_loss < best_loss - 1e-4:
             best_loss, patience_ctr = avg_loss, 0
             best_state = {k: v.clone() for k, v in model.state_dict().items() if "router" in k}
@@ -483,7 +490,10 @@ def run_staged_phase(
                         break
 
             epoch_task += task_loss.item()
-            pbar.set_postfix(task=f"{task_loss.item():.4f}")
+            postfix_kwargs = {"task": f"{task_loss.item():.4f}"}
+            if train_router and n_router_rloo_steps > 0:
+                postfix_kwargs["mean_k"] = f"{epoch_mean_k / n_router_rloo_steps:.2f}"
+            pbar.set_postfix(**postfix_kwargs)
 
         if patience_ctr >= patience:
             break

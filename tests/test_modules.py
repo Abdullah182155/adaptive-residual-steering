@@ -73,6 +73,8 @@ class TestARSModules(unittest.TestCase):
             "gate_only_lr", "gate_only_epochs", "gate_only_save_path",
             "joint_finetune_epochs", "joint_finetune_lr_scale", "joint_finetune_router_lr_scale",
             "gate_retune_epochs", "gate_retune_lr", "phase2_save_path", "lora_save_path",
+            "prompt_shielding", "lambda_synergy", "router_balance_weight", "lambda_cost",
+            "beta_entropy_k", "beta_entropy_subset",
         ]
         for attr in required_attrs:
             self.assertTrue(hasattr(cfg, attr), f"Missing config attribute: {attr}")
