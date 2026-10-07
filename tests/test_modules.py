@@ -65,5 +65,16 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(subset_mask.shape, (self.batch_size, 4))
         self.assertEqual(logp_sub.shape, (self.batch_size,))
 
+    def test_config_attributes(self):
+        cfg = RSCConfig()
+        required_attrs = [
+            "steer_finetune_lr", "steer_finetune_epochs", "steer_finetune_save_path",
+            "gate_only_lr", "gate_only_epochs", "gate_only_save_path",
+            "joint_finetune_epochs", "joint_finetune_lr_scale", "joint_finetune_router_lr_scale",
+            "gate_retune_epochs", "gate_retune_lr", "phase2_save_path", "lora_save_path",
+        ]
+        for attr in required_attrs:
+            self.assertTrue(hasattr(cfg, attr), f"Missing config attribute: {attr}")
+
 if __name__ == "__main__":
     unittest.main()

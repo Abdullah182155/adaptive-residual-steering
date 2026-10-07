@@ -82,6 +82,27 @@ class RSCConfig:
     router_bootstrap_patience: int = 2
     router_bootstrap_save_path: str = "./checkpoints/router_catalog_v14.pt"
     router_probe_every_n_steps: int = 1
+    router_checkpoint_every_n_steps: int = 0
+    router_dead_layer_veto_frac: float = 0.50
+
+    # Phase 2A: SteerNet fine-tuning under learned routing
+    steer_finetune_epochs: int = 2
+    steer_finetune_lr: float = 1e-4
+    steer_finetune_save_path: str = "./checkpoints/steer_finetune.pt"
+
+    # Phase 2B: Token Gate training
+    gate_only_epochs: int = 3
+    gate_only_lr: float = 1e-3
+    gate_only_save_path: str = "./checkpoints/gate_only.pt"
+
+    # Phase 2C: Light joint fine-tuning
+    joint_finetune_epochs: int = 2
+    joint_finetune_lr_scale: float = 0.10
+    joint_finetune_router_lr_scale: float = 0.05
+
+    # Phase 2D: Gate re-tuning against final router
+    gate_retune_epochs: int = 1
+    gate_retune_lr: float = 5e-4
 
     checkpoint_every_n: int = 3
     lr_reduce_factor: float = 0.5
@@ -100,7 +121,13 @@ class RSCConfig:
     def __post_init__(self):
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         # Ensure parent dirs exist for paths
-        for path in [self.lora_save_path, self.phase2_save_path, self.router_bootstrap_save_path]:
+        for path in [
+            self.lora_save_path,
+            self.phase2_save_path,
+            self.router_bootstrap_save_path,
+            self.steer_finetune_save_path,
+            self.gate_only_save_path,
+        ]:
             pdir = os.path.dirname(path)
             if pdir:
                 os.makedirs(pdir, exist_ok=True)
