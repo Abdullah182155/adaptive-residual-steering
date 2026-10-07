@@ -421,6 +421,9 @@ class Phi2WithRSC(nn.Module):
         total = max(1, int(self.routing_forwards.item()))
         return {k: int(count.item()) / total for k, count in enumerate(self.routing_k_hist)}
 
+    def get_layer_synergy_matrix(self) -> Optional[torch.Tensor]:
+        return self.router.get_layer_synergy_matrix()
+
     def remove_hooks(self):
         for h in self._hooks:
             h.remove()
