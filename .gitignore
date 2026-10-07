@@ -1,0 +1,94 @@
+# Original project sources (kept locally as immutable source of truth, excluded from repo)
+RSC_Training.py
+reference_implementation/
+*.original.py
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# PyTorch / Deep Learning model weights & checkpoints
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+checkpoints/
+weights/
+saved_models/
+lora_weights/
+*.onnx
+
+# Cache directories
+.cache/
+hf_cache/
+huggingface/
+torch_cache/
+wandb/
+
+# Data & Datasets
+data/
+datasets_cache/
+*.arrow
+*.parquet
+*.jsonl
+*.csv
+
+# Logs & outputs
+logs/
+runs/
+*.log
+outputs/
+results/
+eval_results/
+diagnostics/
+
+# Jupyter / Notebook checkpoints
+.ipynb_checkpoints/
+*-checkpoint.ipynb
+
+# IDE / OS specific
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Environment variables & secrets
+.env
+*.env
+.env.*
+secrets.json
+
+# Kaggle / Cloud specific temporary dirs
+kaggle/
+working/
