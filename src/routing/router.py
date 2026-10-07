@@ -152,3 +152,15 @@ class JointLayerRouter(nn.Module):
         k_realized = selected_matrix.detach().sum(dim=-1).clamp(min=1, max=self.max_active_layers)
         k_onehot = F.one_hot(k_realized.long() - 1, num_classes=self.max_active_layers).float().mean(dim=0)
         self.k_dist_ema.mul_(0.98).add_(0.02 * k_onehot)
+
+    def get_layer_synergy_matrix(self) -> Optional[torch.Tensor]:
+        """Returns the latest learned cross-layer synergy matrix."""
+        if hasattr(self, "_last_synergy_matrix") and self._last_synergy_matrix is not None:
+            return self._last_synergy_matrix.detach()
+        tokens = self.identity_embed.weight.unsqueeze(0)
+        query = self.synergy_proj(tokens)
+        syn = torch.bmm(query, tokens.transpose(1, 2)) / (self.d_model ** 0.5)
+        syn = 0.5 * (syn + syn.transpose(1, 2))
+        eye = torch.eye(self.n_candidates, device=tokens.device, dtype=torch.bool).unsqueeze(0)
+        return syn.masked_fill(eye, 0.0).detach()
+
