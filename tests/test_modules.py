@@ -190,6 +190,58 @@ class TestARSModules(unittest.TestCase):
                 self.assertTrue(torch.isfinite(param.grad).all(), f"Param {name} gradient contains inf or NaN")
                 self.assertFalse((param.grad == 0).all(), f"Param {name} gradient completely vanished to 0")
 
+    def test_checkpoint_evaluation_both_router_modes(self):
+        from src.training.trainer import _evaluate_and_maybe_checkpoint
+        class DummyLayer(nn.Module):
+            def __init__(self):
+                super().__init__()
+            def forward(self, h, *args, **kwargs):
+                return h
+        class DummyModel(nn.Module):
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": hidden_dim})()
+                self.embed = nn.Embedding(50, hidden_dim)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer() for _ in range(10)])})()
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h, "loss": torch.tensor(0.5)})()
+            def generate(self, input_ids=None, **kwargs):
+                return input_ids
+
+        dummy = DummyModel(self.hidden_dim)
+        cfg = RSCConfig()
+        cfg.accuracy_eval_n = 2
+        wrapper = Phi2WithRSC(dummy, cfg, device=torch.device("cpu"))
+
+        eval_data = [
+            {"input_ids": torch.tensor([1, 2, 3]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor([-100, 2, 3])},
+            {"input_ids": torch.tensor([4, 5, 6]), "attention_mask": torch.tensor([1, 1, 1]), "labels": torch.tensor([-100, 5, 6])},
+        ]
+        tokenizer = type("Tokenizer", (), {
+            "pad_token_id": 0, "eos_token_id": 1,
+            "decode": lambda *a, **k: "#### 42",
+        })()
+
+        # 1. train_router=False (must NOT raise UnboundLocalError)
+        best_acc, best_val, state, p_ctr, improved, cur_val, cur_acc = _evaluate_and_maybe_checkpoint(
+            wrapper, tokenizer, eval_data, cfg, torch.device("cpu"), "./test_ckpt.pt",
+            best_acc=0.0, best_val=float("inf"), patience_ctr=0, train_router=False, label="test_no_router",
+        )
+        self.assertIsNotNone(cur_val)
+
+        # 2. train_router=True (must include active layer metrics without error)
+        best_acc, best_val, state, p_ctr, improved, cur_val, cur_acc = _evaluate_and_maybe_checkpoint(
+            wrapper, tokenizer, eval_data, cfg, torch.device("cpu"), "./test_ckpt.pt",
+            best_acc=0.0, best_val=float("inf"), patience_ctr=0, train_router=True, label="test_with_router",
+        )
+        self.assertIsNotNone(cur_val)
+        if os.path.exists("./test_ckpt.pt"):
+            os.remove("./test_ckpt.pt")
+
 if __name__ == "__main__":
     unittest.main()
+
 
