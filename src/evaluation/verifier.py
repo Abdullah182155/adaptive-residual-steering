@@ -248,18 +248,33 @@ def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512)
     stop_criterion = AnswerStoppingCriteria(tokenizer, prompt_length, max_new_tokens)
     stopping = StoppingCriteriaList([stop_criterion])
 
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            pad_token_id=tokenizer.pad_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-            stopping_criteria=stopping,
-            do_sample=False,
-            repetition_penalty=1.1,
-            no_repeat_ngram_size=6,
-            use_cache=True,
-        )
+    # Multi-shot prompt shielding: protect few-shot demonstrations from steering representation drift
+    if hasattr(model, "set_prompt_shield_mask"):
+        last_q_idx = prompt.rfind("Question:")
+        if last_q_idx > 0:
+            prefix_text = prompt[:last_q_idx]
+            prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=False)
+            prefix_len = min(len(prefix_tokens), prompt_length)
+            shield_mask = torch.zeros((inputs["input_ids"].shape[0], prompt_length), dtype=torch.bool, device=device)
+            shield_mask[:, :prefix_len] = True
+            model.set_prompt_shield_mask(shield_mask)
+
+    try:
+        with torch.no_grad():
+            output_ids = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                stopping_criteria=stopping,
+                do_sample=False,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=6,
+                use_cache=True,
+            )
+    finally:
+        if hasattr(model, "set_prompt_shield_mask"):
+            model.set_prompt_shield_mask(None)
 
     new_ids = output_ids[0][prompt_length:]
     raw_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()

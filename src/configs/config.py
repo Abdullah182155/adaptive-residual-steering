@@ -85,6 +85,16 @@ class RSCConfig:
     router_checkpoint_every_n_steps: int = 0
     router_dead_layer_veto_frac: float = 0.50
 
+    # Cooperative Subset Router & RLOO settings
+    lambda_cost: float = 0.005
+    beta_entropy_k: float = 0.15
+    beta_entropy_subset: float = 0.15
+    router_balance_weight: float = 0.10
+    lambda_synergy: float = 0.10
+
+    # Prompt Shielding (Preserves pristine representations in multi-shot contexts)
+    prompt_shielding: bool = True
+
     # Phase 2A: SteerNet fine-tuning under learned routing
     steer_finetune_epochs: int = 2
     steer_finetune_lr: float = 1e-4

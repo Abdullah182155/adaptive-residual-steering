@@ -55,7 +55,7 @@ class RSCUsefulnessGate(nn.Module):
 
         h_n = self.h_norm(h_fp)
         d_n = self.d_norm(d_det)
-        mag = d_det.norm(dim=-1, keepdim=True)
+        mag = torch.log1p(d_det.norm(dim=-1, keepdim=True))
         cos = F.cosine_similarity(h_fp.detach(), d_det, dim=-1, eps=1e-6).unsqueeze(-1)
 
         if global_context is not None:
@@ -65,7 +65,8 @@ class RSCUsefulnessGate(nn.Module):
 
         feat = torch.cat([h_n, d_n, mag, cos, ctx], dim=-1)  # (B, T, 2d + 2 + global_context_dim)
         x = self.drop(self.act(self.fc1(feat)))
-        alpha = torch.sigmoid(self.fc2(x))  # (B, T, 1)
+        gate_logit = torch.clamp(self.fc2(x), min=-10.0, max=10.0)
+        alpha = torch.sigmoid(gate_logit)  # (B, T, 1)
 
         self.last_alpha = alpha.detach()
         self._alpha_for_aux = alpha
