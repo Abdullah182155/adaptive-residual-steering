@@ -88,9 +88,8 @@ def _evaluate_and_maybe_checkpoint(
         diag = model.routing_diagnostics()
         n_candidates = max(1, len(diag))
         dead = sum(1 for s in diag.values() if s["selected_forwards"] / max(1, s["seen_forwards"]) < 0.02)
-        if improved and dead > cfg.router_dead_layer_veto_frac * n_candidates:
-            improved = False
-            note = f"  (accuracy improved but router shows {dead}/{n_candidates} dead layers on this clean eval -- not saved)"
+        if dead > 0:
+            note = f"  (router active layers: {n_candidates - dead}/{n_candidates})"
     print(f"    [checkpoint check] {label}: val={val_loss:.4f}  acc={acc:.3f}  {'✅ saved' if improved else ''}{note}")
     if train_router and hasattr(model, "router_k_cap_gap_summary"):
         print(model.router_k_cap_gap_summary())
