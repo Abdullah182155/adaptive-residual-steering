@@ -4,8 +4,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, List, Dict, Any, Tuple
+import re
 import numpy as np
 from src.data.dataset import PromptTemplateBank
+from src.evaluation.verifier import extract_final_answer
 
 class LRReducer:
     def __init__(
@@ -222,3 +224,268 @@ def compute_invariance_loss(model, tokenizer, questions, steps_lists, final_answ
         return (1.0 - (z1 * z2).sum(-1)).mean()
     finally:
         h.remove()
+
+def log_gpu_memory(label: str, cfg=None, reset_peak: bool = True):
+    """Memory diagnostic reporting CUDA peak allocated/reserved."""
+    if cfg is not None and not getattr(cfg, "log_gpu_memory", True):
+        return
+    if not torch.cuda.is_available():
+        return
+    alloc_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
+    print(f"    [mem] {label}: peak_allocated={alloc_mb:,.0f}MB  peak_reserved={reserved_mb:,.0f}MB")
+    if reset_peak:
+        torch.cuda.reset_peak_memory_stats()
+
+def _extract_final_number(text: str) -> Optional[float]:
+    """Helper using verifier extract_final_answer with fallback."""
+    num = extract_final_answer(text)
+    if num is not None:
+        return num
+    nums = re.findall(r"-?\d[\d,]*\.?\d*", text)
+    if nums:
+        try:
+            return float(nums[-1].replace(",", ""))
+        except ValueError:
+            return None
+    return None
+
+def compute_pg_loss(
+    model,
+    tokenizer,
+    input_ids,
+    labels,
+    device,
+    cfg,
+    baseline_ema,
+    attention_masks=None,
+    train_batch_ids=None,
+):
+    """Outcome-based policy gradient loss measuring answer correctness under full steering vs no steering."""
+    N = min(cfg.pg_n_samples, input_ids.size(0))
+    advantages = []
+
+    model.eval()
+    with torch.no_grad():
+        for i in range(N):
+            ids_i = input_ids[i : i + 1]
+            lbl_i = labels[i : i + 1]
+            pad_id = tokenizer.pad_token_id
+
+            q_mask = (lbl_i[0] == -100) & (ids_i[0] != pad_id)
+            if q_mask.sum() == 0:
+                continue
+            q_ids = ids_i[0][q_mask].unsqueeze(0)
+            q_attn = torch.ones_like(q_ids)
+
+            gold_mask = lbl_i[0] != -100
+            if gold_mask.sum() == 0:
+                continue
+            gold_text = tokenizer.decode(ids_i[0][gold_mask], skip_special_tokens=True)
+            gold_num = _extract_final_number(gold_text)
+            if gold_num is None:
+                continue
+
+            # Gate ON (1.0)
+            model.set_gate_freeze(True, value=1.0)
+            gen_on = model.generate(
+                input_ids=q_ids,
+                attention_mask=q_attn,
+                max_new_tokens=256,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=pad_id,
+                use_cache=True,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            text_on = tokenizer.decode(gen_on[0][q_ids.size(1) :], skip_special_tokens=True)
+            pred_on = _extract_final_number(text_on)
+            r_on = 1.0 if (pred_on is not None and abs(pred_on - gold_num) < 0.01) else 0.0
+
+            # Gate OFF (0.0)
+            model.set_gate_freeze(True, value=0.0)
+            gen_off = model.generate(
+                input_ids=q_ids,
+                attention_mask=q_attn,
+                max_new_tokens=256,
+                do_sample=False,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=pad_id,
+                use_cache=True,
+            )
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            text_off = tokenizer.decode(gen_off[0][q_ids.size(1) :], skip_special_tokens=True)
+            pred_off = _extract_final_number(text_off)
+            r_off = 1.0 if (pred_off is not None and abs(pred_off - gold_num) < 0.01) else 0.0
+
+            advantages.append(r_on - r_off)
+
+    model.set_gate_freeze(False)
+    model.train()
+    log_gpu_memory("compute_pg_loss after generation rounds", cfg)
+
+    if not advantages:
+        return torch.tensor(0.0, device=device)
+
+    mean_adv = float(np.mean(advantages))
+    baseline_ema[0] = (
+        cfg.pg_baseline_momentum * baseline_ema[0] + (1 - cfg.pg_baseline_momentum) * mean_adv
+    )
+    centred_adv = mean_adv - baseline_ema[0]
+
+    if abs(centred_adv) < 1e-5:
+        return torch.tensor(0.0, device=device)
+
+    # Forward on same batch to get live alphas
+    attn = (
+        attention_masks
+        if attention_masks is not None
+        else (input_ids != tokenizer.pad_token_id).long()
+    )
+    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+        _ = model(input_ids=input_ids, attention_mask=attn, labels=labels)
+
+    pg_total = torch.tensor(0.0, device=device)
+    n_terms = 0
+    for gate in model.gates.values():
+        alpha = gate._alpha_for_aux
+        if alpha is None:
+            continue
+        a = alpha.float().clamp(1e-8, 1 - 1e-8).squeeze(-1)
+        vm = gate._valid_mask
+        if vm is not None and vm.shape == a.shape:
+            answer_mask = labels[:, :a.size(1)].ne(-100) if labels is not None else None
+            if answer_mask is not None:
+                answer_mask = answer_mask[:a.size(0), :a.size(1)]
+                vm = vm & answer_mask
+            weight_sum = vm.float().sum().clamp(min=1)
+            if centred_adv > 0:
+                pg_layer = (-centred_adv) * (torch.log(a) * vm.float()).sum() / weight_sum
+            else:
+                pg_layer = centred_adv * (torch.log(1 - a) * vm.float()).sum() / weight_sum
+        else:
+            if centred_adv > 0:
+                pg_layer = (-centred_adv) * torch.log(a).mean()
+            else:
+                pg_layer = centred_adv * torch.log(1 - a).mean()
+        pg_total = pg_total + pg_layer
+        n_terms += 1
+
+    return pg_total / max(1, n_terms)
+
+@torch.no_grad()
+def _span_logprob(model, input_ids, attention_mask, labels, gate_value):
+    """Mean log-prob of the labelled span under a fixed gate value via teacher-forced forward pass."""
+    model.set_gate_freeze(True, value=gate_value)
+    with torch.amp.autocast("cuda", enabled=input_ids.is_cuda):
+        out = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = out.logits[:, :-1, :].float()
+    tgt = labels[:, 1:]
+    valid = tgt != -100
+    logp = F.log_softmax(logits, dim=-1)
+    tgt_safe = tgt.clamp(min=0)
+    token_logp = torch.gather(logp, 2, tgt_safe.unsqueeze(-1)).squeeze(-1)
+    token_logp = token_logp * valid.float()
+    denom = valid.float().sum(-1).clamp(min=1)
+    return token_logp.sum(-1) / denom
+
+def compute_pg_loss_lite(
+    model,
+    tokenizer,
+    input_ids,
+    labels,
+    device,
+    cfg,
+    baseline_ema,
+    attention_masks=None,
+    train_batch_ids=None,
+):
+    """Teacher-forced counterfactual PG alternative (no autoregressive generation)."""
+    attn = (
+        attention_masks
+        if attention_masks is not None
+        else (input_ids != tokenizer.pad_token_id).long()
+    )
+
+    lp_on = _span_logprob(model, input_ids, attn, labels, 1.0)
+    lp_off = _span_logprob(model, input_ids, attn, labels, 0.0)
+    advantage = lp_on - lp_off
+
+    model.train()
+    model.set_gate_freeze(False)
+    log_gpu_memory("compute_pg_loss_lite after span-logprob probes", cfg)
+
+    mean_adv = advantage.mean().item()
+    baseline_ema[0] = (
+        cfg.pg_baseline_momentum * baseline_ema[0] + (1 - cfg.pg_baseline_momentum) * mean_adv
+    )
+    centred_adv = mean_adv - baseline_ema[0]
+
+    if abs(centred_adv) < 1e-5:
+        return torch.tensor(0.0, device=device)
+
+    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+        _ = model(input_ids=input_ids, attention_mask=attn, labels=labels)
+
+    pg_total = torch.tensor(0.0, device=device)
+    n_terms = 0
+    for gate in model.gates.values():
+        alpha = gate._alpha_for_aux
+        if alpha is None:
+            continue
+        a = alpha.float().clamp(1e-8, 1 - 1e-8).squeeze(-1)
+        vm = gate._valid_mask
+        if vm is not None and vm.shape == a.shape:
+            weight_sum = vm.float().sum().clamp(min=1)
+            if centred_adv > 0:
+                pg_layer = (-centred_adv) * (torch.log(a) * vm.float()).sum() / weight_sum
+            else:
+                pg_layer = centred_adv * (torch.log(1 - a) * vm.float()).sum() / weight_sum
+        else:
+            if centred_adv > 0:
+                pg_layer = (-centred_adv) * torch.log(a).mean()
+            else:
+                pg_layer = centred_adv * torch.log(1 - a).mean()
+        pg_total = pg_total + pg_layer
+        n_terms += 1
+
+    return pg_total / max(1, n_terms)
+
+def run_pg_loss(
+    model,
+    tokenizer,
+    input_ids,
+    labels,
+    device,
+    cfg,
+    baseline_ema,
+    attention_masks=None,
+    train_batch_ids=None,
+):
+    """Dispatches to generation-based or teacher-forced counterfactual PG loss."""
+    if getattr(cfg, "pg_mode", "generation") == "teacher_forced":
+        return compute_pg_loss_lite(
+            model,
+            tokenizer,
+            input_ids,
+            labels,
+            device,
+            cfg,
+            baseline_ema,
+            attention_masks,
+            train_batch_ids,
+        )
+    return compute_pg_loss(
+        model,
+        tokenizer,
+        input_ids,
+        labels,
+        device,
+        cfg,
+        baseline_ema,
+        attention_masks,
+        train_batch_ids,
+    )

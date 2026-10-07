@@ -6,9 +6,21 @@ from .losses import (
     compute_antisat_gate,
     compute_gate_diversity_loss,
     compute_invariance_loss,
+    compute_pg_loss,
+    compute_pg_loss_lite,
+    run_pg_loss,
+    log_gpu_memory,
 )
 from .contrastive import compute_contrastive_gate_loss
-from .trainer import evaluate_loss, evaluate_and_maybe_checkpoint, train_router_bootstrap
+from .trainer import (
+    evaluate_loss,
+    train_phase1_steernet,
+    train_router_bootstrap,
+    run_staged_phase,
+    train_rsc,
+    save_steer_weights,
+    load_steer_weights,
+)
 
 __all__ = [
     "LRReducer",
@@ -19,7 +31,15 @@ __all__ = [
     "compute_gate_diversity_loss",
     "compute_invariance_loss",
     "compute_contrastive_gate_loss",
+    "compute_pg_loss",
+    "compute_pg_loss_lite",
+    "run_pg_loss",
+    "log_gpu_memory",
     "evaluate_loss",
-    "evaluate_and_maybe_checkpoint",
+    "train_phase1_steernet",
     "train_router_bootstrap",
+    "run_staged_phase",
+    "train_rsc",
+    "save_steer_weights",
+    "load_steer_weights",
 ]

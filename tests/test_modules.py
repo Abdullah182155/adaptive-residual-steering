@@ -1,11 +1,25 @@
+import sys
+import os
 import unittest
 import torch
 import torch.nn as nn
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from src.configs.config import RSCConfig
 from src.steering.steernet import RSCSteerNet
 from src.gating.gate import RSCUsefulnessGate
 from src.routing.router import JointLayerRouter
 from src.routing.rloo import sample_k, sample_subset_plackett_luce, policy_entropy_bonus
+from src.training import (
+    train_rsc,
+    train_phase1_steernet,
+    train_router_bootstrap,
+    run_staged_phase,
+    save_steer_weights,
+    load_steer_weights,
+    run_pg_loss,
+)
 
 class TestARSModules(unittest.TestCase):
     def setUp(self):
