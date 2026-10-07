@@ -54,7 +54,7 @@ torch_cache/
 wandb/
 
 # Data & Datasets
-data/
+/data/
 datasets_cache/
 *.arrow
 *.parquet
