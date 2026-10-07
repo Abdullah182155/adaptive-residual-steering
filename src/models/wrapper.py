@@ -40,6 +40,9 @@ class Phi2WithRSC(nn.Module):
         self._last_inferred_k = None
         self._router_context_mask_pending = None
         self._router_context_mask_active = None
+        self._prompt_shield_mask_pending = None
+        self._prompt_shield_mask_active = None
+        self.prompt_shielding = getattr(cfg, "prompt_shielding", True)
         self._router_warmup = False
         self._warmup_cursor = 0
         self._warmup_width_visits = [0] * self.cfg.max_active_layers
@@ -109,7 +112,13 @@ class Phi2WithRSC(nn.Module):
                         route = selected.to(alpha.dtype).view(-1, 1, 1)
                         route_st = route
                         k_scale = wrapper._active_k_realized.to(dtype=alpha.dtype).sqrt().view(-1, 1, 1)
-                        h_new = h_fp + route_st * alpha.detach() * delta * mask.to(alpha.dtype).unsqueeze(-1) / k_scale
+                        steer_mask = mask
+                        if wrapper.prompt_shielding and wrapper._prompt_shield_mask_active is not None:
+                            sh = wrapper._prompt_shield_mask_active
+                            if sh.ndim == 2 and sh.shape[0] == h_fp.shape[0] and sh.shape[1] >= h_fp.shape[1]:
+                                sh_aligned = sh[:, -h_fp.shape[1]:].to(device=h_fp.device, dtype=torch.bool)
+                                steer_mask = steer_mask & (~sh_aligned)
+                        h_new = h_fp + route_st * alpha.detach() * delta * steer_mask.to(alpha.dtype).unsqueeze(-1) / k_scale
                     h_out = h_new.to(h.dtype)
                     if orig_2d:
                         h_out = h_out.squeeze(0)
@@ -142,6 +151,7 @@ class Phi2WithRSC(nn.Module):
                 self._router_logits = self._cached_decode_logits
                 self._router_margins = self._cached_decode_margins
                 self._active_k_realized = self._cached_decode_active_k
+                self._prompt_shield_mask_active = None
             else:
                 self._desired_k = None
                 self._precomputed_routes = None
@@ -156,15 +166,26 @@ class Phi2WithRSC(nn.Module):
                     self._cached_decode_logits = None
                     self._cached_decode_margins = None
                     self._cached_decode_active_k = None
+                    self._prompt_shield_mask_active = self._prompt_shield_mask_pending
 
             self._router_context_mask_active = self._router_context_mask_pending
             self._router_context_mask_pending = None
+            self._prompt_shield_mask_pending = None
             return args, kwargs
 
         self._mask_capture_hook = self.base_model.register_forward_pre_hook(
             _capture_mask_pre_hook, with_kwargs=True
         )
         self._hooks.append(self._mask_capture_hook)
+
+    def set_prompt_shield_mask(self, mask: Optional[torch.Tensor] = None):
+        """Set a boolean mask (B, T) where True indicates tokens that should be shielded
+        (i.e. zero residual steering perturbation and excluded from router pooling)."""
+        self._prompt_shield_mask_pending = mask
+
+    def set_prompt_shielding(self, enabled: bool):
+        """Enable or disable prompt shielding."""
+        self.prompt_shielding = enabled
 
     def set_gate_freeze(self, freeze: bool, value: float = 1.0):
         for gate in self.gates.values():
@@ -220,6 +241,13 @@ class Phi2WithRSC(nn.Module):
 
     def _router_mask_for(self, h: torch.Tensor, fallback_mask: torch.Tensor) -> torch.Tensor:
         mask = self._router_context_mask_active
+        if mask is None and self.prompt_shielding and self._prompt_shield_mask_active is not None:
+            sh = self._prompt_shield_mask_active
+            if sh.ndim == 2 and sh.shape[0] == h.shape[0] and sh.shape[1] >= h.shape[1]:
+                sh_aligned = sh[:, -h.shape[1]:].to(device=h.device, dtype=torch.bool)
+                unshielded = fallback_mask & (~sh_aligned)
+                if unshielded.any():
+                    mask = unshielded
         if mask is None or mask.ndim != 2 or mask.shape[0] != h.shape[0] or mask.shape[1] < h.shape[1]:
             return fallback_mask
         aligned = mask[:, -h.shape[1] :].to(device=h.device, dtype=torch.bool)
