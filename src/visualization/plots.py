@@ -123,7 +123,12 @@ def plot_synergy_heatmap(
     set_ars_publication_theme()
     fig, ax = plt.subplots(figsize=figsize)
 
-    if synergy_matrix.ndim == 3:
+    if hasattr(synergy_matrix, "detach"):
+        synergy_matrix = synergy_matrix.detach().cpu().numpy()
+    elif hasattr(synergy_matrix, "cpu"):
+        synergy_matrix = synergy_matrix.cpu().numpy()
+
+    if isinstance(synergy_matrix, np.ndarray) and synergy_matrix.ndim == 3:
         synergy_matrix = synergy_matrix[0]
     mat = np.array(synergy_matrix, dtype=float)
     N = mat.shape[0]
@@ -190,7 +195,7 @@ def plot_layer_selection_and_k(
 
     # Panel 1: Layer Selection Rates
     layers = sorted([int(k) for k in selection_rates.keys()])
-    rates = [selection_rates.get(l, selection_rates.get(str(l), 0.0)) * 100 for l in layers]
+    rates = [float(selection_rates.get(l, selection_rates.get(str(l), 0.0))) * 100 for l in layers]
     x_layers = [f"L{l}" for l in layers]
 
     bars1 = ax1.bar(
@@ -221,7 +226,7 @@ def plot_layer_selection_and_k(
 
     # Panel 2: Realized K Distribution
     k_keys = sorted([int(k) for k in k_distribution.keys() if int(k) > 0])
-    k_probs = [k_distribution.get(k, k_distribution.get(str(k), 0.0)) * 100 for k in k_keys]
+    k_probs = [float(k_distribution.get(k, k_distribution.get(str(k), 0.0))) * 100 for k in k_keys]
     x_k = [f"K={k}" for k in k_keys]
 
     colors_k = [COLOR_VIVID_ORANGE if p == max(k_probs) else COLOR_GRAY for p in k_probs]
