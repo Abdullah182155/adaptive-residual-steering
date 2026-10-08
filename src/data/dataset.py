@@ -55,8 +55,25 @@ class PromptTemplateBank:
             cls.render(question, steps, final_answer, r2),
         )
 
-def gsm8k_to_cot(tokenizer, cfg: RSCConfig):
+def gsm8k_to_cot(
+    tokenizer,
+    cfg: Optional[RSCConfig] = None,
+    n_samples: Optional[int] = None,
+    max_length: Optional[int] = None,
+    val_split: Optional[float] = None,
+    seed: Optional[int] = None,
+):
     """Loads GSM8K, applies formatting, curriculum sorting, and tokenization."""
+    if cfg is None:
+        cfg = RSCConfig()
+    if n_samples is not None:
+        cfg.n_samples = n_samples
+    if max_length is not None:
+        cfg.max_tok_len = max_length
+    if seed is not None:
+        cfg.seed = seed
+    split_ratio = val_split if val_split is not None else getattr(cfg, "val_split", 0.08)
+
     ds = load_dataset("openai/gsm8k", "main", split="train")
     if cfg.n_samples < len(ds):
         ds = ds.shuffle(seed=cfg.seed).select(range(cfg.n_samples))
@@ -126,5 +143,5 @@ def gsm8k_to_cot(tokenizer, cfg: RSCConfig):
         "torch", columns=["input_ids", "attention_mask", "labels"], output_all_columns=True
     )
 
-    splits = ds.train_test_split(test_size=0.08, seed=cfg.seed)
+    splits = ds.train_test_split(test_size=split_ratio, seed=cfg.seed)
     return splits["train"], splits["test"]

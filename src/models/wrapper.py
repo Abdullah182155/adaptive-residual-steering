@@ -410,8 +410,10 @@ class Phi2WithRSC(nn.Module):
         return {
             int(layer): {
                 "selection_rate_ema": float(self.router.selection_rate_ema[pos].item()),
+                "selection_rate_batch": float(self.router.selection_rate_ema[pos].item()),
                 "logit_ema": float(self.router.logit_ema[pos].item()),
                 "selected_forwards": int(self.router.selected_forwards[pos].item()),
+                "activations_count": int(self.router.selected_forwards[pos].item()),
                 "seen_forwards": int(self.router.seen_forwards[pos].item()),
             }
             for pos, layer in enumerate(self.target_layers)
