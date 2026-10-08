@@ -345,8 +345,10 @@ def compute_pg_loss(
         if attention_masks is not None
         else (input_ids != tokenizer.pad_token_id).long()
     )
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-        _ = model(input_ids=input_ids, attention_mask=attn, labels=labels)
+        _ = model(input_ids=input_ids, attention_mask=attn)
 
     pg_total = torch.tensor(0.0, device=device)
     n_terms = 0
@@ -427,8 +429,10 @@ def compute_pg_loss_lite(
     if abs(centred_adv) < 1e-5:
         return torch.tensor(0.0, device=device)
 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-        _ = model(input_ids=input_ids, attention_mask=attn, labels=labels)
+        _ = model(input_ids=input_ids, attention_mask=attn)
 
     pg_total = torch.tensor(0.0, device=device)
     n_terms = 0

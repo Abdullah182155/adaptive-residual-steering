@@ -399,7 +399,9 @@ def run_staged_phase(
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(input_ids=ids, attention_mask=mask, labels=lbls)
                 task_loss = out.loss
-                scaled_total = task_loss / cfg.grad_accum
+
+            if torch.isfinite(task_loss) and task_loss.requires_grad:
+                scaler.scale(task_loss / cfg.grad_accum).backward()
 
             _gate_aux_this_micro = train_gate and (accum_count == 0 or not train_steer)
             if _gate_aux_this_micro:
@@ -412,19 +414,24 @@ def run_staged_phase(
                 epoch_gate_antisat += asat_loss.item()
                 epoch_gate_contrast += contrast_loss.item()
                 n_gate_aux_steps += 1
-                scaled_total = scaled_total + (
+                aux_loss = (
                     cfg.lambda_l1_gate * l1_loss
                     + cfg.lambda_gate_antisat * asat_loss
                     + cfg.lambda_gate_usefulness * contrast_loss
                     + cfg.lambda_gate_diversity * diversity_loss
                 ) / cfg.grad_accum
+                if torch.isfinite(aux_loss) and aux_loss.requires_grad:
+                    scaler.scale(aux_loss).backward()
 
-            if train_gate and accum_count == 0 and global_step % cfg.pg_every_n_steps == 0:
+            if train_gate and not train_steer and accum_count == 0 and global_step % cfg.pg_every_n_steps == 0:
                 pg_idx = random.sample(range(len(train_data)), min(cfg.pg_n_samples, len(train_data)))
                 pg_ids = torch.stack([train_data[j]["input_ids"] for j in pg_idx]).to(device)
                 pg_lbls = torch.stack([train_data[j]["labels"] for j in pg_idx]).to(device)
                 pg_loss = run_pg_loss(model, tokenizer, pg_ids, pg_lbls, device, cfg, baseline_ema)
-                scaled_total = scaled_total + cfg.lambda_pg * pg_loss
+                if torch.isfinite(pg_loss) and pg_loss.requires_grad:
+                    scaler.scale(cfg.lambda_pg * pg_loss).backward()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if train_steer and accum_count == 0 and global_step % cfg.invariance_every_n_steps == 0:
                 inv_loss = compute_invariance_loss(
@@ -434,24 +441,18 @@ def run_staged_phase(
                     [train_data[i]["final_num"] for i in batch_idx],
                     cfg, device, seed_offset=global_step,
                 )
-                scaled_total = scaled_total + cfg.lambda_invariance * inv_loss
+                if torch.isfinite(inv_loss) and inv_loss.requires_grad:
+                    scaler.scale(cfg.lambda_invariance * inv_loss).backward()
 
             if train_router and accum_count == 0 and global_step % cfg.router_probe_every_n_steps == 0:
                 prompt_mask = mask.bool() & lbls.eq(-100)
                 router_loss, rloo_diag = compute_router_rloo_loss(model, ids, mask, lbls, cfg, prompt_mask=prompt_mask)
-                scaled_total = scaled_total + router_loss
+                if torch.isfinite(router_loss) and router_loss.requires_grad:
+                    scaler.scale(router_loss).backward()
                 if rloo_diag:
                     epoch_policy_loss += rloo_diag["policy_loss"]
                     epoch_mean_k += rloo_diag["mean_k_sampled"]
                     n_router_rloo_steps += 1
-
-            if not torch.isfinite(scaled_total) or not scaled_total.requires_grad:
-                if not torch.isfinite(scaled_total):
-                    optimizer.zero_grad(set_to_none=True)
-                    accum_count = 0
-                continue
-
-            scaler.scale(scaled_total).backward()
             accum_count += 1
             is_last = start + cfg.batch_size >= len(indices)
             if accum_count == cfg.grad_accum or is_last:
