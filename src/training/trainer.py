@@ -400,11 +400,9 @@ def run_staged_phase(
                 out = model(input_ids=ids, attention_mask=mask, labels=lbls)
                 task_loss = out.loss
 
-            if torch.isfinite(task_loss) and task_loss.requires_grad:
-                scaler.scale(task_loss / cfg.grad_accum).backward()
+            micro_loss = (task_loss / cfg.grad_accum) if (torch.isfinite(task_loss) and task_loss.requires_grad) else None
 
-            _gate_aux_this_micro = train_gate and (accum_count == 0 or not train_steer)
-            if _gate_aux_this_micro:
+            if train_gate:
                 l1_loss = compute_l1_gate(model)
                 asat_loss = compute_antisat_gate(model, threshold=0.85)
                 contrast_loss = compute_contrastive_gate_loss(model, ids, lbls, tokenizer, device)
@@ -421,7 +419,10 @@ def run_staged_phase(
                     + cfg.lambda_gate_diversity * diversity_loss
                 ) / cfg.grad_accum
                 if torch.isfinite(aux_loss) and aux_loss.requires_grad:
-                    scaler.scale(aux_loss).backward()
+                    micro_loss = aux_loss if micro_loss is None else (micro_loss + aux_loss)
+
+            if micro_loss is not None:
+                scaler.scale(micro_loss).backward()
 
             if train_gate and not train_steer and accum_count == 0 and global_step % cfg.pg_every_n_steps == 0:
                 pg_idx = random.sample(range(len(train_data)), min(cfg.pg_n_samples, len(train_data)))
