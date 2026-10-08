@@ -146,6 +146,22 @@ class RSCConfig:
     def effective_batch_size(self) -> int:
         return self.batch_size * self.grad_accum
 
+    @property
+    def max_length(self) -> int:
+        return self.max_tok_len
+
+    @max_length.setter
+    def max_length(self, value: int):
+        self.max_tok_len = value
+
+    @property
+    def val_split(self) -> float:
+        return 0.08
+
+    @val_split.setter
+    def val_split(self, value: float):
+        pass
+
     def rsc_layers_for(self, n_total: int) -> List[int]:
         if not 1 <= self.max_active_layers <= 4:
             raise ValueError("max_active_layers must be in [1, 4]")
