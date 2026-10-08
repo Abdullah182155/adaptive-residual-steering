@@ -50,7 +50,7 @@ class RSCUsefulnessGate(nn.Module):
             self._alpha_for_aux = val
             return val
 
-        h_fp = h.float()
+        h_fp = h.detach().float()
         d_det = delta.detach().float()  # No gradient from gate into SteerNet
 
         h_n = self.h_norm(h_fp)

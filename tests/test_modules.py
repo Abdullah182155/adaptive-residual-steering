@@ -241,6 +241,30 @@ class TestARSModules(unittest.TestCase):
         if os.path.exists("./test_ckpt.pt"):
             os.remove("./test_ckpt.pt")
 
+    def test_joint_backward_no_graph_revisit(self):
+        """Ensure joint training (steer + gate) executes cleanly without graph reuse error."""
+        from src.training.losses import compute_l1_gate, compute_antisat_gate
+        gate = RSCUsefulnessGate(hidden_dim=self.hidden_dim, cfg=self.cfg)
+        steer = RSCSteerNet(hidden_dim=self.hidden_dim, rank=16, lora_alpha=32.0)
+
+        h = torch.randn(self.batch_size, self.seq_len, self.hidden_dim, requires_grad=True)
+        delta = steer(h, active_k=torch.tensor([1, 1]))
+        alpha = gate(h, delta)
+        h_out = h + alpha.detach() * delta
+        task_loss = h_out.sum()
+
+        class ModelMock:
+            gates = {"0": gate}
+
+        aux_loss = compute_l1_gate(ModelMock()) + compute_antisat_gate(ModelMock())
+        micro_loss = task_loss + aux_loss
+        micro_loss.backward()
+
+        self.assertIsNotNone(steer.down1.weight.grad)
+        self.assertTrue(torch.isfinite(steer.down1.weight.grad).all())
+        self.assertIsNotNone(gate.fc1.weight.grad)
+        self.assertTrue(torch.isfinite(gate.fc1.weight.grad).all())
+
 if __name__ == "__main__":
     unittest.main()
 
