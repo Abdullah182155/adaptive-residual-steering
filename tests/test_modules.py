@@ -239,7 +239,67 @@ class TestARSModules(unittest.TestCase):
         )
         self.assertIsNotNone(cur_val)
         if os.path.exists("./test_ckpt.pt"):
-            os.remove("./test_ckpt.pt")
+            try:
+                os.remove("./test_ckpt.pt")
+            except OSError:
+                pass
+
+    def test_normalized_synergy_and_cooperation_analysis(self):
+        """Ensure synergy matrix is strictly bounded in [-1, 1] and cooperation analysis works."""
+        target_layers = [9, 11, 13, 15]
+        router = JointLayerRouter(target_layers, hidden_dim=self.hidden_dim, n_layers=20, max_active_layers=4)
+        h = torch.randn(self.batch_size, self.seq_len, self.hidden_dim)
+        mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.bool)
+        u, k_logits = router(h, mask)
+        syn_mat = router.get_layer_synergy_matrix()
+        self.assertIsNotNone(syn_mat)
+        self.assertTrue((syn_mat >= -1.0).all() and (syn_mat <= 1.0).all())
+        # Diagonal must be 0
+        diag = torch.diagonal(syn_mat, dim1=-2, dim2=-1)
+        self.assertTrue((diag == 0.0).all())
+
+        analysis = router.get_cooperation_analysis()
+        self.assertIn("top_synergy_pairs", analysis)
+        self.assertIn("top_antagonistic_pairs", analysis)
+        self.assertIn("mean_synergy", analysis)
+        self.assertIsInstance(analysis["top_synergy_pairs"], list)
+
+    def test_anchor_grounded_rloo_loss(self):
+        """Ensure 3-arm RLOO loss runs with baseline anchor and synergy alignment."""
+        class DummyLayer(nn.Module):
+            def __init__(self, hidden_dim):
+                super().__init__()
+            def forward(self, h, *args, **kwargs):
+                return h
+        class DummyModel(nn.Module):
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": hidden_dim})()
+                self.embed = nn.Embedding(50, hidden_dim)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer(hidden_dim) for _ in range(10)])})()
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h, "loss": torch.tensor(0.5)})()
+
+        dummy = DummyModel(self.hidden_dim)
+        cfg = RSCConfig()
+        wrapper = Phi2WithRSC(dummy, cfg, device=torch.device("cpu"))
+
+        ids = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]])
+        mask = torch.ones_like(ids)
+        lbls = torch.tensor([[-100, 2, 3, 4], [-100, 6, 7, 8]])
+        prompt_mask = mask.bool() & lbls.eq(-100)
+
+        # Trigger forward to cache pooled features
+        _ = wrapper(input_ids=ids, attention_mask=mask)
+        from src.routing.rloo import compute_router_rloo_loss
+        loss, diag = compute_router_rloo_loss(wrapper, ids, mask, lbls, cfg, prompt_mask=prompt_mask)
+        self.assertTrue(torch.isfinite(loss))
+        self.assertIn("win_rate_vs_base", diag)
+        self.assertIn("synergy_align_loss", diag)
+        self.assertIn("mean_reward_delta", diag)
 
     def test_joint_backward_no_graph_revisit(self):
         """Ensure joint training (steer + gate) executes cleanly without graph reuse error."""

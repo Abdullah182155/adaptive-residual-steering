@@ -311,13 +311,19 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             postfix_dict = {"loss": f"{loss.item():.4f}"}
             if rloo_diag:
                 postfix_dict["mean_k"] = f"{rloo_diag.get('mean_k_sampled', 0.0):.2f}"
+                if "win_rate_vs_base" in rloo_diag:
+                    postfix_dict["win_base"] = f"{rloo_diag['win_rate_vs_base'] * 100:.0f}%"
             pbar.set_postfix(**postfix_dict)
 
         avg_loss = running / max(1, n_steps)
         k_dist = model.routing_k_distribution()
         diag = model.routing_diagnostics()
         active_cnt = sum(1 for s in diag.values() if s["selected_forwards"] > 0)
-        print(f"  RouterBootstrap Epoch {epoch+1}: loss={avg_loss:.4f} | active layers={active_cnt}/{len(diag)} | K-dist={k_dist}")
+        coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
+        top_syn_str = ", ".join(f"L{a}+L{b}:{v:+.2f}" for a, b, v in coop.get("top_synergy_pairs", [])[:2])
+        win_str = f" | win_base={rloo_diag.get('win_rate_vs_base', 0.0) * 100:.1f}%" if rloo_diag else ""
+        syn_str = f" | top synergy: [{top_syn_str}]" if top_syn_str else ""
+        print(f"  RouterBootstrap Epoch {epoch+1}: loss={avg_loss:.4f}{win_str} | active layers={active_cnt}/{len(diag)}{syn_str} | K-dist={k_dist}")
         if avg_loss < best_loss - 1e-4:
             best_loss, patience_ctr = avg_loss, 0
             best_state = {k: v.clone() for k, v in model.state_dict().items() if "router" in k}
