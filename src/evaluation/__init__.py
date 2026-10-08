@@ -19,6 +19,12 @@ from .multi_dataset import (
     load_benchmark_dataset,
     BENCHMARK_EXEMPLARS,
 )
+from .multi_benchmark_runner import (
+    evaluate_model_condition,
+    run_fair_multishot_benchmark,
+    format_benchmark_summary_table,
+    export_latex_summary_table,
+)
 
 __all__ = [
     "extract_and_verify_equations",
@@ -38,5 +44,9 @@ __all__ = [
     "evaluate_sample_answer",
     "load_benchmark_dataset",
     "BENCHMARK_EXEMPLARS",
+    "evaluate_model_condition",
+    "run_fair_multishot_benchmark",
+    "format_benchmark_summary_table",
+    "export_latex_summary_table",
 ]
 
