@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Optional
+import numpy as np
+from typing import List, Tuple, Optional, Dict, Any
 from src.configs.config import RSCConfig
 
 class JointLayerRouter(nn.Module):
@@ -120,9 +121,10 @@ class JointLayerRouter(nn.Module):
         pooled_2 = attended_2.mean(dim=1)
         k_logits = self.k_head(pooled_2)
 
-        # Cross-layer cooperation & synergy matrix: S_ij = (e_i W_syn e_j^T) / sqrt(d)
+        # Cross-layer cooperation & synergy matrix: S_ij = tanh((e_i W_syn e_j^T) / sqrt(d))
         query = self.synergy_proj(attended_2)
-        synergy = torch.bmm(query, attended_2.transpose(1, 2)) / (self.d_model ** 0.5)
+        raw_syn = torch.bmm(query, attended_2.transpose(1, 2)) / (self.d_model ** 0.5)
+        synergy = torch.tanh(raw_syn)
         synergy = 0.5 * (synergy + synergy.transpose(1, 2))
         eye = torch.eye(N, device=tokens.device, dtype=torch.bool).unsqueeze(0)
         synergy = synergy.masked_fill(eye, 0.0)
@@ -154,13 +156,34 @@ class JointLayerRouter(nn.Module):
         self.k_dist_ema.mul_(0.98).add_(0.02 * k_onehot)
 
     def get_layer_synergy_matrix(self) -> Optional[torch.Tensor]:
-        """Returns the latest learned cross-layer synergy matrix."""
+        """Returns the latest learned cross-layer synergy matrix bounded in [-1, 1]."""
         if hasattr(self, "_last_synergy_matrix") and self._last_synergy_matrix is not None:
             return self._last_synergy_matrix.detach()
         tokens = self.identity_embed.weight.unsqueeze(0)
         query = self.synergy_proj(tokens)
-        syn = torch.bmm(query, tokens.transpose(1, 2)) / (self.d_model ** 0.5)
+        raw_syn = torch.bmm(query, tokens.transpose(1, 2)) / (self.d_model ** 0.5)
+        syn = torch.tanh(raw_syn)
         syn = 0.5 * (syn + syn.transpose(1, 2))
         eye = torch.eye(self.n_candidates, device=tokens.device, dtype=torch.bool).unsqueeze(0)
         return syn.masked_fill(eye, 0.0).detach()
+
+    def get_cooperation_analysis(self) -> dict:
+        """Extracts top cooperative (synergistic) and conflicting (antagonistic) layer pairs."""
+        syn_mat = self.get_layer_synergy_matrix()
+        if syn_mat is None:
+            return {"top_synergy_pairs": [], "top_antagonistic_pairs": [], "mean_synergy": 0.0}
+        mat = syn_mat[0] if syn_mat.ndim == 3 else syn_mat
+        mat_cpu = mat.detach().cpu().numpy()
+        N = len(self.target_layers)
+        pairs = []
+        for i in range(N):
+            for j in range(i + 1, N):
+                val = float(mat_cpu[i, j])
+                pairs.append((self.target_layers[i], self.target_layers[j], val))
+        pairs_sorted = sorted(pairs, key=lambda x: x[2], reverse=True)
+        return {
+            "top_synergy_pairs": pairs_sorted[:3],
+            "top_antagonistic_pairs": list(reversed(pairs_sorted[-3:])),
+            "mean_synergy": float(mat_cpu[~np.eye(N, dtype=bool)].mean()) if N > 1 else 0.0,
+        }
 

@@ -118,18 +118,48 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
                 nll_b = per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
+        # Arm 0: Ground-truth unsteered baseline anchor
+        model.set_routing_override("none")
+        model.set_router_context_mask(prompt_mask)
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=ids.is_cuda):
+                nll_0 = per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
     finally:
         if old_override is None:
             model.set_routing_override(None)
         else:
             model.set_routing_override(old_override[0], old_override[1])
 
+    reward_0 = (-nll_0).detach()
     lambda_cost = getattr(cfg, "lambda_cost", 0.005)
     reward_a = (-nll_a - lambda_cost * (k_a.float() - 1.0)).detach()
     reward_b = (-nll_b - lambda_cost * (k_b.float() - 1.0)).detach()
-    advantage_a = reward_a - reward_b
 
-    policy_loss = -((logprob_a - logprob_b) * advantage_a).mean()
+    # Anchor-Grounded 3-Arm Leave-One-Out (RLOO)
+    baseline_for_a = (reward_b + reward_0) / 2.0
+    baseline_for_b = (reward_a + reward_0) / 2.0
+    advantage_a = reward_a - baseline_for_a
+    advantage_b = reward_b - baseline_for_b
+
+    policy_loss = -0.5 * (logprob_a * advantage_a + logprob_b * advantage_b).mean()
+
+    # Direct Pairwise Synergy Alignment Loss
+    delta_r_a = (reward_a - reward_0).detach()
+    delta_r_b = (reward_b - reward_0).detach()
+    if synergy is not None:
+        mask_pairs_a = (subset_a_mask.unsqueeze(2) & subset_a_mask.unsqueeze(1)).float()
+        mask_pairs_b = (subset_b_mask.unsqueeze(2) & subset_b_mask.unsqueeze(1)).float()
+        eye_N = torch.eye(model.router.n_candidates, device=ids.device, dtype=torch.bool).unsqueeze(0)
+        mask_pairs_a = mask_pairs_a.masked_fill(eye_N, 0.0)
+        mask_pairs_b = mask_pairs_b.masked_fill(eye_N, 0.0)
+        n_pairs_a = mask_pairs_a.sum(dim=(1, 2)).clamp(min=1.0)
+        n_pairs_b = mask_pairs_b.sum(dim=(1, 2)).clamp(min=1.0)
+        syn_a = (synergy * mask_pairs_a).sum(dim=(1, 2)) / n_pairs_a
+        syn_b = (synergy * mask_pairs_b).sum(dim=(1, 2)) / n_pairs_b
+        synergy_align_loss = -0.5 * (delta_r_a * syn_a + delta_r_b * syn_b).mean()
+    else:
+        synergy_align_loss = torch.tensor(0.0, device=ids.device)
+
     h_k, h_subset = policy_entropy_bonus(u_fresh, k_logits_fresh, K_max)
 
     beta_k = getattr(cfg, "beta_entropy_k", 0.15)
@@ -140,11 +170,22 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     target_sel = (k_a.float() + k_b.float()).mean() / (2.0 * model.router.n_candidates)
     balance_loss = F.mse_loss(mean_selected, target_sel.expand_as(mean_selected))
     lambda_balance = getattr(cfg, "router_balance_weight", 0.10)
+    lambda_synergy = getattr(cfg, "lambda_synergy", 0.10)
 
-    loss = policy_loss - beta_k * h_k - beta_subset * h_subset + lambda_balance * balance_loss
+    loss = (
+        policy_loss
+        - beta_k * h_k
+        - beta_subset * h_subset
+        + lambda_balance * balance_loss
+        + lambda_synergy * synergy_align_loss
+    )
 
+    win_rate = ((reward_a > reward_0).float() + (reward_b > reward_0).float()).mean().item() / 2.0
     diag = {
         "policy_loss": float(policy_loss.detach().item()),
+        "synergy_align_loss": float(synergy_align_loss.detach().item()),
+        "win_rate_vs_base": float(win_rate),
+        "mean_reward_delta": float((0.5 * (delta_r_a + delta_r_b)).mean().item()),
         "h_k_raw": float(h_k.detach().item()),
         "h_k_weighted": float((beta_k * h_k).detach().item()),
         "h_subset_raw": float(h_subset.detach().item()),

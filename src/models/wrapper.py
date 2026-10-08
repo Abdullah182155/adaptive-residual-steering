@@ -424,6 +424,9 @@ class Phi2WithRSC(nn.Module):
     def get_layer_synergy_matrix(self) -> Optional[torch.Tensor]:
         return self.router.get_layer_synergy_matrix()
 
+    def get_cooperation_analysis(self) -> dict:
+        return self.router.get_cooperation_analysis()
+
     def remove_hooks(self):
         for h in self._hooks:
             h.remove()
