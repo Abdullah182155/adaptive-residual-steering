@@ -1,0 +1,44 @@
+<mxfile host="app.diagrams.net" version="22.1.0">
+  <diagram id="router-arch" name="Router Architecture">
+    <mxGraphModel dx="1000" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="900" pageHeight="650" background="#000000" math="1" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+        <mxCell id="title" value="&lt;b&gt;JointLayerRouter: 2-Pass Attention &amp; Synergy Router&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=16;fontColor=#ffffff;" vertex="1" parent="1">
+          <mxGeometry x="150" y="20" width="550" height="30" as="geometry" />
+        </mxCell>
+        <mxCell id="in_h" value="Early Hidden State Tokens &lt;br&gt;&lt;i&gt;H ∈ ℝ^(B×T×d)&lt;/i&gt; (Layer 9)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#111111;strokeColor=#888888;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="270" y="70" width="280" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="sem_proj" value="Semantic Summary Projection &lt;br&gt;&lt;b&gt;LN → Linear(d → 16) → tanh&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#001a26;strokeColor=#00c3ff;fontColor=#00c3ff;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="260" y="145" width="300" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="cand_emb" value="Candidate Embeddings &lt;br&gt;&lt;i&gt;Depth + Identity (d_model=32) + Candidate Semantics&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#111111;strokeColor=#ffffff;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="230" y="220" width="360" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="pass1" value="Pass 1: Joint Self-Attention &lt;br&gt;&lt;b&gt;2 Heads, GELU → UtilityHead (u₁)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a1100;strokeColor=#ff8000;fontColor=#ff9933;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="250" y="295" width="320" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="pass2" value="Pass 2: Iterative Refinement &lt;br&gt;&lt;b&gt;Conditioned on u₁ → Refined Utilities u₂&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a1100;strokeColor=#ff8000;fontColor=#ff9933;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="245" y="370" width="330" height="45" as="geometry" />
+        </mxCell>
+        <mxCell id="k_head" value="K-Head (Softmax)&lt;br&gt;&lt;b&gt;P(K) ∈ ℝ^4 → K=3&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#001a26;strokeColor=#00c3ff;fontColor=#00c3ff;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="100" y="460" width="180" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="topk" value="Top-K Layer Selection&lt;br&gt;&lt;b&gt;argtopk(u₂, K) → {9, 15, 20}&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#002411;strokeColor=#00e676;fontColor=#00e676;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="320" y="460" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="synergy" value="Pairwise Synergy Matrix&lt;br&gt;&lt;b&gt;S_ij = tanh(q_i^T k_j / √d)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a1100;strokeColor=#ffa64d;fontColor=#ffa64d;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="560" y="460" width="200" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="re1" edge="1" source="in_h" target="sem_proj" parent="1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#ff8000;strokeWidth=2;" />
+        <mxCell id="re2" edge="1" source="sem_proj" target="cand_emb" parent="1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#ff8000;strokeWidth=2;" />
+        <mxCell id="re3" edge="1" source="cand_emb" target="pass1" parent="1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#ff8000;strokeWidth=2;" />
+        <mxCell id="re4" edge="1" source="pass1" target="pass2" parent="1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#ff8000;strokeWidth=2;" />
+        <mxCell id="re5" edge="1" source="pass2" target="k_head" parent="1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#00c3ff;strokeWidth=2;" />
+        <mxCell id="re6" edge="1" source="pass2" target="topk" parent="1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#00e676;strokeWidth=2;" />
+        <mxCell id="re7" edge="1" source="pass2" target="synergy" parent="1" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#ffa64d;strokeWidth=2;" />
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
