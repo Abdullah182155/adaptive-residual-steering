@@ -58,13 +58,21 @@ def main():
     if args.curriculum_mode:
         cfg.curriculum_mode = args.curriculum_mode
 
+    from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+
     print("[*] Loading base tokenizer & model...")
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Safeguard against Phi-2 pad_token_id deprecation in latest transformers
+    model_config = AutoConfig.from_pretrained(cfg.model_name, trust_remote_code=True)
+    if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
+        model_config.pad_token_id = tokenizer.eos_token_id
+
     base_model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
+        config=model_config,
         torch_dtype=torch.float32 if device.type == "cpu" else torch.float16,
         trust_remote_code=True,
     ).to(device)
