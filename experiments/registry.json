@@ -1,3 +1,12 @@
 {
-  "experiments": []
+  "experiments": [
+    {
+      "experiment_id": "exp_20261010_085101_ars_phi2_kaggle",
+      "tag": "ars_phi2_kaggle",
+      "created_at": "2026-10-10T08:51:01.900868+00:00",
+      "status": "completed",
+      "git_commit": "aa884e4",
+      "record_path": "experiments/runs/exp_20261010_085101_ars_phi2_kaggle/experiment_record.json"
+    }
+  ]
 }
