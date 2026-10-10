@@ -25,6 +25,8 @@ class RSCConfig:
     lora_dropout: float = 0.05
     steer_magnitude_mode: str = "direct"  # 'direct' or 'decoupled' (direction normalized + bounded scale)
     steer_max_magnitude: float = 2.0
+    steer_max_relative_norm: float = 0.15  # Strictly bounds ||delta|| <= beta * ||h|| to prevent base representation collapse
+    steer_orthogonal_projection: bool = False  # Optional projection onto orthogonal complement of h
 
     # Data
     n_samples: int = 7000
@@ -97,6 +99,8 @@ class RSCConfig:
     beta_entropy_subset: float = 0.15
     router_balance_weight: float = 0.10
     lambda_synergy: float = 0.10
+    router_layer_dropout: float = 0.15  # Stochastic candidate dropout during training to prevent clique stacking
+    router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
 
     # Prompt Shielding (Preserves pristine representations in multi-shot contexts)
     prompt_shielding: bool = True

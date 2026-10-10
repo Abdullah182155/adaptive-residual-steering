@@ -122,5 +122,52 @@ class TestAuditSimplification(unittest.TestCase):
         out = wrapped(input_ids=inp, attention_mask=mask)
         self.assertIsNotNone(out)
 
+    def test_steernet_bounded_relative_norm(self):
+        # Even with an artificially inflated lora_alpha, ||delta|| / ||h|| must never exceed max_relative_norm
+        beta_max = 0.12
+        net = RSCSteerNet(
+            self.hidden_dim, self.rank, lora_alpha=5000.0, max_relative_norm=beta_max
+        )
+        h = torch.randn(2, 8, self.hidden_dim)
+        delta = net(h)
+        h_norm = torch.norm(h.float(), dim=-1, keepdim=True)
+        delta_norm = torch.norm(delta.float(), dim=-1, keepdim=True)
+        rel_ratio = delta_norm / (h_norm + 1e-7)
+        self.assertTrue((rel_ratio <= beta_max + 1e-4).all(), f"Max relative ratio was {rel_ratio.max().item()} > {beta_max}")
+
+    def test_steernet_orthogonal_projection(self):
+        net = RSCSteerNet(
+            self.hidden_dim, self.rank, self.alpha, orthogonal_projection=True
+        )
+        h = torch.randn(2, 8, self.hidden_dim)
+        delta = net(h)
+        dot_product = (delta * h).sum(dim=-1)
+        self.assertTrue(torch.allclose(dot_product, torch.zeros_like(dot_product), atol=1e-4))
+
+    def test_router_difficulty_awareness_and_dropout(self):
+        from src.routing.router import JointLayerRouter
+        router = JointLayerRouter(
+            target_layers=[2, 4, 6],
+            hidden_dim=self.hidden_dim,
+            n_layers=10,
+            max_active_layers=2,
+            layer_dropout=0.5,
+            difficulty_aware=True,
+        )
+        h = torch.randn(2, 8, self.hidden_dim)
+        mask = torch.ones(2, 8, dtype=torch.bool)
+        
+        # Test evaluation mode (no dropout applied)
+        router.eval()
+        u_eval, k_eval = router(h, mask)
+        self.assertEqual(u_eval.shape, (2, 3))
+        self.assertFalse((u_eval <= -5000.0).any())
+
+        # Test training mode (dropout can mask candidate layers)
+        router.train()
+        u_train, k_train = router(h, mask)
+        self.assertEqual(u_train.shape, (2, 3))
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.2.0] - 2026-10-10
+
+### 🎯 Overview
+Architectural overhaul of ARS core components (Semantic Token Gate 2.0, Bounded Relative Perturbation SteerNet 2.0, and Difficulty-Aware Layer Router with Layer Dropout) addressing empirical shortcomings uncovered during controlled ablations on Microsoft Phi-2 (GSM8K).
+
+### 🧠 Architectural Innovations & Upgrades
+- **Semantic Token Gate 2.0 (`src/gating/gate.py`, `src/training/losses.py`):**
+  - **Dead Gradient Elimination:** Resolved root cause of flatline gate telemetry ($\alpha \equiv 0.800$ across all token categories) where zero-initialization of `self.fc2.weight` caused an identically zero gradient $\frac{\partial \mathcal{L}}{\partial W_{\text{fc1}}} = 0$. Replaced with Gaussian initialization $\mathcal{N}(0, 0.02^2)$.
+  - **Causal Depthwise 1D Convolution:** Integrated causal temporal depthwise convolution ($k=3$, `groups=gate_dim`) with identity Dirac initialization, capturing preceding token context (e.g. `Step`, `=`, numbers) without breaking causal autoregression.
+  - **Dynamic Range Span Penalty:** Enhanced `compute_gate_diversity_loss` to penalize narrow dynamic range spans ($\max(\alpha) - \min(\alpha) < 0.15$) alongside token variance.
+- **SteerNet 2.0 — Bounded Relative Perturbation (`src/steering/steernet.py`, `src/configs/config.py`):**
+  - **Relative Norm Envelope:** Enforces $\|\Delta h\| \le \beta_{\max} \|h\|$ ($\beta_{\max} = 0.15$) via smooth scaling factor $\min(1.0, \frac{\beta_{\max} \|h\|}{\|\Delta h\| + \epsilon})$, mathematically preventing unconstrained residual explosion and base representation collapse (which caused the -3.0% regression in ablation Arm 1).
+  - **Orthogonal Steering Projection:** Added configurable orthogonal complement projection $\Delta h_{\perp} = \Delta h - \frac{\langle \Delta h, h \rangle}{\|h\|^2 + \epsilon} h$ to rotate representation features rather than altering base radial magnitude.
+- **Joint Layer Router 2.0 — Difficulty-Aware with Layer Dropout (`src/routing/router.py`, `src/configs/config.py`):**
+  - **Difficulty Conditioning:** Enriched router scalar features with sequence reasoning length ($\log(1 + T)/6.24$) and hidden state token dispersion to adapt layer selection and $K$-budget to problem complexity.
+  - **Stochastic Layer Dropout:** Introduced stochastic layer dropout during training (`router_layer_dropout = 0.15`), masking individual candidate layer logits to break co-dependent clique stacking and force each layer to learn robust independent steering utility.
+
+### 🧪 Verified
+- Unit test suite expanded to **45 / 45 tests passing (100% OK)** in 28.4 seconds.
+- Architecture diagram synchronization and hash integrity verified via `scripts/check_architecture_diagrams.py`.
+
+---
+
 ## [1.1.0] - 2026-10-10
 
 ### 🎯 Overview

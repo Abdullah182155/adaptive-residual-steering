@@ -25,10 +25,16 @@ class RSCUsefulnessGate(nn.Module):
         self.fc1 = nn.Linear(2 * hidden_dim + 2 + global_context_dim, gate_dim)
         self.act = nn.GELU()
         self.drop = nn.Dropout(cfg.gate_dropout)
+
+        # Causal Context Window (k=3) for local syntax & reasoning step awareness
+        self.causal_conv = nn.Conv1d(gate_dim, gate_dim, kernel_size=3, padding=2, groups=gate_dim)
+        nn.init.dirac_(self.causal_conv.weight)
+        nn.init.zeros_(self.causal_conv.bias)
+
         self.fc2 = nn.Linear(gate_dim, 1)
 
-        # Preserve the already-trained Phase-1 correction at the beginning of Phase 2
-        nn.init.zeros_(self.fc2.weight)
+        # Small non-zero initialization ensures gradient flow back into fc1 from step 0
+        nn.init.normal_(self.fc2.weight, std=0.02)
         init_logit = math.log(cfg.gate_init_alpha / (1.0 - cfg.gate_init_alpha))
         self.fc2.bias.data.fill_(init_logit)
 
@@ -78,6 +84,12 @@ class RSCUsefulnessGate(nn.Module):
 
         feat = torch.cat([h_n, d_n, mag, cos, ctx], dim=-1)  # (B, T, 2d + 2 + global_context_dim)
         x = self.drop(self.act(self.fc1(feat)))
+
+        # Local causal temporal context: gather reasoning context from past tokens
+        if x.shape[1] > 1:
+            x_conv = self.causal_conv(x.transpose(1, 2))[:, :, :x.shape[1]].transpose(1, 2)
+            x = x + self.drop(self.act(x_conv))
+
         gate_logit = torch.clamp(self.fc2(x), min=-10.0, max=10.0)
         alpha = torch.sigmoid(gate_logit)  # (B, T, 1)
 

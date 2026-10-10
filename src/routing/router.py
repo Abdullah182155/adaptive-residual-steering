@@ -15,7 +15,9 @@ class JointLayerRouter(nn.Module):
     def __init__(self, target_layers: List[int], hidden_dim: int, n_layers: int,
                  max_active_layers: int = 4,
                  semantic_dim: int = 16, candidate_semantic_dim: int = 8,
-                 d_model: int = 32, n_heads: int = 2):
+                 d_model: int = 32, n_heads: int = 2,
+                 layer_dropout: float = 0.15,
+                 difficulty_aware: bool = True):
         super().__init__()
         self.target_layers = list(target_layers)
         n_candidates = len(self.target_layers)
@@ -23,6 +25,8 @@ class JointLayerRouter(nn.Module):
         self.max_active_layers = max_active_layers
         self.candidate_semantic_dim = candidate_semantic_dim
         self.semantic_dim = semantic_dim
+        self.layer_dropout = layer_dropout
+        self.difficulty_aware = difficulty_aware
         depths = torch.tensor(
             [idx / max(1, n_layers - 1) for idx in self.target_layers], dtype=torch.float32
         )
@@ -35,7 +39,9 @@ class JointLayerRouter(nn.Module):
 
         self.identity_embed = nn.Embedding(n_candidates, d_model)
         nn.init.normal_(self.identity_embed.weight, mean=0.0, std=0.1)
-        self.input_proj = nn.Linear(4 + candidate_semantic_dim, d_model)
+        
+        n_scalar_dim = 5 if difficulty_aware else 3
+        self.input_proj = nn.Linear(n_scalar_dim + 1 + candidate_semantic_dim, d_model)
 
         # Pass 1: initial joint scoring
         self.attend = nn.TransformerEncoderLayer(
@@ -96,7 +102,17 @@ class JointLayerRouter(nn.Module):
         rms_std = centered.square().sum(dim=1).div(denom).sqrt()
         coverage = valid.mean(dim=1)
         pooled = (h_det * valid.unsqueeze(-1)).sum(dim=1) / denom.unsqueeze(-1)
-        self._last_scalars = torch.stack([mean_rms, rms_std, coverage], dim=-1).detach()
+
+        if self.difficulty_aware:
+            # Difficulty indicators:
+            # 1. Normalized sequence reasoning length: log(1 + denom) / 6.24 (capped in [0, 1])
+            norm_len = (torch.log1p(denom) / 6.24).clamp(0.0, 1.0)
+            # 2. Hidden state dispersion (mean absolute token deviation from sequence mean)
+            dispersion = (centered.abs().sum(dim=1) / denom).clamp(min=0.0)
+            self._last_scalars = torch.stack([mean_rms, rms_std, coverage, norm_len, dispersion], dim=-1).detach()
+        else:
+            self._last_scalars = torch.stack([mean_rms, rms_std, coverage], dim=-1).detach()
+
         self._last_pooled = pooled.detach()
         per_candidate_semantic = self._semantic_from_pooled(pooled)
         return self._last_scalars, per_candidate_semantic
@@ -120,6 +136,15 @@ class JointLayerRouter(nn.Module):
         u_final = self.utility_head_refine(attended_2).squeeze(-1)
         pooled_2 = attended_2.mean(dim=1)
         k_logits = self.k_head(pooled_2)
+
+        # Stochastic Layer Dropout during training:
+        # Prevents co-dependent clique stacking by randomly masking candidate layers,
+        # forcing each candidate layer to learn an independent marginal steering utility.
+        if self.training and self.layer_dropout > 0.0:
+            drop_mask = torch.rand_like(u_final) < self.layer_dropout
+            all_dropped = drop_mask.all(dim=-1, keepdim=True)
+            drop_mask = drop_mask & (~all_dropped)
+            u_final = u_final.masked_fill(drop_mask, -1e4)
 
         # Cross-layer cooperation & synergy matrix: S_ij = tanh((e_i W_syn e_j^T) / sqrt(d))
         query = self.synergy_proj(attended_2)

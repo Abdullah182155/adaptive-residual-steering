@@ -41,8 +41,8 @@ def generate_steernet_png(out_path: str):
     # Title
     ax.text(5.0, 8.4, "RSCSteerNet: K-Conditioned Low-Rank Residual MLP",
             color=WHITE, fontsize=14, fontweight="bold", ha="center")
-    ax.text(5.0, 8.0, r"Parameter-efficient correction: $\delta_t = \frac{\alpha}{r} W_{\mathrm{up}}( \mathrm{MLP}(h) + W_k(K) )$",
-            color=GRAY, fontsize=10, ha="center")
+    ax.text(5.0, 8.0, r"Bounded Relative Perturbation: $\|\delta\| \leq \beta \|h\|$, $\delta_t = \frac{\alpha}{r} W_{\mathrm{up}}(\mathrm{MLP}(h) + W_k(K))$",
+            color=GRAY, fontsize=9.5, ha="center")
 
     def draw_box(x, y, w, h, text, sub="", edge=BOX_EDGE, bg=BOX_BG, text_col=WHITE):
         rect = patches.FancyBboxPatch((x - w/2, y - h/2), w, h, boxstyle="round,pad=0.1,rounding_size=0.15",
@@ -288,9 +288,9 @@ def generate_router_png(out_path: str):
     ax.set_ylim(0, 9.5)
     ax.axis("off")
 
-    ax.text(5.0, 9.0, "JointLayerRouter: 2-Pass Attention & Synergy Router",
+    ax.text(5.0, 9.0, "JointLayerRouter: Difficulty-Aware 2-Pass Router",
             color=WHITE, fontsize=14, fontweight="bold", ha="center")
-    ax.text(5.0, 8.6, r"Joint candidate scoring, learned $K$-budget, and Pairwise Synergy Matrix $S_{ij}$",
+    ax.text(5.0, 8.6, r"Difficulty-aware joint scoring, Layer Dropout, learned $K$, and Synergy $S_{ij}$",
             color=GRAY, fontsize=10, ha="center")
 
     def draw_box(x, y, w, h, text, sub="", edge=BOX_EDGE, bg=BOX_BG, text_col=WHITE):
@@ -317,7 +317,7 @@ def generate_router_png(out_path: str):
     draw_arrow(5.0, 7.45, 5.0, 7.05)
 
     # Candidate Embeddings
-    draw_box(5.0, 5.5, 5.0, 0.65, "Candidate Embeddings", r"Depth ($idx/N$) + Identity ($d_{\mathrm{model}}=32$) + Semantics", edge=WHITE)
+    draw_box(5.0, 5.5, 5.2, 0.65, "Candidate Embeddings", r"Depth + Difficulty ($T,\mathrm{var}$) + Identity + Semantics", edge=WHITE)
     draw_arrow(5.0, 6.35, 5.0, 5.85)
 
     # Pass 1: Transformer Encoder

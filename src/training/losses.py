@@ -161,10 +161,10 @@ def compute_gate_diversity_loss(model, floor: float = 0.05) -> torch.Tensor:
             if valid_b.sum() < 3:
                 continue
             vals = a_b[valid_b]
-            max_pos = vals.argmax()
-            vals_excl_max = torch.cat([vals[:max_pos], vals[max_pos + 1:]])
-            std_b = vals_excl_max.std(unbiased=False)
-            total = total + F.relu(floor - std_b) ** 2
+            std_b = vals.std(unbiased=False)
+            span_b = vals.max() - vals.min()
+            # Penalize both low variance and collapsed dynamic range (< 0.15 span)
+            total = total + F.relu(floor - std_b) ** 2 + 0.5 * F.relu(0.15 - span_b) ** 2
             count += 1
     return total / max(1, count)
 

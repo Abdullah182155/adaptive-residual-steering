@@ -26,7 +26,12 @@ class Phi2WithRSC(nn.Module):
         self.gates = nn.ModuleDict()
         self.steer_nets = nn.ModuleDict()
         self.router = JointLayerRouter(
-            self.target_layers, self.hidden_dim, n_layers, cfg.max_active_layers
+            self.target_layers,
+            self.hidden_dim,
+            n_layers,
+            cfg.max_active_layers,
+            layer_dropout=getattr(cfg, "router_layer_dropout", 0.15),
+            difficulty_aware=getattr(cfg, "router_difficulty_aware", True),
         ).to(self.device)
 
         self._hooks = []
@@ -90,6 +95,8 @@ class Phi2WithRSC(nn.Module):
                 self.cfg.lora_dropout,
                 magnitude_mode=getattr(self.cfg, "steer_magnitude_mode", "direct"),
                 max_magnitude=getattr(self.cfg, "steer_max_magnitude", 2.0),
+                max_relative_norm=getattr(self.cfg, "steer_max_relative_norm", 0.15),
+                orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", False),
             ).to(self.device)
             self.gates[str(idx)] = gate
             self.steer_nets[str(idx)] = steer
