@@ -27,9 +27,9 @@ def sample_subset_plackett_luce(
     det_logits = logits.detach()
     for step in range(K_max):
         active = k > step
-        # Dynamically modulate logits with cross-layer synergy from previously selected layers
+        # Dynamically modulate logits with damped cross-layer synergy from previously selected layers
         if step > 0 and synergy_matrix is not None:
-            syn_boost = torch.bmm(selected.float().unsqueeze(1), synergy_matrix).squeeze(1)
+            syn_boost = 0.5 * torch.bmm(selected.float().unsqueeze(1), synergy_matrix).squeeze(1)
             step_logits = logits + syn_boost
             step_det_logits = det_logits + syn_boost.detach()
         else:
@@ -172,12 +172,18 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     lambda_balance = getattr(cfg, "router_balance_weight", 0.10)
     lambda_synergy = getattr(cfg, "lambda_synergy", 0.10)
 
+    # Target-K Centering Loss: penalizes mean K deviating from balanced sweet spot K* = 2.2
+    mean_sampled_k = ((k_a.float() + k_b.float()) / 2.0).mean()
+    k_center_loss = (mean_sampled_k - 2.2).pow(2)
+    lambda_k_center = getattr(cfg, "lambda_k_center", 0.05)
+
     loss = (
         policy_loss
         - beta_k * h_k
         - beta_subset * h_subset
         + lambda_balance * balance_loss
         + lambda_synergy * synergy_align_loss
+        + lambda_k_center * k_center_loss
     )
 
     win_rate = ((reward_a > reward_0).float() + (reward_b > reward_0).float()).mean().item() / 2.0

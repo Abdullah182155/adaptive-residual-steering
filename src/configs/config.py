@@ -52,11 +52,11 @@ class RSCConfig:
     gate_constant_value: float = 0.80
 
     # Gate loss regularisation
-    lambda_pg: float = 2.0
+    lambda_pg: float = 0.5
     lambda_l1_gate: float = 0.001
-    lambda_gate_usefulness: float = 0.80
+    lambda_gate_usefulness: float = 0.30
     lambda_gate_antisat: float = 0.25
-    lambda_gate_diversity: float = 3.0
+    lambda_gate_diversity: float = 0.5
     gate_diversity_floor: float = 0.05
     pg_n_samples: int = 4
     pg_baseline_momentum: float = 0.8
@@ -94,11 +94,12 @@ class RSCConfig:
     router_dead_layer_veto_frac: float = 0.50
 
     # Cooperative Subset Router & RLOO settings
-    lambda_cost: float = 0.005
-    beta_entropy_k: float = 0.15
+    lambda_cost: float = 0.025
+    beta_entropy_k: float = 0.30
     beta_entropy_subset: float = 0.15
     router_balance_weight: float = 0.10
     lambda_synergy: float = 0.10
+    lambda_k_center: float = 0.05
     router_layer_dropout: float = 0.15  # Stochastic candidate dropout during training to prevent clique stacking
     router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
 
@@ -112,7 +113,7 @@ class RSCConfig:
 
     # Phase 2B: Token Gate training
     gate_only_epochs: int = 3
-    gate_only_lr: float = 1e-3
+    gate_only_lr: float = 2e-4
     gate_only_save_path: str = "./checkpoints/gate_only.pt"
 
     # Phase 2C: Light joint fine-tuning
@@ -122,7 +123,7 @@ class RSCConfig:
 
     # Phase 2D: Gate re-tuning against final router
     gate_retune_epochs: int = 1
-    gate_retune_lr: float = 5e-4
+    gate_retune_lr: float = 1e-4
 
     checkpoint_every_n: int = 3
     lr_reduce_factor: float = 0.5

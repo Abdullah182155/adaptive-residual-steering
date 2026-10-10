@@ -338,7 +338,7 @@ class Phi2WithRSC(nn.Module):
                             best = cur_u.argmax().item()
                             sel_idx.append(best)
                             if synergy is not None:
-                                cur_u = cur_u + synergy[b, best]
+                                cur_u = cur_u + 0.5 * synergy[b, best]
                         selected_matrix[b, sel_idx] = True
                 self._desired_k = k_real
             self.router.observe(u, selected_matrix)
