@@ -349,3 +349,7 @@ def generate_experiment_report_charts(
         generated_charts.append(path_progression)
 
     return generated_charts
+
+
+# Backward compatibility alias
+plot_multishot_comparison = plot_multishot_scaling

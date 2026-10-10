@@ -12,6 +12,7 @@ from src.visualization.theme import (
 )
 from src.visualization.plots import (
     plot_multishot_scaling,
+    plot_multishot_comparison,
     plot_synergy_heatmap,
     plot_layer_selection_and_k,
     plot_training_progression,
@@ -19,6 +20,7 @@ from src.visualization.plots import (
 )
 
 __all__ = [
+    "plot_multishot_comparison",
     "set_ars_publication_theme",
     "COLOR_BLACK",
     "COLOR_GRAY",
