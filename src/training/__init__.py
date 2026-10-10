@@ -18,6 +18,7 @@ from .trainer import (
     train_router_bootstrap,
     run_staged_phase,
     train_rsc,
+    train_streamlined_ars,
     save_steer_weights,
     load_steer_weights,
 )
@@ -40,6 +41,7 @@ __all__ = [
     "train_router_bootstrap",
     "run_staged_phase",
     "train_rsc",
+    "train_streamlined_ars",
     "save_steer_weights",
     "load_steer_weights",
 ]

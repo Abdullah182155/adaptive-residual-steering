@@ -49,6 +49,9 @@ class Phi2WithRSC(nn.Module):
         self._prompt_level_selected_count = [0] * len(self.target_layers)
         self._prompt_level_total = 0
         self._routing_override = None
+        if not getattr(cfg, "use_router", True) or getattr(cfg, "fixed_layers", None) is not None:
+            fl = cfg.fixed_layers or list(self.target_layers)
+            self.set_routing_override("only", fl)
         self._router_inference_mode = "argmax"
 
         # Cached decode attributes
@@ -81,7 +84,12 @@ class Phi2WithRSC(nn.Module):
         for idx in self.target_layers:
             gate = RSCUsefulnessGate(self.hidden_dim, self.cfg).to(self.device)
             steer = RSCSteerNet(
-                self.hidden_dim, self.cfg.lora_rank, self.cfg.lora_alpha, self.cfg.lora_dropout
+                self.hidden_dim,
+                self.cfg.lora_rank,
+                self.cfg.lora_alpha,
+                self.cfg.lora_dropout,
+                magnitude_mode=getattr(self.cfg, "steer_magnitude_mode", "direct"),
+                max_magnitude=getattr(self.cfg, "steer_max_magnitude", 2.0),
             ).to(self.device)
             self.gates[str(idx)] = gate
             self.steer_nets[str(idx)] = steer

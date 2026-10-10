@@ -225,7 +225,7 @@ def plot_layer_selection_and_k(
     ax1.set_title("Layer Selection Distribution", fontweight="bold", pad=12)
 
     # Panel 2: Realized K Distribution
-    k_keys = sorted([int(k) for k in k_distribution.keys() if int(k) > 0])
+    k_keys = sorted([int(k) for k in k_distribution.keys() if int(k) >= 0])
     k_probs = [float(k_distribution.get(k, k_distribution.get(str(k), 0.0))) * 100 for k in k_keys]
     x_k = [f"K={k}" for k in k_keys]
 

@@ -519,6 +519,79 @@ def run_staged_phase(
     return global_step, best_val, best_acc
 
 
+def train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device):
+    """Streamlined 2-Stage ARS Training Pipeline (Priority 5 / EXP-06).
+    
+    Stage 1: Representation Warmup (SteerNet on target layers, Gate = 1.0)
+    Stage 2: Joint Gated Optimization (SteerNet + Token Gate simultaneously with decoupled LRs)
+    """
+    logs = {}
+    print("\n" + "=" * 80)
+    print("🚀 RUNNING STREAMLINED 2-STAGE ARS CURRICULUM")
+    print("=" * 80)
+
+    # Stage 1: Warmup
+    orig_p1_epochs = cfg.phase1_epochs
+    cfg.phase1_epochs = getattr(cfg, "streamlined_warmup_epochs", 3)
+    best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(model, train_data, eval_data, cfg, device)
+    cfg.phase1_epochs = orig_p1_epochs
+    logs.update(p1_logs)
+
+    # Stage 2: Joint Gated Optimization
+    model.set_gate_freeze(False)
+    steer_params = []
+    gate_params = []
+    for sn in model.steer_nets.values():
+        for p in sn.parameters():
+            p.requires_grad = True
+            steer_params.append(p)
+    for g in model.gates.values():
+        for p in g.parameters():
+            p.requires_grad = True
+            gate_params.append(p)
+
+    train_router = getattr(cfg, "use_router", True) and getattr(cfg, "fixed_layers", None) is None
+    for p in model.router.parameters():
+        p.requires_grad = train_router
+
+    steer_lr = getattr(cfg, "streamlined_steer_lr", 1e-4)
+    gate_lr = getattr(cfg, "streamlined_gate_lr", 1e-3)
+    param_groups = [
+        {"params": steer_params, "lr": steer_lr},
+        {"params": gate_params, "lr": gate_lr},
+    ]
+    if train_router:
+        param_groups.append({
+            "params": list(model.router.parameters()),
+            "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale,
+        })
+
+    global_step, best_val_s2, best_acc_s2 = run_staged_phase(
+        model, tokenizer, train_data, eval_data, cfg, device,
+        stage_name="STREAMLINED STAGE 2: Joint Gated Optimization",
+        epochs=getattr(cfg, "streamlined_joint_epochs", 3),
+        param_groups=param_groups,
+        save_path=cfg.phase2_save_path,
+        train_steer=True, train_gate=True, train_router=train_router,
+        global_step=0, baseline_ema=[0.0], patience=max(1, cfg.phase2_patience),
+    )
+    logs["streamlined_stage2_val"] = best_val_s2
+    logs["streamlined_stage2_acc"] = best_acc_s2
+
+    if os.path.exists(cfg.phase2_save_path):
+        state = torch.load(cfg.phase2_save_path, map_location=device)
+        model.load_state_dict(state, strict=False)
+        print(f"  ✅ Loaded final streamlined checkpoint from {cfg.phase2_save_path}")
+
+    print("\n" + "=" * 80)
+    print("🎉 STREAMLINED ARS TRAINING COMPLETE!")
+    print(f"   Stage 1 best validation loss: {best_val_p1:.4f}")
+    print(f"   Stage 2 best validation loss: {best_val_s2:.4f} (acc={best_acc_s2:.3f})")
+    print(f"   Final saved checkpoint      : {cfg.phase2_save_path}")
+    print("=" * 80)
+    return logs, best_val_p1, best_val_s2
+
+
 def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device):
     """Complete multi-phase staged training pipeline:
     Phase 1: Pure SteerNet (Warmup Rotation, Gates=1.0)
@@ -528,6 +601,9 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     Phase 2C: Light Joint Fine-Tuning (SteerNet + Gate + Router)
     Phase 2D: Gate Re-Tune (Against Final Router)
     """
+    if getattr(cfg, "curriculum_mode", "full") == "streamlined":
+        return train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg, device)
+
     logs = {}
 
     # PHASE 1: Pure SteerNet

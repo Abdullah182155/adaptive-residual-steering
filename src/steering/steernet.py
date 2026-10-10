@@ -9,8 +9,18 @@ class RSCSteerNet(nn.Module):
     when multiple layers steer concurrently.
     """
 
-    def __init__(self, hidden_dim: int, rank: int, lora_alpha: float, dropout: float = 0.1):
+    def __init__(
+        self,
+        hidden_dim: int,
+        rank: int,
+        lora_alpha: float,
+        dropout: float = 0.1,
+        magnitude_mode: str = "direct",
+        max_magnitude: float = 2.0,
+    ):
         super().__init__()
+        self.magnitude_mode = magnitude_mode
+        self.max_magnitude = max_magnitude
         self.norm = nn.LayerNorm(hidden_dim)
         self.down1 = nn.Linear(hidden_dim, rank, bias=False)
         self.act1 = nn.GELU()
@@ -28,6 +38,9 @@ class RSCSteerNet(nn.Module):
         scaling_factor = lora_alpha / rank
         self.register_buffer("scale", torch.tensor(scaling_factor, dtype=torch.float32))
 
+        # Learnable log-magnitude for decoupled mode
+        self.log_magnitude = nn.Parameter(torch.zeros(1))
+
         for lin in [self.down1, self.mid, self.up]:
             nn.init.xavier_uniform_(lin.weight, gain=0.02)
 
@@ -39,4 +52,12 @@ class RSCSteerNet(nn.Module):
             x = x + self.k_proj(k_norm)
         mid = self.drop2(self.act2(self.mid(x)))
         x = x + mid
-        return self.up(x) * self.scale.to(x.dtype)
+        delta = self.up(x)
+
+        if self.magnitude_mode == "decoupled":
+            d_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
+            direction = delta / d_norm
+            mag = torch.exp(self.log_magnitude).clamp(max=self.max_magnitude)
+            return direction * mag * self.scale.to(x.dtype)
+
+        return delta * self.scale.to(x.dtype)

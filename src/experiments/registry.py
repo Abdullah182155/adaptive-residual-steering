@@ -322,6 +322,8 @@ def create_experiment(tag: str = "ars_run", config: Any = None, notes: str = "",
 def get_experiment(exp_id: str) -> Optional[ExperimentRun]:
     return _default_registry.get_experiment(exp_id)
 
+load_experiment = get_experiment
+
 def list_experiments() -> List[Dict[str, Any]]:
     return _default_registry.list_experiments()
 

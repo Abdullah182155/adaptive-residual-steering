@@ -446,7 +446,7 @@ def load_benchmark_dataset(
                 })
 
         elif key == "svamp":
-            ds = load_dataset("Chillee/SVAMP", split="test")
+            ds = load_dataset("ChilleD/SVAMP", split="test")
             ds = ds.shuffle(seed=seed).select(range(min(n_samples, len(ds))))
             for row in ds:
                 body = row.get("Body", "")
@@ -494,7 +494,7 @@ def load_benchmark_dataset(
                 })
 
         elif key in {"gsm_plus", "gsmplus"}:
-            ds = load_dataset("qintong/GSM-Plus", split="test")
+            ds = load_dataset("qintongli/GSM-Plus", split="test")
             ds = ds.shuffle(seed=seed).select(range(min(n_samples, len(ds))))
             for row in ds:
                 q_text = row.get("question", "")

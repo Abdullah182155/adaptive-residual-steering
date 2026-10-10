@@ -3,6 +3,7 @@ from src.experiments.registry import (
     ExperimentRegistry,
     create_experiment,
     get_experiment,
+    load_experiment,
     list_experiments,
     get_latest_experiment,
 )
@@ -12,6 +13,7 @@ __all__ = [
     "ExperimentRegistry",
     "create_experiment",
     "get_experiment",
+    "load_experiment",
     "list_experiments",
     "get_latest_experiment",
 ]

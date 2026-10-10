@@ -50,7 +50,7 @@ class TestARSVisualizations(unittest.TestCase):
 
     def test_plot_layer_selection_and_k(self):
         sel_rates = {"9": 0.87, "11": 0.27, "15": 0.25, "20": 0.38}
-        k_dist = {"1": 0.03, "2": 0.04, "3": 0.88, "4": 0.05}
+        k_dist = {"0": 0.27, "1": 0.01, "2": 0.02, "3": 0.46, "4": 0.24}
         save_path = os.path.join(self.temp_dir, "layers.png")
         fig = plot_layer_selection_and_k(sel_rates, k_dist, save_path=save_path)
         self.assertIsNotNone(fig)

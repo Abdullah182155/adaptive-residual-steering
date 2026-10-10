@@ -34,6 +34,8 @@ class RSCUsefulnessGate(nn.Module):
 
         self._freeze_gate = False
         self._freeze_gate_value = 1.0
+        self.gating_mode = getattr(cfg, "gating_mode", "learned")
+        self.gate_constant_value = getattr(cfg, "gate_constant_value", 0.80)
         self.last_alpha = None      # (B, T, 1), detached - for diagnostics
         self._alpha_for_aux = None  # (B, T, 1), grad-carrying - for PG loss
         self._valid_mask = None     # (B, T) bool - non-padding positions, set by hook
@@ -43,6 +45,17 @@ class RSCUsefulnessGate(nn.Module):
             val = torch.full(
                 (h.size(0), h.size(1), 1),
                 self._freeze_gate_value,
+                dtype=h.dtype,
+                device=h.device,
+            )
+            self.last_alpha = val.detach()
+            self._alpha_for_aux = val
+            return val
+
+        if self.gating_mode == "constant":
+            val = torch.full(
+                (h.size(0), h.size(1), 1),
+                self.gate_constant_value,
                 dtype=h.dtype,
                 device=h.device,
             )
@@ -71,3 +84,22 @@ class RSCUsefulnessGate(nn.Module):
         self.last_alpha = alpha.detach()
         self._alpha_for_aux = alpha
         return alpha.to(h.dtype)
+
+    def get_saturation_metrics(self) -> dict:
+        """Compute saturation diagnostics from the most recent forward pass."""
+        if self.last_alpha is None:
+            return {"mean_alpha": 0.0, "low_saturation_pct": 0.0, "high_saturation_pct": 0.0}
+        a = self.last_alpha.view(-1)
+        if self._valid_mask is not None:
+            vm = self._valid_mask.view(-1)
+            if vm.any() and vm.numel() == a.numel():
+                a = a[vm]
+        total = max(1, a.numel())
+        low = (a < 0.05).float().sum().item() / total * 100.0
+        high = (a > 0.95).float().sum().item() / total * 100.0
+        mean = a.mean().item()
+        return {
+            "mean_alpha": round(mean, 4),
+            "low_saturation_pct": round(low, 2),
+            "high_saturation_pct": round(high, 2),
+        }

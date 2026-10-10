@@ -28,6 +28,10 @@ def parse_args():
     parser.add_argument("--epochs", type=int, default=None, help="Override epoch count")
     parser.add_argument("--batch_size", type=int, default=None, help="Override micro-batch size")
     parser.add_argument("--lr", type=float, default=None, help="Override learning rate")
+    parser.add_argument("--steer_magnitude_mode", type=str, default="direct", choices=["direct", "decoupled"], help="SteerNet magnitude mode")
+    parser.add_argument("--fixed_layers", type=str, default=None, help="Comma-separated fixed layers (e.g. '11,15,20') to bypass router")
+    parser.add_argument("--gating_mode", type=str, default="learned", choices=["learned", "constant", "step"], help="Token gating mode")
+    parser.add_argument("--curriculum_mode", type=str, default="full", choices=["full", "streamlined"], help="Curriculum mode ('full' 6-phase or 'streamlined' 2-stage)")
     return parser.parse_args()
 
 def main():
@@ -44,6 +48,15 @@ def main():
     if args.lr:
         cfg.phase1_lr = args.lr
         cfg.router_bootstrap_lr = args.lr
+    if args.steer_magnitude_mode:
+        cfg.steer_magnitude_mode = args.steer_magnitude_mode
+    if args.fixed_layers:
+        cfg.fixed_layers = [int(x.strip()) for x in args.fixed_layers.split(",") if x.strip()]
+        cfg.use_router = False
+    if args.gating_mode:
+        cfg.gating_mode = args.gating_mode
+    if args.curriculum_mode:
+        cfg.curriculum_mode = args.curriculum_mode
 
     print("[*] Loading base tokenizer & model...")
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)

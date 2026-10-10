@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import torch
 
 @dataclass
@@ -10,6 +10,8 @@ class RSCConfig:
     # Layer positions are intentionally discovered from the backbone depth.
     # The router decides which candidates to use for each forward pass and selects at most max_active_layers.
     max_active_layers: int = 4
+    use_router: bool = True  # If False, router is bypassed
+    fixed_layers: Optional[List[int]] = None  # If set, forces these exact layers to steer
     # Catalog router: distribution over subsets. Empty is a legal action.
     catalog_include_pairs: bool = True
     catalog_consecutive_triples: bool = True
@@ -21,6 +23,8 @@ class RSCConfig:
     lora_rank: int = 16
     lora_alpha: float = 32.0
     lora_dropout: float = 0.05
+    steer_magnitude_mode: str = "direct"  # 'direct' or 'decoupled' (direction normalized + bounded scale)
+    steer_max_magnitude: float = 2.0
 
     # Data
     n_samples: int = 7000
@@ -42,6 +46,8 @@ class RSCConfig:
     gate_dim: int = 16
     gate_dropout: float = 0.05
     gate_init_alpha: float = 0.80
+    gating_mode: str = "learned"  # 'learned' (MLP), 'constant' (fixed scalar), or 'step'
+    gate_constant_value: float = 0.80
 
     # Gate loss regularisation
     lambda_pg: float = 2.0
@@ -128,6 +134,13 @@ class RSCConfig:
     invariance_every_n_steps: int = 4
     pg_mode: str = "teacher_forced"  # 'teacher_forced' or 'generation'
 
+    # Curriculum mode
+    curriculum_mode: str = "full"  # 'full' (6 phases) or 'streamlined' (2 stages)
+    streamlined_warmup_epochs: int = 3
+    streamlined_joint_epochs: int = 3
+    streamlined_steer_lr: float = 1e-4
+    streamlined_gate_lr: float = 1e-3
+
     def __post_init__(self):
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         # Ensure parent dirs exist for paths
@@ -163,6 +176,8 @@ class RSCConfig:
         pass
 
     def rsc_layers_for(self, n_total: int) -> List[int]:
+        if self.fixed_layers is not None:
+            return sorted(set(max(1, min(int(idx), n_total - 2)) for idx in self.fixed_layers))
         if not 1 <= self.max_active_layers <= 4:
             raise ValueError("max_active_layers must be in [1, 4]")
         start, stop = int(0.30 * n_total), int(0.80 * n_total)
