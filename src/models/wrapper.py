@@ -326,7 +326,14 @@ class Phi2WithRSC(nn.Module):
                         selected_matrix, _ = sample_subset_plackett_luce(u, k_real, synergy_matrix=synergy)
                     k_real = k_real.clamp(min=1, max=K_max)
                 else:
-                    k_real = (k_logits.argmax(dim=-1) + 1).clamp(min=1, max=K_max)
+                    # Use temperature-scaled sampling (not argmax) to prevent K-collapse in inference.
+                    # argmax always picks the peak logit (K=4 after joint training) deterministically,
+                    # while training used Gumbel sampling which naturally explores K=1,2,3.
+                    # We replicate that distribution at inference via softmax with temperature=1.0.
+                    with torch.no_grad():
+                        k_probs = torch.softmax(k_logits.float(), dim=-1)
+                        k_idx = torch.multinomial(k_probs, num_samples=1).squeeze(-1)
+                        k_real = (k_idx + 1).clamp(min=1, max=K_max)
                     selected_matrix = torch.zeros(h.shape[0], n_candidates, dtype=torch.bool, device=h.device)
                     for b in range(h.shape[0]):
                         kb = int(k_real[b].item())
