@@ -53,7 +53,7 @@ class TestARSModules(unittest.TestCase):
         mask = torch.ones(self.batch_size, self.seq_len, dtype=torch.bool)
         u, k_logits = router(h, mask)
         self.assertEqual(u.shape, (self.batch_size, len(target_layers)))
-        self.assertEqual(k_logits.shape, (self.batch_size, 4))
+        self.assertEqual(k_logits.shape, (self.batch_size, 5))  # K in {0, 1, 2, 3, 4}
 
     def test_rloo_sampling(self):
         k_logits = torch.randn(self.batch_size, 4)

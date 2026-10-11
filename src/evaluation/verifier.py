@@ -255,13 +255,15 @@ def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512)
 
     # Multi-shot prompt shielding: protect few-shot demonstrations from steering representation drift
     if hasattr(model, "set_prompt_shield_mask"):
-        last_q_idx = prompt.rfind("Question:")
-        if last_q_idx > 0:
-            prefix_text = prompt[:last_q_idx]
-            prefix_tokens = tokenizer.encode(prefix_text, add_special_tokens=False)
-            prefix_len = min(len(prefix_tokens), prompt_length)
+        q_toks = tokenizer.encode("Question:", add_special_tokens=False)
+        inp_list = inputs["input_ids"][0].tolist()
+        last_match = -1
+        for i in range(len(inp_list) - len(q_toks) + 1):
+            if inp_list[i : i + len(q_toks)] == q_toks:
+                last_match = i
+        if last_match > 0:
             shield_mask = torch.zeros((inputs["input_ids"].shape[0], prompt_length), dtype=torch.bool, device=device)
-            shield_mask[:, :prefix_len] = True
+            shield_mask[:, :last_match] = True
             model.set_prompt_shield_mask(shield_mask)
 
     try:

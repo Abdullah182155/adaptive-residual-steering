@@ -57,7 +57,7 @@ class JointLayerRouter(nn.Module):
             dropout=0.0, activation="gelu", batch_first=True,
         )
         self.utility_head_refine = nn.Linear(d_model, 1)
-        self.k_head = nn.Linear(d_model, max_active_layers)
+        self.k_head = nn.Linear(d_model, max_active_layers + 1)
         self.d_model = d_model
 
         # Cross-layer cooperation & synergy projection
@@ -76,7 +76,7 @@ class JointLayerRouter(nn.Module):
         self.register_buffer("logit_ema", torch.zeros(n_candidates))
         self.register_buffer("logit_sq_ema", torch.zeros(n_candidates))
         self.register_buffer("selection_rate_ema", torch.full((n_candidates,), 0.5))
-        self.register_buffer("k_dist_ema", torch.full((max_active_layers,), 1.0 / max_active_layers))
+        self.register_buffer("k_dist_ema", torch.full((max_active_layers + 1,), 1.0 / (max_active_layers + 1)))
         self.register_buffer("selected_forwards", torch.zeros(n_candidates, dtype=torch.long))
         self.register_buffer("seen_forwards", torch.zeros(n_candidates, dtype=torch.long))
 
@@ -175,9 +175,8 @@ class JointLayerRouter(nn.Module):
         self.logit_ema.mul_(0.98).add_(0.02 * u.detach().mean(dim=0))
         self.logit_sq_ema.mul_(0.98).add_(0.02 * u.detach().pow(2).mean(dim=0))
         realized = selected_matrix.detach().float().mean(dim=0)
-        self.selection_rate_ema.mul_(0.98).add_(0.02 * realized)
-        k_realized = selected_matrix.detach().sum(dim=-1).clamp(min=1, max=self.max_active_layers)
-        k_onehot = F.one_hot(k_realized.long() - 1, num_classes=self.max_active_layers).float().mean(dim=0)
+        k_realized = selected_matrix.detach().sum(dim=-1).clamp(min=0, max=self.max_active_layers)
+        k_onehot = F.one_hot(k_realized.long(), num_classes=self.max_active_layers + 1).float().mean(dim=0)
         self.k_dist_ema.mul_(0.98).add_(0.02 * k_onehot)
 
     def get_layer_synergy_matrix(self) -> Optional[torch.Tensor]:

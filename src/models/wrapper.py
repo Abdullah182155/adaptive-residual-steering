@@ -188,6 +188,9 @@ class Phi2WithRSC(nn.Module):
                     self._cached_decode_margins = None
                     self._cached_decode_active_k = None
                     self._prompt_shield_mask_active = self._prompt_shield_mask_pending
+                    for g in self.gates.values():
+                        if hasattr(g, "reset_conv_cache"):
+                            g.reset_conv_cache()
 
             self._router_context_mask_active = self._router_context_mask_pending
             self._router_context_mask_pending = None
@@ -329,18 +332,18 @@ class Phi2WithRSC(nn.Module):
             else:
                 if self._router_inference_mode == "sample":
                     with torch.no_grad():
-                        k_real, _ = sample_k(k_logits)
+                        k_real, _ = sample_k(k_logits, k_max=K_max)
                         selected_matrix, _ = sample_subset_plackett_luce(u, k_real, synergy_matrix=synergy)
-                    k_real = k_real.clamp(min=1, max=K_max)
+                    k_real = k_real.clamp(min=0, max=K_max)
                 else:
-                    # Use temperature-scaled sampling (not argmax) to prevent K-collapse in inference.
-                    # argmax always picks the peak logit (K=4 after joint training) deterministically,
-                    # while training used Gumbel sampling which naturally explores K=1,2,3.
-                    # We replicate that distribution at inference via softmax with temperature=1.0.
+                    # Use temperature-scaled sampling to reflect the true learned distribution.
                     with torch.no_grad():
                         k_probs = torch.softmax(k_logits.float(), dim=-1)
                         k_idx = torch.multinomial(k_probs, num_samples=1).squeeze(-1)
-                        k_real = (k_idx + 1).clamp(min=1, max=K_max)
+                        if k_logits.shape[-1] > K_max:
+                            k_real = k_idx.clamp(min=0, max=K_max)
+                        else:
+                            k_real = (k_idx + 1).clamp(min=1, max=K_max)
                     selected_matrix = torch.zeros(h.shape[0], n_candidates, dtype=torch.bool, device=h.device)
                     for b in range(h.shape[0]):
                         kb = int(k_real[b].item())

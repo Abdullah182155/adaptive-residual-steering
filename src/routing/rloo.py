@@ -52,9 +52,11 @@ def sample_subset_plackett_luce(
         remaining = remaining & ~newly
     return selected, logprob
 
-def sample_k(k_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Sample K in {1, ..., K_max} via Gumbel-max on k_logits (B, K_max)."""
-    B, K_max = k_logits.shape
+def sample_k(k_logits: torch.Tensor, k_max: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Sample K via Gumbel-max on k_logits.
+    Supports K in {0, ..., K_max} if logits has K_max+1 dim, or {1, ..., K_max} for legacy K_max dim.
+    """
+    B, n_classes = k_logits.shape
     log_p_grad = F.log_softmax(k_logits, dim=-1)
     with torch.no_grad():
         log_p_det = F.log_softmax(k_logits.detach(), dim=-1)
@@ -62,6 +64,9 @@ def sample_k(k_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         gumbel = -torch.log(-torch.log(u_noise))
         choice = (log_p_det + gumbel).argmax(dim=-1)
     logprob = log_p_grad.gather(1, choice.unsqueeze(-1)).squeeze(-1)
+    # If logits dimension includes K=0 (e.g. 5 classes for max 4), choice is already 0..4
+    if n_classes > (k_max or 4):
+        return choice, logprob
     return choice + 1, logprob
 
 def policy_entropy_bonus(logits: torch.Tensor, k_logits: torch.Tensor, k_max: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -132,8 +137,8 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
 
     reward_0 = (-nll_0).detach()
     lambda_cost = getattr(cfg, "lambda_cost", 0.005)
-    reward_a = (-nll_a - lambda_cost * (k_a.float() - 1.0)).detach()
-    reward_b = (-nll_b - lambda_cost * (k_b.float() - 1.0)).detach()
+    reward_a = (-nll_a - lambda_cost * k_a.float()).detach()
+    reward_b = (-nll_b - lambda_cost * k_b.float()).detach()
 
     # Anchor-Grounded 3-Arm Leave-One-Out (RLOO)
     baseline_for_a = (reward_b + reward_0) / 2.0
@@ -165,11 +170,10 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     beta_k = getattr(cfg, "beta_entropy_k", 0.15)
     beta_subset = getattr(cfg, "beta_entropy_subset", 0.15)
 
-    # Anti-monopoly balance loss: prevents single-layer monopoly
-    mean_selected = (subset_a_mask.float() + subset_b_mask.float()).mean(dim=0) / 2.0
-    target_sel = (k_a.float() + k_b.float()).mean() / (2.0 * model.router.n_candidates)
-    balance_loss = F.mse_loss(mean_selected, target_sel.expand_as(mean_selected))
-    lambda_balance = getattr(cfg, "router_balance_weight", 0.10)
+    # Balance loss removed: old MSE loss forced all layers to ~mean(K)/8 (40% each),
+    # preventing specialization. Layer dropout (0.15) already breaks monopoly naturally.
+    balance_loss = torch.tensor(0.0, device=ids.device)
+    lambda_balance = 0.0
     lambda_synergy = getattr(cfg, "lambda_synergy", 0.10)
 
     # Target-K Centering Loss: penalizes mean K deviating from balanced sweet spot K* = 2.2

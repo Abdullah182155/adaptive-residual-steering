@@ -42,9 +42,14 @@ class RSCUsefulnessGate(nn.Module):
         self._freeze_gate_value = 1.0
         self.gating_mode = getattr(cfg, "gating_mode", "learned")
         self.gate_constant_value = getattr(cfg, "gate_constant_value", 0.80)
+        self._conv_cache = None     # (B, 2, gate_dim) state for streaming decode
         self.last_alpha = None      # (B, T, 1), detached - for diagnostics
         self._alpha_for_aux = None  # (B, T, 1), grad-carrying - for PG loss
         self._valid_mask = None     # (B, T) bool - non-padding positions, set by hook
+
+    def reset_conv_cache(self):
+        """Reset streaming state cache for new generation sequences."""
+        self._conv_cache = None
 
     def forward(self, h: torch.Tensor, delta: torch.Tensor, global_context: torch.Tensor = None) -> torch.Tensor:
         if self._freeze_gate:
@@ -85,10 +90,24 @@ class RSCUsefulnessGate(nn.Module):
         feat = torch.cat([h_n, d_n, mag, cos, ctx], dim=-1)  # (B, T, 2d + 2 + global_context_dim)
         x = self.drop(self.act(self.fc1(feat)))
 
-        # Local causal temporal context: gather reasoning context from past tokens
-        if x.shape[1] > 1:
-            x_conv = self.causal_conv(x.transpose(1, 2))[:, :, :x.shape[1]].transpose(1, 2)
+        # Local causal temporal context: streaming causal conv support for both prefill and decode
+        B, T, D = x.shape
+        if T > 1:
+            x_conv = self.causal_conv(x.transpose(1, 2))[:, :, :T].transpose(1, 2)
             x = x + self.drop(self.act(x_conv))
+            # Cache the last 2 steps for subsequent autoregressive decode steps
+            self._conv_cache = x[:, -2:, :].detach()
+        else:
+            # Autoregressive single-step decode (T == 1): maintain temporal context via streaming cache
+            if self._conv_cache is not None and self._conv_cache.shape[0] == B:
+                x_cat = torch.cat([self._conv_cache, x], dim=1)  # (B, 3, D)
+                conv_out = self.causal_conv(x_cat.transpose(1, 2))[:, :, :3].transpose(1, 2)
+                x = x + self.drop(self.act(conv_out[:, -1:, :]))
+                self._conv_cache = x_cat[:, 1:, :].detach()
+            else:
+                x_conv = self.causal_conv(x.transpose(1, 2))[:, :, :1].transpose(1, 2)
+                x = x + self.drop(self.act(x_conv))
+                self._conv_cache = x.detach().repeat(1, 2, 1)
 
         gate_logit = torch.clamp(self.fc2(x), min=-10.0, max=10.0)
         alpha = torch.sigmoid(gate_logit)  # (B, T, 1)

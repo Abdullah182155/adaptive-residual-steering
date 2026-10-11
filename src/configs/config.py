@@ -25,7 +25,7 @@ class RSCConfig:
     lora_dropout: float = 0.05
     steer_magnitude_mode: str = "direct"  # 'direct' or 'decoupled' (direction normalized + bounded scale)
     steer_max_magnitude: float = 2.0
-    steer_max_relative_norm: float = 0.15  # Strictly bounds ||delta|| <= beta * ||h|| to prevent base representation collapse
+    steer_max_relative_norm: float = 0.08  # Strictly bounds ||delta|| <= beta * ||h|| per layer to prevent multi-layer over-perturbation
     steer_orthogonal_projection: bool = False  # Optional projection onto orthogonal complement of h
 
     # Data
