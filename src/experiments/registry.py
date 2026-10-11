@@ -92,6 +92,17 @@ class ExperimentRun:
     def tag(self) -> str:
         return self.data.get("tag", "")
 
+    @property
+    def weights_path(self) -> Optional[str]:
+        """Resolves the weights path for this experiment run."""
+        recorded = self.data.get("artifacts", {}).get("weights_path")
+        if recorded and os.path.exists(recorded):
+            return recorded
+        standard = os.path.join(self.run_dir, "checkpoints", "final_ars_weights.pt")
+        if os.path.exists(standard):
+            return standard
+        return recorded or standard
+
     def log_config(self, cfg: Any):
         """Records hyperparameter configuration."""
         self.data["config"] = _serialize_config(cfg)
