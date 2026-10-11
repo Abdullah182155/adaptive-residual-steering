@@ -58,6 +58,7 @@ class Phi2WithRSC(nn.Module):
             fl = cfg.fixed_layers or list(self.target_layers)
             self.set_routing_override("only", fl)
         self._router_inference_mode = "softmax"  # BUG-02 fix: was "argmax" but that branch now uses softmax sampling
+        self._joint_grad_mode = False  # When True (Phase 2C), task gradient flows through both alpha and delta
 
         # Cached decode attributes
         self._cached_decode_routes = None
@@ -126,14 +127,19 @@ class Phi2WithRSC(nn.Module):
                         g._valid_mask = mask
                         route = selected.to(alpha.dtype).view(-1, 1, 1)
                         route_st = route
-                        k_scale = wrapper._active_k_realized.to(dtype=alpha.dtype).sqrt().view(-1, 1, 1)
+                        # k_scale removed: max_relative_norm already bounds ||delta|| ≤ 0.15*||h||
+                        # per layer. sqrt(K) division was double-dampening, reducing effective
+                        # perturbation to ~7% when K=3 — too weak for meaningful steering.
                         steer_mask = mask
                         if wrapper.prompt_shielding and wrapper._prompt_shield_mask_active is not None:
                             sh = wrapper._prompt_shield_mask_active
                             if sh.ndim == 2 and sh.shape[0] == h_fp.shape[0] and sh.shape[1] >= h_fp.shape[1]:
                                 sh_aligned = sh[:, -h_fp.shape[1]:].to(device=h_fp.device, dtype=torch.bool)
                                 steer_mask = steer_mask & (~sh_aligned)
-                        h_new = h_fp + route_st * alpha.detach() * delta * steer_mask.to(alpha.dtype).unsqueeze(-1) / k_scale
+                        if wrapper._joint_grad_mode:
+                            h_new = h_fp + route_st * alpha * delta * steer_mask.to(alpha.dtype).unsqueeze(-1)
+                        else:
+                            h_new = h_fp + route_st * alpha.detach() * delta * steer_mask.to(alpha.dtype).unsqueeze(-1)
                     h_out = h_new.to(h.dtype)
                     if orig_2d:
                         h_out = h_out.squeeze(0)

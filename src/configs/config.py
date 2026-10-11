@@ -95,11 +95,11 @@ class RSCConfig:
 
     # Cooperative Subset Router & RLOO settings
     lambda_cost: float = 0.025
-    beta_entropy_k: float = 0.30
-    beta_entropy_subset: float = 0.15
-    router_balance_weight: float = 0.10
+    beta_entropy_k: float = 0.03  # was 0.30 — 10× reduction; old value drowned RLOO policy signal
+    beta_entropy_subset: float = 0.02  # was 0.15 — let router specialize layer selection
+    router_balance_weight: float = 0.01  # was 0.10 — layer_dropout already prevents monopoly
     lambda_synergy: float = 0.10
-    lambda_k_center: float = 0.05
+    lambda_k_center: float = 0.0  # was 0.05 — removed; let K be learned purely from reward
     router_layer_dropout: float = 0.15  # Stochastic candidate dropout during training to prevent clique stacking
     router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
 

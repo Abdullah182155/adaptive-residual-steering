@@ -47,7 +47,14 @@ def build_contrast_id_cache(tokenizer):
     _CONTRAST_DISCOURSE_IDS = discourse_ids_set - {unk}
 
 def compute_contrastive_gate_loss(model, ids: torch.Tensor, labels: torch.Tensor, tokenizer, device: torch.device) -> torch.Tensor:
-    """Usefulness targets for gate activations balanced by token category."""
+    """Structural margin loss for gate activations — enforces relative ordering
+    (math_alpha > discourse_alpha > format_alpha) without hardcoded absolute targets.
+    
+    Old design used MSE to fixed targets (0.85, 0.05, 0.40) which fought against
+    the task loss when the backbone's optimal alpha differed. New design only
+    enforces that the gate steers math tokens more than format tokens, and keeps
+    format/prompt alpha below a soft ceiling.
+    """
     build_contrast_id_cache(tokenizer)
     math_ids_t = torch.tensor(sorted(_CONTRAST_MATH_IDS), dtype=torch.long, device=device)
     format_ids_t = torch.tensor(sorted(_CONTRAST_FORMAT_IDS), dtype=torch.long, device=device)
@@ -84,35 +91,27 @@ def compute_contrastive_gate_loss(model, ids: torch.Tensor, labels: torch.Tensor
             math_mask = torch.isin(b_ids, math_ids_t) & valid_b & target_b
             format_mask = torch.isin(b_ids, format_ids_t) & valid_b
             prompt_mask = valid_b & ~target_b
-            other_mask = ~math_mask & ~format_mask & valid_b & target_b
 
             if disc_ids_t is not None:
                 discourse_mask = torch.isin(b_ids, disc_ids_t) & valid_b & target_b
-                other_mask = other_mask & ~discourse_mask
             else:
                 discourse_mask = torch.zeros_like(math_mask)
 
-            if math_mask.any():
-                total = total + (a_b[math_mask] - 0.85).square().mean()
-                count += 1
+            # Soft ceiling: format/prompt alpha should stay low (penalty only if > 0.3)
             if format_mask.any():
-                total = total + (a_b[format_mask] - 0.05).square().mean()
+                total = total + F.relu(a_b[format_mask] - 0.3).square().mean()
                 count += 1
             if prompt_mask.any():
-                total = total + (a_b[prompt_mask] - 0.05).square().mean()
+                total = total + F.relu(a_b[prompt_mask] - 0.3).square().mean()
                 count += 1
-            if discourse_mask.any():
-                total = total + (a_b[discourse_mask] - 0.40).square().mean()
-                count += 1
-            if other_mask.any():
-                total = total + (a_b[other_mask] - 0.40).square().mean()
-                count += 1
-            if math_mask.any() and other_mask.any():
+
+            # Margin: math_alpha should exceed non-math_alpha by at least 0.15
+            if math_mask.any():
                 math_mean = a_b[math_mask].mean()
-                non_math = (format_mask | discourse_mask | other_mask)
-                other_mean = a_b[non_math].mean()
-                margin_loss = F.relu(0.20 - (math_mean - other_mean))
-                total = total + margin_loss
-                count += 1
+                non_math = format_mask | discourse_mask
+                if non_math.any():
+                    non_math_mean = a_b[non_math].mean()
+                    total = total + F.relu(0.15 - (math_mean - non_math_mean))
+                    count += 1
 
     return total / max(1, count)

@@ -682,6 +682,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     for p in model.router.parameters():
         p.requires_grad = True
     model.set_router_exploration(True)
+    model._joint_grad_mode = True  # Let task gradients flow through both alpha and delta
 
     joint_groups = [
         {"params": steer_params_ft, "lr": cfg.steer_finetune_lr * cfg.joint_finetune_lr_scale},
@@ -701,6 +702,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         train_steer=True, train_gate=True, train_router=True,
         global_step=global_step, baseline_ema=[0.0], patience=max(1, cfg.phase2_patience),
     )
+    model._joint_grad_mode = False  # Restore detached mode for Phase 2D
     logs["p2_val"] = [best_val_p2]
 
     # PHASE 2D: Gate Re-tune
