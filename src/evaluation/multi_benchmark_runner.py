@@ -108,6 +108,13 @@ def evaluate_model_condition(
             if progress_callback:
                 progress_callback(idx + 1, n_samples, item)
 
+            # Periodic memory reclamation to prevent silent Linux OOM-killer crashes during long multi-hour runs
+            if (idx + 1) % 25 == 0:
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
     finally:
         # Reset model overrides to clean default state
         if hasattr(model, "set_routing_override"):
