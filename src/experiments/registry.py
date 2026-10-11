@@ -198,6 +198,8 @@ class ExperimentRun:
         if source_path and os.path.exists(source_path) and os.path.abspath(source_path) != os.path.abspath(target_path):
             shutil.copy2(source_path, target_path)
 
+        if "artifacts" not in self.data or not isinstance(self.data["artifacts"], dict):
+            self.data["artifacts"] = {}
         if "charts" not in self.data["artifacts"]:
             self.data["artifacts"]["charts"] = []
         if target_path not in self.data["artifacts"]["charts"]:
