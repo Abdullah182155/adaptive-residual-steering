@@ -1,0 +1,73 @@
+{
+  "experiment_id": "exp_20261011_134907_ars_phi2_kaggle",
+  "tag": "ars_phi2_kaggle",
+  "created_at": "2026-10-11T13:49:07.000000+00:00",
+  "status": "completed",
+  "git_commit": "491bf8d",
+  "notes": "Medium sanity experiment (2,000 train, 300 bootstrap, 30 test problems, decoupled SteerNet r=16, k_scale removed)",
+  "summary_notes": "First run with k_scale removed. ARS achieved +3.33% gain at 0-shot over Baseline (43.33% vs 40.00%). Revealed SteerNet stacking over-perturbation (collapse to 23.33% with all 8 layers active at norm=0.15) and streaming causal conv mismatch during generation, leading to the root-cause fixes.",
+  "training_phases": {
+    "phase1": {
+      "best_val": 0.58
+    }
+  },
+  "benchmarks": {
+    "gsm8k": {
+      "0_shot": {
+        "baseline": 40.00,
+        "steernet": 23.33,
+        "ars": 43.33,
+        "delta_gain": 3.33,
+        "ans_present_baseline": 100.0,
+        "ans_present_steernet": 100.0,
+        "ans_present_ars": 100.0
+      },
+      "2_shot": {
+        "baseline": 46.67,
+        "steernet": 40.00,
+        "ars": 40.00,
+        "delta_gain": -6.67,
+        "ans_present_baseline": 100.0,
+        "ans_present_steernet": 100.0,
+        "ans_present_ars": 96.67
+      },
+      "4_shot": {
+        "baseline": 43.33,
+        "steernet": 26.67,
+        "ars": 36.67,
+        "delta_gain": -6.66,
+        "ans_present_baseline": 90.0,
+        "ans_present_steernet": 100.0,
+        "ans_present_ars": 80.0
+      },
+      "8_shot": {
+        "baseline": 36.67,
+        "steernet": 40.00,
+        "ars": 33.33,
+        "delta_gain": -3.34,
+        "ans_present_baseline": 80.0,
+        "ans_present_steernet": 100.0,
+        "ans_present_ars": 73.33
+      }
+    }
+  },
+  "routing_diagnostics": {
+    "layer_selection_rates": {
+      "L9": 0.4247,
+      "L11": 0.4064,
+      "L13": 0.3892,
+      "L15": 0.4007,
+      "L18": 0.4305,
+      "L20": 0.4692,
+      "L22": 0.3701,
+      "L24": 0.4503
+    },
+    "k_distribution": {
+      "K=0": 0.000,
+      "K=1": 0.0105,
+      "K=2": 0.1467,
+      "K=3": 0.4772,
+      "K=4": 0.3656
+    }
+  }
+}
