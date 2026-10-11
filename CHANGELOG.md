@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.3.0] - 2026-10-11
+
+### 🎯 Empirical Run: `exp_20261011_093749_ars_phi2_kaggle`
+Full multi-stage ARS evaluation on GSM8K (Phi-2, 5,000 train examples, 300 test problems per condition):
+- **2-Shot Breakthrough:** Full ARS Pipeline achieved **48.67%** vs Frozen Baseline **43.33%** (+5.34% gain).
+- **Diagnostics:** $K=0$ probe contamination completely eradicated (0.00% unsteered no-ops).
+- **Audit Findings:** Uncovered root-cause architectural bottlenecks: double-dampening via `k_scale = sqrt(K)`, policy-suppressing entropy regularizers ($\beta=0.30$), and hardcoded MSE gate targets. Full report archived in [`experiments/runs/exp_20261011_093749_ars_phi2_kaggle/EXPERIMENT_REPORT.md`](file:///d:/projects/Adaptive%20Residual%20Steering%20(ARS)/experiments/runs/exp_20261011_093749_ars_phi2_kaggle/EXPERIMENT_REPORT.md).
+
+### 🛠️ Core Root-Cause Refactoring (Commits: `491bf8d`, `a9781f7`)
+- **SteerNet Signal Restoration:** Removed double-dampening `k_scale` division; `max_relative_norm = 0.15` remains the single sufficient norm envelope.
+- **Joint Gradient Flow:** Added `_joint_grad_mode` enabling task-loss gradients through gate activations ($\alpha$) during Phase 2C joint fine-tuning.
+- **Router Policy Calibration:** Slashed $\beta_{\text{entropy\_k}}$ (0.30 $\to$ 0.03) and $\text{balance\_weight}$ (0.10 $\to$ 0.01); removed `lambda_k_center` to unleash natural data-driven $K$-budget decisions.
+- **Margin-Based Gate Supervision:** Replaced fixed MSE targets (0.85/0.05/0.40) with structural margin constraints ($\alpha_{\text{math}} > \alpha_{\text{non-math}} + 0.15$).
+
+---
+
 ## [1.2.0] - 2026-10-10
 
 ### 🎯 Overview
