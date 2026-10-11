@@ -57,7 +57,7 @@ class Phi2WithRSC(nn.Module):
         if not getattr(cfg, "use_router", True) or getattr(cfg, "fixed_layers", None) is not None:
             fl = cfg.fixed_layers or list(self.target_layers)
             self.set_routing_override("only", fl)
-        self._router_inference_mode = "argmax"
+        self._router_inference_mode = "softmax"  # BUG-02 fix: was "argmax" but that branch now uses softmax sampling
 
         # Cached decode attributes
         self._cached_decode_routes = None
@@ -211,9 +211,10 @@ class Phi2WithRSC(nn.Module):
         self._router_warmup = enabled
 
     def set_router_inference_mode(self, mode: str):
-        if mode not in {"argmax", "sample"}:
-            raise ValueError('router inference mode must be "argmax" or "sample"')
-        self._router_inference_mode = mode
+        # BUG-02 fix: 'argmax' renamed to 'softmax' (temp-1 sampling); 'sample' = full Gumbel noise
+        if mode not in {"softmax", "sample", "argmax"}:  # keep "argmax" as alias for backward compat
+            raise ValueError('router inference mode must be "softmax" or "sample"')
+        self._router_inference_mode = "softmax" if mode == "argmax" else mode
 
     def set_router_exploration(self, enabled: bool):
         return
@@ -416,7 +417,7 @@ class Phi2WithRSC(nn.Module):
                 "predicted_k": self.router._last_prediction.detach().cpu().tolist(),
             }
         self._selected_counts = self._selected_counts + selected.long()
-        if layer_idx == self.target_layers[-1] and not self._router_warmup:
+        if layer_idx == self.target_layers[-1] and not self._router_warmup and self._routing_override is None:
             counts = self._selected_counts.clamp(max=self.cfg.max_active_layers)
             self.routing_k_hist.add_(torch.bincount(counts, minlength=self.cfg.max_active_layers + 1))
             self.routing_forwards.add_(counts.numel())

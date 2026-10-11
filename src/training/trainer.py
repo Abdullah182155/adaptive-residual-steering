@@ -451,7 +451,11 @@ def run_staged_phase(
                 if torch.isfinite(inv_loss) and inv_loss.requires_grad:
                     scaler.scale(cfg.lambda_invariance * inv_loss).backward()
 
-            if train_router and accum_count == 0 and global_step % cfg.router_probe_every_n_steps == 0:
+            # BUG-08 fix: trigger RLOO only at the last micro-batch of the accumulation window
+            # (i.e. just before the optimizer.step()). Previously triggered at accum_count==0
+            # (first micro-batch), meaning router got grad_accum × more updates than task loss.
+            is_last_accum = (accum_count == cfg.grad_accum - 1) or (start + cfg.batch_size >= len(indices))
+            if train_router and is_last_accum and global_step % cfg.router_probe_every_n_steps == 0:
                 prompt_mask = mask.bool() & lbls.eq(-100)
                 router_loss, rloo_diag = compute_router_rloo_loss(model, ids, mask, lbls, cfg, prompt_mask=prompt_mask)
                 if torch.isfinite(router_loss) and router_loss.requires_grad:

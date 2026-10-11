@@ -102,11 +102,13 @@ def gsm8k_to_cot(
 
     def get_difficulty(ex):
         text = ex.get("text", "")
+        target_start = ex.get("target_start", 0)  # BUG-04 fix: use pre-computed offset instead of hardcoded string
         ops_count = len(re.findall(r"[\+\-\*\/]", text))
         nums = re.findall(r"-?\d+\.?\d*", text)
         distinct_nums = len(set(nums))
-        answer_start = text.find("Answer: Let's think")
-        chain_len = len(text[answer_start:]) if answer_start >= 0 else 0
+        # BUG-04 fix: was `text.find("Answer: Let's think")` which only matched template-0.
+        # Now correctly uses target_start for all template variants.
+        chain_len = len(text[target_start:]) if target_start > 0 else 0
         score = ops_count * 2 + distinct_nums + chain_len / 100.0
         return {"difficulty_score": score}
 

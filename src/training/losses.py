@@ -358,21 +358,19 @@ def compute_pg_loss(
             continue
         a = alpha.float().clamp(1e-8, 1 - 1e-8).squeeze(-1)
         vm = gate._valid_mask
+        # BUG-05 fix: Unified REINFORCE — loss = -(adv * log(a))
+        # adv > 0 (steering helps) → minimizing pushes log(a) up → a → 1 ✓
+        # adv < 0 (steering hurts) → minimizing pushes log(a) down → a → 0 ✓
+        # Old branched code had sign error in else-branch (drove a→1 when steering hurts).
         if vm is not None and vm.shape == a.shape:
             answer_mask = labels[:, :a.size(1)].ne(-100) if labels is not None else None
             if answer_mask is not None:
                 answer_mask = answer_mask[:a.size(0), :a.size(1)]
                 vm = vm & answer_mask
             weight_sum = vm.float().sum().clamp(min=1)
-            if centred_adv > 0:
-                pg_layer = (-centred_adv) * (torch.log(a) * vm.float()).sum() / weight_sum
-            else:
-                pg_layer = centred_adv * (torch.log(1 - a) * vm.float()).sum() / weight_sum
+            pg_layer = -(centred_adv * (torch.log(a) * vm.float()).sum() / weight_sum)
         else:
-            if centred_adv > 0:
-                pg_layer = (-centred_adv) * torch.log(a).mean()
-            else:
-                pg_layer = centred_adv * torch.log(1 - a).mean()
+            pg_layer = -(centred_adv * torch.log(a).mean())
         pg_total = pg_total + pg_layer
         n_terms += 1
 
@@ -421,10 +419,13 @@ def compute_pg_loss_lite(
     log_gpu_memory("compute_pg_loss_lite after span-logprob probes", cfg)
 
     mean_adv = advantage.mean().item()
+    # BUG-06 fix: normalize by std to reduce high-variance log-prob swings from destabilizing training
+    std_adv = advantage.std().item() if advantage.numel() > 1 else 1.0
+    std_adv = max(std_adv, 1e-6)
     baseline_ema[0] = (
         cfg.pg_baseline_momentum * baseline_ema[0] + (1 - cfg.pg_baseline_momentum) * mean_adv
     )
-    centred_adv = mean_adv - baseline_ema[0]
+    centred_adv = (mean_adv - baseline_ema[0]) / std_adv
 
     if abs(centred_adv) < 1e-5:
         return torch.tensor(0.0, device=device)
@@ -442,17 +443,12 @@ def compute_pg_loss_lite(
             continue
         a = alpha.float().clamp(1e-8, 1 - 1e-8).squeeze(-1)
         vm = gate._valid_mask
+        # BUG-05 fix: Unified REINFORCE — loss = -(adv * log(a))
         if vm is not None and vm.shape == a.shape:
             weight_sum = vm.float().sum().clamp(min=1)
-            if centred_adv > 0:
-                pg_layer = (-centred_adv) * (torch.log(a) * vm.float()).sum() / weight_sum
-            else:
-                pg_layer = centred_adv * (torch.log(1 - a) * vm.float()).sum() / weight_sum
+            pg_layer = -(centred_adv * (torch.log(a) * vm.float()).sum() / weight_sum)
         else:
-            if centred_adv > 0:
-                pg_layer = (-centred_adv) * torch.log(a).mean()
-            else:
-                pg_layer = centred_adv * torch.log(1 - a).mean()
+            pg_layer = -(centred_adv * torch.log(a).mean())
         pg_total = pg_total + pg_layer
         n_terms += 1
 

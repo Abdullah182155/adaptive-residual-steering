@@ -195,14 +195,19 @@ def epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=40, max_ne
         n_steps = len(ex.get("steps_list", [])) if isinstance(ex, dict) else 0
         bucket = "easy" if n_steps <= 1 else "medium" if n_steps <= 3 else "hard"
         buckets[bucket].append(idx)
-    per_bucket = min(n_samples // 3, *(len(v) for v in buckets.values()))
+    # BUG-09 fix: old code used min() across ALL buckets → tiny bucket shrank total eval to 6-9 samples.
+    # New approach: sample proportionally per bucket (at least 1 each), then fill remainder from all eval_data.
+    target_n = min(n_samples, len(eval_data))
+    non_empty = {k: v for k, v in buckets.items() if v}
+    per_bucket = max(1, target_n // max(1, len(non_empty)))
     idxs = []
-    for values in buckets.values():
-        idxs.extend(rng.sample(values, per_bucket))
-    remainder = min(n_samples, len(eval_data)) - len(idxs)
-    if remainder > 0:
+    for values in non_empty.values():
+        idxs.extend(rng.sample(values, min(per_bucket, len(values))))
+    # Fill remainder from any remaining eval examples to reach target_n
+    if len(idxs) < target_n:
         remaining = sorted(set(range(len(eval_data))) - set(idxs))
-        idxs.extend(rng.sample(remaining, min(remainder, len(remaining))))
+        rng.shuffle(remaining)
+        idxs.extend(remaining[: target_n - len(idxs)])
 
     was_training = model.training
     model.eval()
@@ -221,7 +226,7 @@ def epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=40, max_ne
             if gold_mask.sum() == 0:
                 continue
             gold_text = tokenizer.decode(ids[gold_mask], skip_special_tokens=True)
-            gold_num = extract_final_number(gold_text)
+            gold_num = extract_final_answer(gold_text)  # BUG-03 fix: was extract_final_number (too loose)
             if gold_num is None:
                 continue
 
@@ -231,7 +236,7 @@ def epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=40, max_ne
                 do_sample=False, pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
             )
             gen_text = tokenizer.decode(gen[0][q_ids.size(1) :], skip_special_tokens=True)
-            pred_num = extract_final_number(gen_text)
+            pred_num = extract_final_answer(gen_text)  # BUG-03 fix: was extract_final_number (too loose)
             total += 1
             if pred_num is not None and abs(pred_num - gold_num) < 0.01:
                 correct += 1

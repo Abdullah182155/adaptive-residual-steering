@@ -174,11 +174,12 @@ class RSCConfig:
 
     @property
     def val_split(self) -> float:
-        return 0.08
+        return getattr(self, "_val_split", 0.08)
 
     @val_split.setter
     def val_split(self, value: float):
-        pass
+        # BUG-07 fix: was a silent no-op; now stored in backing field _val_split
+        self._val_split = float(value)
 
     def rsc_layers_for(self, n_total: int) -> List[int]:
         if self.fixed_layers is not None:
