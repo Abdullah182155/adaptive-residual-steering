@@ -10,7 +10,8 @@ class RSCConfig:
     # Layer positions are intentionally discovered from the backbone depth.
     # The router decides which candidates to use for each forward pass and selects at most max_active_layers.
     max_active_layers: int = 4
-    fixed_steer_eval_k: int = 2  # calibrated fixed-route SteerNet ablation; must be in [1, max_active_layers]
+    fixed_steer_eval_k: int = 1  # Phase-1 SteerNet control: one independently-trained intervention
+    fixed_steer_eval_layers: Optional[List[int]] = None  # selected only from validation during Phase-1 acceptance
     use_router: bool = True  # If False, router is bypassed
     fixed_layers: Optional[List[int]] = None  # If set, forces these exact layers to steer
     # Catalog router: distribution over subsets. Empty is a legal action.
@@ -44,6 +45,10 @@ class RSCConfig:
     phase1_epochs: int = 12
     phase1_warmup_ratio: float = 0.06
     phase1_patience: int = 4
+    phase1_acceptance_examples: int = 64
+    phase1_acceptance_accuracy_examples: int = 32
+    phase1_min_train_nll_reduction: float = 0.05
+    phase1_min_train_accuracy_gain: float = 0.05
 
     # Phase 2 staged parameters
     phase2_warmup_ratio: float = 0.03
@@ -52,7 +57,7 @@ class RSCConfig:
     # Gate architecture
     gate_dim: int = 16
     gate_dropout: float = 0.05
-    gate_init_alpha: float = 0.80
+    gate_init_alpha: float = 0.50  # neutral start; task loss must earn large residual injection
     gating_mode: str = "learned"  # 'learned' (MLP), 'constant' (fixed scalar), or 'step'
     gate_constant_value: float = 0.80
 
@@ -94,6 +99,15 @@ class RSCConfig:
     router_bootstrap_lr: float = 1e-3
     router_bootstrap_patience: int = 2
     router_bootstrap_save_path: str = "./checkpoints/router_catalog_v14.pt"
+    router_rloo_batch_size: int = 8  # enables batch-level policy diversity, unlike a B=1 RLOO probe
+    intervention_audit_examples: int = 128
+    router_min_eval_k_support: int = 3
+    router_require_eval_k0: bool = True
+    router_min_eval_k_entropy: float = 0.25
+    router_min_eval_active_layers: int = 4
+    router_min_eval_layer_entropy: float = 0.45
+    gate_min_eval_sequence_std: float = 0.015
+    gate_max_eval_high_saturation_pct: float = 20.0
     router_probe_every_n_steps: int = 1
     router_checkpoint_every_n_steps: int = 0
     router_dead_layer_veto_frac: float = 0.50
@@ -106,6 +120,11 @@ class RSCConfig:
     lambda_synergy: float = 0.10
     router_pairwise_probe_probability: float = 0.25  # sample true pair-interaction counterfactuals during RLOO
     lambda_k_center: float = 0.0  # was 0.05 — removed; let K be learned purely from reward
+    # Maximise I(prompt; route): varied marginal choices but confident,
+    # prompt-dependent routes.  This is exploration regularisation only; the
+    # counterfactual reward remains the quality signal.
+    lambda_router_k_mi: float = 0.02
+    lambda_router_layer_mi: float = 0.02
     router_layer_dropout: float = 0.15  # Stochastic candidate dropout during training to prevent clique stacking
     router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
     router_eval_mode: str = "argmax"  # deterministic: argmax; stochastic sampling is training-only by default
@@ -131,6 +150,11 @@ class RSCConfig:
     # Phase 2D: Gate re-tuning against final router
     gate_retune_epochs: int = 1
     gate_retune_lr: float = 1e-4
+
+    # Phase 1 proves each candidate SteerNet can help on its own before any
+    # cooperative route is allowed.  Multi-layer interaction is learned by
+    # RLOO only after this independent capacity check.
+    router_warmup_max_k: int = 1
 
     checkpoint_every_n: int = 3
     lr_reduce_factor: float = 0.5

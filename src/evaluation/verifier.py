@@ -156,7 +156,7 @@ def evaluate_response(response: str, expected: Optional[float], min_steps: int =
 class AnswerStoppingCriteria(StoppingCriteria):
     """Stops generation with a grace period once an answer marker is emitted."""
 
-    def __init__(self, tokenizer, prompt_length: int, max_new: int = 512, grace_tokens: int = 12):
+    def __init__(self, tokenizer, prompt_length: int, max_new: int = 512, grace_tokens: int = 48):
         self.prompt_length = prompt_length
         self.max_new = max_new
         self.grace_tokens = grace_tokens
@@ -246,10 +246,26 @@ def epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=40, max_ne
     return correct / max(1, total)
 
 def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512) -> str:
-    """Generate response with repetition penalty and answer stopping criteria."""
+    """Generate without silently truncating a benchmark's final question.
+
+    A few-shot result is invalid if the prompt plus requested completion does
+    not fit the backbone context.  The previous right-truncation could drop
+    the test question while still returning a numerical-looking score.
+    """
     model.eval()
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=False).to(device)
     prompt_length = inputs["input_ids"].shape[1]
+    backbone = getattr(model, "base_model", model)
+    model_cfg = getattr(backbone, "config", None)
+    context_limit = getattr(model_cfg, "max_position_embeddings", None)
+    if context_limit is None:
+        context_limit = getattr(model_cfg, "n_positions", None)
+    if context_limit is not None and prompt_length + max_new_tokens > int(context_limit):
+        raise ValueError(
+            "Benchmark prompt exceeds model context budget: "
+            f"prompt={prompt_length}, max_new_tokens={max_new_tokens}, context={context_limit}. "
+            "Reduce shots or completion budget; do not silently truncate the test question."
+        )
     stop_criterion = AnswerStoppingCriteria(tokenizer, prompt_length, max_new_tokens)
     stopping = StoppingCriteriaList([stop_criterion])
 

@@ -76,6 +76,7 @@ def evaluate_model_condition(
     correct_count = 0
     total_time = 0.0
     total_tokens = 0
+    prompt_token_counts = []
     detailed_results = []
     n_samples = len(samples)
 
@@ -85,6 +86,8 @@ def evaluate_model_condition(
             gold = sample["gold"]
 
             prompt = build_benchmark_prompt(dataset_name, q, n_shot=n_shot)
+            prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False)) if tokenizer else 0
+            prompt_token_counts.append(prompt_tokens)
             t0 = time.time()
             resp = generate_response(model, tokenizer, prompt, device, max_new_tokens=max_new_tokens)
             elapsed = time.time() - t0
@@ -112,6 +115,7 @@ def evaluate_model_condition(
                 "steps": eval_res["steps"],
                 "time_sec": elapsed,
                 "tokens": n_tok,
+                "prompt_tokens": prompt_tokens,
             }
             detailed_results.append(item)
 
@@ -158,6 +162,8 @@ def evaluate_model_condition(
         "avg_time_sec": round(total_time / max(1, n_samples), 3),
         "tokens_per_sec": round(tok_per_sec, 2),
         "total_time_sec": round(total_time, 2),
+        "mean_prompt_tokens": round(sum(prompt_token_counts) / max(1, n_samples), 1),
+        "max_prompt_tokens": max(prompt_token_counts, default=0),
     }
 
     return {"summary": summary, "detailed_results": detailed_results}
@@ -196,6 +202,10 @@ def run_fair_multishot_benchmark(
     cfg = config or EvalBenchmarkConfig()
     if hasattr(model, "set_prompt_shielding"):
         model.set_prompt_shielding(cfg.prompt_shielding)
+    # Controls do not contribute learned-router telemetry, so this one reset
+    # gives the final dashboard the aggregate of every ARS sample and shot.
+    if hasattr(model, "reset_routing_diagnostics"):
+        model.reset_routing_diagnostics()
     eval_datasets = datasets or cfg.datasets
     eval_shots = shot_counts or cfg.shot_counts
 
@@ -242,7 +252,8 @@ def run_fair_multishot_benchmark(
                 if verbose:
                     print(
                         f"    Result: {acc:.2f}% ({summ['correct']}/{summ['n_samples']}) "
-                        f"| {summ['tokens_per_sec']} tok/s | Ans: {summ['answer_present']}%"
+                        f"| {summ['tokens_per_sec']} tok/s | Ans: {summ['answer_present']}% "
+                        f"| Prompt≤{summ['max_prompt_tokens']} tok"
                     )
 
                 # Sync directly with experiment run if attached

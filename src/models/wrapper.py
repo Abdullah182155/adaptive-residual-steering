@@ -124,10 +124,10 @@ class Phi2WithRSC(nn.Module):
                         if not selected.any():
                             g._alpha_for_aux, g.last_alpha, g._valid_mask = None, None, None
                             return output
-                        wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
+                        if wrapper._routing_override is None:
+                            wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
                         delta = s(h_fp, active_k=wrapper._active_k_realized)
                         alpha = g(h_fp, delta, global_context=wrapper.router._last_semantic_shared)
-                        g._valid_mask = mask
                         route = selected.to(alpha.dtype).view(-1, 1, 1)
                         route_st = route
                         # Each individual SteerNet is bounded, but that alone
@@ -146,6 +146,13 @@ class Phi2WithRSC(nn.Module):
                             if sh.ndim == 2 and sh.shape[0] == h_fp.shape[0] and sh.shape[1] >= h_fp.shape[1]:
                                 sh_aligned = sh[:, -h_fp.shape[1]:].to(device=h_fp.device, dtype=torch.bool)
                                 steer_mask = steer_mask & (~sh_aligned)
+                        # Gate regularisers and telemetry must operate on
+                        # positions that receive an injected residual.  Using
+                        # the padding-only mask included shielded few-shot
+                        # demonstrations, where the gate cannot affect loss.
+                        g._valid_mask = steer_mask
+                        if wrapper._routing_override is None:
+                            g.record_diagnostics(alpha, steer_mask)
                         if wrapper._joint_grad_mode:
                             h_new = h_fp + route_st * alpha * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1)
                         else:
@@ -299,7 +306,10 @@ class Phi2WithRSC(nn.Module):
 
     def _prepare_routes(self, h: torch.Tensor, mask: torch.Tensor):
         if self._precomputed_routes is not None:
-            self.router.seen_forwards += h.shape[0]
+            # Diagnostics describe the learned router only.  Baseline and
+            # fixed-route controls must not dilute their denominator.
+            if self._routing_override is None:
+                self.router.seen_forwards += h.shape[0]
             return
         if self._selected_counts is None or self._selected_counts.shape[0] != h.shape[0]:
             raise RuntimeError("RSC router state was not initialised by the model forward pre-hook")
@@ -309,13 +319,15 @@ class Phi2WithRSC(nn.Module):
         self._router_logits = u
         self._router_margins = u
         self._router_probabilities = F.softmax(u, dim=-1)
-        self.router.seen_forwards += h.shape[0]
+        if self._routing_override is None:
+            self.router.seen_forwards += h.shape[0]
 
         n_candidates = len(self.target_layers)
         K_max = self.cfg.max_active_layers
 
         if self._router_warmup:
-            width = 1 + (self._warmup_cursor % K_max)
+            warmup_max_k = int(getattr(self.cfg, "router_warmup_max_k", 1))
+            width = 1 + (self._warmup_cursor % max(1, min(K_max, warmup_max_k)))
             stride = max(1, n_candidates // width)
             pos = self._warmup_width_visits[width - 1]
             forced_indices = {self.target_layers[(pos + j * stride) % n_candidates] for j in range(width)}
@@ -391,7 +403,17 @@ class Phi2WithRSC(nn.Module):
                 # the trained intervention regime and therefore not an ablation.
                 fixed_k = int(getattr(self.cfg, "fixed_steer_eval_k", 2))
                 fixed_k = max(1, min(fixed_k, K_max, n_candidates))
-                positions = torch.linspace(0, n_candidates - 1, steps=fixed_k, device=h.device).round().long()
+                requested_layers = getattr(self.cfg, "fixed_steer_eval_layers", None)
+                if requested_layers:
+                    positions = torch.tensor(
+                        [self.target_layers.index(layer) for layer in requested_layers if layer in self.target_layers],
+                        device=h.device, dtype=torch.long,
+                    )
+                    if positions.numel() == 0:
+                        raise ValueError("fixed_steer_eval_layers contains no candidate layers")
+                    positions = positions[:fixed_k]
+                else:
+                    positions = torch.linspace(0, n_candidates - 1, steps=fixed_k, device=h.device).round().long()
                 selected_matrix = torch.zeros(h.shape[0], n_candidates, dtype=torch.bool, device=h.device)
                 selected_matrix[:, positions] = True
             else:
@@ -449,6 +471,8 @@ class Phi2WithRSC(nn.Module):
         self.router.seen_forwards.zero_()
         self.routing_k_hist.zero_()
         self.routing_forwards.zero_()
+        for gate in self.gates.values():
+            gate.reset_diagnostics()
 
     def routing_diagnostics(self):
         diag = {}
@@ -469,6 +493,28 @@ class Phi2WithRSC(nn.Module):
     def routing_k_distribution(self):
         total = max(1, int(self.routing_forwards.item()))
         return {k: int(count.item()) / total for k, count in enumerate(self.routing_k_hist)}
+
+    def intervention_diagnostics(self):
+        """Summarize realized K, layer usage, and token-gate diversity."""
+        k_dist = self.routing_k_distribution()
+        layer_rates = [row["selection_rate_ema"] for row in self.routing_diagnostics().values()]
+        layer_total = sum(layer_rates)
+        layer_probs = [rate / layer_total for rate in layer_rates if rate > 0.0]
+        k_probs = [p for p in k_dist.values() if p > 0.0]
+        def normalized_entropy(probs, support):
+            if support <= 1 or not probs:
+                return 0.0
+            entropy = -sum(p * float(torch.log(torch.tensor(p)).item()) for p in probs)
+            return entropy / float(torch.log(torch.tensor(float(support))).item())
+        gate_metrics = {int(layer): gate.get_saturation_metrics() for layer, gate in self.gates.items()}
+        return {
+            "realized_k_distribution": k_dist,
+            "realized_k_support": sum(p > 0.0 for p in k_dist.values()),
+            "realized_k_entropy": round(normalized_entropy(k_probs, len(k_dist)), 4),
+            "layer_selection_entropy": round(normalized_entropy(layer_probs, len(self.target_layers)), 4),
+            "active_layer_count": sum(rate > 0.02 for rate in layer_rates),
+            "gate": gate_metrics,
+        }
 
     def get_layer_synergy_matrix(self) -> Optional[torch.Tensor]:
         return self.router.get_layer_synergy_matrix()

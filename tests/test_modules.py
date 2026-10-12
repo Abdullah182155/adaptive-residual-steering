@@ -11,7 +11,7 @@ from src.steering.steernet import RSCSteerNet
 from src.gating.gate import RSCUsefulnessGate
 from src.models.wrapper import Phi2WithRSC
 from src.routing.router import JointLayerRouter
-from src.routing.rloo import sample_k, sample_subset_plackett_luce, policy_entropy_bonus
+from src.routing.rloo import sample_k, sample_subset_plackett_luce, policy_entropy_bonus, mutual_information_diversity_loss
 from src.training import (
     train_rsc,
     train_phase1_steernet,
@@ -45,6 +45,13 @@ class TestARSModules(unittest.TestCase):
         alpha = gate(h, delta)
         self.assertEqual(alpha.shape, (self.batch_size, self.seq_len, 1))
         self.assertTrue((alpha >= 0.0).all() and (alpha <= 1.0).all())
+        # Health telemetry must exclude non-intervened/prompt-shielded tokens.
+        intervention_mask = torch.zeros(self.batch_size, self.seq_len, dtype=torch.bool)
+        intervention_mask[:, 3:] = True
+        gate.record_diagnostics(alpha, intervention_mask)
+        health = gate.get_saturation_metrics()
+        self.assertEqual(health["intervened_tokens"], self.batch_size * (self.seq_len - 3))
+        self.assertGreaterEqual(health["token_std"], 0.0)
 
     def test_gate_prefill_matches_streaming_decode(self):
         """The causal gate must produce identical values in prefill and decode."""
@@ -78,6 +85,18 @@ class TestARSModules(unittest.TestCase):
         subset_mask, logp_sub = sample_subset_plackett_luce(u, k)
         self.assertEqual(subset_mask.shape, (self.batch_size, 4))
         self.assertEqual(logp_sub.shape, (self.batch_size,))
+
+    def test_router_mutual_information_diversity(self):
+        # Input-dependent, confident decisions must score better than one
+        # globally collapsed route under the batch diversity objective.
+        collapsed_k = torch.tensor([[8.0, 0.0, 0.0], [8.0, 0.0, 0.0]])
+        collapsed_l = torch.tensor([[8.0, 0.0, 0.0], [8.0, 0.0, 0.0]])
+        varied_k = torch.tensor([[8.0, 0.0, 0.0], [0.0, 8.0, 0.0]])
+        varied_l = torch.tensor([[8.0, 0.0, 0.0], [0.0, 8.0, 0.0]])
+        collapsed_losses = mutual_information_diversity_loss(collapsed_k, collapsed_l)
+        varied_losses = mutual_information_diversity_loss(varied_k, varied_l)
+        self.assertLess(varied_losses[0], collapsed_losses[0])
+        self.assertLess(varied_losses[1], collapsed_losses[1])
 
     def test_config_attributes(self):
         cfg = RSCConfig()
@@ -144,6 +163,32 @@ class TestARSModules(unittest.TestCase):
         self.assertTrue(torch.equal(route_a, wrapper._precomputed_routes))
         self.assertTrue(torch.equal(out_a, out_b))
         self.assertTrue(torch.equal(out_a, baseline))
+
+    def test_fixed_route_controls_do_not_pollute_router_telemetry(self):
+        class DummyLayer(nn.Module):
+            def forward(self, h, *args, **kwargs):
+                return h
+
+        class DummyModel(nn.Module):
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": hidden_dim})()
+                self.embed = nn.Embedding(50, hidden_dim)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer() for _ in range(10)])})()
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h})()
+
+        wrapper = Phi2WithRSC(DummyModel(self.hidden_dim), RSCConfig(), device=torch.device("cpu")).eval()
+        wrapper.set_routing_override("balanced")
+        wrapper.set_gate_freeze(True, 1.0)
+        ids = torch.tensor([[1, 2, 3, 4]])
+        _ = wrapper(input_ids=ids, attention_mask=torch.ones_like(ids))
+        diag = wrapper.routing_diagnostics()
+        self.assertTrue(all(row["seen_forwards"] == 0 for row in diag.values()))
+        self.assertTrue(all(row["selected_forwards"] == 0 for row in diag.values()))
 
     def test_cooperative_synergy(self):
         target_layers = [9, 11, 13, 15]

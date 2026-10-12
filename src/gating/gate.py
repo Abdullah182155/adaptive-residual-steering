@@ -46,10 +46,45 @@ class RSCUsefulnessGate(nn.Module):
         self.last_alpha = None      # (B, T, 1), detached - for diagnostics
         self._alpha_for_aux = None  # (B, T, 1), grad-carrying - for PG loss
         self._valid_mask = None     # (B, T) bool - non-padding positions, set by hook
+        self.reset_diagnostics()
 
     def reset_conv_cache(self):
         """Reset streaming state cache for new generation sequences."""
         self._conv_cache = None
+
+    def reset_diagnostics(self):
+        """Reset non-persistent telemetry for tokens that actually receive steering."""
+        self._telemetry = {
+            "count": 0,
+            "sum": 0.0,
+            "sum_sq": 0.0,
+            "sequence_count": 0,
+            "sequence_std_sum": 0.0,
+            "low_count": 0,
+            "high_count": 0,
+        }
+
+    @torch.no_grad()
+    def record_diagnostics(self, alpha: torch.Tensor, intervention_mask: torch.Tensor):
+        """Accumulate token-level gate health only where a residual is injected."""
+        a = alpha.detach().float().squeeze(-1)
+        valid = intervention_mask.detach().to(device=a.device, dtype=torch.bool)
+        if valid.shape != a.shape:
+            raise ValueError(f"gate telemetry mask mismatch: alpha={tuple(a.shape)}, mask={tuple(valid.shape)}")
+        values = a[valid]
+        if values.numel() == 0:
+            return
+        stats = self._telemetry
+        stats["count"] += int(values.numel())
+        stats["sum"] += float(values.sum().item())
+        stats["sum_sq"] += float(values.square().sum().item())
+        stats["low_count"] += int((values < 0.05).sum().item())
+        stats["high_count"] += int((values > 0.95).sum().item())
+        for row, row_mask in zip(a, valid):
+            row_values = row[row_mask]
+            if row_values.numel() >= 2:
+                stats["sequence_count"] += 1
+                stats["sequence_std_sum"] += float(row_values.std(unbiased=False).item())
 
     def forward(self, h: torch.Tensor, delta: torch.Tensor, global_context: torch.Tensor = None) -> torch.Tensor:
         if self._freeze_gate:
@@ -119,20 +154,34 @@ class RSCUsefulnessGate(nn.Module):
         return alpha.to(h.dtype)
 
     def get_saturation_metrics(self) -> dict:
-        """Compute saturation diagnostics from the most recent forward pass."""
-        if self.last_alpha is None:
-            return {"mean_alpha": 0.0, "low_saturation_pct": 0.0, "high_saturation_pct": 0.0}
-        a = self.last_alpha.view(-1)
-        if self._valid_mask is not None:
-            vm = self._valid_mask.view(-1)
-            if vm.any() and vm.numel() == a.numel():
-                a = a[vm]
-        total = max(1, a.numel())
-        low = (a < 0.05).float().sum().item() / total * 100.0
-        high = (a > 0.95).float().sum().item() / total * 100.0
-        mean = a.mean().item()
+        """Return aggregate intervention-token telemetry, not one decode token."""
+        stats = self._telemetry
+        # Direct module tests and lightweight callers may ask for a metric
+        # before a wrapper has supplied an intervention mask.  Preserve the
+        # useful last-forward fallback while ARS diagnostics use the aggregate
+        # branch below.
+        if stats["count"] == 0 and self.last_alpha is not None:
+            a = self.last_alpha.float().squeeze(-1)
+            valid = self._valid_mask
+            if valid is not None and valid.shape == a.shape:
+                a = a[valid]
+            if a.numel() > 0:
+                return {
+                    "mean_alpha": round(float(a.mean().item()), 4),
+                    "token_std": round(float(a.std(unbiased=False).item()), 4),
+                    "mean_sequence_std": 0.0,
+                    "low_saturation_pct": round(float((a < 0.05).float().mean().item() * 100.0), 2),
+                    "high_saturation_pct": round(float((a > 0.95).float().mean().item() * 100.0), 2),
+                    "intervened_tokens": 0,
+                }
+        total = max(1, int(stats["count"]))
+        mean = stats["sum"] / total
+        variance = max(0.0, stats["sum_sq"] / total - mean ** 2)
         return {
             "mean_alpha": round(mean, 4),
-            "low_saturation_pct": round(low, 2),
-            "high_saturation_pct": round(high, 2),
+            "token_std": round(variance ** 0.5, 4),
+            "mean_sequence_std": round(stats["sequence_std_sum"] / max(1, stats["sequence_count"]), 4),
+            "low_saturation_pct": round(100.0 * stats["low_count"] / total, 2),
+            "high_saturation_pct": round(100.0 * stats["high_count"] / total, 2),
+            "intervened_tokens": int(stats["count"]),
         }

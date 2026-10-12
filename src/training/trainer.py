@@ -86,6 +86,151 @@ def evaluate_loss(model, data, cfg: RSCConfig, device: torch.device) -> float:
     return total_nll / max(1, total_tokens)
 
 
+def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
+    """Prove independent Phase-1 steering capacity before routing is trained.
+
+    Each candidate is measured as a single-layer, gate=1 intervention.  The
+    selected fixed control comes from validation NLL only; the training subset
+    is used solely as a capacity acceptance test, never as a benchmark claim.
+    """
+    train_n = min(int(cfg.phase1_acceptance_examples), len(train_data))
+    val_n = min(int(cfg.phase1_acceptance_examples), len(eval_data))
+    train_probe = [train_data[i] for i in range(train_n)]
+    val_probe = [eval_data[i] for i in range(val_n)]
+    old_override = model._routing_override
+    old_layers = getattr(cfg, "fixed_steer_eval_layers", None)
+    try:
+        model.set_routing_override("none")
+        model.set_gate_freeze(False)
+        base_train_nll = evaluate_loss(model, train_probe, cfg, device)
+        base_val_nll = evaluate_loss(model, val_probe, cfg, device)
+        base_train_acc = epoch_end_accuracy(
+            model, tokenizer, train_probe, device,
+            n_samples=min(int(cfg.phase1_acceptance_accuracy_examples), train_n), seed=cfg.seed,
+        )
+
+        candidates = []
+        for layer in model.target_layers:
+            model.set_routing_override("only", [layer])
+            model.set_gate_freeze(True, 1.0)
+            candidates.append({
+                "layer": int(layer),
+                "train_nll": evaluate_loss(model, train_probe, cfg, device),
+                "val_nll": evaluate_loss(model, val_probe, cfg, device),
+            })
+        best = min(candidates, key=lambda row: row["val_nll"])
+        model.set_routing_override("only", [best["layer"]])
+        model.set_gate_freeze(True, 1.0)
+        selected_train_acc = epoch_end_accuracy(
+            model, tokenizer, train_probe, device,
+            n_samples=min(int(cfg.phase1_acceptance_accuracy_examples), train_n), seed=cfg.seed,
+        )
+        nll_reduction = (base_train_nll - best["train_nll"]) / max(base_train_nll, 1e-8)
+        acc_gain = selected_train_acc - base_train_acc
+        cfg.fixed_steer_eval_layers = [best["layer"]]
+        report = {
+            "baseline_train_nll": base_train_nll,
+            "baseline_val_nll": base_val_nll,
+            "baseline_train_accuracy": base_train_acc,
+            "candidates": candidates,
+            "selected_layer": best["layer"],
+            "selected_train_accuracy": selected_train_acc,
+            "train_relative_nll_reduction": nll_reduction,
+            "train_accuracy_gain": acc_gain,
+            "passed": (
+                nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
+                and acc_gain >= float(cfg.phase1_min_train_accuracy_gain)
+            ),
+        }
+        print(
+            "  Phase-1 acceptance: "
+            f"layer=L{best['layer']} | train NLL Δ={nll_reduction * 100:+.1f}% "
+            f"| train acc Δ={acc_gain * 100:+.1f}pp | {'PASS' if report['passed'] else 'FAIL'}"
+        )
+        if not report["passed"]:
+            raise RuntimeError(
+                "Phase-1 SteerNet acceptance failed. Router/gate training is blocked because no independently "
+                "useful steering direction was established. Inspect the candidate report before changing ARS."
+            )
+        return report
+    finally:
+        model.set_gate_freeze(True, 1.0)
+        if old_override is None:
+            model.set_routing_override(None)
+        else:
+            model.set_routing_override(old_override[0], old_override[1])
+        # Preserve the chosen fixed ablation layer even if an earlier config
+        # had none; it is validation-selected above, not test-selected.
+        if not getattr(cfg, "fixed_steer_eval_layers", None):
+            cfg.fixed_steer_eval_layers = old_layers
+
+
+def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
+    """Fail closed when ARS has collapsed routing or a static/saturated gate.
+
+    This is evaluated with the same deterministic argmax route and prompt
+    shielding used by generation.  It is deliberately a health gate, not a
+    benchmark: test labels never choose a route or tune a threshold.
+    """
+    previous_mode = getattr(model, "_router_inference_mode", "argmax")
+    previous_override = model._routing_override
+    model.reset_routing_diagnostics()
+    model.eval()
+    model.set_router_inference_mode("argmax")
+    model.set_routing_override(None)
+    model.set_gate_freeze(False)
+    n = min(int(cfg.intervention_audit_examples), len(eval_data))
+    try:
+        with torch.no_grad():
+            for i in range(n):
+                row = eval_data[i]
+                ids = row["input_ids"].unsqueeze(0).to(device)
+                mask = row["attention_mask"].unsqueeze(0).to(device)
+                labels = row["labels"].unsqueeze(0).to(device)
+                shield = row.get("prompt_shield_mask")
+                shield = shield.unsqueeze(0).to(device) if shield is not None else None
+                model._attn_mask_cache = mask
+                _set_batch_context(model, mask, labels, shield)
+                _ = model(input_ids=ids, attention_mask=mask)
+        report = model.intervention_diagnostics()
+        failures = []
+        k_dist = report["realized_k_distribution"]
+        if cfg.router_require_eval_k0 and k_dist.get(0, 0.0) <= 0.0:
+            failures.append("K=0 was never selected")
+        if report["realized_k_support"] < int(cfg.router_min_eval_k_support):
+            failures.append(f"K support={report['realized_k_support']} < {cfg.router_min_eval_k_support}")
+        if report["realized_k_entropy"] < float(cfg.router_min_eval_k_entropy):
+            failures.append(f"K entropy={report['realized_k_entropy']:.3f} < {cfg.router_min_eval_k_entropy}")
+        if report["active_layer_count"] < int(cfg.router_min_eval_active_layers):
+            failures.append(f"active layers={report['active_layer_count']} < {cfg.router_min_eval_active_layers}")
+        if report["layer_selection_entropy"] < float(cfg.router_min_eval_layer_entropy):
+            failures.append(f"layer entropy={report['layer_selection_entropy']:.3f} < {cfg.router_min_eval_layer_entropy}")
+        active_gates = [row for row in report["gate"].values() if row["intervened_tokens"] > 0]
+        if not active_gates:
+            failures.append("no gate received intervened tokens")
+        else:
+            mean_seq_std = sum(row["mean_sequence_std"] for row in active_gates) / len(active_gates)
+            max_high_sat = max(row["high_saturation_pct"] for row in active_gates)
+            report["mean_gate_sequence_std"] = round(mean_seq_std, 4)
+            report["max_gate_high_saturation_pct"] = round(max_high_sat, 2)
+            if mean_seq_std < float(cfg.gate_min_eval_sequence_std):
+                failures.append(f"gate sequence std={mean_seq_std:.4f} < {cfg.gate_min_eval_sequence_std}")
+            if max_high_sat > float(cfg.gate_max_eval_high_saturation_pct):
+                failures.append(f"gate high saturation={max_high_sat:.1f}% > {cfg.gate_max_eval_high_saturation_pct}%")
+        report["passed"] = not failures
+        report["failures"] = failures
+        print(f"  ARS intervention audit: {report}")
+        if failures:
+            raise RuntimeError("ARS intervention health gate failed: " + "; ".join(failures))
+        return report
+    finally:
+        model.set_router_inference_mode(previous_mode)
+        if previous_override is None:
+            model.set_routing_override(None)
+        else:
+            model.set_routing_override(previous_override[0], previous_override[1])
+
+
 def _evaluate_and_maybe_checkpoint(
     model, tokenizer, eval_data, cfg: RSCConfig, device: torch.device, save_path: str,
     best_acc: float, best_val: float, patience_ctr: int, train_router: bool, label: str,
@@ -109,8 +254,23 @@ def _evaluate_and_maybe_checkpoint(
         dead = sum(1 for s in diag.values() if s["selected_forwards"] / max(1, s["seen_forwards"]) < 0.02)
         k_dist = model.routing_k_distribution()
         k_str = ", ".join(f"K={k}:{v:.2f}" for k, v in k_dist.items() if v > 0.01)
-        note = f"  (active layers: {n_candidates - dead}/{n_candidates} | {k_str})"
+        intervention = model.intervention_diagnostics() if hasattr(model, "intervention_diagnostics") else {}
+        note = (
+            f"  (active layers: {n_candidates - dead}/{n_candidates} | {k_str}"
+            f" | K-H={intervention.get('realized_k_entropy', 0.0):.2f}"
+            f" | L-H={intervention.get('layer_selection_entropy', 0.0):.2f})"
+        )
     print(f"    [checkpoint check] {label}: val={val_loss:.4f}  acc={acc:.3f}  {'[SAVED]' if improved else ''}{note}")
+    if hasattr(model, "intervention_diagnostics"):
+        gate_rows = model.intervention_diagnostics().get("gate", {})
+        active_gates = [row for row in gate_rows.values() if row.get("intervened_tokens", 0) > 0]
+        if active_gates:
+            mean_gate_std = sum(row["mean_sequence_std"] for row in active_gates) / len(active_gates)
+            max_high_sat = max(row["high_saturation_pct"] for row in active_gates)
+            print(
+                f"    [gate health] selected_layers={len(active_gates)} "
+                f"mean_token_std={mean_gate_std:.4f} max_high_sat={max_high_sat:.1f}%"
+            )
     if train_router and hasattr(model, "router_k_cap_gap_summary"):
         print(model.router_k_cap_gap_summary())
     best_state = None
@@ -315,13 +475,16 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
         model.train()
         running, n_steps = 0.0, 0
         epoch_k_samples = []
-        pbar = tqdm(subset_idx, desc=f"RouterBootstrap {epoch + 1}/{cfg.router_bootstrap_epochs}")
-        for i in pbar:
-            ids = train_data[i]["input_ids"].unsqueeze(0).to(device)
-            mask = train_data[i]["attention_mask"].unsqueeze(0).to(device)
-            lbls = train_data[i]["labels"].unsqueeze(0).to(device)
-            shield = train_data[i].get("prompt_shield_mask")
-            shield = shield.unsqueeze(0).to(device) if shield is not None else None
+        rloo_batch_size = max(2, int(getattr(cfg, "router_rloo_batch_size", 8)))
+        pbar = tqdm(range(0, len(subset_idx), rloo_batch_size), desc=f"RouterBootstrap {epoch + 1}/{cfg.router_bootstrap_epochs}")
+        for start in pbar:
+            batch_indices = subset_idx[start : start + rloo_batch_size]
+            ids = torch.stack([train_data[i]["input_ids"] for i in batch_indices]).to(device)
+            mask = torch.stack([train_data[i]["attention_mask"] for i in batch_indices]).to(device)
+            lbls = torch.stack([train_data[i]["labels"] for i in batch_indices]).to(device)
+            shield = None
+            if "prompt_shield_mask" in train_data[batch_indices[0]]:
+                shield = torch.stack([train_data[i]["prompt_shield_mask"] for i in batch_indices]).to(device)
             model._attn_mask_cache = mask
 
             _set_batch_context(model, mask, lbls, shield)
@@ -512,9 +675,26 @@ def run_staged_phase(
             # (first micro-batch), meaning router got grad_accum × more updates than task loss.
             is_last_accum = (accum_count == cfg.grad_accum - 1) or (start + cfg.batch_size >= len(indices))
             if train_router and is_last_accum and global_step % cfg.router_probe_every_n_steps == 0:
-                prompt_mask = mask.bool() & lbls.eq(-100) & ~(shield.bool() if shield is not None else torch.zeros_like(mask, dtype=torch.bool))
+                # A B=1 RLOO probe cannot distinguish input-specific routing
+                # from a globally collapsed argmax.  Draw a separate vectorised
+                # probe minibatch so the mutual-information diversity term and
+                # counterfactual rewards see heterogeneous prompts.
+                probe_idx = random.sample(
+                    range(len(train_data)),
+                    min(max(2, int(getattr(cfg, "router_rloo_batch_size", 8))), len(train_data)),
+                )
+                probe_ids = torch.stack([train_data[i]["input_ids"] for i in probe_idx]).to(device)
+                probe_mask = torch.stack([train_data[i]["attention_mask"] for i in probe_idx]).to(device)
+                probe_lbls = torch.stack([train_data[i]["labels"] for i in probe_idx]).to(device)
+                probe_shield = None
+                if "prompt_shield_mask" in train_data[probe_idx[0]]:
+                    probe_shield = torch.stack([train_data[i]["prompt_shield_mask"] for i in probe_idx]).to(device)
+                prompt_mask = probe_mask.bool() & probe_lbls.eq(-100) & ~(
+                    probe_shield.bool() if probe_shield is not None else torch.zeros_like(probe_mask, dtype=torch.bool)
+                )
                 router_loss, rloo_diag = compute_router_rloo_loss(
-                    model, ids, mask, lbls, cfg, prompt_mask=prompt_mask, shield_mask=shield
+                    model, probe_ids, probe_mask, probe_lbls, cfg,
+                    prompt_mask=prompt_mask, shield_mask=probe_shield,
                 )
                 if torch.isfinite(router_loss) and router_loss.requires_grad:
                     scaler.scale(router_loss).backward()
@@ -670,6 +850,9 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     # PHASE 1: Pure SteerNet
     best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(model, train_data, eval_data, cfg, device)
     logs.update(p1_logs)
+    logs["phase1_acceptance"] = phase1_steernet_acceptance(
+        model, tokenizer, train_data, eval_data, cfg, device
+    )
 
     # PHASE 1.5: Router Bootstrap
     _, best_p15 = train_router_bootstrap(model, train_data, eval_data, cfg, device)
@@ -820,6 +1003,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     if os.path.exists(cfg.phase2_save_path):
         load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
         print(f"  ✅ Loaded final joint+gate-retune checkpoint from {cfg.phase2_save_path}")
+    logs["ars_intervention_audit"] = audit_ars_intervention_health(model, eval_data, cfg, device)
 
     print("\n" + "=" * 80)
     print("🎉 FULL ARS TRAINING COMPLETE!")
