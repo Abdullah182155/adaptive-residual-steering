@@ -222,7 +222,9 @@ def epoch_end_accuracy(
     model.eval()
     correct, total = 0, 0
 
-    iterator = tqdm(idxs, desc=progress_desc, unit="sample", leave=False) if progress_desc else idxs
+    # Keep audit bars in notebook output.  A cleared bar looks like a stalled
+    # cell in Kaggle even though Phi-2 generation is still progressing.
+    iterator = tqdm(idxs, desc=progress_desc, unit="sample", leave=True) if progress_desc else idxs
     with torch.no_grad():
         for i in iterator:
             ids = eval_data[i]["input_ids"]

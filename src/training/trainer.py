@@ -65,7 +65,9 @@ def evaluate_loss(
     total_tokens = 0
 
     starts = range(0, len(data), cfg.batch_size)
-    iterator = tqdm(starts, desc=progress_desc, unit="batch", leave=False) if progress_desc else starts
+    # Acceptance runs are deliberately visible: deleting completed bars makes
+    # the several-minute isolated-layer audit appear to have frozen.
+    iterator = tqdm(starts, desc=progress_desc, unit="batch", leave=True) if progress_desc else starts
     for start in iterator:
         batch_idx = list(range(start, min(start + cfg.batch_size, len(data))))
         ids = torch.stack([data[i]["input_ids"] for i in batch_idx]).to(device)
