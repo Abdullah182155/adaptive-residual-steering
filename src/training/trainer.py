@@ -289,6 +289,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
         random.shuffle(subset_idx)
         model.train()
         running, n_steps = 0.0, 0
+        epoch_k_samples = []
         pbar = tqdm(subset_idx, desc=f"RouterBootstrap {epoch + 1}/{cfg.router_bootstrap_epochs}")
         for i in pbar:
             ids = train_data[i]["input_ids"].unsqueeze(0).to(device)
@@ -313,10 +314,17 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                 postfix_dict["mean_k"] = f"{rloo_diag.get('mean_k_sampled', 0.0):.2f}"
                 if "win_rate_vs_base" in rloo_diag:
                     postfix_dict["win_base"] = f"{rloo_diag['win_rate_vs_base'] * 100:.0f}%"
+                if "sampled_k" in rloo_diag:
+                    epoch_k_samples.extend(rloo_diag["sampled_k"])
             pbar.set_postfix(**postfix_dict)
 
         avg_loss = running / max(1, n_steps)
-        k_dist = model.routing_k_distribution()
+        if epoch_k_samples:
+            k_counts = Counter(epoch_k_samples)
+            tot_k = len(epoch_k_samples)
+            k_dist = {k: round(k_counts.get(k, 0) / tot_k, 3) for k in range(cfg.max_active_layers + 1)}
+        else:
+            k_dist = model.routing_k_distribution()
         diag = model.routing_diagnostics()
         active_cnt = sum(1 for s in diag.values() if s["selected_forwards"] > 0)
         coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
@@ -674,18 +682,17 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # PHASE 2C: Light Joint Fine-tune
+    # PHASE 2C: Coordinated Joint Fine-tune (SteerNet strictly FROZEN to preserve learned steering direction)
     for p in steer_params_ft:
-        p.requires_grad = True
+        p.requires_grad = False
     for p in gate_params_ft:
         p.requires_grad = True
     for p in model.router.parameters():
         p.requires_grad = True
     model.set_router_exploration(True)
-    model._joint_grad_mode = True  # Let task gradients flow through both alpha and delta
+    model._joint_grad_mode = True  # Let task gradients flow through alpha to optimize gate directly
 
     joint_groups = [
-        {"params": steer_params_ft, "lr": cfg.steer_finetune_lr * cfg.joint_finetune_lr_scale},
         {"params": gate_params_ft, "lr": cfg.gate_only_lr * cfg.joint_finetune_lr_scale},
         {
             "params": list(model.router.parameters()),
@@ -695,11 +702,11 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
 
     global_step, best_val_p2, best_acc_p2 = run_staged_phase(
         model, tokenizer, train_data, eval_data, cfg, device,
-        stage_name="PHASE 2C: Light Joint Fine-tune",
+        stage_name="PHASE 2C: Coordinated Gate+Router Fine-tune (SteerNet Frozen)",
         epochs=cfg.joint_finetune_epochs,
         param_groups=joint_groups,
         save_path=cfg.phase2_save_path,
-        train_steer=True, train_gate=True, train_router=True,
+        train_steer=False, train_gate=True, train_router=True,
         global_step=global_step, baseline_ema=[0.0], patience=max(1, cfg.phase2_patience),
     )
     model._joint_grad_mode = False  # Restore detached mode for Phase 2D

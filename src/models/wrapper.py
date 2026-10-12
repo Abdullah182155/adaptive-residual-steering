@@ -439,17 +439,20 @@ class Phi2WithRSC(nn.Module):
         self.routing_forwards.zero_()
 
     def routing_diagnostics(self):
-        return {
-            int(layer): {
-                "selection_rate_ema": float(self.router.selection_rate_ema[pos].item()),
-                "selection_rate_batch": float(self.router.selection_rate_ema[pos].item()),
+        diag = {}
+        for pos, layer in enumerate(self.target_layers):
+            seen = int(self.router.seen_forwards[pos].item())
+            selected = int(self.router.selected_forwards[pos].item())
+            empirical_rate = (selected / seen) if seen > 0 else float(self.router.selection_rate_ema[pos].item())
+            diag[int(layer)] = {
+                "selection_rate_ema": float(empirical_rate),
+                "selection_rate_batch": float(empirical_rate),
                 "logit_ema": float(self.router.logit_ema[pos].item()),
-                "selected_forwards": int(self.router.selected_forwards[pos].item()),
-                "activations_count": int(self.router.selected_forwards[pos].item()),
-                "seen_forwards": int(self.router.seen_forwards[pos].item()),
+                "selected_forwards": selected,
+                "activations_count": selected,
+                "seen_forwards": seen,
             }
-            for pos, layer in enumerate(self.target_layers)
-        }
+        return diag
 
     def routing_k_distribution(self):
         total = max(1, int(self.routing_forwards.item()))

@@ -201,5 +201,6 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         "h_subset_raw": float(h_subset.detach().item()),
         "h_subset_weighted": float((beta_subset * h_subset).detach().item()),
         "mean_k_sampled": float(((k_a.float() + k_b.float()) / 2).mean().item()),
+        "sampled_k": [int(k.item()) for k in torch.cat([k_a.view(-1), k_b.view(-1)])],
     }
     return loss, diag
