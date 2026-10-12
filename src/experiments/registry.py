@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Union
 import torch
 import torch.nn as nn
+from src.experiments.checkpointing import load_ars_checkpoint_strict, save_ars_checkpoint
 
 def _get_git_commit() -> str:
     """Safely retrieves current git commit hash."""
@@ -162,12 +163,16 @@ class ExperimentRun:
     def save_weights(self, model: nn.Module, filename: str = "final_ars_weights.pt") -> str:
         """Saves trainable ARS steering/gate/router weights inside the isolated run directory."""
         dest_path = os.path.join(self.run_dir, "checkpoints", filename)
-        state = {
-            k: v.cpu()
-            for k, v in model.state_dict().items()
-            if "steer_net" in k or "gate" in k or "router" in k
-        }
-        torch.save(state, dest_path)
+        if hasattr(model, "cfg"):
+            save_ars_checkpoint(model, dest_path, phase="experiment-final", cfg=model.cfg)
+        else:
+            # Registry remains usable for generic experiment models; strict ARS
+            # serialization is selected only for an actual ARS wrapper.
+            state = {
+                k: v.cpu() for k, v in model.state_dict().items()
+                if "steer_net" in k or "gate" in k or "router" in k
+            }
+            torch.save(state, dest_path)
         self.data["artifacts"]["weights_path"] = dest_path
         self.save()
         return dest_path
@@ -186,10 +191,10 @@ class ExperimentRun:
             return False
 
         map_loc = device if device is not None else torch.device("cpu")
-        state = torch.load(weights_path, map_location=map_loc)
-        if isinstance(state, dict) and "steer_state" in state:
-            state = state["steer_state"]
-        model.load_state_dict(state, strict=False)
+        if hasattr(model, "cfg"):
+            load_ars_checkpoint_strict(model, weights_path, device=map_loc)
+        else:
+            model.load_state_dict(torch.load(weights_path, map_location=map_loc), strict=False)
         return True
 
     def register_chart(self, chart_name: str, source_path: Optional[str] = None) -> str:

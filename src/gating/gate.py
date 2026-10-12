@@ -94,9 +94,11 @@ class RSCUsefulnessGate(nn.Module):
         B, T, D = x.shape
         if T > 1:
             x_conv = self.causal_conv(x.transpose(1, 2))[:, :, :T].transpose(1, 2)
-            x = x + self.drop(self.act(x_conv))
-            # Cache the last 2 steps for subsequent autoregressive decode steps
+            # Cache *pre-convolution* features.  Caching the residual output
+            # would feed an already-convolved value back into the next decode
+            # step, making token-by-token generation differ from prefill.
             self._conv_cache = x[:, -2:, :].detach()
+            x = x + self.drop(self.act(x_conv))
         else:
             # Autoregressive single-step decode (T == 1): maintain temporal context via streaming cache
             if self._conv_cache is not None and self._conv_cache.shape[0] == B:

@@ -21,30 +21,37 @@ from src.training.losses import (
     log_gpu_memory,
 )
 from src.training.contrastive import compute_contrastive_gate_loss
+from src.experiments.checkpointing import save_ars_checkpoint, load_ars_checkpoint_strict
 
 
-def save_steer_weights(model, path: str):
-    """Save only RSC-specific parameters (SteerNet, Gate, and Router weights)."""
-    os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)
-    state = {
-        k: v.cpu()
-        for k, v in model.state_dict().items()
-        if "steer_net" in k or "gate" in k or "router" in k
-    }
-    torch.save(state, path)
-    print(f"✅ Saved steering weights to {path} ({len(state)} tensors)")
+def _set_batch_context(model, mask: torch.Tensor, labels: torch.Tensor, shield_mask: Optional[torch.Tensor] = None):
+    """Install exact few-shot shielding and route only from the live question prompt."""
+    prompt = mask.bool() & labels.eq(-100)
+    if shield_mask is not None:
+        shield = shield_mask.bool() & mask.bool()
+        if hasattr(model, "set_prompt_shield_mask"):
+            model.set_prompt_shield_mask(shield)
+        prompt = prompt & ~shield
+    elif hasattr(model, "set_prompt_shield_mask"):
+        model.set_prompt_shield_mask(None)
+    model.set_router_context_mask(prompt)
+
+
+def save_steer_weights(
+    model, path: str, cfg: Optional[RSCConfig] = None, phase: str = "ars", prefixes=None
+):
+    """Save ARS tensors with an auditable phase/config/hash sidecar."""
+    report = save_ars_checkpoint(model, path, phase=phase, cfg=cfg or model.cfg, prefixes=prefixes)
+    print(f"✅ Saved {phase} ARS weights to {path} ({report['tensor_count']} tensors; manifest={report['manifest_path']})")
 
 
 def load_steer_weights(model, path: str, device: Optional[torch.device] = None):
     """Load RSC-specific weights into model."""
     if device is None:
         device = next(model.parameters()).device
-    state = torch.load(path, map_location=device)
-    if "steer_state" in state:
-        model.load_state_dict(state["steer_state"], strict=False)
-    else:
-        model.load_state_dict(state, strict=False)
-    print(f"✅ Loaded steering weights from {path}")
+    report = load_ars_checkpoint_strict(model, path, device=device)
+    phase = (report.get("manifest") or {}).get("phase", "legacy-unmanifested")
+    print(f"✅ Loaded strict ARS checkpoint from {path} (phase={phase}, tensors={report['saved_ars_tensors']})")
 
 
 def evaluate_loss(model, data, cfg: RSCConfig, device: torch.device) -> float:
@@ -58,9 +65,13 @@ def evaluate_loss(model, data, cfg: RSCConfig, device: torch.device) -> float:
         ids = torch.stack([data[i]["input_ids"] for i in batch_idx]).to(device)
         mask = torch.stack([data[i]["attention_mask"] for i in batch_idx]).to(device)
         lbls = torch.stack([data[i]["labels"] for i in batch_idx]).to(device)
+        shield = None
+        if "prompt_shield_mask" in data[batch_idx[0]]:
+            shield = torch.stack([data[i]["prompt_shield_mask"] for i in batch_idx]).to(device)
 
         if hasattr(model, "_attn_mask_cache"):
             model._attn_mask_cache = mask
+        _set_batch_context(model, mask, lbls, shield)
 
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
             out = model(input_ids=ids, attention_mask=mask, labels=lbls)
@@ -83,7 +94,13 @@ def _evaluate_and_maybe_checkpoint(
         model.reset_routing_diagnostics()
     val_loss = evaluate_loss(model, eval_data, cfg, device)
     acc = epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=cfg.accuracy_eval_n, seed=cfg.seed)
-    improved = acc > best_acc + 0.005
+    # A generation sample is a noisy checkpoint signal.  It may break ties,
+    # but it must never replace a checkpoint whose teacher-forced validation
+    # loss is materially better (the old rule did exactly that in Phase 2B).
+    val_improved = val_loss < best_val - cfg.early_stop_delta
+    acc_improved = acc > best_acc + 0.005
+    val_tied = abs(val_loss - best_val) <= cfg.early_stop_delta
+    improved = val_improved or (getattr(cfg, "use_accuracy_checkpoint", True) and val_tied and acc_improved)
     note = ""
     if train_router:
         diag = model.routing_diagnostics()
@@ -97,13 +114,14 @@ def _evaluate_and_maybe_checkpoint(
         print(model.router_k_cap_gap_summary())
     best_state = None
     if improved:
-        best_acc, best_val, patience_ctr = acc, val_loss, 0
+        best_acc = max(best_acc, acc)
+        best_val, patience_ctr = val_loss, 0
         best_state = {
             k: v.clone() for k, v in model.state_dict().items()
             if "steer_net" in k or "gate" in k or "router" in k
         }
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-        torch.save(best_state, save_path)
+        save_ars_checkpoint(model, save_path, phase=label, cfg=cfg)
     else:
         patience_ctr += 1
     return best_acc, best_val, best_state, patience_ctr, improved, val_loss, acc
@@ -182,8 +200,11 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
             ids = torch.stack([train_data[i]["input_ids"] for i in batch_idx]).to(device)
             mask = torch.stack([train_data[i]["attention_mask"] for i in batch_idx]).to(device)
             lbls = torch.stack([train_data[i]["labels"] for i in batch_idx]).to(device)
+            shield = None
+            if "prompt_shield_mask" in train_data[batch_idx[0]]:
+                shield = torch.stack([train_data[i]["prompt_shield_mask"] for i in batch_idx]).to(device)
             model._attn_mask_cache = mask
-            model.set_router_context_mask(mask.bool() & (lbls == -100))
+            _set_batch_context(model, mask, lbls, shield)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(input_ids=ids, attention_mask=mask, labels=lbls)
@@ -246,7 +267,9 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
 
     if best_state_p1:
         model.load_state_dict(best_state_p1, strict=False)
-    save_steer_weights(model, cfg.lora_save_path)
+    save_steer_weights(
+        model, cfg.lora_save_path, cfg=cfg, phase="phase1-steernet", prefixes=("steer_nets.",)
+    )
     grad_mon_p1.summary()
     print(f"\n✅ Phase 1 complete — best_val = {best_val_p1:.4f}")
 
@@ -296,10 +319,15 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             ids = train_data[i]["input_ids"].unsqueeze(0).to(device)
             mask = train_data[i]["attention_mask"].unsqueeze(0).to(device)
             lbls = train_data[i]["labels"].unsqueeze(0).to(device)
+            shield = train_data[i].get("prompt_shield_mask")
+            shield = shield.unsqueeze(0).to(device) if shield is not None else None
             model._attn_mask_cache = mask
 
-            prompt_mask = mask.bool() & lbls.eq(-100)
-            loss, rloo_diag = compute_router_rloo_loss(model, ids, mask, lbls, cfg, prompt_mask=prompt_mask)
+            _set_batch_context(model, mask, lbls, shield)
+            prompt_mask = mask.bool() & lbls.eq(-100) & ~(shield.bool() if shield is not None else torch.zeros_like(mask, dtype=torch.bool))
+            loss, rloo_diag = compute_router_rloo_loss(
+                model, ids, mask, lbls, cfg, prompt_mask=prompt_mask, shield_mask=shield
+            )
             if not torch.isfinite(loss):
                 continue
 
@@ -394,6 +422,10 @@ def run_staged_phase(
     for epoch in range(epochs):
         model.train()
         model.set_gate_freeze(not train_gate, 1.0)
+        # Gate-only phases need the real task loss.  The gate still observes
+        # detached h/delta, so this does not unfreeze or backpropagate into the
+        # SteerNet; it only lets task error calibrate alpha.
+        model._joint_grad_mode = bool(train_gate)
         indices = list(range(len(train_data)))
         random.shuffle(indices)
         epoch_task, n_opt_steps, accum_count = 0.0, 0, 0
@@ -408,8 +440,11 @@ def run_staged_phase(
             ids = torch.stack([train_data[i]["input_ids"] for i in batch_idx]).to(device)
             mask = torch.stack([train_data[i]["attention_mask"] for i in batch_idx]).to(device)
             lbls = torch.stack([train_data[i]["labels"] for i in batch_idx]).to(device)
+            shield = None
+            if "prompt_shield_mask" in train_data[batch_idx[0]]:
+                shield = torch.stack([train_data[i]["prompt_shield_mask"] for i in batch_idx]).to(device)
             model._attn_mask_cache = mask
-            model.set_router_context_mask(mask.bool() & (lbls == -100))
+            _set_batch_context(model, mask, lbls, shield)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(input_ids=ids, attention_mask=mask, labels=lbls)
@@ -465,8 +500,10 @@ def run_staged_phase(
             # (first micro-batch), meaning router got grad_accum × more updates than task loss.
             is_last_accum = (accum_count == cfg.grad_accum - 1) or (start + cfg.batch_size >= len(indices))
             if train_router and is_last_accum and global_step % cfg.router_probe_every_n_steps == 0:
-                prompt_mask = mask.bool() & lbls.eq(-100)
-                router_loss, rloo_diag = compute_router_rloo_loss(model, ids, mask, lbls, cfg, prompt_mask=prompt_mask)
+                prompt_mask = mask.bool() & lbls.eq(-100) & ~(shield.bool() if shield is not None else torch.zeros_like(mask, dtype=torch.bool))
+                router_loss, rloo_diag = compute_router_rloo_loss(
+                    model, ids, mask, lbls, cfg, prompt_mask=prompt_mask, shield_mask=shield
+                )
                 if torch.isfinite(router_loss) and router_loss.requires_grad:
                     scaler.scale(router_loss).backward()
                 if rloo_diag:
@@ -592,8 +629,7 @@ def train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg: RSCConfi
     logs["streamlined_stage2_acc"] = best_acc_s2
 
     if os.path.exists(cfg.phase2_save_path):
-        state = torch.load(cfg.phase2_save_path, map_location=device)
-        model.load_state_dict(state, strict=False)
+        load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
         print(f"  ✅ Loaded final streamlined checkpoint from {cfg.phase2_save_path}")
 
     print("\n" + "=" * 80)
@@ -753,8 +789,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     model.set_router_exploration(False)
 
     if os.path.exists(cfg.phase2_save_path):
-        _p2d_state = torch.load(cfg.phase2_save_path, map_location=device)
-        model.load_state_dict(_p2d_state, strict=False)
+        load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
         print(f"  ✅ Loaded final joint+gate-retune checkpoint from {cfg.phase2_save_path}")
 
     print("\n" + "=" * 80)

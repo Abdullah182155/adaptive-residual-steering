@@ -10,6 +10,7 @@ class RSCConfig:
     # Layer positions are intentionally discovered from the backbone depth.
     # The router decides which candidates to use for each forward pass and selects at most max_active_layers.
     max_active_layers: int = 4
+    fixed_steer_eval_k: int = 2  # calibrated fixed-route SteerNet ablation; must be in [1, max_active_layers]
     use_router: bool = True  # If False, router is bypassed
     fixed_layers: Optional[List[int]] = None  # If set, forces these exact layers to steer
     # Catalog router: distribution over subsets. Empty is a legal action.
@@ -27,6 +28,10 @@ class RSCConfig:
     steer_max_magnitude: float = 2.0
     steer_max_relative_norm: float = 0.08  # Strictly bounds ||delta|| <= beta * ||h|| per layer to prevent multi-layer over-perturbation
     steer_orthogonal_projection: bool = False  # Optional projection onto orthogonal complement of h
+    # A route has one shared intervention budget.  Each selected layer receives
+    # K**(-power) of its own bounded delta, so adding layers cannot linearly
+    # multiply the residual displacement.  K=1 remains unchanged.
+    steer_route_budget_power: float = 0.5
 
     # Data
     n_samples: int = 7000
@@ -99,9 +104,11 @@ class RSCConfig:
     beta_entropy_subset: float = 0.02  # was 0.15 — let router specialize layer selection
     router_balance_weight: float = 0.01  # was 0.10 — layer_dropout already prevents monopoly
     lambda_synergy: float = 0.10
+    router_pairwise_probe_probability: float = 0.25  # sample true pair-interaction counterfactuals during RLOO
     lambda_k_center: float = 0.0  # was 0.05 — removed; let K be learned purely from reward
     router_layer_dropout: float = 0.15  # Stochastic candidate dropout during training to prevent clique stacking
     router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
+    router_eval_mode: str = "argmax"  # deterministic: argmax; stochastic sampling is training-only by default
 
     # Prompt Shielding (Preserves pristine representations in multi-shot contexts)
     prompt_shielding: bool = True

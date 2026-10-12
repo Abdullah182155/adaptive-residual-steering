@@ -92,13 +92,29 @@ def policy_entropy_bonus(logits: torch.Tensor, k_logits: torch.Tensor, k_max: in
     return h_k, h_subset
 
 def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
-                              labels: torch.Tensor, cfg, prompt_mask: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, float]]:
+                              labels: torch.Tensor, cfg, prompt_mask: torch.Tensor = None,
+                              shield_mask: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, float]]:
     """RLOO subset selection loss for training cooperative router policy with leave-one-out advantage."""
     if prompt_mask is None:
         prompt_mask = mask.bool() & labels.eq(-100)
-    model.set_router_context_mask(prompt_mask)
-    if model.router._last_pooled is None:
-        return torch.zeros((), device=ids.device), {}
+    # The policy state must come from *this* example.  In bootstrap training
+    # there is otherwise no ordinary task forward before this call, so relying
+    # on _last_pooled trains current rewards against the previous example.
+    # Populate the detached router cache with a fresh, same-example prefill.
+    old_override = model._routing_override
+    try:
+        model.set_routing_override(None)
+        model.set_router_context_mask(prompt_mask)
+        if hasattr(model, "set_prompt_shield_mask"):
+            model.set_prompt_shield_mask(shield_mask)
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=ids.is_cuda):
+                _ = model(input_ids=ids, attention_mask=mask)
+    finally:
+        if old_override is None:
+            model.set_routing_override(None)
+        else:
+            model.set_routing_override(old_override[0], old_override[1])
 
     u_fresh, k_logits_fresh = model.router.recompute_from_cache()
     synergy = getattr(model.router, "_last_synergy_matrix", None)
@@ -112,20 +128,25 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     logprob_b = logprob_k_b + logprob_subset_b
 
     old_override = model._routing_override
+
+    def counterfactual_nll(route_mask: torch.Tensor) -> torch.Tensor:
+        """Evaluate one fixed route with the same prompt/shield contract."""
+        model.set_routing_override("matrix", route_mask.detach())
+        model.set_router_context_mask(prompt_mask)
+        if hasattr(model, "set_prompt_shield_mask"):
+            model.set_prompt_shield_mask(shield_mask)
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", enabled=ids.is_cuda):
+                return per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
+
     try:
-        model.set_routing_override("matrix", subset_a_mask.detach())
-        model.set_router_context_mask(prompt_mask)
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                nll_a = per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
-        model.set_routing_override("matrix", subset_b_mask.detach())
-        model.set_router_context_mask(prompt_mask)
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                nll_b = per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
+        nll_a = counterfactual_nll(subset_a_mask)
+        nll_b = counterfactual_nll(subset_b_mask)
         # Arm 0: Ground-truth unsteered baseline anchor
         model.set_routing_override("none")
         model.set_router_context_mask(prompt_mask)
+        if hasattr(model, "set_prompt_shield_mask"):
+            model.set_prompt_shield_mask(shield_mask)
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
                 nll_0 = per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
@@ -148,22 +169,38 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
 
     policy_loss = -0.5 * (logprob_a * advantage_a + logprob_b * advantage_b).mean()
 
-    # Direct Pairwise Synergy Alignment Loss
+    # Direct pairwise *interaction* signal.  A route's gain over the base is
+    # not synergy: two individually useful layers would otherwise make every
+    # co-selected pair look positive.  For a sampled pair (i,j), estimate
+    # I_ij = R({i,j}) - R({i}) - R({j}) + R(empty), then align only M_ij to it.
+    # This preserves the cooperative-router hypothesis while giving destructive
+    # pairs a negative target instead of allowing universal +1 saturation.
     delta_r_a = (reward_a - reward_0).detach()
     delta_r_b = (reward_b - reward_0).detach()
+    pairwise_interaction_loss = torch.zeros((), device=ids.device)
+    mean_pair_interaction = torch.zeros((), device=ids.device)
     if synergy is not None:
-        mask_pairs_a = (subset_a_mask.unsqueeze(2) & subset_a_mask.unsqueeze(1)).float()
-        mask_pairs_b = (subset_b_mask.unsqueeze(2) & subset_b_mask.unsqueeze(1)).float()
-        eye_N = torch.eye(model.router.n_candidates, device=ids.device, dtype=torch.bool).unsqueeze(0)
-        mask_pairs_a = mask_pairs_a.masked_fill(eye_N, 0.0)
-        mask_pairs_b = mask_pairs_b.masked_fill(eye_N, 0.0)
-        n_pairs_a = mask_pairs_a.sum(dim=(1, 2)).clamp(min=1.0)
-        n_pairs_b = mask_pairs_b.sum(dim=(1, 2)).clamp(min=1.0)
-        syn_a = (synergy * mask_pairs_a).sum(dim=(1, 2)) / n_pairs_a
-        syn_b = (synergy * mask_pairs_b).sum(dim=(1, 2)) / n_pairs_b
-        synergy_align_loss = -0.5 * (delta_r_a * syn_a + delta_r_b * syn_b).mean()
-    else:
-        synergy_align_loss = torch.tensor(0.0, device=ids.device)
+        pair_source = subset_a_mask
+        first = pair_source.float().argmax(dim=-1)
+        without_first = pair_source.clone()
+        without_first.scatter_(1, first.unsqueeze(-1), False)
+        second = without_first.float().argmax(dim=-1)
+        valid_pair = pair_source.sum(dim=-1).ge(2)
+        probe = torch.rand_like(valid_pair.float()) < float(getattr(cfg, "router_pairwise_probe_probability", 0.25))
+        valid_pair = valid_pair & probe
+        if valid_pair.any():
+            singleton_i = torch.zeros_like(pair_source)
+            singleton_j = torch.zeros_like(pair_source)
+            singleton_i.scatter_(1, first.unsqueeze(-1), True)
+            singleton_j.scatter_(1, second.unsqueeze(-1), True)
+            pair_mask = singleton_i | singleton_j
+            nll_i = counterfactual_nll(singleton_i)
+            nll_j = counterfactual_nll(singleton_j)
+            nll_pair = counterfactual_nll(pair_mask)
+            interaction = (-nll_pair + nll_i + nll_j - nll_0).detach()
+            pair_syn = synergy[torch.arange(ids.shape[0], device=ids.device), first, second]
+            pairwise_interaction_loss = -(interaction[valid_pair] * pair_syn[valid_pair]).mean()
+            mean_pair_interaction = interaction[valid_pair].mean()
 
     h_k, h_subset = policy_entropy_bonus(u_fresh, k_logits_fresh, K_max)
 
@@ -186,14 +223,15 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         - beta_k * h_k
         - beta_subset * h_subset
         + lambda_balance * balance_loss
-        + lambda_synergy * synergy_align_loss
+        + lambda_synergy * pairwise_interaction_loss
         + lambda_k_center * k_center_loss
     )
 
     win_rate = ((reward_a > reward_0).float() + (reward_b > reward_0).float()).mean().item() / 2.0
     diag = {
         "policy_loss": float(policy_loss.detach().item()),
-        "synergy_align_loss": float(synergy_align_loss.detach().item()),
+        "synergy_align_loss": float(pairwise_interaction_loss.detach().item()),
+        "pairwise_interaction": float(mean_pair_interaction.detach().item()),
         "win_rate_vs_base": float(win_rate),
         "mean_reward_delta": float((0.5 * (delta_r_a + delta_r_b)).mean().item()),
         "h_k_raw": float(h_k.detach().item()),

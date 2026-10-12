@@ -46,6 +46,19 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(alpha.shape, (self.batch_size, self.seq_len, 1))
         self.assertTrue((alpha >= 0.0).all() and (alpha <= 1.0).all())
 
+    def test_gate_prefill_matches_streaming_decode(self):
+        """The causal gate must produce identical values in prefill and decode."""
+        cfg = RSCConfig(gate_dropout=0.0)
+        gate = RSCUsefulnessGate(hidden_dim=self.hidden_dim, cfg=cfg).eval()
+        h = torch.randn(1, 6, self.hidden_dim)
+        delta = torch.randn_like(h)
+
+        gate.reset_conv_cache()
+        prefill = gate(h, delta).detach()
+        gate.reset_conv_cache()
+        streamed = torch.cat([gate(h[:, i:i + 1], delta[:, i:i + 1]).detach() for i in range(h.shape[1])], dim=1)
+        self.assertTrue(torch.allclose(prefill, streamed, atol=1e-6, rtol=1e-5))
+
     def test_joint_router(self):
         target_layers = [10, 12, 14, 16]
         router = JointLayerRouter(target_layers, hidden_dim=self.hidden_dim, n_layers=20, max_active_layers=4)
@@ -98,6 +111,39 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(wrapper._routing_override[0], "none")
         wrapper.set_routing_override(None)
         self.assertIsNone(wrapper._routing_override)
+
+    def test_argmax_router_keeps_k_zero_and_is_deterministic(self):
+        class DummyLayer(nn.Module):
+            def forward(self, h, *args, **kwargs):
+                return h
+
+        class DummyModel(nn.Module):
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": hidden_dim})()
+                self.embed = nn.Embedding(50, hidden_dim)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer() for _ in range(10)])})()
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h})()
+
+        wrapper = Phi2WithRSC(DummyModel(self.hidden_dim), RSCConfig(), device=torch.device("cpu")).eval()
+        with torch.no_grad():
+            wrapper.router.k_head.weight.zero_()
+            wrapper.router.k_head.bias.fill_(-10.0)
+            wrapper.router.k_head.bias[0] = 10.0
+        ids = torch.tensor([[1, 2, 3, 4]])
+        baseline = wrapper.base_model(input_ids=ids, attention_mask=torch.ones_like(ids)).logits
+        out_a = wrapper(input_ids=ids, attention_mask=torch.ones_like(ids)).logits
+        route_a = wrapper._precomputed_routes.clone()
+        out_b = wrapper(input_ids=ids, attention_mask=torch.ones_like(ids)).logits
+        self.assertEqual(int(wrapper._desired_k.item()), 0)
+        self.assertEqual(int(route_a.sum().item()), 0)
+        self.assertTrue(torch.equal(route_a, wrapper._precomputed_routes))
+        self.assertTrue(torch.equal(out_a, out_b))
+        self.assertTrue(torch.equal(out_a, baseline))
 
     def test_cooperative_synergy(self):
         target_layers = [9, 11, 13, 15]
@@ -243,6 +289,11 @@ class TestARSModules(unittest.TestCase):
                 os.remove("./test_ckpt.pt")
             except OSError:
                 pass
+        if os.path.exists("./test_ckpt.pt.manifest.json"):
+            try:
+                os.remove("./test_ckpt.pt.manifest.json")
+            except OSError:
+                pass
 
     def test_normalized_synergy_and_cooperation_analysis(self):
         """Ensure synergy matrix is strictly bounded in [-1, 1] and cooperation analysis works."""
@@ -300,6 +351,36 @@ class TestARSModules(unittest.TestCase):
         self.assertIn("win_rate_vs_base", diag)
         self.assertIn("synergy_align_loss", diag)
         self.assertIn("mean_reward_delta", diag)
+
+    def test_rloo_refreshes_router_cache_for_current_example(self):
+        """Bootstrap RLOO must not use the pooled state of a preceding sample."""
+        class DummyLayer(nn.Module):
+            def forward(self, h, *args, **kwargs):
+                return h
+
+        class DummyModel(nn.Module):
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": hidden_dim})()
+                self.embed = nn.Embedding(50, hidden_dim)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer() for _ in range(10)])})()
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h})()
+
+        wrapper = Phi2WithRSC(DummyModel(self.hidden_dim), RSCConfig(), device=torch.device("cpu"))
+        stale_ids = torch.tensor([[1, 2, 3, 4]])
+        current_ids = torch.tensor([[5, 6, 7, 8]])
+        mask = torch.ones_like(current_ids)
+        labels = torch.tensor([[-100, 6, 7, 8]])
+        _ = wrapper(input_ids=stale_ids, attention_mask=torch.ones_like(stale_ids))
+        stale_pooled = wrapper.router._last_pooled.clone()
+        from src.routing.rloo import compute_router_rloo_loss
+        loss, _ = compute_router_rloo_loss(wrapper, current_ids, mask, labels, RSCConfig())
+        self.assertTrue(torch.isfinite(loss))
+        self.assertFalse(torch.allclose(wrapper.router._last_pooled, stale_pooled, atol=1e-6))
 
     def test_joint_backward_no_graph_revisit(self):
         """Ensure joint training (steer + gate) executes cleanly without graph reuse error."""

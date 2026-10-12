@@ -30,14 +30,25 @@ def evaluate_model_condition(
     display_examples: int = 2,
     progress_callback: Optional[Callable[[int, int, Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    """Evaluates a model under one of three fair experimental conditions:
-    1. 'baseline': Unsteered backbone (routing override 'none')
-    2. 'steernet': SteerNet only on all layers with gate forced to 1.0 (override 'all', gate freeze True)
-    3. 'ars': Full ARS framework with learned dynamic routing and gating (override None, gate freeze False)
+    """Evaluate a condition under one reproducible intervention contract.
+
+    ``fixed_steernet`` is a legal fixed-K route, never the invalid all-eight
+    stress test.  ``steernet`` keeps the learned router but pins alpha=1, so
+    ARS vs SteerNet measures the Gate contribution under identical routing.
+    ``ars`` enables both learned router and learned gate.
     """
     cond = condition.lower()
-    if cond not in {"baseline", "steernet", "ars"}:
-        raise ValueError(f"Unknown condition '{condition}'. Must be 'baseline', 'steernet', or 'ars'.")
+    if cond not in {"baseline", "fixed_steernet", "steernet", "ars"}:
+        raise ValueError(
+            f"Unknown condition '{condition}'. Must be baseline, fixed_steernet, steernet, or ars."
+        )
+
+    # Benchmark numbers must not vary because the router samples K.  Preserve
+    # an explicitly requested mode so callers can still run a stochastic
+    # robustness study intentionally.
+    previous_mode = getattr(model, "_router_inference_mode", None)
+    if hasattr(model, "set_router_inference_mode"):
+        model.set_router_inference_mode("argmax")
 
     # Set condition routing and gate configuration
     if cond == "baseline":
@@ -45,9 +56,14 @@ def evaluate_model_condition(
             model.set_routing_override("none")
         if hasattr(model, "set_gate_freeze"):
             model.set_gate_freeze(False)
+    elif cond == "fixed_steernet":
+        if hasattr(model, "set_routing_override"):
+            model.set_routing_override("balanced")
+        if hasattr(model, "set_gate_freeze"):
+            model.set_gate_freeze(True, 1.0)
     elif cond == "steernet":
         if hasattr(model, "set_routing_override"):
-            model.set_routing_override("all")
+            model.set_routing_override(None)
         if hasattr(model, "set_gate_freeze"):
             model.set_gate_freeze(True, 1.0)
     elif cond == "ars":
@@ -121,6 +137,8 @@ def evaluate_model_condition(
             model.set_routing_override(None)
         if hasattr(model, "set_gate_freeze"):
             model.set_gate_freeze(False)
+        if previous_mode is not None and hasattr(model, "set_router_inference_mode"):
+            model.set_router_inference_mode(previous_mode)
 
     accuracy = 100.0 * correct_count / max(1, n_samples)
     ans_present = 100.0 * sum(r["has_answer"] for r in detailed_results) / max(1, n_samples)
@@ -175,6 +193,8 @@ def run_fair_multishot_benchmark(
     }
     """
     cfg = config or EvalBenchmarkConfig()
+    if hasattr(model, "set_prompt_shielding"):
+        model.set_prompt_shielding(cfg.prompt_shielding)
     eval_datasets = datasets or cfg.datasets
     eval_shots = shot_counts or cfg.shot_counts
 

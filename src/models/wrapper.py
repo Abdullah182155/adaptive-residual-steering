@@ -57,7 +57,10 @@ class Phi2WithRSC(nn.Module):
         if not getattr(cfg, "use_router", True) or getattr(cfg, "fixed_layers", None) is not None:
             fl = cfg.fixed_layers or list(self.target_layers)
             self.set_routing_override("only", fl)
-        self._router_inference_mode = "softmax"  # BUG-02 fix: was "argmax" but that branch now uses softmax sampling
+        # Evaluation must be reproducible.  Sampling is useful for policy
+        # training, but an evaluation route is a deterministic argmax policy.
+        self._router_inference_mode = getattr(cfg, "router_eval_mode", "argmax")
+        self._router_exploration = True
         self._joint_grad_mode = False  # When True (Phase 2C), task gradient flows through both alpha and delta
 
         # Cached decode attributes
@@ -127,9 +130,16 @@ class Phi2WithRSC(nn.Module):
                         g._valid_mask = mask
                         route = selected.to(alpha.dtype).view(-1, 1, 1)
                         route_st = route
-                        # k_scale removed: max_relative_norm already bounds ||delta|| ≤ 0.15*||h||
-                        # per layer. sqrt(K) division was double-dampening, reducing effective
-                        # perturbation to ~7% when K=3 — too weak for meaningful steering.
+                        # Each individual SteerNet is bounded, but that alone
+                        # does not bound their cumulative displacement across a
+                        # route.  Give a route one shared budget: K=1 is
+                        # untouched; K>1 is scaled by K**(-p), p=0.5 by
+                        # default.  The same operation is used in training and
+                        # generation, so a multi-layer route is never evaluated
+                        # in a larger norm regime than it was trained in.
+                        active_k = wrapper._active_k_realized.to(dtype=alpha.dtype).clamp(min=1)
+                        budget_power = float(getattr(wrapper.cfg, "steer_route_budget_power", 0.0))
+                        route_budget = active_k.pow(-budget_power).view(-1, 1, 1)
                         steer_mask = mask
                         if wrapper.prompt_shielding and wrapper._prompt_shield_mask_active is not None:
                             sh = wrapper._prompt_shield_mask_active
@@ -137,9 +147,9 @@ class Phi2WithRSC(nn.Module):
                                 sh_aligned = sh[:, -h_fp.shape[1]:].to(device=h_fp.device, dtype=torch.bool)
                                 steer_mask = steer_mask & (~sh_aligned)
                         if wrapper._joint_grad_mode:
-                            h_new = h_fp + route_st * alpha * delta * steer_mask.to(alpha.dtype).unsqueeze(-1)
+                            h_new = h_fp + route_st * alpha * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1)
                         else:
-                            h_new = h_fp + route_st * alpha.detach() * delta * steer_mask.to(alpha.dtype).unsqueeze(-1)
+                            h_new = h_fp + route_st * alpha.detach() * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1)
                     h_out = h_new.to(h.dtype)
                     if orig_2d:
                         h_out = h_out.squeeze(0)
@@ -220,13 +230,12 @@ class Phi2WithRSC(nn.Module):
         self._router_warmup = enabled
 
     def set_router_inference_mode(self, mode: str):
-        # BUG-02 fix: 'argmax' renamed to 'softmax' (temp-1 sampling); 'sample' = full Gumbel noise
-        if mode not in {"softmax", "sample", "argmax"}:  # keep "argmax" as alias for backward compat
-            raise ValueError('router inference mode must be "softmax" or "sample"')
-        self._router_inference_mode = "softmax" if mode == "argmax" else mode
+        if mode not in {"sample", "argmax"}:
+            raise ValueError('router inference mode must be "argmax" or "sample"')
+        self._router_inference_mode = mode
 
     def set_router_exploration(self, enabled: bool):
-        return
+        self._router_exploration = bool(enabled)
 
     def set_router_context_mask(self, context_mask=None):
         self._router_context_mask_pending = context_mask
@@ -238,8 +247,8 @@ class Phi2WithRSC(nn.Module):
         if mode == "all":
             mode = "only"
             layers = list(self.target_layers)
-        if mode not in {"only", "exclude", "none", "force", "matrix"}:
-            raise ValueError("routing override must be one of: only, exclude, none, force, matrix, all")
+        if mode not in {"only", "exclude", "none", "force", "matrix", "balanced"}:
+            raise ValueError("routing override must be one of: only, exclude, none, force, matrix, balanced, all")
         if mode == "matrix":
             if not torch.is_tensor(layers) or layers.dtype != torch.bool or layers.dim() != 2:
                 raise ValueError("matrix override requires a (B, n_candidates) bool tensor")
@@ -286,12 +295,6 @@ class Phi2WithRSC(nn.Module):
             ranks = margins.argsort(dim=-1, descending=True).argsort(dim=-1)
             capped = ranks < K
             selected_matrix = torch.where(over_budget.unsqueeze(-1), selected_matrix & capped, selected_matrix)
-        none_selected = ~selected_matrix.any(dim=-1)
-        if none_selected.any():
-            fallback_idx = margins.argmax(dim=-1)
-            fb_mask = torch.zeros_like(selected_matrix)
-            fb_mask[torch.arange(selected_matrix.shape[0], device=selected_matrix.device), fallback_idx] = True
-            selected_matrix = torch.where(none_selected.unsqueeze(-1), fb_mask, selected_matrix)
         return selected_matrix
 
     def _prepare_routes(self, h: torch.Tensor, mask: torch.Tensor):
@@ -324,7 +327,7 @@ class Phi2WithRSC(nn.Module):
             self._desired_k = selected_matrix.long().sum(dim=-1).clamp(min=1, max=K_max)
         elif self._routing_override is None:
             synergy = getattr(self.router, "_last_synergy_matrix", None)
-            if self.training:
+            if self.training and self._router_exploration:
                 with torch.no_grad():
                     k_real, _ = sample_k(k_logits)
                     selected_matrix, _ = sample_subset_plackett_luce(u, k_real, synergy_matrix=synergy)
@@ -336,10 +339,10 @@ class Phi2WithRSC(nn.Module):
                         selected_matrix, _ = sample_subset_plackett_luce(u, k_real, synergy_matrix=synergy)
                     k_real = k_real.clamp(min=0, max=K_max)
                 else:
-                    # Use temperature-scaled sampling to reflect the true learned distribution.
+                    # Deterministic evaluation: select the learned K (including
+                    # K=0) and greedily construct the cooperative subset.
                     with torch.no_grad():
-                        k_probs = torch.softmax(k_logits.float(), dim=-1)
-                        k_idx = torch.multinomial(k_probs, num_samples=1).squeeze(-1)
+                        k_idx = k_logits.float().argmax(dim=-1)
                         if k_logits.shape[-1] > K_max:
                             k_real = k_idx.clamp(min=0, max=K_max)
                         else:
@@ -382,6 +385,15 @@ class Phi2WithRSC(nn.Module):
                     [idx in layers for idx in self.target_layers], device=h.device, dtype=torch.bool
                 ).unsqueeze(0)
                 selected_matrix = base_selected | forced
+            elif mode == "balanced":
+                # Fixed SteerNet ablation: a legal, evenly-spaced K-route.
+                # This is deliberately not "all" candidates, which is outside
+                # the trained intervention regime and therefore not an ablation.
+                fixed_k = int(getattr(self.cfg, "fixed_steer_eval_k", 2))
+                fixed_k = max(1, min(fixed_k, K_max, n_candidates))
+                positions = torch.linspace(0, n_candidates - 1, steps=fixed_k, device=h.device).round().long()
+                selected_matrix = torch.zeros(h.shape[0], n_candidates, dtype=torch.bool, device=h.device)
+                selected_matrix[:, positions] = True
             else:
                 eligible = torch.tensor([idx not in layers for idx in self.target_layers], device=h.device)
                 scores = u.masked_fill(~eligible.unsqueeze(0), float("-inf"))
@@ -391,7 +403,7 @@ class Phi2WithRSC(nn.Module):
         self.router._last_prediction = self._desired_k
         self._last_inferred_k = self._desired_k
         self._precomputed_routes = selected_matrix
-        self._active_k_realized = selected_matrix.sum(dim=-1).clamp(min=1)
+        self._active_k_realized = selected_matrix.sum(dim=-1)
 
         if h.shape[1] > 1:
             self._cached_decode_routes = selected_matrix.detach()
