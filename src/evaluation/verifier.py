@@ -8,6 +8,7 @@ from typing import Optional, List, Dict, Any, Tuple
 import torch
 import numpy as np
 from transformers import StoppingCriteria, StoppingCriteriaList
+from tqdm.auto import tqdm
 
 GSM8K_8SHOT_EXEMPLARS = [
     {
@@ -187,8 +188,16 @@ class AnswerStoppingCriteria(StoppingCriteria):
                             return False
         return False
 
-def epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=40, max_new_tokens=200, seed=0) -> float:
-    """Lightweight final-answer accuracy check for checkpoint selection."""
+def epoch_end_accuracy(
+    model, tokenizer, eval_data, device, n_samples=40, max_new_tokens=200,
+    seed=0, progress_desc: Optional[str] = None,
+) -> float:
+    """Lightweight final-answer accuracy check for checkpoint selection.
+
+    ``progress_desc`` is intentionally optional: a generation-based accuracy
+    check can take minutes on a small GPU, so curriculum callers can expose
+    concrete progress without making library callers noisy by default.
+    """
     rng = random.Random(seed)
     buckets = {"easy": [], "medium": [], "hard": []}
     for idx, ex in enumerate(eval_data):
@@ -213,8 +222,9 @@ def epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=40, max_ne
     model.eval()
     correct, total = 0, 0
 
+    iterator = tqdm(idxs, desc=progress_desc, unit="sample", leave=False) if progress_desc else idxs
     with torch.no_grad():
-        for i in idxs:
+        for i in iterator:
             ids = eval_data[i]["input_ids"]
             lbls = eval_data[i]["labels"]
             pad_id = tokenizer.pad_token_id
@@ -240,6 +250,8 @@ def epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=40, max_ne
             total += 1
             if pred_num is not None and abs(pred_num - gold_num) < 0.01:
                 correct += 1
+            if progress_desc:
+                iterator.set_postfix(acc=f"{correct / total:.1%}", valid=total)
 
     if was_training:
         model.train()

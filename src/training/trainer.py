@@ -1,6 +1,7 @@
 import gc
 import os
 import random
+import time
 from collections import Counter
 import torch
 from tqdm import tqdm
@@ -54,14 +55,18 @@ def load_steer_weights(model, path: str, device: Optional[torch.device] = None):
     print(f"✅ Loaded strict ARS checkpoint from {path} (phase={phase}, tensors={report['saved_ars_tensors']})")
 
 
-def evaluate_loss(model, data, cfg: RSCConfig, device: torch.device) -> float:
-    """Compute per-token cross-entropy loss on eval set."""
+def evaluate_loss(
+    model, data, cfg: RSCConfig, device: torch.device, progress_desc: Optional[str] = None,
+) -> float:
+    """Compute per-token cross-entropy loss, optionally exposing batch progress."""
     was_training = model.training
     model.eval()
     total_nll = 0.0
     total_tokens = 0
 
-    for start in range(0, len(data), cfg.batch_size):
+    starts = range(0, len(data), cfg.batch_size)
+    iterator = tqdm(starts, desc=progress_desc, unit="batch", leave=False) if progress_desc else starts
+    for start in iterator:
         batch_idx = list(range(start, min(start + cfg.batch_size, len(data))))
         ids = torch.stack([data[i]["input_ids"] for i in batch_idx]).to(device)
         mask = torch.stack([data[i]["attention_mask"] for i in batch_idx]).to(device)
@@ -81,6 +86,8 @@ def evaluate_loss(model, data, cfg: RSCConfig, device: torch.device) -> float:
         if n_tokens > 0:
             total_nll += out.loss.item() * n_tokens
             total_tokens += n_tokens
+            if progress_desc:
+                iterator.set_postfix(nll=f"{total_nll / total_tokens:.4f}")
 
     model.train(was_training)
     return total_nll / max(1, total_tokens)
@@ -99,31 +106,55 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
     val_probe = [eval_data[i] for i in range(val_n)]
     old_override = model._routing_override
     old_layers = getattr(cfg, "fixed_steer_eval_layers", None)
+    started_at = time.monotonic()
     try:
+        print("\n" + "=" * 80)
+        print("PHASE 1 ACCEPTANCE AUDIT: Independent SteerNet Capacity")
+        print(
+            f"         Measuring baseline + {len(model.target_layers)} single-layer candidates "
+            f"on {train_n} train / {val_n} validation examples."
+        )
+        print(
+            f"         Then generating {min(int(cfg.phase1_acceptance_accuracy_examples), train_n)} "
+            "train answers for baseline and the selected layer."
+        )
+        print("         Router and learned gate are disabled during this audit.")
+        print("=" * 80)
         model.set_routing_override("none")
         model.set_gate_freeze(False)
-        base_train_nll = evaluate_loss(model, train_probe, cfg, device)
-        base_val_nll = evaluate_loss(model, val_probe, cfg, device)
+        print("  [1/4] Baseline teacher-forced NLL...")
+        base_train_nll = evaluate_loss(model, train_probe, cfg, device, "Acceptance baseline train NLL")
+        base_val_nll = evaluate_loss(model, val_probe, cfg, device, "Acceptance baseline val NLL")
+        print("  [2/4] Baseline generation accuracy...")
         base_train_acc = epoch_end_accuracy(
             model, tokenizer, train_probe, device,
             n_samples=min(int(cfg.phase1_acceptance_accuracy_examples), train_n), seed=cfg.seed,
+            progress_desc="Acceptance baseline accuracy",
         )
+        print(f"        baseline: train_nll={base_train_nll:.4f} val_nll={base_val_nll:.4f} train_acc={base_train_acc:.1%}")
 
         candidates = []
-        for layer in model.target_layers:
+        total_candidates = len(model.target_layers)
+        print(f"  [3/4] Single-layer NLL sweep across {total_candidates} SteerNets...")
+        for candidate_index, layer in enumerate(model.target_layers, start=1):
             model.set_routing_override("only", [layer])
             model.set_gate_freeze(True, 1.0)
-            candidates.append({
+            print(f"        candidate {candidate_index}/{total_candidates}: L{layer}...")
+            candidate = {
                 "layer": int(layer),
-                "train_nll": evaluate_loss(model, train_probe, cfg, device),
-                "val_nll": evaluate_loss(model, val_probe, cfg, device),
-            })
+                "train_nll": evaluate_loss(model, train_probe, cfg, device, f"Acceptance L{layer} train NLL"),
+                "val_nll": evaluate_loss(model, val_probe, cfg, device, f"Acceptance L{layer} val NLL"),
+            }
+            candidates.append(candidate)
+            print(f"          L{layer}: train_nll={candidate['train_nll']:.4f} val_nll={candidate['val_nll']:.4f}")
         best = min(candidates, key=lambda row: row["val_nll"])
         model.set_routing_override("only", [best["layer"]])
         model.set_gate_freeze(True, 1.0)
+        print(f"  [4/4] Selected L{best['layer']} generation accuracy...")
         selected_train_acc = epoch_end_accuracy(
             model, tokenizer, train_probe, device,
             n_samples=min(int(cfg.phase1_acceptance_accuracy_examples), train_n), seed=cfg.seed,
+            progress_desc=f"Acceptance L{best['layer']} accuracy",
         )
         nll_reduction = (base_train_nll - best["train_nll"]) / max(base_train_nll, 1e-8)
         acc_gain = selected_train_acc - base_train_acc
@@ -147,6 +178,7 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             f"layer=L{best['layer']} | train NLL Δ={nll_reduction * 100:+.1f}% "
             f"| train acc Δ={acc_gain * 100:+.1f}pp | {'PASS' if report['passed'] else 'FAIL'}"
         )
+        print(f"  Acceptance audit finished in {(time.monotonic() - started_at) / 60:.1f} min.")
         if not report["passed"]:
             raise RuntimeError(
                 "Phase-1 SteerNet acceptance failed. Router/gate training is blocked because no independently "
