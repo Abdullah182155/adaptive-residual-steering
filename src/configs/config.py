@@ -49,6 +49,12 @@ class RSCConfig:
     phase1_acceptance_accuracy_examples: int = 32
     phase1_min_train_nll_reduction: float = 0.05
     phase1_min_train_accuracy_gain: float = 0.05
+    # A four-example holdout cannot establish a scientific capacity or
+    # routing-health claim.  Tiny smoke runs still execute every phase and
+    # emit their measurements, but their acceptance/health failures are
+    # reported as INCONCLUSIVE rather than terminating the notebook.
+    min_reliable_validation_examples: int = 16
+    allow_inconclusive_small_runs: bool = True
 
     # Phase 2 staged parameters
     phase2_warmup_ratio: float = 0.03

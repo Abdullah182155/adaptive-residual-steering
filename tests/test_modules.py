@@ -21,6 +21,7 @@ from src.training import (
     load_steer_weights,
     run_pg_loss,
 )
+from src.training.trainer import _small_run_waiver
 
 class TestARSModules(unittest.TestCase):
     def setUp(self):
@@ -106,10 +107,18 @@ class TestARSModules(unittest.TestCase):
             "joint_finetune_epochs", "joint_finetune_lr_scale", "joint_finetune_router_lr_scale",
             "gate_retune_epochs", "gate_retune_lr", "phase2_save_path", "lora_save_path",
             "prompt_shielding", "lambda_synergy", "router_balance_weight", "lambda_cost",
-            "beta_entropy_k", "beta_entropy_subset",
+            "beta_entropy_k", "beta_entropy_subset", "min_reliable_validation_examples",
+            "allow_inconclusive_small_runs",
         ]
         for attr in required_attrs:
             self.assertTrue(hasattr(cfg, attr), f"Missing config attribute: {attr}")
+
+    def test_tiny_holdout_marks_audit_inconclusive_not_passed(self):
+        cfg = RSCConfig(min_reliable_validation_examples=16, allow_inconclusive_small_runs=True)
+        self.assertTrue(_small_run_waiver(4, cfg))
+        self.assertFalse(_small_run_waiver(16, cfg))
+        cfg.allow_inconclusive_small_runs = False
+        self.assertFalse(_small_run_waiver(4, cfg))
 
     def test_routing_override_modes(self):
         class DummyModel(nn.Module):

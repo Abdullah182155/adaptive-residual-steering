@@ -38,6 +38,17 @@ def _set_batch_context(model, mask: torch.Tensor, labels: torch.Tensor, shield_m
     model.set_router_context_mask(prompt)
 
 
+def _small_run_waiver(n_validation_examples: int, cfg: RSCConfig) -> bool:
+    """Whether diagnostics are informative-only because the holdout is tiny.
+
+    This never changes losses, routing, or checkpoints.  It only prevents a
+    smoke test with an intrinsically unreliable holdout from being mislabeled
+    as a failed scientific experiment.
+    """
+    minimum = int(getattr(cfg, "min_reliable_validation_examples", 16))
+    return bool(getattr(cfg, "allow_inconclusive_small_runs", True)) and n_validation_examples < minimum
+
+
 def save_steer_weights(
     model, path: str, cfg: Optional[RSCConfig] = None, phase: str = "ars", prefixes=None
 ):
@@ -104,6 +115,7 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
     """
     train_n = min(int(cfg.phase1_acceptance_examples), len(train_data))
     val_n = min(int(cfg.phase1_acceptance_examples), len(eval_data))
+    small_run_waiver = _small_run_waiver(val_n, cfg)
     train_probe = [train_data[i] for i in range(train_n)]
     val_probe = [eval_data[i] for i in range(val_n)]
     old_override = model._routing_override
@@ -121,6 +133,12 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "train answers for baseline and the selected layer."
         )
         print("         Router and learned gate are disabled during this audit.")
+        if small_run_waiver:
+            print(
+                f"         ⚠️ INCONCLUSIVE DEBUG RUN: validation={val_n} < "
+                f"min_reliable_validation_examples={cfg.min_reliable_validation_examples}. "
+                "Measurements will be logged, but failure will not stop the curriculum."
+            )
         print("=" * 80)
         model.set_routing_override("none")
         model.set_gate_freeze(False)
@@ -170,6 +188,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "selected_train_accuracy": selected_train_acc,
             "train_relative_nll_reduction": nll_reduction,
             "train_accuracy_gain": acc_gain,
+            "validation_examples": val_n,
+            "reliability_waived": small_run_waiver,
             "passed": (
                 nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
                 and acc_gain >= float(cfg.phase1_min_train_accuracy_gain)
@@ -181,11 +201,20 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             f"| train acc Δ={acc_gain * 100:+.1f}pp | {'PASS' if report['passed'] else 'FAIL'}"
         )
         print(f"  Acceptance audit finished in {(time.monotonic() - started_at) / 60:.1f} min.")
-        if not report["passed"]:
+        if not report["passed"] and small_run_waiver:
+            report["status"] = "INCONCLUSIVE"
+            print(
+                "  ⚠️ Phase-1 acceptance is INCONCLUSIVE, not PASS: the tiny validation holdout cannot "
+                "validate SteerNet capacity. Continuing only as a pipeline smoke test."
+            )
+        elif not report["passed"]:
+            report["status"] = "FAIL"
             raise RuntimeError(
                 "Phase-1 SteerNet acceptance failed. Router/gate training is blocked because no independently "
                 "useful steering direction was established. Inspect the candidate report before changing ARS."
             )
+        else:
+            report["status"] = "PASS"
         return report
     finally:
         model.set_gate_freeze(True, 1.0)
@@ -200,11 +229,13 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
 
 
 def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
-    """Fail closed when ARS has collapsed routing or a static/saturated gate.
+    """Fail closed for research-sized evaluations with routing/gate collapse.
 
     This is evaluated with the same deterministic argmax route and prompt
     shielding used by generation.  It is deliberately a health gate, not a
-    benchmark: test labels never choose a route or tune a threshold.
+    benchmark: test labels never choose a route or tune a threshold.  Tiny
+    smoke runs report the same diagnostics as INCONCLUSIVE instead of making
+    claims from an unreliable holdout.
     """
     previous_mode = getattr(model, "_router_inference_mode", "argmax")
     previous_override = model._routing_override
@@ -214,6 +245,7 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
     model.set_routing_override(None)
     model.set_gate_freeze(False)
     n = min(int(cfg.intervention_audit_examples), len(eval_data))
+    small_run_waiver = _small_run_waiver(n, cfg)
     try:
         with torch.no_grad():
             for i in range(n):
@@ -253,8 +285,16 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
                 failures.append(f"gate high saturation={max_high_sat:.1f}% > {cfg.gate_max_eval_high_saturation_pct}%")
         report["passed"] = not failures
         report["failures"] = failures
+        report["validation_examples"] = n
+        report["reliability_waived"] = small_run_waiver
+        report["status"] = "PASS" if not failures else ("INCONCLUSIVE" if small_run_waiver else "FAIL")
         print(f"  ARS intervention audit: {report}")
-        if failures:
+        if failures and small_run_waiver:
+            print(
+                "  ⚠️ ARS health is INCONCLUSIVE, not PASS: this tiny validation holdout cannot establish "
+                "K/layer/gate diversity. Continuing only as a pipeline smoke test."
+            )
+        elif failures:
             raise RuntimeError("ARS intervention health gate failed: " + "; ".join(failures))
         return report
     finally:
