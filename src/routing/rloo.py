@@ -131,7 +131,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             model.set_prompt_shield_mask(shield_mask)
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                _ = model(input_ids=ids, attention_mask=mask)
+                _ = model(input_ids=ids, attention_mask=mask, use_cache=False)
     finally:
         if old_override is None:
             model.set_routing_override(None)
@@ -159,7 +159,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             model.set_prompt_shield_mask(shield_mask)
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                return per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
+                return per_example_answer_nll(model(input_ids=ids, attention_mask=mask, use_cache=False).logits, labels)
 
     def deterministic_counterfactual_nll(route_mask: torch.Tensor) -> torch.Tensor:
         """Score one auxiliary counterfactual without dropout noise."""
@@ -187,7 +187,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             model.set_prompt_shield_mask(shield_mask)
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                nll_0 = per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
+                nll_0 = per_example_answer_nll(model(input_ids=ids, attention_mask=mask, use_cache=False).logits, labels)
     finally:
         if old_override is None:
             model.set_routing_override(None)

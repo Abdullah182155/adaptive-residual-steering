@@ -18,7 +18,8 @@ from src.training.losses import (
     compute_antisat_gate,
     compute_gate_diversity_loss,
     compute_invariance_loss,
-    run_pg_loss,
+    compute_pg_advantage_lite,
+    compute_pg_gate_loss_from_live_alphas,
     log_gpu_memory,
 )
 from src.training.contrastive import compute_contrastive_gate_loss
@@ -93,7 +94,7 @@ def evaluate_loss(
         _set_batch_context(model, mask, lbls, shield)
 
         with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-            out = model(input_ids=ids, attention_mask=mask, labels=lbls)
+            out = model(input_ids=ids, attention_mask=mask, labels=lbls, use_cache=False)
 
         n_tokens = (lbls != -100).sum().item()
         if n_tokens > 0:
@@ -257,7 +258,7 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
                 shield = shield.unsqueeze(0).to(device) if shield is not None else None
                 model._attn_mask_cache = mask
                 _set_batch_context(model, mask, labels, shield)
-                _ = model(input_ids=ids, attention_mask=mask)
+                _ = model(input_ids=ids, attention_mask=mask, use_cache=False)
         report = model.intervention_diagnostics()
         failures = []
         k_dist = report["realized_k_distribution"]
@@ -442,7 +443,7 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
             _set_batch_context(model, mask, lbls, shield)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(input_ids=ids, attention_mask=mask, labels=lbls)
+                out = model(input_ids=ids, attention_mask=mask, labels=lbls, use_cache=False)
                 loss = out.loss / cfg.grad_accum
 
             if not torch.isfinite(loss):
@@ -695,8 +696,25 @@ def run_staged_phase(
             model._attn_mask_cache = mask
             _set_batch_context(model, mask, lbls, shield)
 
+            # Compute the detached ON/OFF reward before creating this step's
+            # task graph.  Reusing the live gate alphas below avoids the old
+            # extra graph on a 4-example PG batch, the direct cause of T4 OOM.
+            pg_advantage = None
+            if train_gate and not train_steer and accum_count == 0 and global_step % cfg.pg_every_n_steps == 0:
+                pg_advantage = compute_pg_advantage_lite(
+                    model, tokenizer, ids, lbls, device, cfg, baseline_ema,
+                    attention_masks=mask,
+                    router_context_mask=(
+                        mask.bool() & lbls.eq(-100) & ~(
+                            shield.bool() if shield is not None else torch.zeros_like(mask, dtype=torch.bool)
+                        )
+                    ),
+                    shield_mask=shield,
+                )
+                _set_batch_context(model, mask, lbls, shield)
+
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                out = model(input_ids=ids, attention_mask=mask, labels=lbls)
+                out = model(input_ids=ids, attention_mask=mask, labels=lbls, use_cache=False)
                 task_loss = out.loss
 
             micro_loss = (task_loss / cfg.grad_accum) if (torch.isfinite(task_loss) and task_loss.requires_grad) else None
@@ -720,18 +738,17 @@ def run_staged_phase(
                 if torch.isfinite(aux_loss) and aux_loss.requires_grad:
                     micro_loss = aux_loss if micro_loss is None else (micro_loss + aux_loss)
 
+            if pg_advantage is not None:
+                pg_loss = compute_pg_gate_loss_from_live_alphas(model, pg_advantage) / cfg.grad_accum
+                if torch.isfinite(pg_loss) and pg_loss.requires_grad:
+                    # PG and task/aux losses share this forward's gate graph;
+                    # combine them before one backward rather than retaining
+                    # the whole Phi-2 graph for a second backward call.
+                    micro_loss = (cfg.lambda_pg * pg_loss) if micro_loss is None else (micro_loss + cfg.lambda_pg * pg_loss)
+
             if micro_loss is not None:
                 scaler.scale(micro_loss).backward()
-
-            if train_gate and not train_steer and accum_count == 0 and global_step % cfg.pg_every_n_steps == 0:
-                pg_idx = random.sample(range(len(train_data)), min(cfg.pg_n_samples, len(train_data)))
-                pg_ids = torch.stack([train_data[j]["input_ids"] for j in pg_idx]).to(device)
-                pg_lbls = torch.stack([train_data[j]["labels"] for j in pg_idx]).to(device)
-                pg_loss = run_pg_loss(model, tokenizer, pg_ids, pg_lbls, device, cfg, baseline_ema)
-                if torch.isfinite(pg_loss) and pg_loss.requires_grad:
-                    scaler.scale(cfg.lambda_pg * pg_loss).backward()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+            del out
 
             if train_steer and accum_count == 0 and global_step % cfg.invariance_every_n_steps == 0:
                 inv_loss = compute_invariance_loss(
@@ -816,6 +833,8 @@ def run_staged_phase(
 
             epoch_task += task_loss.item()
             postfix_kwargs = {"task": f"{task_loss.item():.4f}"}
+            if pg_advantage is not None:
+                postfix_kwargs["pg_adv"] = f"{pg_advantage:+.3f}"
             if train_router and n_router_rloo_steps > 0:
                 postfix_kwargs["mean_k"] = f"{epoch_mean_k / n_router_rloo_steps:.2f}"
             pbar.set_postfix(**postfix_kwargs)

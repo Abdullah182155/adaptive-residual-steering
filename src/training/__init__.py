@@ -8,6 +8,8 @@ from .losses import (
     compute_invariance_loss,
     compute_pg_loss,
     compute_pg_loss_lite,
+    compute_pg_advantage_lite,
+    compute_pg_gate_loss_from_live_alphas,
     run_pg_loss,
     log_gpu_memory,
 )
@@ -34,6 +36,8 @@ __all__ = [
     "compute_contrastive_gate_loss",
     "compute_pg_loss",
     "compute_pg_loss_lite",
+    "compute_pg_advantage_lite",
+    "compute_pg_gate_loss_from_live_alphas",
     "run_pg_loss",
     "log_gpu_memory",
     "evaluate_loss",

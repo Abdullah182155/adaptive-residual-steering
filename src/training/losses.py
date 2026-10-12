@@ -207,7 +207,7 @@ def compute_invariance_loss(model, tokenizer, questions, steps_lists, final_answ
             enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=cfg.max_tok_len).to(device)
             model._attn_mask_cache = enc["attention_mask"]
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"])
+                model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], use_cache=False)
             hs = pooled["cur"].float()
             mask = enc["attention_mask"].unsqueeze(-1).float()
             mean_pool = (hs * mask).sum(1) / mask.sum(1).clamp(min=1)
@@ -381,16 +381,91 @@ def _span_logprob(model, input_ids, attention_mask, labels, gate_value):
     """Mean log-prob of the labelled span under a fixed gate value via teacher-forced forward pass."""
     model.set_gate_freeze(True, value=gate_value)
     with torch.amp.autocast("cuda", enabled=input_ids.is_cuda):
-        out = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = out.logits[:, :-1, :].float()
+        out = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+    logits = out.logits[:, :-1, :]
     tgt = labels[:, 1:]
     valid = tgt != -100
-    logp = F.log_softmax(logits, dim=-1)
-    tgt_safe = tgt.clamp(min=0)
-    token_logp = torch.gather(logp, 2, tgt_safe.unsqueeze(-1)).squeeze(-1)
-    token_logp = token_logp * valid.float()
+    # ``log_softmax`` materialised a second full (B,T,V) float tensor.  Phi-2
+    # has a 51k vocabulary, so that temporary alone is hundreds of MB for a
+    # PG probe.  Cross entropy keeps only the per-token result we need.
+    token_nll = F.cross_entropy(
+        logits.flatten(0, 1).float(), tgt.reshape(-1), ignore_index=-100, reduction="none"
+    ).view_as(tgt)
     denom = valid.float().sum(-1).clamp(min=1)
-    return token_logp.sum(-1) / denom
+    return -(token_nll * valid.float()).sum(-1) / denom
+
+
+@torch.no_grad()
+def compute_pg_advantage_lite(
+    model, tokenizer, input_ids, labels, device, cfg, baseline_ema, attention_masks=None,
+    router_context_mask=None, shield_mask=None,
+):
+    """Estimate a detached Gate-ON vs Gate-OFF advantage before a task graph exists.
+
+    The old implementation called this probe *after* the task backward graph
+    had been created and then built another Phi-2 graph solely to recover gate
+    activations.  On a T4 that overlaps two full activation graphs and OOMs.
+    This function performs only two sequential no-grad forwards; the caller
+    applies the resulting scalar to activations from its ordinary task forward.
+    """
+    attn = attention_masks if attention_masks is not None else (input_ids != tokenizer.pad_token_id).long()
+    module_modes = {module: module.training for module in model.modules()}
+    gate_state = [(gate._freeze_gate, gate._freeze_gate_value) for gate in model.gates.values()]
+    try:
+        model.eval()  # deterministic counterfactual reward; no dropout noise.
+        # The wrapper consumes pending masks on every full prefill.  Reinstall
+        # them for both arms so their reward difference uses the exact same
+        # question-only routing and few-shot shielding contract.
+        context = router_context_mask
+        if context is None:
+            context = attn.bool() & labels.eq(-100)
+        model.set_router_context_mask(context)
+        if hasattr(model, "set_prompt_shield_mask"):
+            model.set_prompt_shield_mask(shield_mask)
+        lp_on = _span_logprob(model, input_ids, attn, labels, 1.0)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        model.set_router_context_mask(context)
+        if hasattr(model, "set_prompt_shield_mask"):
+            model.set_prompt_shield_mask(shield_mask)
+        lp_off = _span_logprob(model, input_ids, attn, labels, 0.0)
+        advantage = lp_on - lp_off
+    finally:
+        for gate, (frozen, value) in zip(model.gates.values(), gate_state):
+            gate._freeze_gate = frozen
+            gate._freeze_gate_value = value
+        for module, was_training in module_modes.items():
+            module.train(was_training)
+
+    mean_adv = advantage.mean().item()
+    std_adv = advantage.std().item() if advantage.numel() > 1 else 1.0
+    baseline_ema[0] = (
+        cfg.pg_baseline_momentum * baseline_ema[0] + (1 - cfg.pg_baseline_momentum) * mean_adv
+    )
+    return (mean_adv - baseline_ema[0]) / max(std_adv, 1e-6)
+
+
+def compute_pg_gate_loss_from_live_alphas(model, centred_adv: float) -> torch.Tensor:
+    """REINFORCE gate loss using alphas from the caller's existing task graph."""
+    device = next(model.parameters()).device
+    if abs(centred_adv) < 1e-5:
+        return torch.tensor(0.0, device=device)
+    pg_total = torch.tensor(0.0, device=device)
+    n_terms = 0
+    for gate in model.gates.values():
+        alpha = gate._alpha_for_aux
+        if alpha is None:
+            continue
+        a = alpha.float().clamp(1e-8, 1 - 1e-8).squeeze(-1)
+        vm = gate._valid_mask
+        if vm is not None and vm.shape == a.shape:
+            weight_sum = vm.float().sum().clamp(min=1)
+            pg_layer = -(centred_adv * (torch.log(a) * vm.float()).sum() / weight_sum)
+        else:
+            pg_layer = -(centred_adv * torch.log(a).mean())
+        pg_total = pg_total + pg_layer
+        n_terms += 1
+    return pg_total / max(1, n_terms)
 
 def compute_pg_loss_lite(
     model,
@@ -403,56 +478,29 @@ def compute_pg_loss_lite(
     attention_masks=None,
     train_batch_ids=None,
 ):
-    """Teacher-forced counterfactual PG alternative (no autoregressive generation)."""
+    """Legacy standalone teacher-forced PG helper.
+
+    Training uses ``compute_pg_advantage_lite`` before the task forward plus
+    ``compute_pg_gate_loss_from_live_alphas`` after it, so it never overlaps
+    two Phi-2 graphs.  This helper remains for external callers.
+    """
     attn = (
         attention_masks
         if attention_masks is not None
         else (input_ids != tokenizer.pad_token_id).long()
     )
 
-    lp_on = _span_logprob(model, input_ids, attn, labels, 1.0)
-    lp_off = _span_logprob(model, input_ids, attn, labels, 0.0)
-    advantage = lp_on - lp_off
-
+    centred_adv = compute_pg_advantage_lite(
+        model, tokenizer, input_ids, labels, device, cfg, baseline_ema, attn
+    )
     model.train()
     model.set_gate_freeze(False)
-    log_gpu_memory("compute_pg_loss_lite after span-logprob probes", cfg)
-
-    mean_adv = advantage.mean().item()
-    # BUG-06 fix: normalize by std to reduce high-variance log-prob swings from destabilizing training
-    std_adv = advantage.std().item() if advantage.numel() > 1 else 1.0
-    std_adv = max(std_adv, 1e-6)
-    baseline_ema[0] = (
-        cfg.pg_baseline_momentum * baseline_ema[0] + (1 - cfg.pg_baseline_momentum) * mean_adv
-    )
-    centred_adv = (mean_adv - baseline_ema[0]) / std_adv
-
-    if abs(centred_adv) < 1e-5:
-        return torch.tensor(0.0, device=device)
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-        _ = model(input_ids=input_ids, attention_mask=attn)
-
-    pg_total = torch.tensor(0.0, device=device)
-    n_terms = 0
-    for gate in model.gates.values():
-        alpha = gate._alpha_for_aux
-        if alpha is None:
-            continue
-        a = alpha.float().clamp(1e-8, 1 - 1e-8).squeeze(-1)
-        vm = gate._valid_mask
-        # BUG-05 fix: Unified REINFORCE — loss = -(adv * log(a))
-        if vm is not None and vm.shape == a.shape:
-            weight_sum = vm.float().sum().clamp(min=1)
-            pg_layer = -(centred_adv * (torch.log(a) * vm.float()).sum() / weight_sum)
-        else:
-            pg_layer = -(centred_adv * torch.log(a).mean())
-        pg_total = pg_total + pg_layer
-        n_terms += 1
-
-    return pg_total / max(1, n_terms)
+        _ = model(input_ids=input_ids, attention_mask=attn, use_cache=False)
+    return compute_pg_gate_loss_from_live_alphas(model, centred_adv)
 
 def run_pg_loss(
     model,
