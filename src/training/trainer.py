@@ -664,6 +664,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print("         SteerNet weights locked to Phase 1 optimal checkpoint.")
         print("=" * 80)
         global_step = 0
+        best_p2a_val = best_val_p1
         logs["p2a_val"] = best_val_p1
 
     model.reset_routing_diagnostics()
