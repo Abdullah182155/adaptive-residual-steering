@@ -56,6 +56,7 @@ def load_steer_weights(model, path: str, device: Optional[torch.device] = None):
 
 def evaluate_loss(model, data, cfg: RSCConfig, device: torch.device) -> float:
     """Compute per-token cross-entropy loss on eval set."""
+    was_training = model.training
     model.eval()
     total_nll = 0.0
     total_tokens = 0
@@ -81,7 +82,7 @@ def evaluate_loss(model, data, cfg: RSCConfig, device: torch.device) -> float:
             total_nll += out.loss.item() * n_tokens
             total_tokens += n_tokens
 
-    model.train()
+    model.train(was_training)
     return total_nll / max(1, total_tokens)
 
 
@@ -421,6 +422,17 @@ def run_staged_phase(
 
     for epoch in range(epochs):
         model.train()
+        # The frozen backbone must remain in inference mode.  Leaving it in
+        # ``train`` here makes a frozen model's dropout part of the target the
+        # small ARS modules are trying to optimise, while deployment uses
+        # ``eval``.  Frozen route/steer modules also need their deployment
+        # behaviour when training only the gate.
+        model.base_model.eval()
+        if not train_router:
+            model.router.eval()
+        if not train_steer:
+            for steer_net in model.steer_nets.values():
+                steer_net.eval()
         model.set_gate_freeze(not train_gate, 1.0)
         # Gate-only phases need the real task loss.  The gate still observes
         # detached h/delta, so this does not unfreeze or backpropagate into the
@@ -713,7 +725,10 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         p.requires_grad = False
     model.set_gate_freeze(False)
     model.set_router_warmup(False)
-    model.set_router_exploration(True)
+    # Gate-only learning must see the same deterministic route that will be
+    # deployed and validated.  Sampling routes here trained the gate against a
+    # different intervention distribution from argmax evaluation.
+    model.set_router_exploration(False)
     gate_params_ft = []
     for key in sorted(model.gates.keys(), key=lambda k: int(k)):
         for p in model.gates[key].parameters():
@@ -730,6 +745,17 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         global_step=global_step, baseline_ema=[0.0], patience=cfg.phase2_patience,
     )
     logs["p2b_val"] = best_p2b_val
+
+    # run_staged_phase intentionally does not mutate the model back to its
+    # best in-memory state.  Phase 2B therefore used to hand its *last* epoch
+    # (which can be worse) to Phase 2C, and Phase 2C could overwrite the only
+    # final checkpoint even when it was inferior to Phase 2B.  Reload the
+    # audited Phase-2B best checkpoint and seed the global Phase-2 checkpoint
+    # with it before allowing router updates.
+    if not os.path.exists(cfg.gate_only_save_path):
+        raise RuntimeError("Phase 2B completed without a checkpoint; cannot establish the Phase 2 baseline.")
+    load_ars_checkpoint_strict(model, cfg.gate_only_save_path, device=device)
+    save_ars_checkpoint(model, cfg.phase2_save_path, phase="phase2b-global-baseline", cfg=cfg)
     model.reset_routing_diagnostics()
     gc.collect()
     if torch.cuda.is_available():
@@ -761,11 +787,14 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         save_path=cfg.phase2_save_path,
         train_steer=False, train_gate=True, train_router=True,
         global_step=global_step, baseline_ema=[0.0], patience=max(1, cfg.phase2_patience),
+        init_best_acc=best_p2b_acc, init_best_val=best_p2b_val,
     )
     model._joint_grad_mode = False  # Restore detached mode for Phase 2D
     logs["p2_val"] = [best_val_p2]
 
-    # PHASE 2D: Gate Re-tune
+    # PHASE 2D: Gate Re-tune.  Reload the globally best Phase-2 state, rather
+    # than continuing from the final (possibly non-improving) Phase-2C step.
+    load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
     for p in model.router.parameters():
         p.requires_grad = False
     for p in steer_params_ft:

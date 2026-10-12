@@ -32,10 +32,11 @@ def evaluate_model_condition(
 ) -> Dict[str, Any]:
     """Evaluate a condition under one reproducible intervention contract.
 
-    ``fixed_steernet`` is a legal fixed-K route, never the invalid all-eight
-    stress test.  ``steernet`` keeps the learned router but pins alpha=1, so
-    ARS vs SteerNet measures the Gate contribution under identical routing.
-    ``ars`` enables both learned router and learned gate.
+    ``fixed_steernet`` is the pure SteerNet control: a legal fixed-K route,
+    never the invalid all-eight stress test.  ``steernet`` keeps the learned
+    router but pins alpha=1, so it is explicitly a Router+SteerNet control.
+    ARS vs Router+SteerNet then measures the Gate contribution under
+    identical routing; ``ars`` enables both learned router and learned gate.
     """
     cond = condition.lower()
     if cond not in {"baseline", "fixed_steernet", "steernet", "ars"}:
@@ -274,30 +275,33 @@ def run_fair_multishot_benchmark(
 # ==============================================================================
 
 def format_benchmark_summary_table(benchmark_results: Dict[str, Any]) -> str:
-    """Formats an ASCII comparison table matching Baseline vs SteerNet vs Full ARS."""
+    """Format all controls without mislabelling Router+SteerNet as SteerNet-only."""
     lines = [
-        "=" * 92,
-        f"{'Dataset':<14} | {'Shots':<6} | {'Baseline':<12} | {'SteerNet Only':<15} | {'Full ARS':<15} | {'Gain (vs Base)':<14}",
-        "-" * 92,
+        "=" * 124,
+        f"{'Dataset':<14} | {'Shots':<6} | {'Baseline':<10} | {'Fixed SteerNet':<15} | {'Router+SteerNet':<17} | {'Full ARS':<12} | {'ARS Δ':<10}",
+        "-" * 124,
     ]
 
     for ds_name, conds in benchmark_results.items():
         base_dict = conds.get("baseline", {})
+        fixed_dict = conds.get("fixed_steernet", {})
         steer_dict = conds.get("steernet", {})
         ars_dict = conds.get("ars", {})
 
         all_shots = sorted(
-            list(set(list(base_dict.keys()) + list(steer_dict.keys()) + list(ars_dict.keys()))),
+            list(set(list(base_dict.keys()) + list(fixed_dict.keys()) + list(steer_dict.keys()) + list(ars_dict.keys()))),
             key=lambda s: int(s.split("_")[0]) if "_" in s and s.split("_")[0].isdigit() else 0,
         )
 
         for shot_k in all_shots:
             shot_num = shot_k.split("_")[0]
             b_val = base_dict.get(shot_k)
+            f_val = fixed_dict.get(shot_k)
             s_val = steer_dict.get(shot_k)
             a_val = ars_dict.get(shot_k)
 
             b_str = f"{b_val:.2f}%" if b_val is not None else "--"
+            f_str = f"{f_val:.2f}%" if f_val is not None else "--"
             s_str = f"{s_val:.2f}%" if s_val is not None else "--"
             a_str = f"{a_val:.2f}%" if a_val is not None else "--"
 
@@ -308,7 +312,7 @@ def format_benchmark_summary_table(benchmark_results: Dict[str, Any]) -> str:
                 gain_str = "--"
 
             lines.append(
-                f"{ds_name.upper():<14} | {shot_num + '-shot':<6} | {b_str:<12} | {s_str:<15} | {a_str:<15} | {gain_str:<14}"
+                f"{ds_name.upper():<14} | {shot_num + '-shot':<6} | {b_str:<10} | {f_str:<15} | {s_str:<17} | {a_str:<12} | {gain_str:<10}"
             )
         lines.append("-" * 92)
 
@@ -326,19 +330,20 @@ def export_latex_summary_table(
         r"\begin{table*}[t]",
         r"\centering",
         r"\small",
-        r"\begin{tabular}{lccccc}",
+        r"\begin{tabular}{lcccccc}",
         r"\toprule",
-        r"\textbf{Dataset} & \textbf{Shots} & \textbf{Frozen Baseline} & \textbf{SteerNet Only} & \textbf{Full ARS Pipeline} & \textbf{$\Delta$ Gain} \\",
+        r"\textbf{Dataset} & \textbf{Shots} & \textbf{Frozen Baseline} & \textbf{Fixed SteerNet} & \textbf{Router+SteerNet} & \textbf{Full ARS} & \textbf{$\Delta$ Gain} \\",
         r"\midrule",
     ]
 
     for ds_name, conds in benchmark_results.items():
         base_dict = conds.get("baseline", {})
+        fixed_dict = conds.get("fixed_steernet", {})
         steer_dict = conds.get("steernet", {})
         ars_dict = conds.get("ars", {})
 
         all_shots = sorted(
-            list(set(list(base_dict.keys()) + list(steer_dict.keys()) + list(ars_dict.keys()))),
+            list(set(list(base_dict.keys()) + list(fixed_dict.keys()) + list(steer_dict.keys()) + list(ars_dict.keys()))),
             key=lambda s: int(s.split("_")[0]) if "_" in s and s.split("_")[0].isdigit() else 0,
         )
 
@@ -346,10 +351,12 @@ def export_latex_summary_table(
             ds_col = f"\\textbf{{{ds_name.upper()}}}" if i == 0 else ""
             shot_num = shot_k.split("_")[0] + "-shot"
             b_val = base_dict.get(shot_k)
+            f_val = fixed_dict.get(shot_k)
             s_val = steer_dict.get(shot_k)
             a_val = ars_dict.get(shot_k)
 
             b_str = f"{b_val:.2f}\\%" if b_val is not None else "--"
+            f_str = f"{f_val:.2f}\\%" if f_val is not None else "--"
             s_str = f"{s_val:.2f}\\%" if s_val is not None else "--"
             a_str = f"\\textbf{{{a_val:.2f}\\%}}" if a_val is not None else "--"
 
@@ -359,7 +366,7 @@ def export_latex_summary_table(
             else:
                 gain_str = "--"
 
-            latex_lines.append(f"{ds_col} & {shot_num} & {b_str} & {s_str} & {a_str} & {gain_str} \\\\")
+            latex_lines.append(f"{ds_col} & {shot_num} & {b_str} & {f_str} & {s_str} & {a_str} & {gain_str} \\\\")
         latex_lines.append(r"\midrule")
 
     # Remove the last midrule and replace with bottomrule

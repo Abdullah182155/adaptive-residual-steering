@@ -183,6 +183,7 @@ class TestARSModules(unittest.TestCase):
 
         dummy = DummyModel(self.hidden_dim)
         cfg = RSCConfig()
+        cfg.router_pairwise_probe_probability = 1.0
         wrapper = Phi2WithRSC(dummy, cfg, device=torch.device("cpu"))
         wrapper.eval()
 
@@ -351,6 +352,10 @@ class TestARSModules(unittest.TestCase):
         self.assertIn("win_rate_vs_base", diag)
         self.assertIn("synergy_align_loss", diag)
         self.assertIn("mean_reward_delta", diag)
+        # Pairwise probes are auxiliary counterfactuals: they must not leak
+        # their last fixed route into the next ordinary training forward.
+        self.assertIsNone(wrapper._routing_override)
+        self.assertTrue(wrapper.training)
 
     def test_rloo_refreshes_router_cache_for_current_example(self):
         """Bootstrap RLOO must not use the pooled state of a preceding sample."""

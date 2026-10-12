@@ -102,6 +102,11 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     # on _last_pooled trains current rewards against the previous example.
     # Populate the detached router cache with a fresh, same-example prefill.
     old_override = model._routing_override
+    # Counterfactual reward is a comparison between routes.  It must not draw
+    # a different dropout mask for each arm, otherwise RLOO learns dropout
+    # noise instead of route utility.  Preserve every module's mode because
+    # this function is called from a mixed-mode staged curriculum.
+    module_modes = {module: module.training for module in model.modules()}
     try:
         model.set_routing_override(None)
         model.set_router_context_mask(prompt_mask)
@@ -139,7 +144,23 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
                 return per_example_answer_nll(model(input_ids=ids, attention_mask=mask).logits, labels)
 
+    def deterministic_counterfactual_nll(route_mask: torch.Tensor) -> torch.Tensor:
+        """Score one auxiliary counterfactual without dropout noise."""
+        modes = {module: module.training for module in model.modules()}
+        prior_override = model._routing_override
+        model.eval()
+        try:
+            return counterfactual_nll(route_mask)
+        finally:
+            if prior_override is None:
+                model.set_routing_override(None)
+            else:
+                model.set_routing_override(prior_override[0], prior_override[1])
+            for module, was_training in modes.items():
+                module.train(was_training)
+
     try:
+        model.eval()
         nll_a = counterfactual_nll(subset_a_mask)
         nll_b = counterfactual_nll(subset_b_mask)
         # Arm 0: Ground-truth unsteered baseline anchor
@@ -155,6 +176,8 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             model.set_routing_override(None)
         else:
             model.set_routing_override(old_override[0], old_override[1])
+        for module, was_training in module_modes.items():
+            module.train(was_training)
 
     reward_0 = (-nll_0).detach()
     lambda_cost = getattr(cfg, "lambda_cost", 0.005)
@@ -194,9 +217,9 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             singleton_i.scatter_(1, first.unsqueeze(-1), True)
             singleton_j.scatter_(1, second.unsqueeze(-1), True)
             pair_mask = singleton_i | singleton_j
-            nll_i = counterfactual_nll(singleton_i)
-            nll_j = counterfactual_nll(singleton_j)
-            nll_pair = counterfactual_nll(pair_mask)
+            nll_i = deterministic_counterfactual_nll(singleton_i)
+            nll_j = deterministic_counterfactual_nll(singleton_j)
+            nll_pair = deterministic_counterfactual_nll(pair_mask)
             interaction = (-nll_pair + nll_i + nll_j - nll_0).detach()
             pair_syn = synergy[torch.arange(ids.shape[0], device=ids.device), first, second]
             pairwise_interaction_loss = -(interaction[valid_pair] * pair_syn[valid_pair]).mean()
