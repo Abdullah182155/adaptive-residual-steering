@@ -1,0 +1,94 @@
+{
+  "experiment_id": "exp_20261011_225923_ars_phi2_kaggle",
+  "tag": "ars_phi2_kaggle",
+  "created_at": "2026-10-11T22:59:23.000000+00:00",
+  "status": "completed",
+  "git_commit": "f08ea50",
+  "notes": "Milestone Turnaround Experiment: Full 5,000 train samples on GSM8K with calibrated norm=0.08, streaming gate conv, expanded K=0..4, and exact prompt shielding.",
+  "summary_notes": "Breakthrough multi-shot reasoning performance: ARS achieved +12.0% (50% vs 38%) at 0-shot, +11.0% (50% vs 39%) at 4-shot, and +21.0% (53% vs 32%) at 8-shot over Frozen Baseline. Solved context-distraction scaling law degradation.",
+  "training_phases": {
+    "phase1": {
+      "best_val": 0.6392
+    },
+    "phase1_5_bootstrap": {
+      "best_probe_loss": 0.8765,
+      "win_rate": 1.0
+    },
+    "phase2a_steer_ft": {
+      "best_val": 0.6397,
+      "acc": 0.550
+    },
+    "phase2b_gate_only": {
+      "best_val": 0.7797,
+      "acc": 0.470
+    },
+    "phase2c_joint": {
+      "best_val": 0.6179,
+      "acc": 0.560,
+      "mean_k": 3.13
+    },
+    "phase2d_gate_retune": {
+      "best_val": 0.6179,
+      "acc": 0.490
+    }
+  },
+  "benchmarks": {
+    "gsm8k": {
+      "0_shot": {
+        "baseline": 38.00,
+        "steernet": 37.00,
+        "ars": 50.00,
+        "delta_gain": 12.00,
+        "ans_present_baseline": 100.0,
+        "ans_present_steernet": 100.0,
+        "ans_present_ars": 99.0
+      },
+      "2_shot": {
+        "baseline": 42.00,
+        "steernet": 41.00,
+        "ars": 48.00,
+        "delta_gain": 6.00,
+        "ans_present_baseline": 99.0,
+        "ans_present_steernet": 100.0,
+        "ans_present_ars": 99.0
+      },
+      "4_shot": {
+        "baseline": 39.00,
+        "steernet": 37.00,
+        "ars": 50.00,
+        "delta_gain": 11.00,
+        "ans_present_baseline": 92.0,
+        "ans_present_steernet": 100.0,
+        "ans_present_ars": 95.0
+      },
+      "8_shot": {
+        "baseline": 32.00,
+        "steernet": 37.00,
+        "ars": 53.00,
+        "delta_gain": 21.00,
+        "ans_present_baseline": 74.0,
+        "ans_present_steernet": 100.0,
+        "ans_present_ars": 98.0
+      }
+    }
+  },
+  "routing_diagnostics": {
+    "layer_activations": {
+      "L9": 33930,
+      "L11": 91127,
+      "L13": 50305,
+      "L15": 33930,
+      "L18": 33930,
+      "L20": 91481,
+      "L22": 33930,
+      "L24": 86067
+    },
+    "k_distribution": {
+      "K=0": 0.0040,
+      "K=1": 0.0065,
+      "K=2": 0.0971,
+      "K=3": 0.6041,
+      "K=4": 0.2883
+    }
+  }
+}

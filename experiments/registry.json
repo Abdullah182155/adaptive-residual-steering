@@ -31,6 +31,14 @@
       "status": "completed",
       "git_commit": "491bf8d",
       "record_path": "experiments/runs/exp_20261011_134907_ars_phi2_kaggle/experiment_record.json"
+    },
+    {
+      "experiment_id": "exp_20261011_225923_ars_phi2_kaggle",
+      "tag": "ars_phi2_kaggle",
+      "created_at": "2026-10-11T22:59:23.000000+00:00",
+      "status": "completed",
+      "git_commit": "f08ea50",
+      "record_path": "experiments/runs/exp_20261011_225923_ars_phi2_kaggle/experiment_record.json"
     }
   ]
 }
