@@ -106,8 +106,8 @@ class RSCConfig:
     # Prompt Shielding (Preserves pristine representations in multi-shot contexts)
     prompt_shielding: bool = True
 
-    # Phase 2A: SteerNet fine-tuning under learned routing
-    steer_finetune_epochs: int = 2
+    # Phase 2A: SteerNet fine-tuning (0 = Frozen SteerNet discipline; trained exclusively in Phase 1)
+    steer_finetune_epochs: int = 0
     steer_finetune_lr: float = 1e-4
     steer_finetune_save_path: str = "./checkpoints/steer_finetune.pt"
 

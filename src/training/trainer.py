@@ -629,27 +629,42 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # PHASE 2A: SteerNet Fine-tune
-    for p in model.router.parameters():
-        p.requires_grad = False
-    model.set_gate_freeze(True, 1.0)
-    model.set_router_warmup(True)
+    # SteerNet parameter collection and freezing
     steer_params_ft = []
     for sn in model.steer_nets.values():
         for p in sn.parameters():
-            p.requires_grad = True
+            p.requires_grad = False
             steer_params_ft.append(p)
 
-    global_step, best_p2a_val, best_p2a_acc = run_staged_phase(
-        model, tokenizer, train_data, eval_data, cfg, device,
-        stage_name="PHASE 2A: SteerNet Fine-tune (exhaustive rotation, gate=1.0)",
-        epochs=cfg.steer_finetune_epochs,
-        param_groups=[{"params": steer_params_ft, "lr": cfg.steer_finetune_lr}],
-        save_path=cfg.steer_finetune_save_path,
-        train_steer=True, train_gate=False, train_router=False,
-        global_step=0, baseline_ema=[0.0], patience=cfg.phase2_patience,
-    )
-    logs["p2a_val"] = best_p2a_val
+    # PHASE 2A: SteerNet Fine-tune (Skipped by default under Frozen SteerNet discipline)
+    if getattr(cfg, "steer_finetune_epochs", 0) > 0:
+        for p in steer_params_ft:
+            p.requires_grad = True
+        for p in model.router.parameters():
+            p.requires_grad = False
+        model.set_gate_freeze(True, 1.0)
+        model.set_router_warmup(True)
+
+        global_step, best_p2a_val, best_p2a_acc = run_staged_phase(
+            model, tokenizer, train_data, eval_data, cfg, device,
+            stage_name="PHASE 2A: SteerNet Fine-tune (exhaustive rotation, gate=1.0)",
+            epochs=cfg.steer_finetune_epochs,
+            param_groups=[{"params": steer_params_ft, "lr": cfg.steer_finetune_lr}],
+            save_path=cfg.steer_finetune_save_path,
+            train_steer=True, train_gate=False, train_router=False,
+            global_step=0, baseline_ema=[0.0], patience=cfg.phase2_patience,
+        )
+        logs["p2a_val"] = best_p2a_val
+        for p in steer_params_ft:
+            p.requires_grad = False
+    else:
+        print("\n" + "=" * 80)
+        print("PHASE 2A: SteerNet Fine-tune SKIPPED (Frozen SteerNet Discipline)")
+        print("         SteerNet weights locked to Phase 1 optimal checkpoint.")
+        print("=" * 80)
+        global_step = 0
+        logs["p2a_val"] = best_val_p1
+
     model.reset_routing_diagnostics()
     gc.collect()
     if torch.cuda.is_available():
