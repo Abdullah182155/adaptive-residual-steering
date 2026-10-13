@@ -1,40 +1,12 @@
-<mxfile host="app.diagrams.net" version="22.1.0">
-  <diagram id="router-arch" name="Router Architecture">
-    <mxGraphModel dx="1000" dy="700" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="900" pageHeight="650" background="#000000" math="1" shadow="0">
-      <root>
-        <mxCell id="0" />
-        <mxCell id="1" parent="0" />
-        <mxCell id="title" value="&lt;b&gt;JointLayerRouter: Difficulty-Aware 2-Pass Router 2.0&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=16;fontColor=#ffffff;" vertex="1" parent="1">
-          <mxGeometry x="150" y="20" width="550" height="30" as="geometry" />
-        </mxCell>
-        <mxCell id="in_h" value="Early Hidden State Tokens &lt;br&gt;&lt;i&gt;H ∈ ℝ^(B×T×d)&lt;/i&gt; (Layer 9)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#111111;strokeColor=#888888;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1">
-          <mxGeometry x="270" y="70" width="280" height="45" as="geometry" />
-        </mxCell>
-        <mxCell id="sem_proj" value="Semantic Summary &amp; Difficulty Extraction &lt;br&gt;&lt;b&gt;LN → Linear(d → 16) → tanh + [log(1+T), disp]&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a1100;strokeColor=#ffa64d;fontColor=#ffa64d;strokeWidth=2;" vertex="1" parent="1">
-          <mxGeometry x="230" y="145" width="360" height="45" as="geometry" />
-        </mxCell>
-        <mxCell id="cand_emb" value="Candidate Embeddings &lt;br&gt;&lt;i&gt;Depth + Difficulty + Identity (d_model=32) + Semantics&lt;/i&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#111111;strokeColor=#ffffff;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1">
-          <mxGeometry x="220" y="220" width="380" height="45" as="geometry" />
-        </mxCell>
-        <mxCell id="pass1_2" value="Pass 1 &amp; 2: Joint Attention &amp; Stochastic Layer Dropout &lt;br&gt;&lt;b&gt;Self-Attention → u₁ → Refine Head u₂ (Dropout p=0.15)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a1100;strokeColor=#ff8000;fontColor=#ff9933;strokeWidth=2;" vertex="1" parent="1">
-          <mxGeometry x="200" y="295" width="420" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="k_head" value="K-Head (Softmax)&lt;br&gt;&lt;b&gt;P(K) ∈ ℝ^4 → K=3&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a1100;strokeColor=#ffa64d;fontColor=#ffa64d;strokeWidth=2;" vertex="1" parent="1">
-          <mxGeometry x="80" y="380" width="180" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="topk" value="Top-K Layer Selection&lt;br&gt;&lt;b&gt;argtopk(u₂, K) → {11, 15, 20}&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a1100;strokeColor=#ff8000;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1">
-          <mxGeometry x="310" y="380" width="200" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="synergy" value="Pairwise Synergy Matrix&lt;br&gt;&lt;b&gt;S_ij = tanh(q_i^T k_j / √d)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1a1100;strokeColor=#ffa64d;fontColor=#ffa64d;strokeWidth=2;" vertex="1" parent="1">
-          <mxGeometry x="560" y="380" width="200" height="50" as="geometry" />
-        </mxCell>
-        <mxCell id="re1" edge="1" source="in_h" target="sem_proj" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ff8000;strokeWidth=2;" />
-        <mxCell id="re2" edge="1" source="sem_proj" target="cand_emb" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ffa64d;strokeWidth=2;" />
-        <mxCell id="re3" edge="1" source="cand_emb" target="pass1_2" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ff8000;strokeWidth=2;" />
-        <mxCell id="re4" edge="1" source="pass1_2" target="k_head" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ffa64d;strokeWidth=2;" />
-        <mxCell id="re5" edge="1" source="pass1_2" target="topk" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ff8000;strokeWidth=2;" />
-        <mxCell id="re6" edge="1" source="pass1_2" target="synergy" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ffa64d;strokeWidth=2;" />
-      </root>
-    </mxGraphModel>
-  </diagram>
-</mxfile>
+<mxfile host="app.diagrams.net" version="22.1.0"><diagram id="router" name="router"><mxGraphModel dx="1000" dy="700" grid="1" page="1" pageWidth="1000" pageHeight="700" background="#000000" math="1"><root><mxCell id="0"/><mxCell id="1" parent="0"/><mxCell id="title" value="&lt;b&gt;JointLayerRouter: Counterfactual Cooperative Selection&lt;/b&gt;" style="text;html=1;strokeColor=none;fillColor=none;align=center;verticalAlign=middle;fontSize=16;fontColor=#ffffff;" vertex="1" parent="1"><mxGeometry x="120" y="20" width="760" height="30" as="geometry"/></mxCell><mxCell id="h" value="Layer-9 hidden states + unshielded mask" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#121212;strokeColor=#888888;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1"><mxGeometry x="230" y="85" width="340" height="50" as="geometry"/></mxCell>
+        <mxCell id="pool" value="Masked pooling + difficulty features" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#121212;strokeColor=#ffa64d;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1"><mxGeometry x="200" y="175" width="400" height="55" as="geometry"/></mxCell>
+        <mxCell id="cand" value="Eight candidates: {9,11,13,15,18,20,22,24}" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#121212;strokeColor=#ffffff;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1"><mxGeometry x="175" y="270" width="450" height="55" as="geometry"/></mxCell>
+        <mxCell id="score" value="Two-pass joint scoring&lt;br&gt;utility logits + K head; no layer dropout" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#121212;strokeColor=#ff8000;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1"><mxGeometry x="155" y="370" width="490" height="55" as="geometry"/></mxCell>
+        <mxCell id="k" value="K ∈ {0,1,2,3,4}&lt;br&gt;K=0: no intervention" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#121212;strokeColor=#ffa64d;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1"><mxGeometry x="40" y="490" width="220" height="55" as="geometry"/></mxCell>
+        <mxCell id="subset" value="Deterministic cooperative subset" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#121212;strokeColor=#ff8000;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1"><mxGeometry x="300" y="490" width="250" height="55" as="geometry"/></mxCell>
+        <mxCell id="syn" value="Bounded synergy&lt;br&gt;validated by counterfactuals" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#121212;strokeColor=#ffa64d;fontColor=#ffffff;strokeWidth=2;" vertex="1" parent="1"><mxGeometry x="590" y="490" width="220" height="55" as="geometry"/></mxCell><mxCell id="e1" edge="1" source="h" target="pool" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ff8000;strokeWidth=2;endArrow=block;"/>
+        <mxCell id="e2" edge="1" source="pool" target="cand" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ffa64d;strokeWidth=2;endArrow=block;"/>
+        <mxCell id="e3" edge="1" source="cand" target="score" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ff8000;strokeWidth=2;endArrow=block;"/>
+        <mxCell id="e4" edge="1" source="score" target="k" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ffa64d;strokeWidth=2;endArrow=block;"/>
+        <mxCell id="e5" edge="1" source="score" target="subset" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ff8000;strokeWidth=2;endArrow=block;"/>
+        <mxCell id="e6" edge="1" source="score" target="syn" parent="1" style="edgeStyle=orthogonalEdgeStyle;rounded=0;strokeColor=#ffa64d;strokeWidth=2;endArrow=block;"/></root></mxGraphModel></diagram></mxfile>

@@ -38,21 +38,43 @@ class RSCConfig:
     # tail a larger, explicitly auditable weight in every trainable ARS
     # objective and in router counterfactual rewards.
     answer_tail_tokens: int = 8
-    answer_tail_weight: float = 4.0
+    # A completion is evaluated autoregressively, not under a supplied gold
+    # prefix.  A very large tail multiplier can therefore overfit the final
+    # answer marker under teacher forcing while degrading free generation.
+    # Keep a modest answer emphasis and let held-out generation decide whether
+    # a Phase-1 checkpoint is usable.
+    answer_tail_weight: float = 2.0
 
     # Data
     n_samples: int = 7000
     max_tok_len: int = 384
-    fewshot_train_prob: float = 0.30
-    fewshot_train_max_demos: int = 2
+    # ARS learns its intrinsic question-to-reasoning intervention from a
+    # zero-shot prompt.  Few-shot examples are an evaluation-time context
+    # whose residual stream is protected by prompt shielding, not supervised
+    # training data.
+    fewshot_train_prob: float = 0.0
+    fewshot_train_max_demos: int = 0
 
     # Phase 1: SteerNet only
-    phase1_lr: float = 5e-3
-    phase1_epochs: int = 12
+    # Each candidate only sees roughly 1/N of a rotated Phase-1 epoch.  5e-3
+    # produced large teacher-forced NLL gains but severe free-generation
+    # regressions on this small-data regime.  This is intentionally a
+    # conservative adapter learning rate; generation validation owns model
+    # selection below.
+    phase1_lr: float = 5e-4
+    phase1_epochs: int = 4
     phase1_warmup_ratio: float = 0.06
     phase1_patience: int = 4
     phase1_acceptance_examples: int = 64
     phase1_acceptance_accuracy_examples: int = 32
+    # Screen all candidates cheaply before spending the full held-out
+    # generation budget on the most promising routes.  This prevents NLL from
+    # silently excluding a layer whose free-generation behaviour is better.
+    phase1_generation_screen_examples: int = 8
+    phase1_generation_candidate_count: int = 3
+    # A larger held-out zero-shot screen, rather than a training-prompt
+    # accuracy proxy, decides whether the final Phase-1 adapter is usable.
+    phase1_generation_max_new_tokens: int = 256
     phase1_min_train_nll_reduction: float = 0.05
     phase1_min_val_nll_reduction: float = 0.05
     # Generation on a 32-example diagnostic set has 3.125pp granularity; it
@@ -69,6 +91,11 @@ class RSCConfig:
     # Kaggle run continues to save checkpoints, plots, and audit evidence.
     # This must never turn a warning into a claimed PASS.
     continue_on_diagnostic_failure: bool = True
+    # Continuing a notebook must not mean training a router on a demonstrably
+    # destructive SteerNet objective.  When Phase 1 fails on held-out
+    # generation, preserve its artifacts and return a baseline-equivalent
+    # ARS checkpoint marked diagnostic-only instead of inventing Phase 2.
+    skip_adaptive_phases_when_phase1_fails: bool = True
 
     # Phase 2 staged parameters
     phase2_warmup_ratio: float = 0.03
@@ -139,7 +166,11 @@ class RSCConfig:
     router_dead_layer_veto_frac: float = 0.50
 
     # Cooperative Subset Router & RLOO settings
-    lambda_cost: float = 0.025
+    # A route is charged a per-layer intervention tariff relative to the
+    # unsteered answer NLL of the same example.  The former fixed 0.025 cost
+    # was negligible beside 0.2--0.4 NLL deltas, so K=4 won almost always.
+    lambda_cost: float = 0.025  # absolute floor for already-easy examples
+    router_relative_k_cost: float = 0.10
     beta_entropy_k: float = 0.03  # was 0.30 — 10× reduction; old value drowned RLOO policy signal
     beta_entropy_subset: float = 0.02  # was 0.15 — let router specialize layer selection
     router_balance_weight: float = 0.01  # was 0.10 — layer_dropout already prevents monopoly
@@ -207,7 +238,11 @@ class RSCConfig:
     grad_warn_threshold: float = 2.0
 
     # Prompt Diversification & Invariance
-    diversify_prompts: bool = True
+    # Keep Phase-1's structural grammar identical to the zero-shot benchmark
+    # prompt.  Prompt-format robustness is a separate controlled ablation;
+    # mixing formats here made the Phase-1 capacity test non-comparable with
+    # the reported benchmark.
+    diversify_prompts: bool = False
     lambda_invariance: float = 0.5
     invariance_every_n_steps: int = 4
     pg_mode: str = "teacher_forced"  # 'teacher_forced' or 'generation'

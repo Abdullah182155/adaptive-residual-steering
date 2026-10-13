@@ -271,8 +271,18 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             module.train(was_training)
 
     reward_0 = (-nll_0).detach()
-    lambda_cost = getattr(cfg, "lambda_cost", 0.005)
-    action_rewards = (-arm_nll - lambda_cost * k_actions.float()).detach()
+    # A fixed K tariff is scale-blind: with answer NLL around one nat, the
+    # former 0.025 cost was too small to ever offset a teacher-forced gain and
+    # made K=4 the default policy.  Price each extra residual against the
+    # unsteered difficulty of the *same* example.  K=0 is therefore a real
+    # competing action whenever the marginal likelihood gain is insufficient.
+    absolute_cost = float(getattr(cfg, "lambda_cost", 0.005))
+    relative_cost = float(getattr(cfg, "router_relative_k_cost", 0.0))
+    per_layer_cost = torch.maximum(
+        torch.full_like(nll_0, absolute_cost),
+        nll_0.detach() * relative_cost,
+    )
+    action_rewards = (-arm_nll - per_layer_cost.unsqueeze(1) * k_actions.float()).detach()
 
     # Anchor-grounded leave-one-out advantage for each sampled subset.  K
     # itself is evaluated exhaustively and receives direct action-value
@@ -382,6 +392,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         "k_preference_loss": float(k_preference_loss.detach().item()),
         "synergy_prior_loss": float(synergy_prior_loss.detach().item()),
         "k0_probability": float(F.softmax(k_logits_fresh.detach(), dim=-1)[:, 0].mean().item()),
+        "mean_per_layer_cost": float(per_layer_cost.mean().item()),
         "argmax_k_distribution": {
             int(k): float((k_logits_fresh.detach().argmax(dim=-1) == k).float().mean().item())
             for k in range(k_logits_fresh.shape[-1])
