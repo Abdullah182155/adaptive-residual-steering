@@ -21,7 +21,7 @@ from src.training import (
     load_steer_weights,
     run_pg_loss,
 )
-from src.training.trainer import _small_run_waiver
+from src.training.trainer import _small_run_waiver, _optimizer_has_gradients
 
 class TestARSModules(unittest.TestCase):
     def setUp(self):
@@ -136,6 +136,12 @@ class TestARSModules(unittest.TestCase):
         self.assertFalse(_small_run_waiver(16, cfg))
         cfg.allow_inconclusive_small_runs = False
         self.assertFalse(_small_run_waiver(4, cfg))
+
+    def test_optimizer_gradient_guard_handles_a_legal_k_zero_window(self):
+        parameter = torch.nn.Parameter(torch.tensor(1.0))
+        self.assertFalse(_optimizer_has_gradients([parameter]))
+        (parameter * 2.0).backward()
+        self.assertTrue(_optimizer_has_gradients([parameter]))
 
     def test_routing_override_modes(self):
         class DummyModel(nn.Module):

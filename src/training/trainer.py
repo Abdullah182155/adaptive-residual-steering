@@ -50,6 +50,11 @@ def _small_run_waiver(n_validation_examples: int, cfg: RSCConfig) -> bool:
     return bool(getattr(cfg, "allow_inconclusive_small_runs", True)) and n_validation_examples < minimum
 
 
+def _optimizer_has_gradients(parameters) -> bool:
+    """Whether this accumulation window actually called backward on an optimizer parameter."""
+    return any(parameter.grad is not None for parameter in parameters)
+
+
 def save_steer_weights(
     model, path: str, cfg: Optional[RSCConfig] = None, phase: str = "ars", prefixes=None
 ):
@@ -771,6 +776,7 @@ def run_staged_phase(
         indices = list(range(len(train_data)))
         random.shuffle(indices)
         epoch_task, n_opt_steps, accum_count = 0.0, 0, 0
+        no_gradient_windows = 0
 
         epoch_gate_l1, epoch_gate_div, epoch_gate_antisat, epoch_gate_contrast, n_gate_aux_steps = 0.0, 0.0, 0.0, 0.0, 0
         epoch_policy_loss, epoch_mean_k, n_router_rloo_steps = 0.0, 0.0, 0
@@ -888,40 +894,54 @@ def run_staged_phase(
             accum_count += 1
             is_last = start + cfg.batch_size >= len(indices)
             if accum_count == cfg.grad_accum or is_last:
-                scaler.unscale_(optimizer)
-                for p in all_params:
-                    if p.grad is not None and not torch.isfinite(p.grad).all():
-                        p.grad.zero_()
-                torch.nn.utils.clip_grad_norm_(all_params, cfg.clip_grad)
-                if cfg.use_gradient_monitor:
-                    grad_mon.check(all_params, global_step)
-                scaler.step(optimizer)
-                scaler.update()
-                lr_reducer.scheduler_step()
-                optimizer.zero_grad(set_to_none=True)
-                accum_count = 0
-                global_step += 1
-                n_opt_steps += 1
+                if not _optimizer_has_gradients(all_params):
+                    # Legal for K=0: with a frozen backbone and no selected
+                    # layer, this window contains no trainable graph.  AMP
+                    # cannot unscale before scale/backward, so record the
+                    # condition and continue instead of crashing the run.
+                    no_gradient_windows += 1
+                    if no_gradient_windows == 1:
+                        print(
+                            f"  ⚠️ {stage_name.split(':')[0]} has a no-gradient window "
+                            "(usually K=0/no selected layer); optimizer step skipped."
+                        )
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_count = 0
+                else:
+                    scaler.unscale_(optimizer)
+                    for p in all_params:
+                        if p.grad is not None and not torch.isfinite(p.grad).all():
+                            p.grad.zero_()
+                    torch.nn.utils.clip_grad_norm_(all_params, cfg.clip_grad)
+                    if cfg.use_gradient_monitor:
+                        grad_mon.check(all_params, global_step)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    lr_reducer.scheduler_step()
+                    optimizer.zero_grad(set_to_none=True)
+                    accum_count = 0
+                    global_step += 1
+                    n_opt_steps += 1
 
-                if global_step % 50 == 0:
-                    gc.collect()
-                    log_gpu_memory(f"run_staged_phase step {global_step}", cfg)
+                    if global_step % 50 == 0:
+                        gc.collect()
+                        log_gpu_memory(f"run_staged_phase step {global_step}", cfg)
 
-                if (
-                    train_router
-                    and cfg.router_checkpoint_every_n_steps > 0
-                    and global_step % cfg.router_checkpoint_every_n_steps == 0
-                ):
-                    best_acc, best_val, sub_state, patience_ctr, _, _, _ = _evaluate_and_maybe_checkpoint(
-                        model, tokenizer, eval_data, cfg, device, save_path,
-                        best_acc, best_val, patience_ctr, train_router,
-                        label=f"step {global_step} (mid-epoch {epoch + 1})",
-                    )
-                    if sub_state is not None:
-                        best_state = sub_state
-                    if patience_ctr >= patience:
-                        print(f"  {stage_name.split(':')[0]} early stopping (mid-epoch).")
-                        break
+                    if (
+                        train_router
+                        and cfg.router_checkpoint_every_n_steps > 0
+                        and global_step % cfg.router_checkpoint_every_n_steps == 0
+                    ):
+                        best_acc, best_val, sub_state, patience_ctr, _, _, _ = _evaluate_and_maybe_checkpoint(
+                            model, tokenizer, eval_data, cfg, device, save_path,
+                            best_acc, best_val, patience_ctr, train_router,
+                            label=f"step {global_step} (mid-epoch {epoch + 1})",
+                        )
+                        if sub_state is not None:
+                            best_state = sub_state
+                        if patience_ctr >= patience:
+                            print(f"  {stage_name.split(':')[0]} early stopping (mid-epoch).")
+                            break
 
             epoch_task += task_loss.item()
             postfix_kwargs = {"task": f"{task_loss.item():.4f}"}
@@ -941,7 +961,8 @@ def run_staged_phase(
         )
         if epoch_state is not None:
             best_state = epoch_state
-        print(f"  {stage_name.split(':')[0]} Epoch {epoch + 1}: task={avg_task:.4f}  val={cur_val_loss:.4f}  acc={cur_acc:.3f}  {'✅' if improved else ''}")
+        skip_note = f" | skipped_no_grad_windows={no_gradient_windows}" if no_gradient_windows else ""
+        print(f"  {stage_name.split(':')[0]} Epoch {epoch + 1}: task={avg_task:.4f}  val={cur_val_loss:.4f}  acc={cur_acc:.3f}  {'✅' if improved else ''}{skip_note}")
 
     return global_step, best_val, best_acc
 
