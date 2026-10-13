@@ -11,7 +11,14 @@ from src.steering.steernet import RSCSteerNet
 from src.gating.gate import RSCUsefulnessGate
 from src.models.wrapper import Phi2WithRSC
 from src.routing.router import JointLayerRouter
-from src.routing.rloo import sample_k, sample_subset_plackett_luce, policy_entropy_bonus, mutual_information_diversity_loss, counterfactual_k_preference_loss
+from src.routing.rloo import (
+    sample_k,
+    sample_subset_plackett_luce,
+    policy_entropy_bonus,
+    mutual_information_diversity_loss,
+    counterfactual_k_preference_loss,
+    per_example_answer_nll,
+)
 from src.training import (
     train_rsc,
     train_phase1_steernet,
@@ -103,16 +110,26 @@ class TestARSModules(unittest.TestCase):
         # K=0 is not prescribed: it receives the largest target probability
         # only because its observed counterfactual reward is largest.
         logits = torch.zeros(2, 5, requires_grad=True)
-        k_a = torch.tensor([2, 3])
-        k_b = torch.tensor([4, 1])
+        k_actions = torch.tensor([[1, 2, 4], [1, 3, 4]])
         loss = counterfactual_k_preference_loss(
-            logits, k_a, k_b,
+            logits, k_actions,
             reward_0=torch.tensor([0.0, 0.0]),
-            reward_a=torch.tensor([-1.0, -1.0]),
-            reward_b=torch.tensor([-2.0, -2.0]),
+            action_rewards=torch.tensor([[-1.0, -1.0, -2.0], [-1.0, -1.0, -2.0]]),
         )
         loss.backward()
         self.assertLess(logits.grad[:, 0].mean().item(), 0.0)
+
+    def test_answer_tail_weight_penalizes_final_answer_errors(self):
+        """A copied rationale cannot hide an incorrect completion tail."""
+        logits = torch.full((1, 5, 6), -6.0)
+        labels = torch.tensor([[-100, 1, 2, 3, 4]])
+        logits[0, 0, 1] = 6.0  # first target correct
+        logits[0, 1, 2] = 6.0  # second target correct
+        logits[0, 2, 0] = 6.0  # final-tail targets deliberately wrong
+        logits[0, 3, 0] = 6.0
+        ordinary = per_example_answer_nll(logits, labels)
+        answer_aware = per_example_answer_nll(logits, labels, answer_tail_tokens=2, answer_tail_weight=4.0)
+        self.assertGreater(answer_aware.item(), ordinary.item())
 
     def test_config_attributes(self):
         cfg = RSCConfig()
@@ -125,7 +142,8 @@ class TestARSModules(unittest.TestCase):
             "beta_entropy_k", "beta_entropy_subset", "min_reliable_validation_examples",
             "allow_inconclusive_small_runs", "router_preflight_examples",
             "router_fail_fast_on_collapse", "lambda_router_k_preference",
-            "continue_on_diagnostic_failure",
+            "continue_on_diagnostic_failure", "answer_tail_tokens",
+            "answer_tail_weight", "router_synergy_limit",
         ]
         for attr in required_attrs:
             self.assertTrue(hasattr(cfg, attr), f"Missing config attribute: {attr}")
@@ -382,7 +400,7 @@ class TestARSModules(unittest.TestCase):
         u, k_logits = router(h, mask)
         syn_mat = router.get_layer_synergy_matrix()
         self.assertIsNotNone(syn_mat)
-        self.assertTrue((syn_mat >= -1.0).all() and (syn_mat <= 1.0).all())
+        self.assertTrue((syn_mat >= -router.synergy_limit).all() and (syn_mat <= router.synergy_limit).all())
         # Diagonal must be 0
         diag = torch.diagonal(syn_mat, dim1=-2, dim2=-1)
         self.assertTrue((diag == 0.0).all())
@@ -394,7 +412,7 @@ class TestARSModules(unittest.TestCase):
         self.assertIsInstance(analysis["top_synergy_pairs"], list)
 
     def test_anchor_grounded_rloo_loss(self):
-        """Ensure 3-arm RLOO loss runs with baseline anchor and synergy alignment."""
+        """Ensure exhaustive-K RLOO loss runs with baseline anchor and synergy alignment."""
         class DummyLayer(nn.Module):
             def __init__(self, hidden_dim):
                 super().__init__()
@@ -429,6 +447,7 @@ class TestARSModules(unittest.TestCase):
         self.assertIn("win_rate_vs_base", diag)
         self.assertIn("synergy_align_loss", diag)
         self.assertIn("mean_reward_delta", diag)
+        self.assertEqual(diag["counterfactual_k_actions"], [1, 2, 3, 4])
         # Pairwise probes are auxiliary counterfactuals: they must not leak
         # their last fixed route into the next ordinary training forward.
         self.assertIsNone(wrapper._routing_override)

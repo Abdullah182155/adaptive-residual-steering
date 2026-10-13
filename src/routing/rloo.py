@@ -2,15 +2,33 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Dict, Any, Optional
 
-def per_example_answer_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    """Mean next-token NLL for each example, excluding masked prompt tokens."""
+def per_example_answer_nll(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    answer_tail_tokens: int = 0,
+    answer_tail_weight: float = 1.0,
+) -> torch.Tensor:
+    """Mean answer NLL, optionally emphasizing each completion's final tail.
+
+    The final numerical answer is at the end of the supervised completion in
+    the GSM8K curriculum.  Uniform token NLL can reward copied prose while
+    the generated answer gets worse, so the tail is weighted explicitly.
+    Defaults preserve the ordinary mean-NLL behaviour for existing callers.
+    """
     shift_logits = logits[:, :-1, :].float()
     shift_labels = labels[:, 1:]
     token_nll = F.cross_entropy(
         shift_logits.transpose(1, 2), shift_labels, ignore_index=-100, reduction="none"
     )
     valid = shift_labels.ne(-100)
-    return (token_nll * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+    weights = valid.to(token_nll.dtype)
+    tail_count = max(0, int(answer_tail_tokens))
+    if tail_count and float(answer_tail_weight) != 1.0:
+        for row in range(valid.shape[0]):
+            positions = valid[row].nonzero(as_tuple=False).flatten()
+            if positions.numel():
+                weights[row, positions[-tail_count:]] = float(answer_tail_weight)
+    return (token_nll * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
 
 def sample_subset_plackett_luce(
     logits: torch.Tensor,
@@ -116,28 +134,26 @@ def mutual_information_diversity_loss(
 
 def counterfactual_k_preference_loss(
     k_logits: torch.Tensor,
-    k_a: torch.Tensor,
-    k_b: torch.Tensor,
+    k_actions: torch.Tensor,
     reward_0: torch.Tensor,
-    reward_a: torch.Tensor,
-    reward_b: torch.Tensor,
-    temperature: float = 0.05,
+    action_rewards: torch.Tensor,
+    temperature: float = 0.10,
 ) -> torch.Tensor:
-    """Distil observed {K=0, K_a, K_b} counterfactual rewards into K logits.
+    """Distil measured K-action rewards into deterministic K logits.
 
-    Each row supervises only actions actually evaluated for that prompt.  This
-    is not a fixed K schedule: K=0 wins only when its unsteered reward exceeds
-    the sampled intervention routes.  Duplicate sampled K values are averaged
-    before the soft preference target is formed.
+    ``k_actions`` has shape ``(B, A)`` and may contain any evaluated subset of
+    ``{1, ..., K_max}``; the unsteered K=0 reward is always included.  The
+    router is not rewarded for a K merely because it happened to be sampled:
+    its deterministic deployment head sees the actual counterfactual ranking.
     """
     B, n_actions = k_logits.shape
     rewards_sum = torch.zeros(B, n_actions, device=k_logits.device, dtype=k_logits.dtype)
     counts = torch.zeros_like(rewards_sum)
-    zero = torch.zeros_like(k_a)
-    for actions, rewards in ((zero, reward_0), (k_a, reward_a), (k_b, reward_b)):
-        actions = actions.long().clamp(0, n_actions - 1)
-        rewards_sum.scatter_add_(1, actions.unsqueeze(1), rewards.to(k_logits.dtype).unsqueeze(1))
-        counts.scatter_add_(1, actions.unsqueeze(1), torch.ones_like(rewards, dtype=k_logits.dtype).unsqueeze(1))
+    zero = torch.zeros(B, 1, device=k_logits.device, dtype=torch.long)
+    actions = torch.cat([zero, k_actions.long()], dim=1).clamp(0, n_actions - 1)
+    rewards = torch.cat([reward_0.to(k_logits.dtype).unsqueeze(1), action_rewards.to(k_logits.dtype)], dim=1)
+    rewards_sum.scatter_add_(1, actions, rewards)
+    counts.scatter_add_(1, actions, torch.ones_like(rewards))
     observed = counts > 0
     mean_reward = rewards_sum / counts.clamp_min(1)
     target_scores = (mean_reward / max(float(temperature), 1e-4)).masked_fill(~observed, float("-inf"))
@@ -161,6 +177,10 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     # this function is called from a mixed-mode staged curriculum.
     module_modes = {module: module.training for module in model.modules()}
     try:
+        # Train exactly the deterministic utility function that deployment
+        # uses.  A training-only layer-dropout mask otherwise creates apparent
+        # route diversity which disappears under eval/argmax.
+        model.router.eval()
         model.set_routing_override(None)
         model.set_router_context_mask(prompt_mask)
         if hasattr(model, "set_prompt_shield_mask"):
@@ -178,12 +198,21 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     synergy = getattr(model.router, "_last_synergy_matrix", None)
     K_max = model.cfg.max_active_layers
 
-    k_a, logprob_k_a = sample_k(k_logits_fresh)
-    k_b, logprob_k_b = sample_k(k_logits_fresh)
-    subset_a_mask, logprob_subset_a = sample_subset_plackett_luce(u_fresh, k_a, synergy_matrix=synergy)
-    subset_b_mask, logprob_subset_b = sample_subset_plackett_luce(u_fresh, k_b, synergy_matrix=synergy)
-    logprob_a = logprob_k_a + logprob_subset_a
-    logprob_b = logprob_k_b + logprob_subset_b
+    # K is a tiny discrete action space (0..4), so it is both cheaper in
+    # variance and more scientifically defensible to score every non-zero K
+    # than to hope two random samples cover it.  This is *not* a fixed route:
+    # each K still samples a prompt-conditioned Plackett-Luce subset, and the
+    # K head is supervised only by these counterfactual rewards.
+    k_actions = torch.arange(1, K_max + 1, device=ids.device, dtype=torch.long)
+    k_actions = k_actions.unsqueeze(0).expand(ids.shape[0], -1)
+    subset_masks = []
+    subset_logprobs = []
+    for arm in range(K_max):
+        route_mask, route_logprob = sample_subset_plackett_luce(
+            u_fresh, k_actions[:, arm], synergy_matrix=synergy
+        )
+        subset_masks.append(route_mask)
+        subset_logprobs.append(route_logprob)
 
     old_override = model._routing_override
 
@@ -195,7 +224,12 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             model.set_prompt_shield_mask(shield_mask)
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                return per_example_answer_nll(model(input_ids=ids, attention_mask=mask, use_cache=False).logits, labels)
+                return per_example_answer_nll(
+                    model(input_ids=ids, attention_mask=mask, use_cache=False).logits,
+                    labels,
+                    answer_tail_tokens=getattr(cfg, "answer_tail_tokens", 0),
+                    answer_tail_weight=getattr(cfg, "answer_tail_weight", 1.0),
+                )
 
     def deterministic_counterfactual_nll(route_mask: torch.Tensor) -> torch.Tensor:
         """Score one auxiliary counterfactual without dropout noise."""
@@ -214,8 +248,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
 
     try:
         model.eval()
-        nll_a = counterfactual_nll(subset_a_mask)
-        nll_b = counterfactual_nll(subset_b_mask)
+        arm_nll = torch.stack([counterfactual_nll(route_mask) for route_mask in subset_masks], dim=1)
         # Arm 0: Ground-truth unsteered baseline anchor
         model.set_routing_override("none")
         model.set_router_context_mask(prompt_mask)
@@ -223,7 +256,12 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             model.set_prompt_shield_mask(shield_mask)
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                nll_0 = per_example_answer_nll(model(input_ids=ids, attention_mask=mask, use_cache=False).logits, labels)
+                nll_0 = per_example_answer_nll(
+                    model(input_ids=ids, attention_mask=mask, use_cache=False).logits,
+                    labels,
+                    answer_tail_tokens=getattr(cfg, "answer_tail_tokens", 0),
+                    answer_tail_weight=getattr(cfg, "answer_tail_weight", 1.0),
+                )
     finally:
         if old_override is None:
             model.set_routing_override(None)
@@ -234,16 +272,16 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
 
     reward_0 = (-nll_0).detach()
     lambda_cost = getattr(cfg, "lambda_cost", 0.005)
-    reward_a = (-nll_a - lambda_cost * k_a.float()).detach()
-    reward_b = (-nll_b - lambda_cost * k_b.float()).detach()
+    action_rewards = (-arm_nll - lambda_cost * k_actions.float()).detach()
 
-    # Anchor-Grounded 3-Arm Leave-One-Out (RLOO)
-    baseline_for_a = (reward_b + reward_0) / 2.0
-    baseline_for_b = (reward_a + reward_0) / 2.0
-    advantage_a = reward_a - baseline_for_a
-    advantage_b = reward_b - baseline_for_b
-
-    policy_loss = -0.5 * (logprob_a * advantage_a + logprob_b * advantage_b).mean()
+    # Anchor-grounded leave-one-out advantage for each sampled subset.  K
+    # itself is evaluated exhaustively and receives direct action-value
+    # supervision below; this policy term learns which *layers* are useful at
+    # a given K without an off-policy, forced-K gradient.
+    reward_sum = action_rewards.sum(dim=1, keepdim=True) + reward_0.unsqueeze(1)
+    advantages = action_rewards - (reward_sum - action_rewards) / float(K_max)
+    subset_logprobs_t = torch.stack(subset_logprobs, dim=1)
+    policy_loss = -(subset_logprobs_t * advantages).mean()
 
     # Direct pairwise *interaction* signal.  A route's gain over the base is
     # not synergy: two individually useful layers would otherwise make every
@@ -251,12 +289,14 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     # I_ij = R({i,j}) - R({i}) - R({j}) + R(empty), then align only M_ij to it.
     # This preserves the cooperative-router hypothesis while giving destructive
     # pairs a negative target instead of allowing universal +1 saturation.
-    delta_r_a = (reward_a - reward_0).detach()
-    delta_r_b = (reward_b - reward_0).detach()
+    reward_deltas = (action_rewards - reward_0.unsqueeze(1)).detach()
     pairwise_interaction_loss = torch.zeros((), device=ids.device)
     mean_pair_interaction = torch.zeros((), device=ids.device)
     if synergy is not None:
-        pair_source = subset_a_mask
+        # K=2 is the first non-trivial pair route and therefore measures a
+        # clean second-order interaction instead of an arbitrary pair inside
+        # a much larger selected set.
+        pair_source = subset_masks[1] if K_max >= 2 else subset_masks[0]
         first = pair_source.float().argmax(dim=-1)
         without_first = pair_source.clone()
         without_first.scatter_(1, first.unsqueeze(-1), False)
@@ -275,7 +315,11 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             nll_pair = deterministic_counterfactual_nll(pair_mask)
             interaction = (-nll_pair + nll_i + nll_j - nll_0).detach()
             pair_syn = synergy[torch.arange(ids.shape[0], device=ids.device), first, second]
-            pairwise_interaction_loss = -(interaction[valid_pair] * pair_syn[valid_pair]).mean()
+            target_scale = max(float(getattr(cfg, "router_synergy_target_scale", 0.10)), 1e-4)
+            interaction_target = torch.tanh(interaction / target_scale)
+            pairwise_interaction_loss = F.smooth_l1_loss(
+                pair_syn[valid_pair], interaction_target[valid_pair], beta=0.25,
+            )
             mean_pair_interaction = interaction[valid_pair].mean()
 
     h_k, h_subset = policy_entropy_bonus(u_fresh, k_logits_fresh, K_max)
@@ -295,13 +339,16 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     lambda_k_mi = getattr(cfg, "lambda_router_k_mi", 0.0)
     lambda_layer_mi = getattr(cfg, "lambda_router_layer_mi", 0.0)
     k_preference_loss = counterfactual_k_preference_loss(
-        k_logits_fresh, k_a, k_b, reward_0, reward_a, reward_b,
+        k_logits_fresh, k_actions, reward_0, action_rewards,
         temperature=float(getattr(cfg, "router_k_preference_temperature", 0.05)),
     )
     lambda_k_preference = float(getattr(cfg, "lambda_router_k_preference", 0.0))
+    synergy_prior_loss = model.router.synergy_prior_loss(synergy) if synergy is not None else torch.zeros((), device=ids.device)
+    lambda_synergy_prior = float(getattr(cfg, "lambda_synergy_prior", 0.0))
 
-    # Target-K Centering Loss: penalizes mean K deviating from balanced sweet spot K* = 2.2
-    mean_sampled_k = ((k_a.float() + k_b.float()) / 2.0).mean()
+    # Kept at zero by default for backwards-compatible configuration.  The
+    # reported mean is exhaustive K coverage, not a biased random sample.
+    mean_sampled_k = k_actions.float().mean()
     k_center_loss = (mean_sampled_k - 2.2).pow(2)
     lambda_k_center = getattr(cfg, "lambda_k_center", 0.05)
 
@@ -315,28 +362,30 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         + lambda_k_mi * k_mi_loss
         + lambda_layer_mi * layer_mi_loss
         + lambda_k_preference * k_preference_loss
+        + lambda_synergy_prior * synergy_prior_loss
     )
 
-    win_rate = ((reward_a > reward_0).float() + (reward_b > reward_0).float()).mean().item() / 2.0
+    win_rate = (action_rewards > reward_0.unsqueeze(1)).float().mean().item()
     diag = {
         "policy_loss": float(policy_loss.detach().item()),
         "synergy_align_loss": float(pairwise_interaction_loss.detach().item()),
         "pairwise_interaction": float(mean_pair_interaction.detach().item()),
         "win_rate_vs_base": float(win_rate),
-        "mean_reward_delta": float((0.5 * (delta_r_a + delta_r_b)).mean().item()),
+        "mean_reward_delta": float(reward_deltas.mean().item()),
         "h_k_raw": float(h_k.detach().item()),
         "h_k_weighted": float((beta_k * h_k).detach().item()),
         "h_subset_raw": float(h_subset.detach().item()),
         "h_subset_weighted": float((beta_subset * h_subset).detach().item()),
-        "mean_k_sampled": float(((k_a.float() + k_b.float()) / 2).mean().item()),
+        "mean_k_sampled": float(mean_sampled_k.detach().item()),
         "k_mi_loss": float(k_mi_loss.detach().item()),
         "layer_mi_loss": float(layer_mi_loss.detach().item()),
         "k_preference_loss": float(k_preference_loss.detach().item()),
+        "synergy_prior_loss": float(synergy_prior_loss.detach().item()),
         "k0_probability": float(F.softmax(k_logits_fresh.detach(), dim=-1)[:, 0].mean().item()),
         "argmax_k_distribution": {
             int(k): float((k_logits_fresh.detach().argmax(dim=-1) == k).float().mean().item())
             for k in range(k_logits_fresh.shape[-1])
         },
-        "sampled_k": [int(k.item()) for k in torch.cat([k_a.view(-1), k_b.view(-1)])],
+        "counterfactual_k_actions": list(range(1, K_max + 1)),
     }
     return loss, diag

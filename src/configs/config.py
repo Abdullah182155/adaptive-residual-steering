@@ -33,6 +33,12 @@ class RSCConfig:
     # K**(-power) of its own bounded delta, so adding layers cannot linearly
     # multiply the residual displacement.  K=1 remains unchanged.
     steer_route_budget_power: float = 0.5
+    # Teacher forcing can reduce the loss of boilerplate reasoning tokens
+    # while making the generated final answer worse.  Give the final answer
+    # tail a larger, explicitly auditable weight in every trainable ARS
+    # objective and in router counterfactual rewards.
+    answer_tail_tokens: int = 8
+    answer_tail_weight: float = 4.0
 
     # Data
     n_samples: int = 7000
@@ -133,7 +139,12 @@ class RSCConfig:
     beta_entropy_k: float = 0.03  # was 0.30 — 10× reduction; old value drowned RLOO policy signal
     beta_entropy_subset: float = 0.02  # was 0.15 — let router specialize layer selection
     router_balance_weight: float = 0.01  # was 0.10 — layer_dropout already prevents monopoly
-    lambda_synergy: float = 0.10
+    # Pair interactions are regressed to measured counterfactual interaction,
+    # not pushed by an unbounded signed correlation objective.
+    lambda_synergy: float = 0.25
+    lambda_synergy_prior: float = 0.01
+    router_synergy_target_scale: float = 0.10
+    router_synergy_limit: float = 0.75
     router_pairwise_probe_probability: float = 0.25  # sample true pair-interaction counterfactuals during RLOO
     lambda_k_center: float = 0.0  # was 0.05 — removed; let K be learned purely from reward
     # Maximise I(prompt; route): varied marginal choices but confident,
@@ -148,8 +159,11 @@ class RSCConfig:
     # the deterministic K head.  RLOO alone updates sampled log-probabilities
     # and allowed a global K=3 bias to survive at argmax deployment.
     lambda_router_k_preference: float = 0.25
-    router_k_preference_temperature: float = 0.05
-    router_layer_dropout: float = 0.15  # Stochastic candidate dropout during training to prevent clique stacking
+    router_k_preference_temperature: float = 0.10
+    # Subset sampling and measured counterfactuals provide exploration.  Do
+    # not mask utilities only during training: that produces a policy which
+    # differs from deterministic deployment and can fake diversity.
+    router_layer_dropout: float = 0.0
     router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
     router_eval_mode: str = "argmax"  # deterministic: argmax; stochastic sampling is training-only by default
 

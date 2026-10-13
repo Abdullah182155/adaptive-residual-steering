@@ -32,6 +32,7 @@ class Phi2WithRSC(nn.Module):
             cfg.max_active_layers,
             layer_dropout=getattr(cfg, "router_layer_dropout", 0.15),
             difficulty_aware=getattr(cfg, "router_difficulty_aware", True),
+            synergy_limit=getattr(cfg, "router_synergy_limit", 0.75),
         ).to(self.device)
 
         self._hooks = []

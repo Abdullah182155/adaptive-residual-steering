@@ -17,7 +17,8 @@ class JointLayerRouter(nn.Module):
                  semantic_dim: int = 16, candidate_semantic_dim: int = 8,
                  d_model: int = 32, n_heads: int = 2,
                  layer_dropout: float = 0.15,
-                 difficulty_aware: bool = True):
+                 difficulty_aware: bool = True,
+                 synergy_limit: float = 0.75):
         super().__init__()
         self.target_layers = list(target_layers)
         n_candidates = len(self.target_layers)
@@ -27,6 +28,7 @@ class JointLayerRouter(nn.Module):
         self.semantic_dim = semantic_dim
         self.layer_dropout = layer_dropout
         self.difficulty_aware = difficulty_aware
+        self.synergy_limit = float(synergy_limit)
         depths = torch.tensor(
             [idx / max(1, n_layers - 1) for idx in self.target_layers], dtype=torch.float32
         )
@@ -63,6 +65,11 @@ class JointLayerRouter(nn.Module):
         # Cross-layer cooperation & synergy projection
         self.synergy_proj = nn.Linear(d_model, d_model, bias=False)
         nn.init.orthogonal_(self.synergy_proj.weight, gain=0.1)
+        # A pair-specific residual prevents one shared projection from
+        # broadcasting the sign of a single destructive pair to every pair.
+        # It is deliberately zero-initialised: no cooperation is assumed
+        # before an interaction counterfactual measures it.
+        self.synergy_pair_bias = nn.Parameter(torch.zeros(n_candidates, n_candidates))
 
         # Initialize final decision heads near zero for conservative initial boundaries
         nn.init.zeros_(self.utility_head.weight)
@@ -146,18 +153,43 @@ class JointLayerRouter(nn.Module):
             drop_mask = drop_mask & (~all_dropped)
             u_final = u_final.masked_fill(drop_mask, -1e4)
 
-        # Cross-layer cooperation & synergy matrix: S_ij = tanh((e_i W_syn e_j^T) / sqrt(d))
-        query = self.synergy_proj(attended_2)
-        raw_syn = torch.bmm(query, attended_2.transpose(1, 2)) / (self.d_model ** 0.5)
-        synergy = torch.tanh(raw_syn)
-        synergy = 0.5 * (synergy + synergy.transpose(1, 2))
-        eye = torch.eye(N, device=tokens.device, dtype=torch.bool).unsqueeze(0)
-        synergy = synergy.masked_fill(eye, 0.0)
+        synergy = self._compute_synergy(attended_2)
         self._last_synergy_matrix = synergy
 
         if return_synergy:
             return u_final, k_logits, synergy
         return u_final, k_logits
+
+    def _compute_synergy(self, candidate_states: torch.Tensor) -> torch.Tensor:
+        """Bound context-aware pair interactions around a zero prior.
+
+        The old unnormalised dot product could grow without bound and tanh
+        therefore saturated every pair at -1 or +1.  Cosine similarity keeps
+        the contextual term finite, while the symmetric pair table receives
+        gradients only for the pair whose counterfactual was actually probed.
+        """
+        n_candidates = candidate_states.shape[1]
+        query = F.normalize(self.synergy_proj(candidate_states), dim=-1, eps=1e-6)
+        keys = F.normalize(candidate_states, dim=-1, eps=1e-6)
+        contextual = torch.bmm(query, keys.transpose(1, 2))
+        contextual = 0.5 * (contextual + contextual.transpose(1, 2))
+        pair_bias = 0.5 * (self.synergy_pair_bias + self.synergy_pair_bias.transpose(0, 1))
+        raw = contextual + pair_bias.unsqueeze(0)
+        # Keep the router's subset bonus in a non-saturated, interpretable
+        # range.  A measured interaction may still be negative or positive.
+        synergy = self.synergy_limit * torch.tanh(raw)
+        eye = torch.eye(n_candidates, device=candidate_states.device, dtype=torch.bool).unsqueeze(0)
+        return synergy.masked_fill(eye, 0.0)
+
+    def synergy_prior_loss(self, synergy: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Shrink unmeasured pair scores toward the neutral no-interaction prior."""
+        matrix = synergy if synergy is not None else self._last_synergy_matrix
+        if matrix is None:
+            return self.synergy_pair_bias.square().mean()
+        n_candidates = matrix.shape[-1]
+        eye = torch.eye(n_candidates, device=matrix.device, dtype=torch.bool).unsqueeze(0)
+        values = matrix.masked_select(~eye)
+        return values.square().mean() if values.numel() else matrix.new_zeros(())
 
     def forward(self, h: torch.Tensor, valid_mask: torch.Tensor, return_synergy: bool = False):
         scalars, per_candidate_semantic = self._base_features(h, valid_mask)
@@ -184,12 +216,7 @@ class JointLayerRouter(nn.Module):
         if hasattr(self, "_last_synergy_matrix") and self._last_synergy_matrix is not None:
             return self._last_synergy_matrix.detach()
         tokens = self.identity_embed.weight.unsqueeze(0)
-        query = self.synergy_proj(tokens)
-        raw_syn = torch.bmm(query, tokens.transpose(1, 2)) / (self.d_model ** 0.5)
-        syn = torch.tanh(raw_syn)
-        syn = 0.5 * (syn + syn.transpose(1, 2))
-        eye = torch.eye(self.n_candidates, device=tokens.device, dtype=torch.bool).unsqueeze(0)
-        return syn.masked_fill(eye, 0.0).detach()
+        return self._compute_synergy(tokens).detach()
 
     def get_cooperation_analysis(self) -> dict:
         """Extracts top cooperative (synergistic) and conflicting (antagonistic) layer pairs."""

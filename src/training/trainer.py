@@ -2,14 +2,13 @@ import gc
 import os
 import random
 import time
-from collections import Counter
 import torch
 from tqdm import tqdm
 from typing import List, Dict, Any, Tuple, Optional
 
 from src.configs.config import RSCConfig
 from src.evaluation.verifier import epoch_end_accuracy
-from src.routing.rloo import compute_router_rloo_loss
+from src.routing.rloo import compute_router_rloo_loss, per_example_answer_nll
 from src.training.losses import (
     LRReducer,
     CheckpointManager,
@@ -55,6 +54,16 @@ def _optimizer_has_gradients(parameters) -> bool:
     return any(parameter.grad is not None for parameter in parameters)
 
 
+def _answer_aware_loss(logits: torch.Tensor, labels: torch.Tensor, cfg: RSCConfig) -> torch.Tensor:
+    """Differentiable completion loss that gives the final answer tail real weight."""
+    return per_example_answer_nll(
+        logits,
+        labels,
+        answer_tail_tokens=getattr(cfg, "answer_tail_tokens", 0),
+        answer_tail_weight=getattr(cfg, "answer_tail_weight", 1.0),
+    ).mean()
+
+
 def save_steer_weights(
     model, path: str, cfg: Optional[RSCConfig] = None, phase: str = "ars", prefixes=None
 ):
@@ -74,12 +83,13 @@ def load_steer_weights(model, path: str, device: Optional[torch.device] = None):
 
 def evaluate_loss(
     model, data, cfg: RSCConfig, device: torch.device, progress_desc: Optional[str] = None,
+    answer_aware: bool = False,
 ) -> float:
-    """Compute per-token cross-entropy loss, optionally exposing batch progress."""
+    """Compute standard or final-answer-aware completion loss with visible progress."""
     was_training = model.training
     model.eval()
     total_nll = 0.0
-    total_tokens = 0
+    total_weight = 0
 
     starts = range(0, len(data), cfg.batch_size)
     # Acceptance runs are deliberately visible: deleting completed bars makes
@@ -103,13 +113,19 @@ def evaluate_loss(
 
         n_tokens = (lbls != -100).sum().item()
         if n_tokens > 0:
-            total_nll += out.loss.item() * n_tokens
-            total_tokens += n_tokens
+            if answer_aware:
+                batch_nll = _answer_aware_loss(out.logits, lbls, cfg).item()
+                batch_weight = ids.shape[0]
+            else:
+                batch_nll = out.loss.item()
+                batch_weight = n_tokens
+            total_nll += batch_nll * batch_weight
+            total_weight += batch_weight
             if progress_desc:
-                iterator.set_postfix(nll=f"{total_nll / total_tokens:.4f}")
+                iterator.set_postfix(nll=f"{total_nll / total_weight:.4f}")
 
     model.train(was_training)
-    return total_nll / max(1, total_tokens)
+    return total_nll / max(1, total_weight)
 
 
 def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
@@ -148,9 +164,9 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
         print("=" * 80)
         model.set_routing_override("none")
         model.set_gate_freeze(False)
-        print("  [1/4] Baseline teacher-forced NLL...")
-        base_train_nll = evaluate_loss(model, train_probe, cfg, device, "Acceptance baseline train NLL")
-        base_val_nll = evaluate_loss(model, val_probe, cfg, device, "Acceptance baseline val NLL")
+        print("  [1/4] Baseline answer-weighted teacher-forced NLL...")
+        base_train_nll = evaluate_loss(model, train_probe, cfg, device, "Acceptance baseline train NLL", answer_aware=True)
+        base_val_nll = evaluate_loss(model, val_probe, cfg, device, "Acceptance baseline val NLL", answer_aware=True)
         print("  [2/4] Baseline generation accuracy...")
         base_train_acc = epoch_end_accuracy(
             model, tokenizer, train_probe, device,
@@ -168,8 +184,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             print(f"        candidate {candidate_index}/{total_candidates}: L{layer}...")
             candidate = {
                 "layer": int(layer),
-                "train_nll": evaluate_loss(model, train_probe, cfg, device, f"Acceptance L{layer} train NLL"),
-                "val_nll": evaluate_loss(model, val_probe, cfg, device, f"Acceptance L{layer} val NLL"),
+                "train_nll": evaluate_loss(model, train_probe, cfg, device, f"Acceptance L{layer} train NLL", answer_aware=True),
+                "val_nll": evaluate_loss(model, val_probe, cfg, device, f"Acceptance L{layer} val NLL", answer_aware=True),
             }
             candidates.append(candidate)
             print(f"          L{layer}: train_nll={candidate['train_nll']:.4f} val_nll={candidate['val_nll']:.4f}")
@@ -400,7 +416,7 @@ def _evaluate_and_maybe_checkpoint(
     """Evaluates val CE loss + accuracy and saves checkpoint if improved."""
     if train_router:
         model.reset_routing_diagnostics()
-    val_loss = evaluate_loss(model, eval_data, cfg, device)
+    val_loss = evaluate_loss(model, eval_data, cfg, device, answer_aware=True)
     acc = epoch_end_accuracy(model, tokenizer, eval_data, device, n_samples=cfg.accuracy_eval_n, seed=cfg.seed)
     # A generation sample is a noisy checkpoint signal.  It may break ties,
     # but it must never replace a checkpoint whose teacher-forced validation
@@ -531,7 +547,7 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(input_ids=ids, attention_mask=mask, labels=lbls, use_cache=False)
-                loss = out.loss / cfg.grad_accum
+                loss = _answer_aware_loss(out.logits, lbls, cfg) / cfg.grad_accum
 
             if not torch.isfinite(loss):
                 continue
@@ -559,7 +575,7 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
             pbar.set_postfix(loss=f"{loss.item() * cfg.grad_accum:.4f}")
 
         avg_loss = epoch_loss / max(1, n_optimizer_steps * cfg.grad_accum)
-        val_loss = evaluate_loss(model, eval_data, cfg, device)
+        val_loss = evaluate_loss(model, eval_data, cfg, device, answer_aware=True)
         logs["p1_train"].append(avg_loss)
         logs["p1_val"].append(val_loss)
 
@@ -636,7 +652,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
         random.shuffle(subset_idx)
         model.train()
         running, n_steps = 0.0, 0
-        epoch_k_samples = []
+        counterfactual_k_actions = None
         rloo_batch_size = max(2, int(getattr(cfg, "router_rloo_batch_size", 8)))
         pbar = tqdm(range(0, len(subset_idx), rloo_batch_size), desc=f"RouterBootstrap {epoch + 1}/{cfg.router_bootstrap_epochs}")
         for start in pbar:
@@ -666,20 +682,17 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             n_steps += 1
             postfix_dict = {"loss": f"{loss.item():.4f}"}
             if rloo_diag:
-                postfix_dict["mean_k"] = f"{rloo_diag.get('mean_k_sampled', 0.0):.2f}"
+                postfix_dict["mean_Kcf"] = f"{rloo_diag.get('mean_k_sampled', 0.0):.2f}"
                 if "win_rate_vs_base" in rloo_diag:
                     postfix_dict["win_base"] = f"{rloo_diag['win_rate_vs_base'] * 100:.0f}%"
-                if "sampled_k" in rloo_diag:
-                    epoch_k_samples.extend(rloo_diag["sampled_k"])
+                counterfactual_k_actions = rloo_diag.get("counterfactual_k_actions", counterfactual_k_actions)
             pbar.set_postfix(**postfix_dict)
 
         avg_loss = running / max(1, n_steps)
-        if epoch_k_samples:
-            k_counts = Counter(epoch_k_samples)
-            tot_k = len(epoch_k_samples)
-            k_dist = {k: round(k_counts.get(k, 0) / tot_k, 3) for k in range(cfg.max_active_layers + 1)}
-        else:
-            k_dist = model.routing_k_distribution()
+        k_cf_str = (
+            " | K counterfactuals={0," + ",".join(str(k) for k in counterfactual_k_actions) + "}"
+            if counterfactual_k_actions else ""
+        )
         diag = model.routing_diagnostics()
         active_cnt = sum(1 for s in diag.values() if s["selected_forwards"] > 0)
         coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
@@ -696,7 +709,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             ) if rloo_diag else ""
         )
         syn_str = f" | top synergy: [{top_syn_str}]" if top_syn_str else ""
-        print(f"  RouterBootstrap Epoch {epoch+1}: loss={avg_loss:.4f}{win_str}{k_pref_str}{k_argmax_str} | active layers={active_cnt}/{len(diag)}{syn_str} | K-dist={k_dist}")
+        print(f"  RouterBootstrap Epoch {epoch+1}: loss={avg_loss:.4f}{win_str}{k_pref_str}{k_argmax_str} | active layers={active_cnt}/{len(diag)}{syn_str}{k_cf_str}")
         if avg_loss < best_loss - 1e-4:
             best_loss, patience_ctr = avg_loss, 0
             best_state = {k: v.clone() for k, v in model.state_dict().items() if "router" in k}
@@ -813,7 +826,7 @@ def run_staged_phase(
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(input_ids=ids, attention_mask=mask, labels=lbls, use_cache=False)
-                task_loss = out.loss
+                task_loss = _answer_aware_loss(out.logits, lbls, cfg)
 
             micro_loss = (task_loss / cfg.grad_accum) if (torch.isfinite(task_loss) and task_loss.requires_grad) else None
 
