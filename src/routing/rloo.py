@@ -92,7 +92,9 @@ def policy_entropy_bonus(logits: torch.Tensor, k_logits: torch.Tensor, k_max: in
     return h_k, h_subset
 
 
-def mutual_information_diversity_loss(k_logits: torch.Tensor, layer_logits: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def mutual_information_diversity_loss(
+    k_logits: torch.Tensor, layer_logits: torch.Tensor, temperature: float = 1.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return negative I(prompt; K) and negative I(prompt; first layer).
 
     A per-example entropy bonus alone can leave every prompt with the same
@@ -101,12 +103,46 @@ def mutual_information_diversity_loss(k_logits: torch.Tensor, layer_logits: torc
     It does not prescribe a particular K or layer for any example.
     """
     def negative_mi(logits: torch.Tensor) -> torch.Tensor:
-        probs = F.softmax(logits, dim=-1)
+        # Using T=1 rewarded harmless changes in soft probability while the
+        # actual deployment argmax remained permanently K=3.  A low but finite
+        # temperature makes this a surrogate for diversity of discrete routes.
+        probs = F.softmax(logits / max(float(temperature), 1e-3), dim=-1)
         marginal = probs.mean(dim=0)
         h_marginal = -(marginal * marginal.clamp_min(1e-8).log()).sum()
         h_conditional = -(probs * probs.clamp_min(1e-8).log()).sum(dim=-1).mean()
         return h_conditional - h_marginal
     return negative_mi(k_logits), negative_mi(layer_logits)
+
+
+def counterfactual_k_preference_loss(
+    k_logits: torch.Tensor,
+    k_a: torch.Tensor,
+    k_b: torch.Tensor,
+    reward_0: torch.Tensor,
+    reward_a: torch.Tensor,
+    reward_b: torch.Tensor,
+    temperature: float = 0.05,
+) -> torch.Tensor:
+    """Distil observed {K=0, K_a, K_b} counterfactual rewards into K logits.
+
+    Each row supervises only actions actually evaluated for that prompt.  This
+    is not a fixed K schedule: K=0 wins only when its unsteered reward exceeds
+    the sampled intervention routes.  Duplicate sampled K values are averaged
+    before the soft preference target is formed.
+    """
+    B, n_actions = k_logits.shape
+    rewards_sum = torch.zeros(B, n_actions, device=k_logits.device, dtype=k_logits.dtype)
+    counts = torch.zeros_like(rewards_sum)
+    zero = torch.zeros_like(k_a)
+    for actions, rewards in ((zero, reward_0), (k_a, reward_a), (k_b, reward_b)):
+        actions = actions.long().clamp(0, n_actions - 1)
+        rewards_sum.scatter_add_(1, actions.unsqueeze(1), rewards.to(k_logits.dtype).unsqueeze(1))
+        counts.scatter_add_(1, actions.unsqueeze(1), torch.ones_like(rewards, dtype=k_logits.dtype).unsqueeze(1))
+    observed = counts > 0
+    mean_reward = rewards_sum / counts.clamp_min(1)
+    target_scores = (mean_reward / max(float(temperature), 1e-4)).masked_fill(~observed, float("-inf"))
+    target = F.softmax(target_scores, dim=-1)
+    return -(target * F.log_softmax(k_logits, dim=-1)).sum(dim=-1).mean()
 
 def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
                               labels: torch.Tensor, cfg, prompt_mask: torch.Tensor = None,
@@ -243,7 +279,10 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             mean_pair_interaction = interaction[valid_pair].mean()
 
     h_k, h_subset = policy_entropy_bonus(u_fresh, k_logits_fresh, K_max)
-    k_mi_loss, layer_mi_loss = mutual_information_diversity_loss(k_logits_fresh, u_fresh)
+    diversity_temp = float(getattr(cfg, "router_diversity_temperature", 1.0))
+    k_mi_loss, layer_mi_loss = mutual_information_diversity_loss(
+        k_logits_fresh, u_fresh, temperature=diversity_temp,
+    )
 
     beta_k = getattr(cfg, "beta_entropy_k", 0.15)
     beta_subset = getattr(cfg, "beta_entropy_subset", 0.15)
@@ -255,6 +294,11 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     lambda_synergy = getattr(cfg, "lambda_synergy", 0.10)
     lambda_k_mi = getattr(cfg, "lambda_router_k_mi", 0.0)
     lambda_layer_mi = getattr(cfg, "lambda_router_layer_mi", 0.0)
+    k_preference_loss = counterfactual_k_preference_loss(
+        k_logits_fresh, k_a, k_b, reward_0, reward_a, reward_b,
+        temperature=float(getattr(cfg, "router_k_preference_temperature", 0.05)),
+    )
+    lambda_k_preference = float(getattr(cfg, "lambda_router_k_preference", 0.0))
 
     # Target-K Centering Loss: penalizes mean K deviating from balanced sweet spot K* = 2.2
     mean_sampled_k = ((k_a.float() + k_b.float()) / 2.0).mean()
@@ -270,6 +314,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         + lambda_k_center * k_center_loss
         + lambda_k_mi * k_mi_loss
         + lambda_layer_mi * layer_mi_loss
+        + lambda_k_preference * k_preference_loss
     )
 
     win_rate = ((reward_a > reward_0).float() + (reward_b > reward_0).float()).mean().item() / 2.0
@@ -286,6 +331,12 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         "mean_k_sampled": float(((k_a.float() + k_b.float()) / 2).mean().item()),
         "k_mi_loss": float(k_mi_loss.detach().item()),
         "layer_mi_loss": float(layer_mi_loss.detach().item()),
+        "k_preference_loss": float(k_preference_loss.detach().item()),
+        "k0_probability": float(F.softmax(k_logits_fresh.detach(), dim=-1)[:, 0].mean().item()),
+        "argmax_k_distribution": {
+            int(k): float((k_logits_fresh.detach().argmax(dim=-1) == k).float().mean().item())
+            for k in range(k_logits_fresh.shape[-1])
+        },
         "sampled_k": [int(k.item()) for k in torch.cat([k_a.view(-1), k_b.view(-1)])],
     }
     return loss, diag

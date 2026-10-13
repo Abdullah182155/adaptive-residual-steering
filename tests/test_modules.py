@@ -11,7 +11,7 @@ from src.steering.steernet import RSCSteerNet
 from src.gating.gate import RSCUsefulnessGate
 from src.models.wrapper import Phi2WithRSC
 from src.routing.router import JointLayerRouter
-from src.routing.rloo import sample_k, sample_subset_plackett_luce, policy_entropy_bonus, mutual_information_diversity_loss
+from src.routing.rloo import sample_k, sample_subset_plackett_luce, policy_entropy_bonus, mutual_information_diversity_loss, counterfactual_k_preference_loss
 from src.training import (
     train_rsc,
     train_phase1_steernet,
@@ -99,6 +99,21 @@ class TestARSModules(unittest.TestCase):
         self.assertLess(varied_losses[0], collapsed_losses[0])
         self.assertLess(varied_losses[1], collapsed_losses[1])
 
+    def test_counterfactual_k_preference_trains_unsteered_when_it_wins(self):
+        # K=0 is not prescribed: it receives the largest target probability
+        # only because its observed counterfactual reward is largest.
+        logits = torch.zeros(2, 5, requires_grad=True)
+        k_a = torch.tensor([2, 3])
+        k_b = torch.tensor([4, 1])
+        loss = counterfactual_k_preference_loss(
+            logits, k_a, k_b,
+            reward_0=torch.tensor([0.0, 0.0]),
+            reward_a=torch.tensor([-1.0, -1.0]),
+            reward_b=torch.tensor([-2.0, -2.0]),
+        )
+        loss.backward()
+        self.assertLess(logits.grad[:, 0].mean().item(), 0.0)
+
     def test_config_attributes(self):
         cfg = RSCConfig()
         required_attrs = [
@@ -108,7 +123,8 @@ class TestARSModules(unittest.TestCase):
             "gate_retune_epochs", "gate_retune_lr", "phase2_save_path", "lora_save_path",
             "prompt_shielding", "lambda_synergy", "router_balance_weight", "lambda_cost",
             "beta_entropy_k", "beta_entropy_subset", "min_reliable_validation_examples",
-            "allow_inconclusive_small_runs",
+            "allow_inconclusive_small_runs", "router_preflight_examples",
+            "router_fail_fast_on_collapse", "lambda_router_k_preference",
         ]
         for attr in required_attrs:
             self.assertTrue(hasattr(cfg, attr), f"Missing config attribute: {attr}")

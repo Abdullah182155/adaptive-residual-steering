@@ -178,6 +178,7 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             progress_desc=f"Acceptance L{best['layer']} accuracy",
         )
         nll_reduction = (base_train_nll - best["train_nll"]) / max(base_train_nll, 1e-8)
+        val_nll_reduction = (base_val_nll - best["val_nll"]) / max(base_val_nll, 1e-8)
         acc_gain = selected_train_acc - base_train_acc
         cfg.fixed_steer_eval_layers = [best["layer"]]
         report = {
@@ -188,19 +189,26 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "selected_layer": best["layer"],
             "selected_train_accuracy": selected_train_acc,
             "train_relative_nll_reduction": nll_reduction,
+            "val_relative_nll_reduction": val_nll_reduction,
             "train_accuracy_gain": acc_gain,
             "validation_examples": val_n,
             "reliability_waived": small_run_waiver,
             "passed": (
                 nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
+                and val_nll_reduction >= float(cfg.phase1_min_val_nll_reduction)
                 and acc_gain >= float(cfg.phase1_min_train_accuracy_gain)
             ),
         }
         print(
             "  Phase-1 acceptance: "
-            f"layer=L{best['layer']} | train NLL Δ={nll_reduction * 100:+.1f}% "
+            f"layer=L{best['layer']} | train/val NLL Δ={nll_reduction * 100:+.1f}%/{val_nll_reduction * 100:+.1f}% "
             f"| train acc Δ={acc_gain * 100:+.1f}pp | {'PASS' if report['passed'] else 'FAIL'}"
         )
+        if acc_gain < float(getattr(cfg, "phase1_accuracy_warning_gain", 0.05)):
+            print(
+                "  ⚠️ Generation improvement is below the reporting target; NLL capacity is accepted, "
+                "but the final fixed-SteerNet benchmark must confirm a meaningful accuracy gain."
+            )
         print(f"  Acceptance audit finished in {(time.monotonic() - started_at) / 60:.1f} min.")
         if not report["passed"] and small_run_waiver:
             report["status"] = "INCONCLUSIVE"
@@ -297,6 +305,68 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
             )
         elif failures:
             raise RuntimeError("ARS intervention health gate failed: " + "; ".join(failures))
+        return report
+    finally:
+        model.set_router_inference_mode(previous_mode)
+        if previous_override is None:
+            model.set_routing_override(None)
+        else:
+            model.set_routing_override(previous_override[0], previous_override[1])
+
+
+def audit_router_policy_health(model, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
+    """Verify deterministic K/layer diversity before expensive gate training.
+
+    Bootstrap sampling can look diverse even if every deployment argmax is the
+    same K and triplet.  This preflight runs the deployment policy itself, so
+    a collapsed router is rejected before Phase 2B consumes hours of GPU time.
+    """
+    previous_mode = getattr(model, "_router_inference_mode", "argmax")
+    previous_override = model._routing_override
+    model.reset_routing_diagnostics()
+    model.eval()
+    model.set_router_inference_mode("argmax")
+    model.set_routing_override(None)
+    n = min(int(getattr(cfg, "router_preflight_examples", 128)), len(eval_data))
+    waiver = _small_run_waiver(n, cfg)
+    try:
+        with torch.no_grad():
+            for i in range(n):
+                row = eval_data[i]
+                ids = row["input_ids"].unsqueeze(0).to(device)
+                mask = row["attention_mask"].unsqueeze(0).to(device)
+                labels = row["labels"].unsqueeze(0).to(device)
+                shield = row.get("prompt_shield_mask")
+                shield = shield.unsqueeze(0).to(device) if shield is not None else None
+                model._attn_mask_cache = mask
+                _set_batch_context(model, mask, labels, shield)
+                _ = model(input_ids=ids, attention_mask=mask, use_cache=False)
+        report = model.intervention_diagnostics()
+        failures = []
+        k_dist = report["realized_k_distribution"]
+        if cfg.router_require_eval_k0 and k_dist.get(0, 0.0) <= 0.0:
+            failures.append("K=0 was never selected")
+        if report["realized_k_support"] < int(cfg.router_min_eval_k_support):
+            failures.append(f"K support={report['realized_k_support']} < {cfg.router_min_eval_k_support}")
+        if report["realized_k_entropy"] < float(cfg.router_min_eval_k_entropy):
+            failures.append(f"K entropy={report['realized_k_entropy']:.3f} < {cfg.router_min_eval_k_entropy}")
+        if report["active_layer_count"] < int(cfg.router_min_eval_active_layers):
+            failures.append(f"active layers={report['active_layer_count']} < {cfg.router_min_eval_active_layers}")
+        if report["layer_selection_entropy"] < float(cfg.router_min_eval_layer_entropy):
+            failures.append(f"layer entropy={report['layer_selection_entropy']:.3f} < {cfg.router_min_eval_layer_entropy}")
+        report.update({
+            "validation_examples": n,
+            "reliability_waived": waiver,
+            "passed": not failures,
+            "failures": failures,
+            "status": "PASS" if not failures else ("INCONCLUSIVE" if waiver else "FAIL"),
+        })
+        print(f"  Router deployment preflight: {report}")
+        if failures and not waiver and getattr(cfg, "router_fail_fast_on_collapse", True):
+            raise RuntimeError(
+                "Router bootstrap deployment preflight failed; Phase 2B is blocked to avoid training a gate "
+                "against a collapsed policy: " + "; ".join(failures)
+            )
         return report
     finally:
         model.set_router_inference_mode(previous_mode)
@@ -598,8 +668,18 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
         coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
         top_syn_str = ", ".join(f"L{a}+L{b}:{v:+.2f}" for a, b, v in coop.get("top_synergy_pairs", [])[:2])
         win_str = f" | win_base={rloo_diag.get('win_rate_vs_base', 0.0) * 100:.1f}%" if rloo_diag else ""
+        k_pref_str = (
+            f" | Kpref={rloo_diag.get('k_preference_loss', 0.0):.3f} "
+            f"p(K0)={rloo_diag.get('k0_probability', 0.0):.2f}"
+            if rloo_diag else ""
+        )
+        k_argmax_str = (
+            " | argmax-K=" + ",".join(
+                f"{k}:{v:.2f}" for k, v in rloo_diag.get("argmax_k_distribution", {}).items()
+            ) if rloo_diag else ""
+        )
         syn_str = f" | top synergy: [{top_syn_str}]" if top_syn_str else ""
-        print(f"  RouterBootstrap Epoch {epoch+1}: loss={avg_loss:.4f}{win_str} | active layers={active_cnt}/{len(diag)}{syn_str} | K-dist={k_dist}")
+        print(f"  RouterBootstrap Epoch {epoch+1}: loss={avg_loss:.4f}{win_str}{k_pref_str}{k_argmax_str} | active layers={active_cnt}/{len(diag)}{syn_str} | K-dist={k_dist}")
         if avg_loss < best_loss - 1e-4:
             best_loss, patience_ctr = avg_loss, 0
             best_state = {k: v.clone() for k, v in model.state_dict().items() if "router" in k}
@@ -950,6 +1030,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     # PHASE 1.5: Router Bootstrap
     _, best_p15 = train_router_bootstrap(model, train_data, eval_data, cfg, device)
     logs["router_bootstrap_loss"] = best_p15
+    logs["router_bootstrap_preflight"] = audit_router_policy_health(model, eval_data, cfg, device)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

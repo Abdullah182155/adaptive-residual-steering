@@ -48,7 +48,11 @@ class RSCConfig:
     phase1_acceptance_examples: int = 64
     phase1_acceptance_accuracy_examples: int = 32
     phase1_min_train_nll_reduction: float = 0.05
-    phase1_min_train_accuracy_gain: float = 0.05
+    phase1_min_val_nll_reduction: float = 0.05
+    # Generation on a 32-example diagnostic set has 3.125pp granularity; it
+    # is a non-regression guard, not a statistically valid +5pp gate.
+    phase1_min_train_accuracy_gain: float = 0.0
+    phase1_accuracy_warning_gain: float = 0.05
     # A four-example holdout cannot establish a scientific capacity or
     # routing-health claim.  Tiny smoke runs still execute every phase and
     # emit their measurements, but their acceptance/health failures are
@@ -106,6 +110,8 @@ class RSCConfig:
     router_bootstrap_patience: int = 2
     router_bootstrap_save_path: str = "./checkpoints/router_catalog_v14.pt"
     router_rloo_batch_size: int = 8  # enables batch-level policy diversity, unlike a B=1 RLOO probe
+    router_preflight_examples: int = 128
+    router_fail_fast_on_collapse: bool = True
     intervention_audit_examples: int = 128
     router_min_eval_k_support: int = 3
     router_require_eval_k0: bool = True
@@ -129,8 +135,16 @@ class RSCConfig:
     # Maximise I(prompt; route): varied marginal choices but confident,
     # prompt-dependent routes.  This is exploration regularisation only; the
     # counterfactual reward remains the quality signal.
-    lambda_router_k_mi: float = 0.02
-    lambda_router_layer_mi: float = 0.02
+    # Low-temperature MI acts on near-discrete choices, preventing a router
+    # whose soft probabilities vary slightly while every argmax is identical.
+    router_diversity_temperature: float = 0.35
+    lambda_router_k_mi: float = 0.10
+    lambda_router_layer_mi: float = 0.10
+    # Directly distil the three counterfactual rewards (K=0, K_a, K_b) into
+    # the deterministic K head.  RLOO alone updates sampled log-probabilities
+    # and allowed a global K=3 bias to survive at argmax deployment.
+    lambda_router_k_preference: float = 0.25
+    router_k_preference_temperature: float = 0.05
     router_layer_dropout: float = 0.15  # Stochastic candidate dropout during training to prevent clique stacking
     router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
     router_eval_mode: str = "argmax"  # deterministic: argmax; stochastic sampling is training-only by default
