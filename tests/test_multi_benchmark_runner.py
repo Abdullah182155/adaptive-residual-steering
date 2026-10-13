@@ -151,6 +151,19 @@ class TestMultiBenchmarkRunner(unittest.TestCase):
         self.assertIn(r"\textbf{+10.00\%}", latex_str)
         self.assertIn(r"\end{table*}", latex_str)
 
+    def test_latex_bolds_the_actual_row_winner_not_ars_by_default(self):
+        tree = {
+            "gsm8k": {
+                "baseline": {"0_shot": 40.0},
+                "fixed_steernet": {"0_shot": 45.0},
+                "steernet": {"0_shot": 39.0},
+                "ars": {"0_shot": 34.0},
+            }
+        }
+        latex_str = export_latex_summary_table(tree)
+        self.assertIn(r"\textbf{45.00\%}", latex_str)
+        self.assertNotIn(r"\textbf{34.00\%}", latex_str)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,7 +82,11 @@ class RSCConfig:
     gate_constant_value: float = 0.80
 
     # Gate loss regularisation
-    lambda_pg: float = 0.5
+    # Do not use one global ON/OFF reward to update every token gate.  That
+    # estimator has no token credit assignment and drives all alphas together
+    # toward saturation.  The differentiable answer-aware task loss provides
+    # the correct local gate signal; generation PG remains opt-in research.
+    lambda_pg: float = 0.0
     lambda_l1_gate: float = 0.001
     lambda_gate_usefulness: float = 0.30
     lambda_gate_antisat: float = 0.25

@@ -811,7 +811,13 @@ def run_staged_phase(
             # task graph.  Reusing the live gate alphas below avoids the old
             # extra graph on a 4-example PG batch, the direct cause of T4 OOM.
             pg_advantage = None
-            if train_gate and not train_steer and accum_count == 0 and global_step % cfg.pg_every_n_steps == 0:
+            if (
+                train_gate
+                and not train_steer
+                and float(getattr(cfg, "lambda_pg", 0.0)) > 0.0
+                and accum_count == 0
+                and global_step % cfg.pg_every_n_steps == 0
+            ):
                 pg_advantage = compute_pg_advantage_lite(
                     model, tokenizer, ids, lbls, device, cfg, baseline_ema,
                     attention_masks=mask,

@@ -143,10 +143,11 @@ class TestARSModules(unittest.TestCase):
             "allow_inconclusive_small_runs", "router_preflight_examples",
             "router_fail_fast_on_collapse", "lambda_router_k_preference",
             "continue_on_diagnostic_failure", "answer_tail_tokens",
-            "answer_tail_weight", "router_synergy_limit",
+            "answer_tail_weight", "router_synergy_limit", "lambda_pg",
         ]
         for attr in required_attrs:
             self.assertTrue(hasattr(cfg, attr), f"Missing config attribute: {attr}")
+        self.assertEqual(cfg.lambda_pg, 0.0)
 
     def test_tiny_holdout_marks_audit_inconclusive_not_passed(self):
         cfg = RSCConfig(min_reliable_validation_examples=16, allow_inconclusive_small_runs=True)

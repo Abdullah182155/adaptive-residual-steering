@@ -366,10 +366,27 @@ def export_latex_summary_table(
             s_val = steer_dict.get(shot_k)
             a_val = ars_dict.get(shot_k)
 
-            b_str = f"{b_val:.2f}\\%" if b_val is not None else "--"
-            f_str = f"{f_val:.2f}\\%" if f_val is not None else "--"
-            s_str = f"{s_val:.2f}\\%" if s_val is not None else "--"
-            a_str = f"\\textbf{{{a_val:.2f}\\%}}" if a_val is not None else "--"
+            row_values = {
+                "baseline": b_val,
+                "fixed_steernet": f_val,
+                "steernet": s_val,
+                "ars": a_val,
+            }
+            observed = [value for value in row_values.values() if value is not None]
+            best_value = max(observed) if observed else None
+
+            def render(value):
+                if value is None:
+                    return "--"
+                text = f"{value:.2f}\\%"
+                # A publication table must never make ARS look best merely
+                # because it is the proposed method.  Ties are all bolded.
+                return f"\\textbf{{{text}}}" if value == best_value else text
+
+            b_str = render(b_val)
+            f_str = render(f_val)
+            s_str = render(s_val)
+            a_str = render(a_val)
 
             if a_val is not None and b_val is not None:
                 diff = a_val - b_val
