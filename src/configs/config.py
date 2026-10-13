@@ -59,6 +59,10 @@ class RSCConfig:
     # reported as INCONCLUSIVE rather than terminating the notebook.
     min_reliable_validation_examples: int = 16
     allow_inconclusive_small_runs: bool = True
+    # Diagnostic gates always record a failed scientific condition, but a
+    # Kaggle run continues to save checkpoints, plots, and audit evidence.
+    # This must never turn a warning into a claimed PASS.
+    continue_on_diagnostic_failure: bool = True
 
     # Phase 2 staged parameters
     phase2_warmup_ratio: float = 0.03
@@ -111,7 +115,7 @@ class RSCConfig:
     router_bootstrap_save_path: str = "./checkpoints/router_catalog_v14.pt"
     router_rloo_batch_size: int = 8  # enables batch-level policy diversity, unlike a B=1 RLOO probe
     router_preflight_examples: int = 128
-    router_fail_fast_on_collapse: bool = True
+    router_fail_fast_on_collapse: bool = False
     intervention_audit_examples: int = 128
     router_min_eval_k_support: int = 3
     router_require_eval_k0: bool = True

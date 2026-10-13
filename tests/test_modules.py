@@ -125,6 +125,7 @@ class TestARSModules(unittest.TestCase):
             "beta_entropy_k", "beta_entropy_subset", "min_reliable_validation_examples",
             "allow_inconclusive_small_runs", "router_preflight_examples",
             "router_fail_fast_on_collapse", "lambda_router_k_preference",
+            "continue_on_diagnostic_failure",
         ]
         for attr in required_attrs:
             self.assertTrue(hasattr(cfg, attr), f"Missing config attribute: {attr}")

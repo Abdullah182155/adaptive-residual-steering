@@ -217,11 +217,14 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 "validate SteerNet capacity. Continuing only as a pipeline smoke test."
             )
         elif not report["passed"]:
-            report["status"] = "FAIL"
-            raise RuntimeError(
-                "Phase-1 SteerNet acceptance failed. Router/gate training is blocked because no independently "
-                "useful steering direction was established. Inspect the candidate report before changing ARS."
+            report["status"] = "FAIL_CONTINUED"
+            warning = (
+                "  ⚠️ Phase-1 SteerNet acceptance FAILED. Router/gate results are diagnostic-only because "
+                "independent steering capacity was not established. Continuing to preserve checkpoints and evidence."
             )
+            print(warning)
+            if not getattr(cfg, "continue_on_diagnostic_failure", True):
+                raise RuntimeError(warning)
         else:
             report["status"] = "PASS"
         return report
@@ -296,7 +299,7 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
         report["failures"] = failures
         report["validation_examples"] = n
         report["reliability_waived"] = small_run_waiver
-        report["status"] = "PASS" if not failures else ("INCONCLUSIVE" if small_run_waiver else "FAIL")
+        report["status"] = "PASS" if not failures else ("INCONCLUSIVE" if small_run_waiver else "FAIL_CONTINUED")
         print(f"  ARS intervention audit: {report}")
         if failures and small_run_waiver:
             print(
@@ -304,7 +307,13 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
                 "K/layer/gate diversity. Continuing only as a pipeline smoke test."
             )
         elif failures:
-            raise RuntimeError("ARS intervention health gate failed: " + "; ".join(failures))
+            warning = (
+                "  ⚠️ ARS intervention health FAILED. Final checkpoint is retained for diagnosis only: "
+                + "; ".join(failures)
+            )
+            print(warning)
+            if not getattr(cfg, "continue_on_diagnostic_failure", True):
+                raise RuntimeError(warning)
         return report
     finally:
         model.set_router_inference_mode(previous_mode)
@@ -359,14 +368,17 @@ def audit_router_policy_health(model, eval_data, cfg: RSCConfig, device: torch.d
             "reliability_waived": waiver,
             "passed": not failures,
             "failures": failures,
-            "status": "PASS" if not failures else ("INCONCLUSIVE" if waiver else "FAIL"),
+            "status": "PASS" if not failures else ("INCONCLUSIVE" if waiver else "FAIL_CONTINUED"),
         })
         print(f"  Router deployment preflight: {report}")
-        if failures and not waiver and getattr(cfg, "router_fail_fast_on_collapse", True):
-            raise RuntimeError(
-                "Router bootstrap deployment preflight failed; Phase 2B is blocked to avoid training a gate "
-                "against a collapsed policy: " + "; ".join(failures)
+        if failures and not waiver:
+            warning = (
+                "  ⚠️ Router deployment preflight FAILED. Continuing with diagnostic-only Phase 2 results: "
+                + "; ".join(failures)
             )
+            print(warning)
+            if getattr(cfg, "router_fail_fast_on_collapse", False) and not getattr(cfg, "continue_on_diagnostic_failure", True):
+                raise RuntimeError(warning)
         return report
     finally:
         model.set_router_inference_mode(previous_mode)
