@@ -88,13 +88,15 @@ class JointLayerRouter(nn.Module):
         nn.init.zeros_(self.k_head.weight)
         nn.init.zeros_(self.k_head.bias)
 
-        # Diagnostic tracking buffers (detached, real decisions only)
-        self.register_buffer("logit_ema", torch.zeros(n_candidates))
-        self.register_buffer("logit_sq_ema", torch.zeros(n_candidates))
-        self.register_buffer("selection_rate_ema", torch.full((n_candidates,), 0.5))
-        self.register_buffer("k_dist_ema", torch.full((max_active_layers + 1,), 1.0 / (max_active_layers + 1)))
-        self.register_buffer("selected_forwards", torch.zeros(n_candidates, dtype=torch.long))
-        self.register_buffer("seen_forwards", torch.zeros(n_candidates, dtype=torch.long))
+        # Diagnostic tracking buffers (detached, real decisions only).
+        # ISSUE-18 fix: persistent=False → not saved/loaded with checkpoints.
+        # Prevents hash churn and eliminates stale EMAs across runs.
+        self.register_buffer("logit_ema", torch.zeros(n_candidates), persistent=False)
+        self.register_buffer("logit_sq_ema", torch.zeros(n_candidates), persistent=False)
+        self.register_buffer("selection_rate_ema", torch.full((n_candidates,), 0.5), persistent=False)
+        self.register_buffer("k_dist_ema", torch.full((max_active_layers + 1,), 1.0 / (max_active_layers + 1)), persistent=False)
+        self.register_buffer("selected_forwards", torch.zeros(n_candidates, dtype=torch.long), persistent=False)
+        self.register_buffer("seen_forwards", torch.zeros(n_candidates, dtype=torch.long), persistent=False)
 
         self._last_scalars = None
         self._last_pooled = None

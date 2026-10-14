@@ -904,6 +904,8 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             # --- Step 2: Differentiable K=2 joint-NLL correction for SteerNets ---
             # RLOO runs under no_grad, so SteerNets only receive gradient from this step.
             # We pick the top-synergy pair so the correction reinforces actual cooperation.
+            # OOM FIX: run on a single example (ids[:1]) instead of the full batch.
+            # Full-batch logits.float() = [B,T,V] fp32 → ~800 MB at B=8; single = ~100 MB.
             if lambda_joint > 0.0 and steer_params and len(model.target_layers) >= 2:
                 coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
                 top_pairs = coop.get("top_synergy_pairs", [])
@@ -914,7 +916,12 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                     layer_i, layer_j = model.target_layers[0], model.target_layers[1]
 
                 n_cands = len(model.target_layers)
-                k2_mask = torch.zeros(ids.shape[0], n_cands, dtype=torch.bool, device=device)
+                # Single example: avoids holding B×T×V graph in memory alongside RLOO activations
+                s_ids  = ids[:1]
+                s_mask = mask[:1]
+                s_lbls = lbls[:1]
+                s_shield = shield[:1] if shield is not None else None
+                k2_mask = torch.zeros(1, n_cands, dtype=torch.bool, device=device)
                 if layer_i in model.target_layers:
                     k2_mask[:, model.target_layers.index(layer_i)] = True
                 if layer_j in model.target_layers:
@@ -923,14 +930,19 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                 model.train()
                 model.set_gate_freeze(True, 1.0)
                 model.set_routing_override("matrix", k2_mask)
-                _set_batch_context(model, mask, lbls, shield)
+                _set_batch_context(model, s_mask, s_lbls, s_shield)
+
+                # Free fragmented cache before the differentiable forward
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
                 try:
-                    with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                        joint_out = model(input_ids=ids, attention_mask=mask, use_cache=False)
+                    with torch.amp.autocast("cuda", enabled=s_ids.is_cuda):
+                        joint_out = model(input_ids=s_ids, attention_mask=s_mask, use_cache=False)
                         joint_nll = per_example_answer_nll(
                             joint_out.logits,
-                            lbls,
+                            s_lbls,
                             answer_tail_tokens=int(getattr(cfg, "answer_tail_tokens", 0)),
                             answer_tail_weight=float(getattr(cfg, "answer_tail_weight", 1.0)),
                         ).mean()
@@ -1347,6 +1359,17 @@ def train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg: RSCConfi
     return logs, best_val_p1, best_val_s2
 
 
+def _purge_ckpt(path: str) -> None:
+    """ISSUE-15: delete a checkpoint and its manifest before a new run starts.
+
+    Prevents phases that save nothing (all-NaN val, early exception, best_val
+    never improving on init_best_val) from silently loading a previous run's file.
+    """
+    for p in (path, path + ".manifest.json"):
+        if os.path.exists(p):
+            os.remove(p)
+
+
 def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device):
     """Complete multi-phase staged training pipeline:
     Phase 1: Pure SteerNet (Warmup Rotation, Gates=1.0)
@@ -1360,6 +1383,15 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         return train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg, device)
 
     logs = {}
+
+    # ISSUE-15: purge stale checkpoint files from previous runs before writing new ones
+    for _ckpt_path in (
+        getattr(cfg, "gate_only_save_path", None),
+        getattr(cfg, "steer_finetune_save_path", None),
+        getattr(cfg, "phase2_save_path", None),
+    ):
+        if _ckpt_path:
+            _purge_ckpt(_ckpt_path)
 
     # PHASE 1: Pure SteerNet
     best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(model, train_data, eval_data, cfg, device)

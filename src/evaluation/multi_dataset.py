@@ -235,56 +235,14 @@ def build_benchmark_prompt(dataset_name: str, question: str, n_shot: int = 0) ->
 # ==============================================================================
 
 def extract_numeric_answer(text: str) -> Optional[float]:
-    """Extract numeric answer via strict priority hierarchy."""
-    def safe_float(s: str) -> Optional[float]:
-        try:
-            s = s.replace(",", "").replace("$", "").replace("%", "").strip()
-            if not s or not any(c.isdigit() for c in s):
-                return None
-            return float(s)
-        except (ValueError, AttributeError):
-            return None
+    """Extract numeric answer. Alias of answers.extract_numeric_answer (ISSUE-13 unified extractor).
 
-    # Priority 1: #### <number>
-    m = re.search(r"####\s*\$?(-?\d[\d,]*\.?\d*)", text)
-    if m:
-        return safe_float(m.group(1))
+    The old implementation used r'(?:=|is)\\s*\\$?...' which matched 'is' inside
+    'this'/'his', producing wrong answers. The unified extractor uses '=' only.
+    """
+    from src.evaluation.answers import extract_numeric_answer as _extract
+    return _extract(text)
 
-    # Priority 2: LaTeX \boxed{<num>}
-    m = re.search(r"\\boxed\{\s*\$?(-?\d[\d,]*\.?\d*)\s*\}", text)
-    if m:
-        return safe_float(m.group(1))
-
-    # Priority 3: Final answer [is] <number>
-    m = re.search(r"[Ff]inal\s+answer(?:\s+is)?\s*[:\-]?\s*\$?(-?[\d,]+\.?\d*)", text)
-    if m:
-        return safe_float(m.group(1))
-
-    # Priority 4: The answer is <number>
-    m = re.search(r"[Tt]he\s+answer\s+is\s*[:\-]?\s*\$?(-?[\d,]+\.?\d*)", text)
-    if m:
-        return safe_float(m.group(1))
-
-    # Priority 5: Therefore ... <number>.
-    m = re.search(r"[Tt]herefore[^.]*?(-?\d[\d,]*\.?\d*)[^.]*\.", text)
-    if m:
-        sentence_match = re.search(r"[Tt]herefore[^.]*\.", text)
-        if sentence_match:
-            nums = re.findall(r"-?[\d,]+\.?\d*", sentence_match.group())
-            if nums:
-                return safe_float(nums[-1])
-
-    # Priority 6: Last assignment = or is <number>
-    matches = list(re.finditer(r"(?:=|is)\s*\$?(-?[\d,]+\.?\d*)", text))
-    if matches:
-        return safe_float(matches[-1].group(1))
-
-    # Priority 7: Last standalone number
-    nums = re.findall(r"-?\d[\d,]*\.?\d*", text)
-    if nums:
-        return safe_float(nums[-1])
-
-    return None
 
 
 def extract_choice_answer(text: str) -> Optional[str]:
@@ -486,25 +444,40 @@ def load_benchmark_dataset(
             for row in ds:
                 q_text = row.get("problem", "")
                 ans_raw = row.get("answer", "")
-                gold_val = extract_numeric_answer(str(ans_raw))
+                # MATH-500 answers are LaTeX strings (e.g. '\frac{14}{3}', '9', '\text{Evelyn}').
+                # Preserve the raw string; try to parse as float for purely numeric answers.
+                ans_str = str(ans_raw).strip()
+                try:
+                    gold_val: Optional[float] = float(ans_str.replace(",", ""))
+                except (ValueError, TypeError):
+                    # Keep as string — evaluate_sample_answer handles LaTeX string comparison
+                    gold_val = ans_str if ans_str else None  # type: ignore[assignment]
                 samples.append({
                     "question": q_text,
                     "gold": gold_val,
                     "dataset": "math500",
                 })
 
+
         elif key in {"gsm_plus", "gsmplus"}:
             ds = load_dataset("qintongli/GSM-Plus", split="test")
             ds = ds.shuffle(seed=seed).select(range(min(n_samples, len(ds))))
             for row in ds:
                 q_text = row.get("question", "")
-                ans_str = row.get("answer", "")
-                gold_val = extract_numeric_answer(str(ans_str))
+                # qintongli/GSM-Plus stores answer as a plain number string e.g. '27',
+                # not in #### format. Try direct float() first, then extractor fallback.
+                ans_raw = row.get("answer", "")
+                ans_str = str(ans_raw).strip().replace(",", "")
+                try:
+                    gold_val: Optional[float] = float(ans_str)
+                except (ValueError, TypeError):
+                    gold_val = extract_numeric_answer(ans_str)
                 samples.append({
                     "question": q_text,
                     "gold": gold_val,
                     "dataset": "gsm_plus",
                 })
+
 
         else:
             raise ValueError(f"Unknown benchmark dataset name: {dataset_name}")

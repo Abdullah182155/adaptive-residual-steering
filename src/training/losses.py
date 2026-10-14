@@ -10,19 +10,25 @@ from src.data.dataset import PromptTemplateBank
 from src.evaluation.verifier import extract_final_answer
 
 class LRReducer:
-    def __init__(
-        self,
-        optimizer,
-        total_steps,
-        factor=0.5,
-        patience=3,
-        min_lr=1e-6,
-        delta=1e-4,
-        warmup_steps=0,
-    ):
+    """Cosine LR schedule with linear warmup and plateau-triggered peak reduction.
+
+    ISSUE-10 fix — two bugs in the original:
+    1. Warmup was a no-op: `step = max(0, current_step - warmup_steps)` made
+       `step == 0` throughout warmup, so `cosine_factor == 1.0` from step 1 (full LR).
+    2. Plateau set `current_step = warmup_steps`, restarting the cosine from its peak —
+       potentially *raising* LR after a plateau (e.g. 2.75e-4 → jump to 2.5e-4 peak).
+
+    Fixed behaviour:
+    - Linear ramp from 0 → base_lr over warmup_steps.
+    - Monotone cosine decay from base_lr → min_lr over the remaining steps.
+    - Plateau only shrinks the peak (base_lrs) and keeps the schedule position.
+    """
+
+    def __init__(self, optimizer, total_steps, factor=0.5, patience=3,
+                 min_lr=1e-6, delta=1e-4, warmup_steps=0):
         self.optimizer = optimizer
-        self.total_steps = total_steps
-        self.warmup_steps = warmup_steps
+        self.total_steps = max(1, int(total_steps))
+        self.warmup_steps = max(0, int(warmup_steps))
         self.current_step = 0
         self.factor = factor
         self.patience = patience
@@ -34,31 +40,35 @@ class LRReducer:
         self.original_base_lrs = list(self.base_lrs)
         self.n_reductions = 0
 
+    def _schedule_factor(self) -> float:
+        if self.warmup_steps > 0 and self.current_step < self.warmup_steps:
+            # Linear warmup: 1/warmup_steps → 1.0
+            return (self.current_step + 1) / float(self.warmup_steps)
+        remaining = max(1, self.total_steps - self.warmup_steps)
+        progress = min(1.0, (self.current_step - self.warmup_steps) / remaining)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
     def step(self, val_loss):
+        """Plateau: shrink the peak LR but keep the schedule position (never raises LR)."""
         if val_loss < self.best_loss - self.delta:
-            self.best_loss = val_loss
+            self.best_loss, self.wait = val_loss, 0
+            return
+        self.wait += 1
+        if self.wait >= self.patience:
+            self.n_reductions += 1
+            # Reduce the peak; do NOT reset current_step (would restart cosine from peak)
+            self.base_lrs = [max(lr * self.factor, self.min_lr) for lr in self.base_lrs]
             self.wait = 0
-        else:
-            self.wait += 1
-            if self.wait >= self.patience:
-                self.n_reductions += 1
-                self.base_lrs = [
-                    max(lr * (self.factor**self.n_reductions), self.min_lr) for lr in self.original_base_lrs
-                ]
-                self.current_step = self.warmup_steps
-                self.wait = 0
-                print(
-                    f"  ⚠️ LR reduced (×{self.factor}^{self.n_reductions}): "
-                    f"{[f'{lr:.2e}' for lr in self.base_lrs]}"
-                )
+            print(
+                f"  ⚠️ LR peak reduced (×{self.factor}^{self.n_reductions}): "
+                f"{[f'{lr:.2e}' for lr in self.base_lrs]}"
+            )
 
     def scheduler_step(self):
-        self.current_step += 1
-        step = max(0, self.current_step - self.warmup_steps)
-        remaining = max(1, self.total_steps - self.warmup_steps)
-        cosine_factor = 0.5 * (1 + math.cos(math.pi * step / remaining))
+        f = self._schedule_factor()
         for i, pg in enumerate(self.optimizer.param_groups):
-            pg["lr"] = max(self.min_lr, self.base_lrs[i] * cosine_factor)
+            pg["lr"] = max(self.min_lr, self.base_lrs[i] * f)
+        self.current_step += 1
 
 class CheckpointManager:
     def __init__(self, checkpoint_dir, keep_last=3):

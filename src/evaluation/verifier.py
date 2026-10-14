@@ -82,57 +82,15 @@ def extract_and_verify_equations(text: str) -> Tuple[int, int, List[Tuple[str, b
     return total, correct, details
 
 def extract_final_number(text: str) -> Optional[float]:
-    """Pull the number after '#### ' if present, else fallback to the last number in text."""
-    m = re.search(r"####\s*(-?[\d,]+\.?\d*)", text)
-    if m:
-        try:
-            return float(m.group(1).replace(",", ""))
-        except ValueError:
-            pass
-    nums = re.findall(r"-?\d[\d,]*\.?\d*", text)
-    if nums:
-        try:
-            return float(nums[-1].replace(",", ""))
-        except ValueError:
-            return None
-    return None
+    """Pull the numeric answer from text. Alias of extract_numeric_answer (ISSUE-13 unified extractor)."""
+    from src.evaluation.answers import extract_numeric_answer
+    return extract_numeric_answer(text)
 
 def extract_final_answer(text: str) -> Optional[float]:
-    """Extract numeric answer via strict priority levels."""
-    def safe_float(s: str) -> Optional[float]:
-        try:
-            s = s.replace(",", "").replace("$", "").strip()
-            if not s or not any(c.isdigit() for c in s):
-                return None
-            return float(s)
-        except (ValueError, AttributeError):
-            return None
+    """Extract numeric answer via strict priority levels. Alias of extract_numeric_answer (ISSUE-13 unified extractor)."""
+    from src.evaluation.answers import extract_numeric_answer
+    return extract_numeric_answer(text)
 
-    m = re.search(r"####\s*\$?(-?\d[\d,]*\.?\d*)", text)
-    if m:
-        return safe_float(m.group(1))
-
-    m = re.search(r"[Ff]inal\s+answer(?:\s+is)?\s*[:\-]?\s*\$?(-?[\d,]+\.?\d*)", text)
-    if m:
-        return safe_float(m.group(1))
-
-    m = re.search(r"[Tt]he\s+answer\s+is\s*[:\-]?\s*\$?(-?[\d,]+\.?\d*)", text)
-    if m:
-        return safe_float(m.group(1))
-
-    m = re.search(r"[Tt]herefore[^.]*?(\d[\d,]*\.?\d*)[^.]*\.", text)
-    if m:
-        sentence_match = re.search(r"[Tt]herefore[^.]*\.", text)
-        if sentence_match:
-            nums = re.findall(r"-?[\d,]+\.?\d*", sentence_match.group())
-            if nums:
-                return safe_float(nums[-1])
-
-    matches = list(re.finditer(r"(?:=|is)\s*\$?(-?[\d,]+\.?\d*)", text))
-    if matches:
-        return safe_float(matches[-1].group(1))
-
-    return None
 
 def evaluate_response(response: str, expected: Optional[float], min_steps: int = 1) -> Dict[str, Any]:
     extracted = extract_final_answer(response)
@@ -309,8 +267,10 @@ def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512,
                 eos_token_id=tokenizer.eos_token_id,
                 stopping_criteria=stopping,
                 do_sample=False,
-                repetition_penalty=1.1,
-                no_repeat_ngram_size=6,
+                # ISSUE-12 fix: removed repetition_penalty=1.1 and no_repeat_ngram_size=6.
+                # Those flags penalised recurring arithmetic tokens and banned 6-token prompt
+                # spans (including few-shot template endings like "dollars.\nFinal answer:"),
+                # producing asymmetric confounds between baseline and ARS arms.
                 use_cache=True,
             )
     finally:

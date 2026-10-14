@@ -512,3 +512,41 @@ if __name__ == "__main__":
     unittest.main()
 
 
+
+
+class TestAnswerExtractor(unittest.TestCase):
+    """ISSUE-13: canonical extract_numeric_answer word-boundary tests."""
+
+    def setUp(self):
+        from src.evaluation.answers import extract_numeric_answer as _ex
+        self.ex = _ex
+
+    def test_gsm8k_hash_marker(self):
+        self.assertEqual(self.ex("Step 1: x\n#### 18"), 18)
+
+    def test_comma_number(self):
+        self.assertEqual(self.ex("#### 1,234."), 1234)
+
+    def test_dollar_prefix(self):
+        self.assertEqual(self.ex("Final answer: $6"), 6)
+
+    def test_fallback_last_equals(self):
+        self.assertEqual(self.ex("she gave this 5 away, so 7 - 2 = 5 apples"), 5)
+        self.assertEqual(self.ex("his 12 books and 3 + 4 = 7"), 7)
+
+    def test_no_number_returns_none(self):
+        self.assertIsNone(self.ex("no numbers here"))
+
+    def test_is_substring_bug_fixed(self):
+        # No explicit marker and no '=' in "this 5" → None (old bug returned 5)
+        result = self.ex("she gave this 5 away without any equals")
+        self.assertIsNone(result)
+
+    def test_boxed_marker(self):
+        self.assertEqual(self.ex(r"answer: \boxed{42}"), 42)
+
+    def test_the_answer_is_marker(self):
+        self.assertEqual(self.ex("The answer is: 100"), 100)
+
+    def test_negative_number(self):
+        self.assertEqual(self.ex("#### -5"), -5)
