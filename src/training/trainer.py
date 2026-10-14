@@ -793,10 +793,46 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
 
 
 def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device: torch.device):
-    """Phase 1.5: Router Bootstrap with frozen SteerNet & Gate using RLOO counterfactual loss."""
+    """Phase 1.5: Router Bootstrap with SteerNet compatibility correction (RC-5).
+
+    ROOT CAUSE of router K=1 collapse:
+      Phase 1 trains each SteerNet independently to minimise NLL for K=1.
+      When Phase 1.5 probes K=2 counterfactuals, independently-trained vectors
+      always INTERFERE (their residual deltas partially cancel), so K=2 NLL is
+      genuinely worse than K=1 NLL.  The router correctly learns K=1 is best.
+      Preflight fails.  Phase 2 is skipped.  Vicious cycle.
+
+    RC-5 fix — two mechanisms:
+      1. Compatibility LR: SteerNets are kept TRAINABLE during bootstrap with a
+         tiny lr = bootstrap_steer_compat_lr_scale * router_bootstrap_lr (default
+         5%).  Small enough that Phase-1 corrections are not destroyed; large
+         enough to nudge vectors toward complementarity over many steps.
+      2. Joint-NLL correction: after each RLOO step, we do a DIFFERENTIABLE
+         forward with the top-synergy K=2 pair and backprop only through
+         SteerNet params.  This gives SteerNets a direct training signal to
+         produce complementary (not interfering) deltas for K>1 routes.
+         RLOO itself runs under torch.no_grad() so it cannot teach SteerNets
+         this — the correction step is the only path for that gradient.
+
+    SteerNets are snapshotted before bootstrap and restored if preflight later
+    fails, so Phase-1 work is never permanently destroyed.
+    """
+    # --- Snapshot Phase-1 SteerNet state for safe restore on preflight failure ---
+    steer_snapshot = {
+        k: v.clone() for k, v in model.state_dict().items() if "steer_net" in k
+    }
+
+    # --- RC-5: keep SteerNets TRAINABLE with tiny compatibility LR ---
+    compat_lr_scale = float(getattr(cfg, "bootstrap_steer_compat_lr_scale", 0.05))
+    compat_lr = compat_lr_scale * cfg.router_bootstrap_lr
+    steer_params = []
     for sn in model.steer_nets.values():
         for p in sn.parameters():
-            p.requires_grad = False
+            p.requires_grad = True
+            steer_params.append(p)
+
+    lambda_joint = float(getattr(cfg, "bootstrap_joint_nll_weight", 0.3))
+
     model.set_gate_freeze(True, 1.0)
     model.set_router_warmup(False)
     model.set_routing_override(None)
@@ -805,26 +841,39 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
     for p in router_params:
         p.requires_grad = True
 
-    optimizer = torch.optim.AdamW(router_params, lr=cfg.router_bootstrap_lr, weight_decay=cfg.weight_decay)
+    # Two param groups: router at full LR, SteerNets at compat_lr
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": router_params, "lr": cfg.router_bootstrap_lr},
+            {"params": steer_params, "lr": compat_lr},
+        ],
+        weight_decay=cfg.weight_decay,
+    )
     model.reset_routing_diagnostics()
 
     pool_size = min(cfg.router_bootstrap_n_examples, len(train_data))
     rng = random.Random(cfg.seed)
     subset_idx = rng.sample(range(len(train_data)), pool_size)
+    # best_state now covers router AND steer_nets so the best joint checkpoint is restored
     best_state, best_loss, patience_ctr = None, float("inf"), 0
 
     print("\n" + "=" * 80)
-    print("PHASE 1.5: Router Bootstrap (RLOO Counterfactual Loss)")
-    print(f"           epochs={cfg.router_bootstrap_epochs}, lr={cfg.router_bootstrap_lr}")
+    print("PHASE 1.5: Router Bootstrap + SteerNet Compatibility Correction (RC-5)")
+    print(f"           epochs={cfg.router_bootstrap_epochs}, router_lr={cfg.router_bootstrap_lr:.2e}")
+    print(f"           steer_compat_lr={compat_lr:.2e}  joint_nll_weight={lambda_joint}")
     print("=" * 80)
 
     for epoch in range(cfg.router_bootstrap_epochs):
         random.shuffle(subset_idx)
         model.train()
         running, n_steps = 0.0, 0
+        running_joint_nll, n_joint_steps = 0.0, 0
         counterfactual_k_actions = None
         rloo_batch_size = max(2, int(getattr(cfg, "router_rloo_batch_size", 8)))
-        pbar = tqdm(range(0, len(subset_idx), rloo_batch_size), desc=f"RouterBootstrap {epoch + 1}/{cfg.router_bootstrap_epochs}")
+        pbar = tqdm(
+            range(0, len(subset_idx), rloo_batch_size),
+            desc=f"RouterBootstrap {epoch + 1}/{cfg.router_bootstrap_epochs}",
+        )
         for start in pbar:
             batch_indices = subset_idx[start : start + rloo_batch_size]
             ids = torch.stack([train_data[i]["input_ids"] for i in batch_indices]).to(device)
@@ -836,7 +885,11 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             model._attn_mask_cache = mask
 
             _set_batch_context(model, mask, lbls, shield)
-            prompt_mask = mask.bool() & lbls.eq(-100) & ~(shield.bool() if shield is not None else torch.zeros_like(mask, dtype=torch.bool))
+            prompt_mask = mask.bool() & lbls.eq(-100) & ~(
+                shield.bool() if shield is not None else torch.zeros_like(mask, dtype=torch.bool)
+            )
+
+            # --- Step 1: RLOO router loss (router params + SteerNet compat gradient) ---
             loss, rloo_diag = compute_router_rloo_loss(
                 model, ids, mask, lbls, cfg, prompt_mask=prompt_mask, shield_mask=shield
             )
@@ -846,6 +899,53 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(router_params, cfg.clip_grad)
+            # Note: steer_params grad clipping happens AFTER joint-NLL correction below
+
+            # --- Step 2: Differentiable K=2 joint-NLL correction for SteerNets ---
+            # RLOO runs under no_grad, so SteerNets only receive gradient from this step.
+            # We pick the top-synergy pair so the correction reinforces actual cooperation.
+            if lambda_joint > 0.0 and steer_params and len(model.target_layers) >= 2:
+                coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
+                top_pairs = coop.get("top_synergy_pairs", [])
+                # Use best positive-synergy pair; fall back to first two candidate layers
+                if top_pairs and len(top_pairs[0]) >= 3 and top_pairs[0][2] > 0:
+                    layer_i, layer_j = int(top_pairs[0][0]), int(top_pairs[0][1])
+                else:
+                    layer_i, layer_j = model.target_layers[0], model.target_layers[1]
+
+                n_cands = len(model.target_layers)
+                k2_mask = torch.zeros(ids.shape[0], n_cands, dtype=torch.bool, device=device)
+                if layer_i in model.target_layers:
+                    k2_mask[:, model.target_layers.index(layer_i)] = True
+                if layer_j in model.target_layers:
+                    k2_mask[:, model.target_layers.index(layer_j)] = True
+
+                model.train()
+                model.set_gate_freeze(True, 1.0)
+                model.set_routing_override("matrix", k2_mask)
+                _set_batch_context(model, mask, lbls, shield)
+
+                try:
+                    with torch.amp.autocast("cuda", enabled=ids.is_cuda):
+                        joint_out = model(input_ids=ids, attention_mask=mask, use_cache=False)
+                        joint_nll = per_example_answer_nll(
+                            joint_out.logits,
+                            lbls,
+                            answer_tail_tokens=int(getattr(cfg, "answer_tail_tokens", 0)),
+                            answer_tail_weight=float(getattr(cfg, "answer_tail_weight", 1.0)),
+                        ).mean()
+                    if torch.isfinite(joint_nll):
+                        (lambda_joint * joint_nll).backward()
+                        running_joint_nll += joint_nll.item()
+                        n_joint_steps += 1
+                except Exception:
+                    pass  # never let correction crash the training loop
+                finally:
+                    model.set_routing_override(None)
+
+            # Clip steer params AFTER both backward passes accumulate gradients
+            if steer_params:
+                torch.nn.utils.clip_grad_norm_(steer_params, cfg.clip_grad)
             optimizer.step()
 
             running += loss.item()
@@ -859,6 +959,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             pbar.set_postfix(**postfix_dict)
 
         avg_loss = running / max(1, n_steps)
+        avg_joint = running_joint_nll / max(1, n_joint_steps) if n_joint_steps > 0 else float("nan")
         k_cf_str = (
             " | K counterfactuals={0," + ",".join(str(k) for k in counterfactual_k_actions) + "}"
             if counterfactual_k_actions else ""
@@ -880,10 +981,20 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             ) if rloo_diag else ""
         )
         syn_str = f" | top synergy: [{top_syn_str}]" if top_syn_str else ""
-        print(f"  RouterBootstrap Epoch {epoch+1}: loss={avg_loss:.4f}{win_str}{k_pref_str}{k_argmax_str} | active layers={active_cnt}/{len(diag)}{syn_str}{k_cf_str}")
+        joint_str = f" | joint_nll={avg_joint:.4f}" if n_joint_steps > 0 else ""
+        print(
+            f"  RouterBootstrap Epoch {epoch + 1}: loss={avg_loss:.4f}"
+            f"{win_str}{k_pref_str}{k_argmax_str}"
+            f" | active layers={active_cnt}/{len(diag)}"
+            f"{syn_str}{joint_str}{k_cf_str}"
+        )
         if avg_loss < best_loss - 1e-4:
             best_loss, patience_ctr = avg_loss, 0
-            best_state = {k: v.clone() for k, v in model.state_dict().items() if "router" in k}
+            # Save both router AND steer_nets so best joint checkpoint can be restored
+            best_state = {
+                k: v.clone() for k, v in model.state_dict().items()
+                if "router" in k or "steer_net" in k
+            }
         else:
             patience_ctr += 1
         if patience_ctr >= cfg.router_bootstrap_patience:
@@ -891,6 +1002,12 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
 
     if best_state:
         model.load_state_dict(best_state, strict=False)
+
+    # Re-freeze SteerNets after bootstrap; router stays trained
+    for sn in model.steer_nets.values():
+        for p in sn.parameters():
+            p.requires_grad = False
+
     model.set_routing_override(None)
     save_path = cfg.router_bootstrap_save_path
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
@@ -898,7 +1015,9 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
     # Now uses save_ars_checkpoint for consistency with all other phases.
     save_ars_checkpoint(model, save_path, phase='phase1.5-router-bootstrap', cfg=cfg, prefixes=('router.',))
     print(f"✅ Router Bootstrap complete — best_probe_loss = {best_loss:.4f}")
-    return best_state, best_loss
+    # steer_snapshot is returned so the caller can restore Phase-1 SteerNet state
+    # if the router preflight subsequently fails (prevents corrupting Phase-1 work).
+    return best_state, best_loss, steer_snapshot
 
 
 def run_staged_phase(
@@ -1286,8 +1405,8 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print(f"   Final saved checkpoint        : {cfg.phase2_save_path}")
         return logs, best_val_p1, best_val_p1
 
-    # PHASE 1.5: Router Bootstrap
-    _, best_p15 = train_router_bootstrap(model, train_data, eval_data, cfg, device)
+    # PHASE 1.5: Router Bootstrap (RC-5: returns steer_snapshot for safe restore)
+    _, best_p15, steer_snapshot_p15 = train_router_bootstrap(model, train_data, eval_data, cfg, device)
     logs["router_bootstrap_loss"] = best_p15
     logs["router_bootstrap_preflight"] = audit_router_policy_health(model, eval_data, cfg, device)
     router_report = logs["router_bootstrap_preflight"]
@@ -1300,6 +1419,10 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print("ROUTER DEPLOYMENT GATE: ADAPTIVE PHASES SKIPPED")
         print("         Deployment argmax collapsed; Gate/Phase 2 cannot make this a valid ARS policy.")
         print("         Retaining Phase-1 and Router diagnostics; no Full-ARS checkpoint claim is produced.")
+        # RC-5: restore Phase-1 SteerNet state so bootstrap didn't corrupt the best known checkpoint
+        if steer_snapshot_p15:
+            model.load_state_dict(steer_snapshot_p15, strict=False)
+            print("         ↩️  Phase-1 SteerNet weights restored (bootstrap did not improve preflight).")
         print("=" * 80)
         logs["adaptive_phases_status"] = "SKIPPED_COLLAPSED_ROUTER"
         logs["ars_intervention_audit"] = {

@@ -174,6 +174,15 @@ class RSCConfig:
     router_bootstrap_lr: float = 1e-3
     router_bootstrap_patience: int = 2
     router_bootstrap_save_path: str = "./checkpoints/router_catalog_v14.pt"
+    # RC-5 root-cause fix: SteerNets trained independently for K=1 always produce
+    # interfering residual vectors when combined, making K>1 NLL strictly worse than
+    # K=1 — so the router rationally collapses to K=1. Fix: keep SteerNets trainable
+    # during bootstrap with a tiny "compatibility LR" (= scale * router_bootstrap_lr)
+    # so they learn complementary directions. A differentiable K=2 joint-NLL correction
+    # (run after each RLOO step through the top-synergy pair) provides the direct
+    # gradient that RLOO's no_grad cannot. See train_router_bootstrap docstring.
+    bootstrap_steer_compat_lr_scale: float = 0.05   # SteerNet LR = 5% of router LR
+    bootstrap_joint_nll_weight: float = 0.3          # weight of K=2 joint-NLL correction
     router_rloo_batch_size: int = 8  # enables batch-level policy diversity, unlike a B=1 RLOO probe
     router_preflight_examples: int = 128
     router_fail_fast_on_collapse: bool = False
