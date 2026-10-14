@@ -64,7 +64,16 @@ class JointLayerRouter(nn.Module):
 
         # Cross-layer cooperation & synergy projection
         self.synergy_proj = nn.Linear(d_model, d_model, bias=False)
-        nn.init.orthogonal_(self.synergy_proj.weight, gain=0.1)
+        # RC-3 fix: was orthogonal_(gain=0.1) which made synergy_proj perpendicular to
+        # input space, causing cosine_sim(proj(x), x) ~= 0 or negative from the first
+        # forward pass. Every pair scored ~-0.54 (uniform negative synergy) regardless
+        # of actual layer compatibility, so the router correctly learned K=1 is always
+        # better. Fix: near-identity init (scaled eye + small noise) so synergy starts
+        # at 0.0 (neutral) and learns from actual counterfactual interaction signals.
+        d_syn = self.synergy_proj.weight.shape[0]
+        nn.init.eye_(self.synergy_proj.weight)
+        with torch.no_grad():
+            self.synergy_proj.weight.add_(torch.randn_like(self.synergy_proj.weight) * 0.01)
         # A pair-specific residual prevents one shared projection from
         # broadcasting the sign of a single destructive pair to every pair.
         # It is deliberately zero-initialised: no cooperation is assumed

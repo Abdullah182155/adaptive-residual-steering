@@ -193,10 +193,18 @@ class RSCConfig:
     # A route is charged a per-layer intervention tariff relative to the
     # unsteered answer NLL of the same example.  The former fixed 0.025 cost
     # was negligible beside 0.2--0.4 NLL deltas, so K=4 won almost always.
-    lambda_cost: float = 0.025  # absolute floor for already-easy examples
-    router_relative_k_cost: float = 0.10
-    beta_entropy_k: float = 0.03  # was 0.30 — 10× reduction; old value drowned RLOO policy signal
-    beta_entropy_subset: float = 0.02  # was 0.15 — let router specialize layer selection
+    # RC-2 fix: lambda_cost 0.025->0.005 (absolute floor only for near-zero NLL examples)
+    lambda_cost: float = 0.005
+    # RC-2 fix: router_relative_k_cost 0.10->0.03
+    # Root cause: per_layer_cost = max(0.005, NLL*0.10) >= 0.11 nat for NLL~1.1,
+    # while the total entropy bonus beta_entropy_k * log(5) = 0.03*1.609 = 0.048 nat.
+    # Cost > entropy bonus => K=1 is always the mathematically optimal greedy choice.
+    # With 0.03: cost = 0.033 nat, entropy bonus = 0.10*1.609 = 0.161 nat => router CAN explore.
+    router_relative_k_cost: float = 0.03
+    # RC-2 fix: beta_entropy_k 0.03->0.10, beta_entropy_subset 0.02->0.05
+    # The entropy bonus must be large enough to overcome k_cost under genuine reward noise.
+    beta_entropy_k: float = 0.10
+    beta_entropy_subset: float = 0.05
     router_balance_weight: float = 0.01  # was 0.10 — layer_dropout already prevents monopoly
     # Pair interactions are regressed to measured counterfactual interaction,
     # not pushed by an unbounded signed correlation objective.
@@ -204,7 +212,11 @@ class RSCConfig:
     lambda_synergy_prior: float = 0.01
     router_synergy_target_scale: float = 0.10
     router_synergy_limit: float = 0.75
-    router_pairwise_probe_probability: float = 0.25  # sample true pair-interaction counterfactuals during RLOO
+    # RC-4 fix: was 0.25 — only 25% of bootstrap steps measured pairwise interactions,
+    # meaning the synergy matrix barely received gradient signal in short runs.
+    # With small data (25 steps/epoch), only ~6 steps per epoch updated synergy.
+    # At 0.75, ~19 steps/epoch update synergy => router learns interaction structure faster.
+    router_pairwise_probe_probability: float = 0.75
     lambda_k_center: float = 0.0  # was 0.05 — removed; let K be learned purely from reward
     # Maximise I(prompt; route): varied marginal choices but confident,
     # prompt-dependent routes.  This is exploration regularisation only; the

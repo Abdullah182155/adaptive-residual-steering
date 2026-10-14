@@ -346,13 +346,18 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     balance_loss = torch.tensor(0.0, device=ids.device)
     lambda_balance = 0.0
     lambda_synergy = getattr(cfg, "lambda_synergy", 0.10)
-    lambda_k_mi = getattr(cfg, "lambda_router_k_mi", 0.0)
-    lambda_layer_mi = getattr(cfg, "lambda_router_layer_mi", 0.0)
+    # RC-1 fix: previously hardcoded to default=0.0, silently disabling all three
+    # diversity losses regardless of config. Config sets lambda_router_k_mi=0.10,
+    # lambda_router_layer_mi=0.10, lambda_router_k_preference=0.25 -- those must
+    # actually be used. The old getattr(..., 0.0) was a backwards-compat stub
+    # that was never updated when these hyperparams were added to config.
+    lambda_k_mi = float(getattr(cfg, "lambda_router_k_mi", 0.10))
+    lambda_layer_mi = float(getattr(cfg, "lambda_router_layer_mi", 0.10))
     k_preference_loss = counterfactual_k_preference_loss(
         k_logits_fresh, k_actions, reward_0, action_rewards,
-        temperature=float(getattr(cfg, "router_k_preference_temperature", 0.05)),
+        temperature=float(getattr(cfg, "router_k_preference_temperature", 0.10)),
     )
-    lambda_k_preference = float(getattr(cfg, "lambda_router_k_preference", 0.0))
+    lambda_k_preference = float(getattr(cfg, "lambda_router_k_preference", 0.25))
     synergy_prior_loss = model.router.synergy_prior_loss(synergy) if synergy is not None else torch.zeros((), device=ids.device)
     lambda_synergy_prior = float(getattr(cfg, "lambda_synergy_prior", 0.0))
 
