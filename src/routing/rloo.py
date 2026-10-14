@@ -360,7 +360,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
     # reported mean is exhaustive K coverage, not a biased random sample.
     mean_sampled_k = k_actions.float().mean()
     k_center_loss = (mean_sampled_k - 2.2).pow(2)
-    lambda_k_center = getattr(cfg, "lambda_k_center", 0.05)
+    lambda_k_center = getattr(cfg, "lambda_k_center", 0.0)  # BUG-C1 fix: fallback 0.05→0.0 (matches config.py)
 
     loss = (
         policy_loss

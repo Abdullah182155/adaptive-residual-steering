@@ -30,7 +30,7 @@ class Phi2WithRSC(nn.Module):
             self.hidden_dim,
             n_layers,
             cfg.max_active_layers,
-            layer_dropout=getattr(cfg, "router_layer_dropout", 0.15),
+            layer_dropout=getattr(cfg, "router_layer_dropout", 0.0),  # BUG-C2 fix: fallback 0.15→0.0 (matches config.py; avoids train/eval mismatch)
             difficulty_aware=getattr(cfg, "router_difficulty_aware", True),
             synergy_limit=getattr(cfg, "router_synergy_limit", 0.75),
         ).to(self.device)
@@ -106,8 +106,8 @@ class Phi2WithRSC(nn.Module):
                 self.cfg.lora_dropout,
                 magnitude_mode=getattr(self.cfg, "steer_magnitude_mode", "direct"),
                 max_magnitude=getattr(self.cfg, "steer_max_magnitude", 2.0),
-                max_relative_norm=getattr(self.cfg, "steer_max_relative_norm", 0.15),
-                orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", False),
+                max_relative_norm=getattr(self.cfg, "steer_max_relative_norm", 0.04),     # BUG-C3 fix: 0.15→0.04
+                orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", True),  # BUG-C4 fix: False→True
             ).to(self.device)
             self.gates[str(idx)] = gate
             self.steer_nets[str(idx)] = steer
@@ -142,7 +142,13 @@ class Phi2WithRSC(nn.Module):
                             # generated token; every cached single-token call
                             # then aligns with the next generated token.
                             traced = alpha.detach().float().squeeze(-1)
-                            token_alpha = traced[:, -1] if wrapper._trace_cached_decode else traced[:, -1]
+                            # BUG-I4 fix: previous if/else were identical (both traced[:, -1]).
+                            # Prefill (T>1): use mean across all valid positions for a representative summary.
+                            # Cached decode (T=1): use the single token gate value directly.
+                            if wrapper._trace_cached_decode:
+                                token_alpha = traced[:, -1]      # autoregressive single-token step
+                            else:
+                                token_alpha = traced.mean(dim=1) # prefill: mean over all positions
                             wrapper.last_gate_trace[int(layer_idx)].append(float(token_alpha[0].cpu().item()))
                         route = selected.to(alpha.dtype).view(-1, 1, 1)
                         route_st = route

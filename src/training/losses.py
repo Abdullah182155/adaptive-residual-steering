@@ -206,12 +206,16 @@ def compute_invariance_loss(model, tokenizer, questions, steps_lists, final_answ
         def encode(texts):
             enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=cfg.max_tok_len).to(device)
             model._attn_mask_cache = enc["attention_mask"]
-            with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], use_cache=False)
+            # WARN-2 fix: backbone is frozen; no backward graph needed through Phi-2.
+            # Gradient for the invariance cosine loss flows only through the pooled z vectors.
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], use_cache=False)
             hs = pooled["cur"].float()
             mask = enc["attention_mask"].unsqueeze(-1).float()
             mean_pool = (hs * mask).sum(1) / mask.sum(1).clamp(min=1)
             return F.normalize(mean_pool, dim=-1)
+
 
         view1, view2 = [], []
         for j, (q, steps, ans) in enumerate(zip(questions, steps_lists, final_answers)):

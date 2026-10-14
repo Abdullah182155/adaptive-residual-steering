@@ -894,10 +894,9 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
     model.set_routing_override(None)
     save_path = cfg.router_bootstrap_save_path
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
-    torch.save(
-        {k: v.cpu() for k, v in model.state_dict().items() if "router" in k},
-        save_path,
-    )
+    # BUG-C5 fix: was raw torch.save (no manifest/hash/config provenance).
+    # Now uses save_ars_checkpoint for consistency with all other phases.
+    save_ars_checkpoint(model, save_path, phase='phase1.5-router-bootstrap', cfg=cfg, prefixes=('router.',))
     print(f"✅ Router Bootstrap complete — best_probe_loss = {best_loss:.4f}")
     return best_state, best_loss
 

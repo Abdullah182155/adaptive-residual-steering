@@ -207,6 +207,9 @@ class JointLayerRouter(nn.Module):
         self.logit_ema.mul_(0.98).add_(0.02 * u.detach().mean(dim=0))
         self.logit_sq_ema.mul_(0.98).add_(0.02 * u.detach().pow(2).mean(dim=0))
         realized = selected_matrix.detach().float().mean(dim=0)
+        # BUG-I1 fix: selection_rate_ema was never updated — always stayed at init value 0.5.
+        # Now properly tracks empirical per-layer selection rate via EMA.
+        self.selection_rate_ema.mul_(0.98).add_(0.02 * realized)
         k_realized = selected_matrix.detach().sum(dim=-1).clamp(min=0, max=self.max_active_layers)
         k_onehot = F.one_hot(k_realized.long(), num_classes=self.max_active_layers + 1).float().mean(dim=0)
         self.k_dist_ema.mul_(0.98).add_(0.02 * k_onehot)
