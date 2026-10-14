@@ -16,6 +16,20 @@ import torch
 
 ARS_PREFIXES = ("steer_nets.", "gates.", "router.")
 
+# These settings determine tensor topology or inference semantics.  An
+# evaluator must reconstruct them from the checkpoint provenance *before*
+# wrapping Phi-2; guessing rank alone can load a different router/gate model
+# and silently invalidate a component comparison.
+CHECKPOINT_CONFIG_FIELDS = frozenset({
+    "model_name", "max_active_layers", "candidate_layers", "fixed_steer_eval_k",
+    "fixed_steer_eval_layers", "fixed_steer_eval_gate_scale", "use_router",
+    "lora_rank", "lora_alpha", "lora_dropout", "steer_magnitude_mode",
+    "steer_max_magnitude", "steer_max_relative_norm", "steer_orthogonal_projection",
+    "steer_route_budget_power", "gate_dim", "gate_dropout", "gate_init_alpha",
+    "gating_mode", "gate_constant_value", "router_difficulty_aware",
+    "router_synergy_limit", "router_eval_mode", "prompt_shielding",
+})
+
 
 def is_ars_key(name: str) -> bool:
     return name.startswith(ARS_PREFIXES)
@@ -65,6 +79,43 @@ def _json_config(cfg: Any) -> Dict[str, Any]:
     if hasattr(cfg, "__dict__"):
         return {k: v for k, v in vars(cfg).items() if not k.startswith("_")}
     return {}
+
+
+def load_checkpoint_manifest(path: str | Path) -> Optional[Dict[str, Any]]:
+    """Read an ARS provenance sidecar without touching model tensors."""
+    checkpoint = Path(path)
+    manifest_path = checkpoint.with_suffix(checkpoint.suffix + ".manifest.json")
+    if not manifest_path.exists():
+        return None
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"Checkpoint manifest must be a JSON object: {manifest_path}")
+    return payload
+
+
+def apply_checkpoint_config(cfg: Any, path: str | Path) -> Dict[str, Any]:
+    """Restore checkpoint-defining settings onto ``cfg`` before wrapper creation.
+
+    Only architecture/inference fields are restored.  Runtime choices such as
+    data size, device, optimizer, and output paths deliberately remain under
+    the caller's control.  The returned mapping is suitable for audit logs.
+    """
+    manifest = load_checkpoint_manifest(path)
+    if manifest is None:
+        return {}
+    saved = manifest.get("config", {})
+    if not isinstance(saved, dict):
+        raise TypeError("Checkpoint manifest config must be a JSON object.")
+    applied = {}
+    for key in sorted(CHECKPOINT_CONFIG_FIELDS):
+        if key in saved and hasattr(cfg, key):
+            value = saved[key]
+            # JSON represents tuple-valued configuration as lists.  The
+            # selected fields currently need no tuple coercion, but preserve
+            # regular Python scalar/list values exactly for dataclass config.
+            setattr(cfg, key, value)
+            applied[key] = value
+    return applied
 
 
 def save_ars_checkpoint(
@@ -130,8 +181,7 @@ def load_ars_checkpoint_strict(
     failed = sorted(set(saved) & set(result.missing_keys))
     if failed or result.unexpected_keys:
         raise RuntimeError(f"PyTorch did not apply all saved ARS tensors: missing={failed}, unexpected={result.unexpected_keys}")
-    manifest_path = Path(path).with_suffix(Path(path).suffix + ".manifest.json")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else None
+    manifest = load_checkpoint_manifest(path)
     if manifest is not None and manifest.get("state_sha256") != state_sha256(saved):
-        raise RuntimeError(f"ARS checkpoint hash disagrees with its manifest: {manifest_path}")
+        raise RuntimeError(f"ARS checkpoint hash disagrees with its manifest: {Path(path).with_suffix(Path(path).suffix + '.manifest.json')}")
     return {"saved_ars_tensors": len(saved), "manifest": manifest, "non_ars_missing": len(result.missing_keys)}

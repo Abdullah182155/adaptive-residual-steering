@@ -259,7 +259,7 @@ def epoch_end_accuracy(
         model.train()
     return correct / max(1, total)
 
-def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512) -> str:
+def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512, collect_trace: bool = False) -> str:
     """Generate without silently truncating a benchmark's final question.
 
     A few-shot result is invalid if the prompt plus requested completion does
@@ -296,6 +296,10 @@ def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512)
             shield_mask[:, :last_match] = True
             model.set_prompt_shield_mask(shield_mask)
 
+    if collect_trace and hasattr(model, "set_gate_trace"):
+        model.set_gate_trace(True)
+    if collect_trace and hasattr(model, "set_routing_trace"):
+        model.set_routing_trace(True)
     try:
         with torch.no_grad():
             output_ids = model.generate(
@@ -310,6 +314,27 @@ def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512)
                 use_cache=True,
             )
     finally:
+        if collect_trace:
+            # Copy before disabling collection, whose public setter clears
+            # transient state.  The resulting object is JSON-safe and can be
+            # attached to the qualitative result without retaining tensors.
+            gate_trace = {
+                int(layer): list(values)
+                for layer, values in (getattr(model, "last_gate_trace", None) or {}).items()
+            }
+            routing_trace = {
+                int(layer): dict(values)
+                for layer, values in (getattr(model, "last_routing_trace", None) or {}).items()
+            }
+            model.last_generation_trace = {
+                "gate": gate_trace,
+                "routing": routing_trace,
+                "generated_token_ids": output_ids[0][prompt_length:].detach().cpu().tolist() if "output_ids" in locals() else [],
+            }
+            if hasattr(model, "set_gate_trace"):
+                model.set_gate_trace(False)
+            if hasattr(model, "set_routing_trace"):
+                model.set_routing_trace(False)
         if hasattr(model, "set_prompt_shield_mask"):
             model.set_prompt_shield_mask(None)
 

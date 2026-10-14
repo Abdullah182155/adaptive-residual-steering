@@ -61,7 +61,11 @@ def evaluate_model_condition(
         if hasattr(model, "set_routing_override"):
             model.set_routing_override("balanced")
         if hasattr(model, "set_gate_freeze"):
-            model.set_gate_freeze(True, 1.0)
+            # Keep the harness usable with deliberately minimal test/dummy
+            # models while real wrappers receive the validation-calibrated
+            # fixed-control intensity from their configuration.
+            cfg = getattr(model, "cfg", None)
+            model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
     elif cond == "steernet":
         if hasattr(model, "set_routing_override"):
             model.set_routing_override(None)
@@ -89,7 +93,11 @@ def evaluate_model_condition(
             prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False)) if tokenizer else 0
             prompt_token_counts.append(prompt_tokens)
             t0 = time.time()
-            resp = generate_response(model, tokenizer, prompt, device, max_new_tokens=max_new_tokens)
+            collect_trace = idx < max(0, int(display_examples))
+            resp = generate_response(
+                model, tokenizer, prompt, device, max_new_tokens=max_new_tokens,
+                collect_trace=collect_trace,
+            )
             elapsed = time.time() - t0
             total_time += elapsed
 
@@ -116,14 +124,34 @@ def evaluate_model_condition(
                 "time_sec": elapsed,
                 "tokens": n_tok,
                 "prompt_tokens": prompt_tokens,
+                "routing_trace": (
+                    getattr(model, "last_generation_trace", {}).get("routing", {}) if collect_trace else {}
+                ),
+                "gate_trace": (
+                    getattr(model, "last_generation_trace", {}).get("gate", {}) if collect_trace else {}
+                ),
+                "generated_token_ids": (
+                    getattr(model, "last_generation_trace", {}).get("generated_token_ids", []) if collect_trace else []
+                ),
             }
             detailed_results.append(item)
 
             if idx < display_examples:
                 icon = "✅" if is_corr else "❌"
-                logger.info(
-                    "[%s|%s|%d-shot] [%d/%d] %s Gold: %s | Got: %s (%.2fs)",
-                    dataset_name.upper(), cond, n_shot, idx + 1, n_samples, icon, gold, eval_res["extracted"], elapsed,
+                selected_layers = sorted(
+                    f"L{layer}" for layer, trace in item["routing_trace"].items()
+                    if trace.get("selected", [False])[0]
+                )
+                desired_k = next(
+                    (trace.get("desired_k", [0])[0] for trace in item["routing_trace"].values()),
+                    0,
+                )
+                print(
+                    f"\n[QUALITATIVE {idx + 1}/{display_examples} | {dataset_name.upper()} | "
+                    f"{cond.upper()} | {n_shot}-shot] {icon}\n"
+                    f"Question: {q}\nGold: {gold}\nPrediction: {eval_res['extracted']}\n"
+                    f"Route: K={desired_k}, layers={selected_layers or ['none']}\n"
+                    f"Generated CoT:\n{resp}\n"
                 )
 
             if progress_callback:
@@ -183,6 +211,7 @@ def run_fair_multishot_benchmark(
     shot_counts: Optional[List[int]] = None,
     experiment_run: Optional[Any] = None,
     verbose: bool = True,
+    qualitative_examples: int = 5,
 ) -> Dict[str, Any]:
     """Executes fair multi-shot evaluation protocol spanning datasets and conditions.
 
@@ -241,6 +270,7 @@ def run_fair_multishot_benchmark(
                     n_shot=shot,
                     condition=cond,
                     max_new_tokens=cfg.max_new_tokens,
+                    display_examples=qualitative_examples,
                 )
 
                 summ = res["summary"]

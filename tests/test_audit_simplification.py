@@ -104,6 +104,14 @@ class TestAuditSimplification(unittest.TestCase):
         target_layers = cfg.rsc_layers_for(10)
         self.assertEqual(target_layers, [3, 5, 7])
 
+    def test_phi2_uses_explicit_canonical_candidate_layers(self):
+        # Candidate placement is a scientific configuration, not a derived
+        # percentage range that can silently replace specified layers.
+        self.assertEqual(
+            RSCConfig().rsc_layers_for(32),
+            [11, 13, 15, 17, 18, 20, 22, 24],
+        )
+
     def test_model_wrapper_fixed_layers_routing(self):
         cfg = RSCConfig()
         cfg.fixed_layers = [3, 5]

@@ -265,6 +265,55 @@ def plot_layer_selection_and_k(
     return fig
 
 
+def plot_token_gate_heatmap(
+    gate_trace: Dict[Union[int, str], List[float]],
+    generated_tokens: List[str],
+    layer_labels: Optional[List[Union[int, str]]] = None,
+    title: str = "Token-Level ARS Gate Values During Generation",
+    save_path: Optional[str] = None,
+    figsize: Tuple[int, int] = (14, 5),
+) -> plt.Figure:
+    """Render exact decoded-token gate values, including zeroed inactive layers.
+
+    ``gate_trace`` contains only layers selected by a route.  Supplying
+    ``layer_labels`` retains every candidate as a row and displays unselected
+    layers as zero, so a sparse plot cannot be mistaken for missing telemetry.
+    """
+    set_ars_publication_theme()
+    ordered_layers = layer_labels or sorted(gate_trace, key=lambda value: int(str(value).lstrip("L")))
+    normalised_layers = [int(str(layer).lstrip("L")) for layer in ordered_layers]
+    n_tokens = max(1, len(generated_tokens), *(len(v) for v in gate_trace.values()))
+    values = np.zeros((len(normalised_layers), n_tokens), dtype=float)
+    for row, layer in enumerate(normalised_layers):
+        series = gate_trace.get(layer, gate_trace.get(str(layer), gate_trace.get(f"L{layer}", [])))
+        values[row, : min(n_tokens, len(series))] = np.asarray(series[:n_tokens], dtype=float)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    image = ax.imshow(values, aspect="auto", interpolation="nearest", cmap="inferno", vmin=0.0, vmax=1.0)
+    ax.set_yticks(np.arange(len(normalised_layers)))
+    ax.set_yticklabels([f"L{layer}" for layer in normalised_layers], fontweight="bold")
+    tick_count = min(24, n_tokens)
+    tick_positions = np.unique(np.linspace(0, n_tokens - 1, tick_count, dtype=int))
+    labels = []
+    for pos in tick_positions:
+        token = generated_tokens[pos] if pos < len(generated_tokens) else "<stop>"
+        token = token.replace("\n", "↵").strip() or "␠"
+        labels.append(token[:16])
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(labels, rotation=60, ha="right", fontsize=8)
+    ax.set_xlabel("Generated reasoning tokens", fontweight="bold")
+    ax.set_ylabel("Candidate residual layer", fontweight="bold")
+    ax.set_title(title, fontweight="bold", pad=14)
+    colorbar = fig.colorbar(image, ax=ax, fraction=0.035, pad=0.02)
+    colorbar.set_label("Gate value $g_l(t)$", color=COLOR_LABEL_LIGHT_GRAY, fontweight="bold")
+    colorbar.ax.tick_params(color=COLOR_TICK_GRAY, labelcolor=COLOR_TICK_GRAY)
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(os.path.abspath(save_path)), exist_ok=True)
+        plt.savefig(save_path, facecolor=COLOR_BLACK, dpi=180)
+    return fig
+
+
 def plot_training_progression(
     training_logs: Dict[str, Dict[str, float]],
     save_path: Optional[str] = None,

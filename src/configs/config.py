@@ -10,8 +10,14 @@ class RSCConfig:
     # Layer positions are intentionally discovered from the backbone depth.
     # The router decides which candidates to use for each forward pass and selects at most max_active_layers.
     max_active_layers: int = 4
+    # Canonical Phi-2 candidate blocks.  Earlier code derived a percentage
+    # range and silently substituted L9 for the specified L17.  Candidate
+    # placement is part of the experimental hypothesis, so it must be an
+    # explicit, checkpoint-visible configuration rather than a heuristic.
+    candidate_layers: Optional[List[int]] = None
     fixed_steer_eval_k: int = 1  # Phase-1 SteerNet control: one independently-trained intervention
     fixed_steer_eval_layers: Optional[List[int]] = None  # selected only from validation during Phase-1 acceptance
+    fixed_steer_eval_gate_scale: float = 1.0  # validation-calibrated fixed-control intensity
     use_router: bool = True  # If False, router is bypassed
     fixed_layers: Optional[List[int]] = None  # If set, forces these exact layers to steer
     # Catalog router: distribution over subsets. Empty is a legal action.
@@ -25,10 +31,13 @@ class RSCConfig:
     lora_rank: int = 16
     lora_alpha: float = 32.0
     lora_dropout: float = 0.05
-    steer_magnitude_mode: str = "direct"  # 'direct' or 'decoupled' (direction normalized + bounded scale)
+    steer_magnitude_mode: str = "decoupled"  # normalized direction + bounded magnitude
     steer_max_magnitude: float = 2.0
-    steer_max_relative_norm: float = 0.08  # Strictly bounds ||delta|| <= beta * ||h|| per layer to prevent multi-layer over-perturbation
-    steer_orthogonal_projection: bool = False  # Optional projection onto orthogonal complement of h
+    # A residual perturbation is an angular intervention, not a new radial
+    # feature.  The tighter 4% envelope and orthogonal projection limit
+    # out-of-distribution drift in Phi-2's early/middle residual stream.
+    steer_max_relative_norm: float = 0.04
+    steer_orthogonal_projection: bool = True
     # A route has one shared intervention budget.  Each selected layer receives
     # K**(-power) of its own bounded delta, so adding layers cannot linearly
     # multiply the residual displacement.  K=1 remains unchanged.
@@ -66,7 +75,12 @@ class RSCConfig:
     phase1_warmup_ratio: float = 0.06
     phase1_patience: int = 4
     phase1_acceptance_examples: int = 64
-    phase1_acceptance_accuracy_examples: int = 32
+    # A 32-item probe has 3.125pp quantisation and accepted a +9.4pp result
+    # that reversed by -12pp on an external 50-item benchmark.  Use 64 held-
+    # out items by default so Phase 1 is a capacity gate rather than a noisy
+    # optimistic selector.  Debug configurations may lower this explicitly;
+    # their report remains diagnostic-only.
+    phase1_acceptance_accuracy_examples: int = 64
     # Screen all candidates cheaply before spending the full held-out
     # generation budget on the most promising routes.  This prevents NLL from
     # silently excluding a layer whose free-generation behaviour is better.
@@ -75,12 +89,18 @@ class RSCConfig:
     # A larger held-out zero-shot screen, rather than a training-prompt
     # accuracy proxy, decides whether the final Phase-1 adapter is usable.
     phase1_generation_max_new_tokens: int = 256
+    # Select residual intensity on validation free generation after selecting
+    # a candidate layer.  This is a bounded calibration of the model's own
+    # learned direction, not a test-set threshold or a hidden override.
+    phase1_gate_scale_grid: Tuple[float, ...] = (0.25, 0.50, 0.75, 1.0)
     phase1_min_train_nll_reduction: float = 0.05
     phase1_min_val_nll_reduction: float = 0.05
-    # Generation on a 32-example diagnostic set has 3.125pp granularity; it
-    # is a non-regression guard, not a statistically valid +5pp gate.
-    phase1_min_train_accuracy_gain: float = 0.0
-    phase1_accuracy_warning_gain: float = 0.05
+    # Do not promote an adapter merely because it does not regress on a tiny
+    # teacher-forced probe.  This is an *independent held-out generation*
+    # gain, despite the legacy field retained below for old notebooks.
+    phase1_min_validation_accuracy_gain: float = 0.10
+    phase1_min_train_accuracy_gain: float = 0.10  # legacy alias; prefer the field above
+    phase1_accuracy_warning_gain: float = 0.10
     # A four-example holdout cannot establish a scientific capacity or
     # routing-health claim.  Tiny smoke runs still execute every phase and
     # emit their measurements, but their acceptance/health failures are
@@ -96,6 +116,10 @@ class RSCConfig:
     # generation, preserve its artifacts and return a baseline-equivalent
     # ARS checkpoint marked diagnostic-only instead of inventing Phase 2.
     skip_adaptive_phases_when_phase1_fails: bool = True
+    # An adaptive phase is not allowed to follow a deployment-policy collapse
+    # just because ``continue_on_diagnostic_failure`` keeps notebooks alive.
+    # It saves a baseline-safe checkpoint and records the failed preflight.
+    skip_adaptive_phases_when_router_fails: bool = True
 
     # Phase 2 staged parameters
     phase2_warmup_ratio: float = 0.03
@@ -294,7 +318,13 @@ class RSCConfig:
             return sorted(set(max(1, min(int(idx), n_total - 2)) for idx in self.fixed_layers))
         if not 1 <= self.max_active_layers <= 4:
             raise ValueError("max_active_layers must be in [1, 4]")
-        start, stop = int(0.30 * n_total), int(0.80 * n_total)
-        count = min(8, max(1, stop - start))
-        indices = torch.linspace(start, stop - 1, steps=count).round().long().tolist()
+        # Block indices are zero-based, matching ``base_model.model.layers``.
+        # For Phi-2 (32 blocks) this is exactly the candidate set in the ARS
+        # protocol.  Small synthetic backbones retain the same relative depth
+        # profile for tests without changing the real-model experiment.
+        canonical = self.candidate_layers or [11, 13, 15, 17, 18, 20, 22, 24]
+        if n_total == 32:
+            indices = canonical
+        else:
+            indices = [round(int(idx) * (n_total - 1) / 31) for idx in canonical]
         return sorted(set(max(1, min(idx, n_total - 2)) for idx in indices))

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from src.configs.config import RSCConfig
+from src.experiments.checkpointing import apply_checkpoint_config
 from src.experiments.registry import (
     ExperimentRegistry,
     ExperimentRun,
@@ -98,6 +99,27 @@ class TestExperimentRegistry(unittest.TestCase):
         success = run.load_weights(model, filename="final_ars_weights.pt")
         self.assertTrue(success)
         self.assertFalse((model.steer_net_0.weight == 999.0).all())
+
+    def test_manifest_restores_checkpoint_defining_config(self):
+        class ARSDummy(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.cfg = RSCConfig(
+                    candidate_layers=[11, 13], lora_rank=8, lora_alpha=16.0,
+                    fixed_steer_eval_layers=[13], fixed_steer_eval_gate_scale=0.25,
+                )
+                self.steer_nets = nn.ModuleDict({"11": nn.Linear(2, 2), "13": nn.Linear(2, 2)})
+                self.gates = nn.ModuleDict({"11": nn.Linear(2, 1), "13": nn.Linear(2, 1)})
+                self.router = nn.Linear(2, 2)
+
+        run = self.registry.create_experiment(tag="manifest_config")
+        path = run.save_weights(ARSDummy(), filename="ars.pt")
+        evaluation_cfg = RSCConfig(candidate_layers=[9], lora_rank=32, lora_alpha=64.0)
+        applied = apply_checkpoint_config(evaluation_cfg, path)
+        self.assertEqual(applied["candidate_layers"], [11, 13])
+        self.assertEqual(evaluation_cfg.lora_rank, 8)
+        self.assertEqual(evaluation_cfg.fixed_steer_eval_layers, [13])
+        self.assertEqual(evaluation_cfg.fixed_steer_eval_gate_scale, 0.25)
 
 if __name__ == "__main__":
     unittest.main()

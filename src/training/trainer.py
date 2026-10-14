@@ -138,6 +138,7 @@ def _phase1_zero_shot_generation_probe(
     device: torch.device,
     n_samples: int,
     layer: Optional[int] = None,
+    gate_value: float = 1.0,
     progress_desc: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Measure a Phase-1 route on held-out benchmark-format generation.
@@ -170,7 +171,7 @@ def _phase1_zero_shot_generation_probe(
             model.set_gate_freeze(False)
         else:
             model.set_routing_override("only", [int(layer)])
-            model.set_gate_freeze(True, 1.0)
+            model.set_gate_freeze(True, float(gate_value))
 
         iterator = tqdm(rows, desc=progress_desc, unit="sample", leave=True) if progress_desc else rows
         for row in iterator:
@@ -319,11 +320,43 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             shortlist,
             key=lambda row: (row["heldout_generation_accuracy"], -row["val_nll"]),
         )
-        selected_val_acc = best["heldout_generation_accuracy"]
+        # The fixed control previously forced alpha=1 even when the learned
+        # direction was only useful at a smaller residual intensity.  Calibrate
+        # this one scalar on the same held-out validation generation protocol;
+        # external benchmark examples remain untouched.
+        scale_grid = sorted({
+            min(1.0, max(0.0, float(scale)))
+            for scale in getattr(cfg, "phase1_gate_scale_grid", (1.0,))
+        })
+        scale_results = [{
+            "gate_scale": 1.0,
+            "accuracy": best["heldout_generation_accuracy"],
+            "answer_present": best["heldout_answer_present"],
+        }]
+        print(f"  [calibration] L{best['layer']} residual intensity grid: {scale_grid}")
+        for scale in scale_grid:
+            if abs(scale - 1.0) < 1e-8:
+                continue
+            calibrated = _phase1_zero_shot_generation_probe(
+                model, tokenizer, val_probe, cfg, device, generation_n, layer=best["layer"], gate_value=scale,
+                progress_desc=f"Acceptance L{best['layer']} alpha={scale:.2f}",
+            )
+            scale_results.append({
+                "gate_scale": scale,
+                "accuracy": calibrated["accuracy"],
+                "answer_present": calibrated["answer_present"],
+            })
+            print(
+                f"          alpha={scale:.2f}: heldout_acc={calibrated['accuracy']:.1%} "
+                f"answer_present={calibrated['answer_present']:.1%}"
+            )
+        best_scale = max(scale_results, key=lambda row: (row["accuracy"], row["gate_scale"]))
+        selected_val_acc = best_scale["accuracy"]
         nll_reduction = (base_train_nll - best["train_nll"]) / max(base_train_nll, 1e-8)
         val_nll_reduction = (base_val_nll - best["val_nll"]) / max(base_val_nll, 1e-8)
         acc_gain = selected_val_acc - base_val_acc
         cfg.fixed_steer_eval_layers = [best["layer"]]
+        cfg.fixed_steer_eval_gate_scale = float(best_scale["gate_scale"])
         report = {
             "baseline_train_nll": base_train_nll,
             "baseline_val_nll": base_val_nll,
@@ -331,6 +364,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "candidates": candidates,
             "selected_layer": best["layer"],
             "selected_validation_accuracy": selected_val_acc,
+            "fixed_steer_gate_scale": cfg.fixed_steer_eval_gate_scale,
+            "gate_scale_candidates": scale_results,
             "train_relative_nll_reduction": nll_reduction,
             "val_relative_nll_reduction": val_nll_reduction,
             "validation_accuracy_gain": acc_gain,
@@ -339,13 +374,18 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "passed": (
                 nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
                 and val_nll_reduction >= float(cfg.phase1_min_val_nll_reduction)
-                and acc_gain >= float(cfg.phase1_min_train_accuracy_gain)
+                and acc_gain >= float(getattr(
+                    cfg,
+                    "phase1_min_validation_accuracy_gain",
+                    cfg.phase1_min_train_accuracy_gain,
+                ))
             ),
         }
         print(
             "  Phase-1 acceptance: "
             f"layer=L{best['layer']} | train/val NLL Δ={nll_reduction * 100:+.1f}%/{val_nll_reduction * 100:+.1f}% "
-            f"| held-out generation Δ={acc_gain * 100:+.1f}pp | {'PASS' if report['passed'] else 'FAIL'}"
+            f"| alpha={cfg.fixed_steer_eval_gate_scale:.2f} | held-out generation Δ={acc_gain * 100:+.1f}pp "
+            f"| {'PASS' if report['passed'] else 'FAIL'}"
         )
         if acc_gain < float(getattr(cfg, "phase1_accuracy_warning_gain", 0.05)):
             print(
@@ -1251,6 +1291,26 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     _, best_p15 = train_router_bootstrap(model, train_data, eval_data, cfg, device)
     logs["router_bootstrap_loss"] = best_p15
     logs["router_bootstrap_preflight"] = audit_router_policy_health(model, eval_data, cfg, device)
+    router_report = logs["router_bootstrap_preflight"]
+    if (
+        not router_report["passed"]
+        and not router_report.get("reliability_waived", False)
+        and bool(getattr(cfg, "skip_adaptive_phases_when_router_fails", True))
+    ):
+        print("\n" + "=" * 80)
+        print("ROUTER DEPLOYMENT GATE: ADAPTIVE PHASES SKIPPED")
+        print("         Deployment argmax collapsed; Gate/Phase 2 cannot make this a valid ARS policy.")
+        print("         Retaining Phase-1 and Router diagnostics; no Full-ARS checkpoint claim is produced.")
+        print("=" * 80)
+        logs["adaptive_phases_status"] = "SKIPPED_COLLAPSED_ROUTER"
+        logs["ars_intervention_audit"] = {
+            "status": "NOT_RUN_COLLAPSED_ROUTER",
+            "passed": False,
+            "failures": list(router_report.get("failures", [])),
+        }
+        # The Phase-1 artifact is intentionally retained.  Do not overwrite
+        # the deployment checkpoint with an invalid gate/router composition.
+        return logs, best_val_p1, best_val_p1
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

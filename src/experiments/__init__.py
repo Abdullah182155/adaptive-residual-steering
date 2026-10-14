@@ -17,6 +17,14 @@ __all__ = [
     "list_experiments",
     "get_latest_experiment",
 ]
-from .checkpointing import load_ars_checkpoint_strict, save_ars_checkpoint
+from .checkpointing import (
+    apply_checkpoint_config,
+    load_ars_checkpoint_strict,
+    load_checkpoint_manifest,
+    save_ars_checkpoint,
+)
 
-__all__ = ["load_ars_checkpoint_strict", "save_ars_checkpoint"]
+__all__ = [
+    "apply_checkpoint_config", "load_ars_checkpoint_strict",
+    "load_checkpoint_manifest", "save_ars_checkpoint",
+]

@@ -67,7 +67,7 @@ def _header(ax, x, title, subtitle):
 
 def generate_steernet_png(path: str) -> None:
     fig, ax = _canvas()
-    _header(ax, 6, "RSCSteerNet: K-Conditioned Bounded Low-Rank Residual MLP", r"Active routes use rank $r=16$, $\alpha=32$, decoupled magnitude, and $\|\delta\|\leq0.08\|h\|$")
+    _header(ax, 6, "RSCSteerNet: K-Conditioned Bounded Low-Rank Residual MLP", r"Active routes use rank $r=16$, $\alpha=32$, decoupled magnitude, $\delta\perp h$, and $\|\delta\|\leq0.04\|h\|$")
     _box(ax, 3.25, 5.8, 3.2, .65, "Input Hidden State", r"$h\in\mathbb{R}^{B\times T\times2560}$", GRAY)
     _arrow(ax, 3.25, 5.47, 3.25, 4.9, GRAY)
     _box(ax, 3.25, 4.55, 3.2, .65, "LayerNorm", r"$\mathrm{LN}(h)$", GRAY)
@@ -82,7 +82,7 @@ def generate_steernet_png(path: str) -> None:
     _arrow(ax, 6.8, 2.72, 6.8, 2.38, AMBER)
     _box(ax, 6, 2.08, 4.5, .68, "Rank-16 Residual MLP", "conditioning addition, GELU, rank-level skip", ORANGE, AMBER)
     _arrow(ax, 6, 1.74, 6, 1.2)
-    _box(ax, 6, .88, 5.8, .72, "Up Projection + Decoupled Magnitude + Relative Bound", r"$16\rightarrow2560$; output $\delta$ satisfies $\|\delta\|\leq0.08\|h\|$", AMBER)
+    _box(ax, 6, .88, 5.8, .72, "Up Projection + Decoupled Magnitude + Orthogonal Bound", r"$16\rightarrow2560$; $\delta\perp h$, $\|\delta\|\leq0.04\|h\|$", AMBER)
     ax.text(6, .22, "K=0 bypasses SteerNet completely.", color=LIGHT_GRAY, fontsize=8.3, ha="center", style="italic")
     _save(fig, path)
 
@@ -115,11 +115,11 @@ def generate_gate_png(path: str) -> None:
 def generate_router_png(path: str) -> None:
     fig, ax = _canvas()
     _header(ax, 6, "JointLayerRouter: Counterfactual Cooperative Layer Selection", "RLOO learns when and where to intervene; benchmark evaluation uses deterministic argmax routing")
-    _box(ax, 6, 5.85, 4.8, .65, "Router Input at Candidate Layer 9", r"hidden states $H\in\mathbb{R}^{B\times T\times2560}$ and unshielded-token mask", GRAY)
+    _box(ax, 6, 5.85, 4.8, .65, "Router Input at Candidate Layer 11", r"hidden states $H\in\mathbb{R}^{B\times T\times2560}$ and unshielded-token mask", GRAY)
     _arrow(ax, 6, 5.52, 6, 4.97)
     _box(ax, 6, 4.65, 5.9, .65, "Masked Pooling and Difficulty Features", "semantic summary, RMS statistics, sequence length, hidden-state dispersion", AMBER)
     _arrow(ax, 6, 4.32, 6, 3.77)
-    _box(ax, 6, 3.45, 6.8, .65, "Eight Candidate Representations", r"depth + identity + pooled semantics for $\{9,11,13,15,18,20,22,24\}$", WHITE)
+    _box(ax, 6, 3.45, 6.8, .65, "Eight Candidate Representations", r"depth + identity + pooled semantics for $\{11,13,15,17,18,20,22,24\}$", WHITE)
     _arrow(ax, 6, 3.12, 6, 2.57)
     _box(ax, 6, 2.25, 6.1, .65, "Two-Pass Joint Attention Scoring", "utility logits and learned K distribution; no layer dropout", ORANGE, AMBER)
     ax.plot([6, 6], [1.92, 1.62], color=ORANGE, lw=2); ax.plot([2.25, 9.75], [1.62, 1.62], color=ORANGE, lw=2)
@@ -178,7 +178,7 @@ def _drawio(path, name, title, nodes, links) -> None:
 
 
 def generate_steernet_drawio(path: str) -> None:
-    nodes = [("h", "Input h&lt;br&gt;B×T×2560", 70, 90, 190, 50, GRAY), ("ln", "LayerNorm(h)", 70, 180, 190, 45, GRAY), ("down", "Down + GELU&lt;br&gt;2560 → 16; drop 0.05", 50, 270, 230, 55, ORANGE), ("k", "Active K&lt;br&gt;K ∈ {1,2,3,4}", 520, 180, 210, 45, AMBER), ("kp", "K conditioning W_K(K/4)", 520, 270, 210, 50, AMBER), ("mid", "Rank-16 residual MLP", 285, 375, 280, 55, ORANGE), ("out", "Up + decoupled magnitude&lt;br&gt;‖δ‖ ≤ 0.08‖h‖", 265, 485, 320, 55, AMBER), ("zero", "K=0 bypasses SteerNet", 630, 485, 190, 45, GRAY)]
+    nodes = [("h", "Input h&lt;br&gt;B×T×2560", 70, 90, 190, 50, GRAY), ("ln", "LayerNorm(h)", 70, 180, 190, 45, GRAY), ("down", "Down + GELU&lt;br&gt;2560 → 16; drop 0.05", 50, 270, 230, 55, ORANGE), ("k", "Active K&lt;br&gt;K ∈ {1,2,3,4}", 520, 180, 210, 45, AMBER), ("kp", "K conditioning W_K(K/4)", 520, 270, 210, 50, AMBER), ("mid", "Rank-16 residual MLP", 285, 375, 280, 55, ORANGE), ("out", "Up + decoupled magnitude&lt;br&gt;δ ⟂ h; ‖δ‖ ≤ 0.04‖h‖", 265, 485, 320, 55, AMBER), ("zero", "K=0 bypasses SteerNet", 630, 485, 190, 45, GRAY)]
     links = [("e1", "h", "ln", GRAY), ("e2", "ln", "down"), ("e3", "down", "mid"), ("e4", "k", "kp", AMBER), ("e5", "kp", "mid", AMBER), ("e6", "mid", "out", AMBER)]
     _drawio(path, "steernet", "RSCSteerNet: Bounded Low-Rank Residual MLP", nodes, links)
 
@@ -190,7 +190,7 @@ def generate_gate_drawio(path: str) -> None:
 
 
 def generate_router_drawio(path: str) -> None:
-    nodes = [("h", "Layer-9 hidden states + unshielded mask", 230, 85, 340, 50, GRAY), ("pool", "Masked pooling + difficulty features", 200, 175, 400, 55, AMBER), ("cand", "Eight candidates: {9,11,13,15,18,20,22,24}", 175, 270, 450, 55, WHITE), ("score", "Two-pass joint scoring&lt;br&gt;utility logits + K head; no layer dropout", 155, 370, 490, 55, ORANGE), ("k", "K ∈ {0,1,2,3,4}&lt;br&gt;K=0: no intervention", 40, 490, 220, 55, AMBER), ("subset", "Deterministic cooperative subset", 300, 490, 250, 55, ORANGE), ("syn", "Bounded synergy&lt;br&gt;validated by counterfactuals", 590, 490, 220, 55, AMBER)]
+    nodes = [("h", "Layer-11 hidden states + unshielded mask", 230, 85, 340, 50, GRAY), ("pool", "Masked pooling + difficulty features", 200, 175, 400, 55, AMBER), ("cand", "Eight candidates: {11,13,15,17,18,20,22,24}", 175, 270, 450, 55, WHITE), ("score", "Two-pass joint scoring&lt;br&gt;utility logits + K head; no layer dropout", 155, 370, 490, 55, ORANGE), ("k", "K ∈ {0,1,2,3,4}&lt;br&gt;K=0: no intervention", 40, 490, 220, 55, AMBER), ("subset", "Deterministic cooperative subset", 300, 490, 250, 55, ORANGE), ("syn", "Bounded synergy&lt;br&gt;validated by counterfactuals", 590, 490, 220, 55, AMBER)]
     links = [("e1", "h", "pool"), ("e2", "pool", "cand", AMBER), ("e3", "cand", "score"), ("e4", "score", "k", AMBER), ("e5", "score", "subset"), ("e6", "score", "syn", AMBER)]
     _drawio(path, "router", "JointLayerRouter: Counterfactual Cooperative Selection", nodes, links)
 

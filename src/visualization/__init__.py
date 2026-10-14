@@ -15,6 +15,7 @@ from src.visualization.plots import (
     plot_multishot_comparison,
     plot_synergy_heatmap,
     plot_layer_selection_and_k,
+    plot_token_gate_heatmap,
     plot_training_progression,
     generate_experiment_report_charts,
 )
@@ -34,6 +35,7 @@ __all__ = [
     "plot_multishot_scaling",
     "plot_synergy_heatmap",
     "plot_layer_selection_and_k",
+    "plot_token_gate_heatmap",
     "plot_training_progression",
     "generate_experiment_report_charts",
 ]

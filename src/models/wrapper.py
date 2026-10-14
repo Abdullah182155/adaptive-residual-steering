@@ -74,6 +74,12 @@ class Phi2WithRSC(nn.Module):
         self._active_k_realized = None
         self._collect_routing_trace = False
         self.last_routing_trace = None
+        # Per-generation evidence used by the qualitative evaluator.  Values
+        # are detached scalar alphas only; tracing never retains a model graph.
+        self._collect_gate_trace = False
+        self.last_gate_trace = None
+        self._trace_cached_decode = False
+        self._steering_telemetry = {}
 
         self.register_buffer(
             "routing_k_hist",
@@ -129,6 +135,15 @@ class Phi2WithRSC(nn.Module):
                             wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
                         delta = s(h_fp, active_k=wrapper._active_k_realized)
                         alpha = g(h_fp, delta, global_context=wrapper.router._last_semantic_shared)
+                        if wrapper._collect_gate_trace:
+                            if wrapper.last_gate_trace is None:
+                                wrapper.last_gate_trace = {int(layer): [] for layer in wrapper.target_layers}
+                            # The prefill's final alpha controls the first
+                            # generated token; every cached single-token call
+                            # then aligns with the next generated token.
+                            traced = alpha.detach().float().squeeze(-1)
+                            token_alpha = traced[:, -1] if wrapper._trace_cached_decode else traced[:, -1]
+                            wrapper.last_gate_trace[int(layer_idx)].append(float(token_alpha[0].cpu().item()))
                         route = selected.to(alpha.dtype).view(-1, 1, 1)
                         route_st = route
                         # Each individual SteerNet is bounded, but that alone
@@ -152,6 +167,20 @@ class Phi2WithRSC(nn.Module):
                         # the padding-only mask included shielded few-shot
                         # demonstrations, where the gate cannot affect loss.
                         g._valid_mask = steer_mask
+                        if wrapper._routing_override is None:
+                            valid = steer_mask & selected.view(-1, 1)
+                            if valid.any():
+                                raw_ratio = (delta.norm(dim=-1) / h_fp.norm(dim=-1).clamp_min(1e-6))[valid]
+                                effective = delta * alpha * route_budget
+                                effective_ratio = (effective.norm(dim=-1) / h_fp.norm(dim=-1).clamp_min(1e-6))[valid]
+                                metrics = wrapper._steering_telemetry.setdefault(
+                                    int(layer_idx), {"count": 0, "raw_sum": 0.0, "effective_sum": 0.0, "raw_max": 0.0, "effective_max": 0.0}
+                                )
+                                metrics["count"] += int(valid.sum().item())
+                                metrics["raw_sum"] += float(raw_ratio.sum().item())
+                                metrics["effective_sum"] += float(effective_ratio.sum().item())
+                                metrics["raw_max"] = max(metrics["raw_max"], float(raw_ratio.max().item()))
+                                metrics["effective_max"] = max(metrics["effective_max"], float(effective_ratio.max().item()))
                         if wrapper._routing_override is None:
                             g.record_diagnostics(alpha, steer_mask)
                         if wrapper._joint_grad_mode:
@@ -181,6 +210,9 @@ class Phi2WithRSC(nn.Module):
             batch = inp.shape[0] if inp is not None else mask.shape[0]
 
             is_cached_decode = (inp_len == 1 and mask_len > 1)
+            self._trace_cached_decode = is_cached_decode
+            if self._collect_gate_trace and not is_cached_decode:
+                self.last_gate_trace = {int(layer): [] for layer in self.target_layers}
             self._selected_counts = torch.zeros(batch, dtype=torch.long, device=next(self.gates.parameters()).device)
 
             if is_cached_decode and self._cached_decode_routes is not None:
@@ -272,6 +304,14 @@ class Phi2WithRSC(nn.Module):
         self._collect_routing_trace = enabled
         if not enabled:
             self.last_routing_trace = None
+
+    def set_gate_trace(self, enabled: bool):
+        """Collect detached per-token gate values for one generated sample."""
+        self._collect_gate_trace = bool(enabled)
+        if enabled:
+            self.last_gate_trace = {int(layer): [] for layer in self.target_layers}
+        else:
+            self.last_gate_trace = None
 
     def _valid_mask_for(self, h: torch.Tensor) -> torch.Tensor:
         mask = self._attn_mask_cache
@@ -472,6 +512,7 @@ class Phi2WithRSC(nn.Module):
         self.router.seen_forwards.zero_()
         self.routing_k_hist.zero_()
         self.routing_forwards.zero_()
+        self._steering_telemetry = {}
         for gate in self.gates.values():
             gate.reset_diagnostics()
 
@@ -515,7 +556,23 @@ class Phi2WithRSC(nn.Module):
             "layer_selection_entropy": round(normalized_entropy(layer_probs, len(self.target_layers)), 4),
             "active_layer_count": sum(rate > 0.02 for rate in layer_rates),
             "gate": gate_metrics,
+            "steering": self.steering_diagnostics(),
         }
+
+    def steering_diagnostics(self) -> Dict[int, Dict[str, float]]:
+        """Return observed residual displacement, not just configured bounds."""
+        summary = {}
+        for layer in self.target_layers:
+            row = self._steering_telemetry.get(int(layer), {})
+            count = max(1, int(row.get("count", 0)))
+            summary[int(layer)] = {
+                "intervened_tokens": int(row.get("count", 0)),
+                "mean_raw_relative_norm": round(float(row.get("raw_sum", 0.0)) / count, 6),
+                "mean_effective_relative_norm": round(float(row.get("effective_sum", 0.0)) / count, 6),
+                "max_raw_relative_norm": round(float(row.get("raw_max", 0.0)), 6),
+                "max_effective_relative_norm": round(float(row.get("effective_max", 0.0)), 6),
+            }
+        return summary
 
     def get_layer_synergy_matrix(self) -> Optional[torch.Tensor]:
         return self.router.get_layer_synergy_matrix()

@@ -9,6 +9,7 @@ from src.visualization import (
     plot_multishot_scaling,
     plot_synergy_heatmap,
     plot_layer_selection_and_k,
+    plot_token_gate_heatmap,
     plot_training_progression,
     generate_experiment_report_charts,
 )
@@ -56,6 +57,21 @@ class TestARSVisualizations(unittest.TestCase):
         self.assertIsNotNone(fig)
         self.assertTrue(os.path.exists(save_path))
         self.assertGreater(os.path.getsize(save_path), 1000)
+
+    def test_plot_token_gate_heatmap_includes_unselected_layers(self):
+        # The visual must retain a zero row for L11 rather than hiding a
+        # non-selected layer and making absent telemetry look healthy.
+        save_path = os.path.join(self.temp_dir, "gate_heatmap.png")
+        fig = plot_token_gate_heatmap(
+            {9: [0.15, 0.85, 0.40]},
+            ["Let", "x", "="],
+            layer_labels=[9, 11],
+            save_path=save_path,
+        )
+        self.assertIsNotNone(fig)
+        self.assertTrue(os.path.exists(save_path))
+        self.assertGreater(os.path.getsize(save_path), 1000)
+        np.testing.assert_allclose(fig.axes[0].images[0].get_array()[1], np.zeros(3))
 
     def test_plot_training_progression(self):
         logs = {

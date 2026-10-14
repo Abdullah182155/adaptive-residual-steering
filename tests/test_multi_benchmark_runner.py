@@ -100,6 +100,29 @@ class TestMultiBenchmarkRunner(unittest.TestCase):
         self.assertEqual(res["summary"]["condition"], "steernet")
         self.assertEqual(res["summary"]["n_shot"], 2)
 
+    def test_fixed_steernet_uses_calibrated_gate_scale(self):
+        # A fixed SteerNet control must use the validation-selected residual
+        # intensity, not silently restore the historical alpha=1.0 setting.
+        self.model.cfg = type("Cfg", (), {"fixed_steer_eval_gate_scale": 0.25})()
+        samples = [{"question": "What is 40 + 2?", "gold": 42.0}]
+        seen_values = []
+        original = self.model.set_gate_freeze
+
+        def capture(freeze, value=1.0):
+            seen_values.append((freeze, value))
+            original(freeze, value)
+
+        self.model.set_gate_freeze = capture
+        evaluate_model_condition(
+            model=self.model,
+            tokenizer=self.tokenizer,
+            device=self.device,
+            dataset_name="gsm8k",
+            samples=samples,
+            condition="fixed_steernet",
+        )
+        self.assertIn((True, 0.25), seen_values)
+
     def test_run_fair_multishot_benchmark_mock(self):
         cfg = EvalBenchmarkConfig(
             datasets=["gsm8k"],

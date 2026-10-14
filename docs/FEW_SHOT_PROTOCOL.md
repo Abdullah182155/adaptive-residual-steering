@@ -44,10 +44,10 @@ Every test item is presented with identical token prefixes across three experime
    - Base model (e.g., `microsoft/phi-2`, 2.7B) with all steering hooks disabled:
    - `model.set_routing_override('none')`
    - Measures raw, unmodified backbone capability.
-2. **Condition 2 (SteerNet Only)**:
-   - SteerNet injected across all candidate layers simultaneously with Token Gates pinned to $1.0$:
-   - `model.set_routing_override('all')`, `model.set_gate_freeze(True, 1.0)`
-   - Measures raw uncurated representation injection without dynamic routing or token selectivity.
+2. **Condition 2 (Fixed SteerNet Control)**:
+   - One validation-selected, legal $K=1$ SteerNet route is enabled at its validation-calibrated intensity.
+   - `model.set_routing_override('balanced')`, `model.set_gate_freeze(True, calibrated_alpha)`
+   - It measures the independently established SteerNet direction.  Enabling all candidates is an out-of-distribution stress test, not a fair ablation.
 3. **Condition 3 (Full ARS Pipeline)**:
    - Dynamic 2-pass cooperative layer routing + token-level usefulness gating + prompt shielding:
    - `model.set_routing_override(None)`, `model.set_gate_freeze(False)`

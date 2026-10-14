@@ -6,7 +6,7 @@ This document provides the formal mathematical formulation and algorithmic speci
 
 ## 1. SteerNet: $K$-Conditioned Low-Rank Residual Correction
 
-SteerNet operates as a non-invasive residual-stream intervention attached via PyTorch forward hooks at selected transformer blocks $l \in \mathcal{L}_{\text{target}}$. 
+SteerNet operates as a non-invasive residual-stream intervention attached via PyTorch forward hooks at selected transformer blocks $l \in \mathcal{L}_{\text{target}}$.  For Phi-2, the checkpoint-visible canonical candidate set is $\{11, 13, 15, 17, 18, 20, 22, 24\}$ (zero-based `base_model.model.layers` indices); it is never inferred from a percentage range.
 
 ### 1.1 Architectural Formulation
 For hidden state $h_l^{(t)} \in \mathbb{R}^d$ at layer $l$ and sequence position $t$, SteerNet computes candidate correction $\Delta h_l^{(t)}$:
@@ -58,7 +58,7 @@ $$\mathcal{L}_{\text{gate}} = \mathcal{L}_{\text{usefulness}} + \lambda_{\text{L
 ### 3.1 Two-Pass Attention Router Architecture
 The router evaluates candidate layers $l \in \mathcal{L}_{\text{target}}$ through a 2-pass cross-attention mechanism:
 1. **Pass 1 (Layer Utility Head)**: Computes unnormalized layer utilities $u_l \in \mathbb{R}$ for each candidate layer.
-2. **Pass 2 ($K$-Distribution Head)**: Computes logits over the cardinality distribution $P(K) = \text{Softmax}(\pi_K)$ for $K \in \{1, \dots, K_{\max}\}$.
+2. **Pass 2 ($K$-Distribution Head)**: Computes logits over the cardinality distribution $P(K) = \text{Softmax}(\pi_K)$ for $K \in \{0, \dots, K_{\max}\}$.  $K=0$ is the explicit frozen-backbone action.
 
 ### 3.2 Tanh-Normalized Pairwise Synergy Matrix
 Cross-layer interaction is modeled via a learnable symmetric matrix $W_{\text{syn}} \in \mathbb{R}^{N \times N}$. To prevent gradient saturation, the synergy matrix is strictly bounded:
