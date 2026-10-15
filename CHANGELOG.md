@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.4.0] - 2026-10-16
+
+### 🎯 Empirical Run: `exp_20261015_211528_ars_phi2_kaggle`
+Full multi-stage ARS evaluation on GSM8K (Microsoft Phi-2 2.7B, Kaggle 2× Tesla T4, 2,500 train examples, 50 test problems per condition):
+- **Headline Benchmark Matrix (n=50):**
+  - **0-Shot:** Full ARS **60.00%** vs Baseline **52.00%** (+8.00% absolute gain; 95% CI: [-11.0, +27.0]%).
+  - **2-Shot:** Full ARS **62.00%** vs Baseline **60.00%** (+2.00% absolute gain; 95% CI: [-17.0, +21.0]%).
+  - **8-Shot:** Full ARS **58.00%** vs Baseline **58.00%** (+0.00% gain / parity; 95% CI: [-19.0, +19.0]%).
+- **Deep Diagnostic Revelations:**
+  1. **Format Proxy Effect:** SteerNet gain is concentrated at 0-shot where no exemplars are present. With 2 exemplars, baseline accuracy increases from 52% to 60%, matching SteerNet and demonstrating that perturbations acted as implicit format cues ("Step 1:") rather than genuine reasoning enhancements.
+  2. **Token Gate Saturation:** Gate values saturated to $\alpha \approx 1.0$ (mean $\alpha = 0.9999-1.0$, std $< 0.0002$), rendering the dynamic token gate an identity multiplier without token discrimination.
+  3. **Norm Cap Clamping:** Perturbations pinned to the 4% hard cap (`mean_raw_relative_norm` $\approx 0.04$) across 99.5% of tokens, causing gradient zeroing at the boundary.
+  4. **Router Lookup Collapse:** Router collapsed to a fixed shot-count lookup table (0-shot: $K=2$ `[L11, L20]`; 2-shot/8-shot: $K=1$ `[L20]`).
+- Full report archived in [`experiments/runs/exp_20261015_211528_ars_phi2_kaggle/EXPERIMENT_REPORT.md`](file:///d:/projects/Adaptive%20Residual%20Steering%20(ARS)/experiments/runs/exp_20261015_211528_ars_phi2_kaggle/EXPERIMENT_REPORT.md).
+
+### 🛠️ Architecture & Pipeline Hardening (Commits: `0200b7a`, `214227e`, `eb58bd8`)
+- **Smooth Monotone Norm Saturation (`src/steering/steernet.py`, `src/models/wrapper.py`):** Replaced hard 4% clamp with smooth monotone saturation envelope $f(\delta) = \text{cap} \cdot \frac{\delta}{\sqrt{\|\delta\|^2 + \text{cap}^2}}$ ensuring non-zero gradients across all perturbation magnitudes; re-zeroed `mag_head.bias`.
+- **Micro-Batch Padding Trimming (`src/training/trainer.py`):** Wired `_trim_batch` at all forward/backward stacking sites, dynamically trimming sequences to actual token lengths and doubling training throughput (~2x compute savings).
+- **Steer/Router Data Splitting (`src/training/trainer.py`):** Wired `split_steer_router(train_data, 0.2)` across all training phases (Phases 1, 1.5, 2A, 2B, 2C, 2D) to isolate SteerNet and Router optimization, eliminating data leakage.
+- **Production Deployment Finalization (`src/evaluation/deployment.py`, `src/training/trainer.py`):** Wired `finalize_deployment` on held-out confirmation rows using a 95% paired bootstrap confidence interval ($\text{lo\_ci} > 0$), writing `deployment_mode` to model checkpoint manifests.
+- **Audit Fast-Path (`src/configs/config.py`):** Set `phase1_acceptance_accuracy_examples = 0` and `phase1_generation_screen_examples = 0`, bypassing 65 minutes of noisy preflight generation audits.
+- **Unified Generation Verifier (`src/evaluation/verifier.py`, `src/evaluation/answers.py`):** Standardized `epoch_end_accuracy` to use `AnswerStoppingCriteria`, symmetric text-level extraction, continuation trimming, and expanded stop markers (`_STOP_MARKERS`) to eliminate hallucinated follow-up tails.
+- **Paired Bootstrap Benchmark Reporting (`src/evaluation/multi_benchmark_runner.py`):** Integrated `format_benchmark_cell` to report empirical accuracy alongside paired $\Delta$ 95% bootstrap intervals and statistical significance asterisks (`*`).
+- **Format Control Diagnostic (`scripts/format_control.py`):** Resolved constructor import (`Phi2WithRSC`) and dataset loading signatures to enable direct testing of format-isolated steering.
+
+### 🧪 Verified
+- Unit test suite expanded to **86 / 86 tests passing (100% OK)** in 55.4 seconds.
+- Architecture diagram synchronization and hash integrity verified via `scripts/check_architecture_diagrams.py`.
+
+---
+
 ## [1.3.0] - 2026-10-11
 
 ### 🎯 Empirical Run: `exp_20261011_093749_ars_phi2_kaggle`
