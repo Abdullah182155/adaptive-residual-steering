@@ -3,7 +3,6 @@ ARC_Research.pptx
 ARS_Research_Presentation.pptx
 scripts/build_full_ars_presentation.py
 scratch/
-diagrams/
 
 # Original project sources (kept locally as immutable source of truth, excluded from repo)
 RSC_Training.py
