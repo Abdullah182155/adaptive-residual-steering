@@ -112,10 +112,19 @@ def evaluate_response(response: str, expected: Optional[float], min_steps: int =
         "quality": quality,
     }
 
+def _safe_decode(tokenizer, token_ids, skip_special_tokens: bool = True) -> str:
+    """Decode tokens tolerating mock/custom tokenizers without clean_up_tokenization_spaces."""
+    try:
+        return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens, clean_up_tokenization_spaces=False)
+    except TypeError:
+        return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+
 class AnswerStoppingCriteria(StoppingCriteria):
     """Stops generation with a grace period once an answer marker is emitted."""
 
     def __init__(self, tokenizer, prompt_length: int, max_new: int = 512, grace_tokens: int = 48):
+        self.tokenizer = tokenizer
         self.prompt_length = prompt_length
         self.max_new = max_new
         self.grace_tokens = grace_tokens
@@ -125,9 +134,27 @@ class AnswerStoppingCriteria(StoppingCriteria):
         self._marker_seen_at = None
 
     def __call__(self, input_ids: torch.Tensor, scores, **kwargs) -> bool:
-        if input_ids.shape[1] - self.prompt_length > self.max_new:
-            return True
         cur_len = input_ids.shape[1] - self.prompt_length
+        if cur_len > self.max_new:
+            return True
+
+        # Text-level early stops: cut at hallucinated follow-up questions and
+        # repetition loops. These apply symmetrically to all arms (baseline and
+        # ARS) so they do not introduce measurement bias. Check every 8 tokens
+        # to avoid per-token decode overhead.
+        if cur_len >= 8 and cur_len % 8 == 0:
+            from src.evaluation.answers import _STOP_MARKERS, should_stop_on_repeat
+            # Decode last ~160 tokens for follow-up question detection
+            tail_ids = input_ids[0, self.prompt_length:]
+            tail_start = max(0, tail_ids.shape[0] - 160)
+            tail_text = _safe_decode(self.tokenizer, tail_ids[tail_start:])
+            if any(re.search(p, tail_text) for p in _STOP_MARKERS):
+                return True
+            if cur_len % 16 == 0:
+                full_tail = _safe_decode(self.tokenizer, tail_ids)
+                if should_stop_on_repeat(full_tail):
+                    return True
+
         if self._marker_seen_at is not None:
             return cur_len >= self._marker_seen_at + self.grace_tokens
 
@@ -299,17 +326,10 @@ def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512,
             model.set_prompt_shield_mask(None)
 
     new_ids = output_ids[0][prompt_length:]
-    raw_text = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+    raw_text = _safe_decode(tokenizer, new_ids).strip()
 
-    for pat in [
-        r"####\s*-?\d[\d,]*\.?\d*",
-        r"[Ff]inal\s+answer\s*[:\-]?\s*-?\d[\d,]*\.?\d*",
-        r"[Tt]herefore[^.\n]*\.",
-        r"[Tt]he answer is[^.\n]*\.",
-    ]:
-        m = re.search(pat, raw_text)
-        if m:
-            raw_text = raw_text[: m.end()].strip()
-            break
-
+    from src.evaluation.answers import cut_continuation, truncate_at_answer
+    raw_text = cut_continuation(raw_text)
+    raw_text = truncate_at_answer(raw_text)
     return raw_text
+

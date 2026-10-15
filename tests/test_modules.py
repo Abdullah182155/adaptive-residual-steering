@@ -292,6 +292,11 @@ class TestARSModules(unittest.TestCase):
         # Force a steering layer active
         wrapper.set_routing_override("all")
         wrapper.set_gate_freeze(True, 1.0)
+        # Ensure non-zero steering intervention (since identity init starts at delta=0)
+        with torch.no_grad():
+            for sn in wrapper.steer_nets.values():
+                sn.up.weight.fill_(0.1)
+                sn.mag_head.bias.fill_(0.0)
 
         # Hook to capture hidden states at the last steered layer
         steered_layer = wrapper.target_layers[-1]
@@ -550,3 +555,117 @@ class TestAnswerExtractor(unittest.TestCase):
 
     def test_negative_number(self):
         self.assertEqual(self.ex("#### -5"), -5)
+
+
+class TestStopAndExtraction(unittest.TestCase):
+    """A-1 run-analysis: cut_continuation, should_stop_on_repeat, extraction priority."""
+
+    def setUp(self):
+        from src.evaluation.answers import (
+            cut_continuation, should_stop_on_repeat, extract_numeric_answer,
+        )
+        self.cut = cut_continuation
+        self.stop = should_stop_on_repeat
+        self.ex = extract_numeric_answer
+
+    def test_cut_continuation_removes_follow_up(self):
+        text = "Final answer: 42\nQuestion: There are 10 apples..."
+        self.assertEqual(self.cut(text), "Final answer: 42")
+
+    def test_cut_continuation_no_follow_up_unchanged(self):
+        text = "Step 1: x = 5\nFinal answer: 5"
+        self.assertEqual(self.cut(text), text)
+
+    def test_should_stop_on_repeat_detects_loop(self):
+        repeated = "She has 10 apples left after giving some away.\n" * 4
+        self.assertTrue(self.stop(repeated))
+
+    def test_should_stop_on_repeat_no_loop(self):
+        text = "Step 1: x = 5\nStep 2: y = 10\nStep 3: z = 15\n"
+        self.assertFalse(self.stop(text))
+
+    def test_extract_indras_final_answer_line(self):
+        # 'Final answer: Indras has 6 letters and her sister has 13 letters'
+        # should return 13 (last number in the Final answer line)
+        result = self.ex("Final answer: Indras has 6 letters and her sister has 13 letters")
+        self.assertEqual(result, 13)
+
+    def test_extract_no_hallucinated_tail(self):
+        # The #### in the follow-up question should NOT override the real answer
+        text = "Final answer: 10\nQuestion: Now there are 9. #### 9"
+        self.assertEqual(self.ex(text), 10)  # cut_continuation removes the tail
+
+    def test_extract_equals_beats_therefore(self):
+        # '=' scan should win over 'therefore' heuristic
+        text = "Therefore, she has many apples. The total is = 7"
+        self.assertEqual(self.ex(text), 7)
+
+
+class TestPairedCI(unittest.TestCase):
+    """A-2: paired_delta_ci correctness."""
+
+    def setUp(self):
+        from src.evaluation.deployment import paired_delta_ci
+        self.ci = paired_delta_ci
+
+    def test_zero_diff_ci_contains_zero(self):
+        flags = [1, 0, 1, 0, 1, 1, 0, 1, 0, 0] * 10
+        d, lo, hi = self.ci(flags, flags, n_boot=500)
+        self.assertAlmostEqual(d, 0.0)
+        self.assertLessEqual(lo, 0.0)
+        self.assertGreaterEqual(hi, 0.0)
+
+    def test_large_diff_ci_positive(self):
+        a = [0] * 100
+        b = [1] * 100
+        d, lo, hi = self.ci(a, b, n_boot=500)
+        self.assertAlmostEqual(d, 1.0)
+        self.assertGreater(lo, 0.5)
+
+    def test_mismatched_lengths_raises(self):
+        with self.assertRaises(ValueError):
+            self.ci([1, 0], [1, 0, 1])
+
+
+class TestSteerNetIdentityInit(unittest.TestCase):
+    """ISSUE-5: SteerNet must produce near-zero delta at initialization."""
+
+    def test_identity_at_init(self):
+        """up.weight = zeros means delta ~ 0 for all inputs at init."""
+        steer = RSCSteerNet(hidden_dim=64, rank=8, lora_alpha=16.0, magnitude_mode='direct')
+        steer.eval()
+        with torch.no_grad():
+            h = torch.randn(2, 10, 64)
+            delta = steer(h, active_k=torch.tensor([1, 2]))
+        self.assertLess(
+            delta.abs().max().item(), 1e-4,
+            f"Expected near-zero delta at init, got max={delta.abs().max().item():.6f}"
+        )
+
+    def test_route_width_config_fields_exist(self):
+        """ISSUE-3: Config must have router_warmup_random_subsets and router_warmup_max_k=4."""
+        cfg = self.cfg if hasattr(self, 'cfg') else RSCConfig()
+        self.assertTrue(hasattr(cfg, 'router_warmup_random_subsets'))
+        self.assertTrue(hasattr(cfg, 'router_warmup_max_k'))
+        self.assertEqual(cfg.router_warmup_max_k, 4)
+        self.assertTrue(cfg.router_warmup_random_subsets)
+
+
+class TestGateStreamingTrainedConv(unittest.TestCase):
+    """ISSUE-17: Gate prefill and streaming decode must match even after conv weights are trained/perturbed."""
+
+    def test_gate_streaming_matches_prefill_with_trained_conv(self):
+        import torch
+        from src.configs.config import RSCConfig
+        from src.gating.gate import RSCUsefulnessGate
+        gate = RSCUsefulnessGate(hidden_dim=64, cfg=RSCConfig(gate_dropout=0.0)).eval()
+        with torch.no_grad():
+            gate.causal_conv.weight.normal_(0, 0.5)
+            gate.causal_conv.bias.normal_(0, 0.1)
+        h = torch.randn(1, 6, 64)
+        delta = torch.randn_like(h)
+        gate.reset_conv_cache()
+        prefill = gate(h, delta).detach()
+        gate.reset_conv_cache()
+        streamed = torch.cat([gate(h[:, i:i + 1], delta[:, i:i + 1]).detach() for i in range(h.shape[1])], dim=1)
+        self.assertTrue(torch.allclose(prefill, streamed, atol=1e-5, rtol=1e-4))

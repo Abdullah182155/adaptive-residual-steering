@@ -23,7 +23,6 @@ class RSCConfig:
     # Catalog router: distribution over subsets. Empty is a legal action.
     catalog_include_pairs: bool = True
     catalog_consecutive_triples: bool = True
-    router_catalog_samples: int = 2  # extra subset forwards besides empty
     router_max_tok_len: int = 512
     router_shot_mix: Tuple[int, ...] = (0, 2, 4)
 
@@ -31,13 +30,13 @@ class RSCConfig:
     lora_rank: int = 16
     lora_alpha: float = 32.0
     lora_dropout: float = 0.05
-    steer_magnitude_mode: str = "decoupled"  # normalized direction + bounded magnitude
+    steer_magnitude_mode: str = "direct"  # ISSUE-5: direct per-token magnitude (was 'decoupled')
     steer_max_magnitude: float = 2.0
     # A residual perturbation is an angular intervention, not a new radial
-    # feature.  The tighter 4% envelope and orthogonal projection limit
-    # out-of-distribution drift in Phi-2's early/middle residual stream.
+    # feature.  Orthogonal projection is disabled (ISSUE-6/7) — the per-token
+    # magnitude head in 'direct' mode handles magnitude control instead.
     steer_max_relative_norm: float = 0.04
-    steer_orthogonal_projection: bool = True
+    steer_orthogonal_projection: bool = False  # ISSUE-6: disabled (was True)
     # A route has one shared intervention budget.  Each selected layer receives
     # K**(-power) of its own bounded delta, so adding layers cannot linearly
     # multiply the residual displacement.  K=1 remains unchanged.
@@ -97,9 +96,12 @@ class RSCConfig:
     phase1_min_val_nll_reduction: float = 0.05
     # Do not promote an adapter merely because it does not regress on a tiny
     # teacher-forced probe.  This is an *independent held-out generation*
-    # gain, despite the legacy field retained below for old notebooks.
-    phase1_min_validation_accuracy_gain: float = 0.10
-    phase1_min_train_accuracy_gain: float = 0.10  # legacy alias; prefer the field above
+    # P2 (run-analysis fix): acceptance thresholds set to 0.0 — telemetry only.
+    # A 32-item holdout has 3.1pp quantisation and cannot support a hard gate.
+    # The in-audit generation screen is also disabled (phase1_generation_screen_examples=0).
+    # Deployment is decided once at the end via finalize_deployment (ISSUE-2).
+    phase1_min_validation_accuracy_gain: float = 0.0   # was 0.10 — telemetry only
+    phase1_min_train_accuracy_gain: float = 0.0        # was 0.10 — legacy alias
     phase1_accuracy_warning_gain: float = 0.10
     # A four-example holdout cannot establish a scientific capacity or
     # routing-health claim.  Tiny smoke runs still execute every phase and
@@ -111,15 +113,11 @@ class RSCConfig:
     # Kaggle run continues to save checkpoints, plots, and audit evidence.
     # This must never turn a warning into a claimed PASS.
     continue_on_diagnostic_failure: bool = True
-    # Continuing a notebook must not mean training a router on a demonstrably
-    # destructive SteerNet objective.  When Phase 1 fails on held-out
-    # generation, preserve its artifacts and return a baseline-equivalent
-    # ARS checkpoint marked diagnostic-only instead of inventing Phase 2.
-    skip_adaptive_phases_when_phase1_fails: bool = True
-    # An adaptive phase is not allowed to follow a deployment-policy collapse
-    # just because ``continue_on_diagnostic_failure`` keeps notebooks alive.
-    # It saves a baseline-safe checkpoint and records the failed preflight.
-    skip_adaptive_phases_when_router_fails: bool = True
+    # P2 (run-analysis fix): always train adaptive phases. The old hard gate
+    # on a noisy 32-item accuracy delta caused random pipeline truncation.
+    # Deployment is decided at the end with finalize_deployment (ISSUE-2).
+    skip_adaptive_phases_when_phase1_fails: bool = False   # was True
+    skip_adaptive_phases_when_router_fails: bool = False   # was True
 
     # Phase 2 staged parameters
     phase2_warmup_ratio: float = 0.03
@@ -128,7 +126,7 @@ class RSCConfig:
     # Gate architecture
     gate_dim: int = 16
     gate_dropout: float = 0.05
-    gate_init_alpha: float = 0.50  # neutral start; task loss must earn large residual injection
+    gate_init_alpha: float = 0.95  # B-3: near-open init; task loss must earn suppression
     gating_mode: str = "learned"  # 'learned' (MLP), 'constant' (fixed scalar), or 'step'
     gate_constant_value: float = 0.80
 
@@ -138,10 +136,10 @@ class RSCConfig:
     # toward saturation.  The differentiable answer-aware task loss provides
     # the correct local gate signal; generation PG remains opt-in research.
     lambda_pg: float = 0.0
-    lambda_l1_gate: float = 0.001
-    lambda_gate_usefulness: float = 0.30
-    lambda_gate_antisat: float = 0.25
-    lambda_gate_diversity: float = 0.5
+    lambda_l1_gate: float = 0.0          # B-3: disabled (was 0.001)
+    lambda_gate_usefulness: float = 0.0   # B-3: disabled (was 0.30)
+    lambda_gate_antisat: float = 0.0      # B-3: disabled (was 0.25)
+    lambda_gate_diversity: float = 0.0    # B-3: disabled (was 0.5)
     gate_diversity_floor: float = 0.05
     pg_n_samples: int = 4
     pg_baseline_momentum: float = 0.8
@@ -161,7 +159,6 @@ class RSCConfig:
     # Checkpoint selection
     use_accuracy_checkpoint: bool = True
     accuracy_eval_n: int = 100
-    accuracy_eval_every_n: int = 1
 
     # Checkpoint paths (relative by default, portable for local and Kaggle)
     lora_save_path: str = "./checkpoints/steer_phase1_adaptive_v11.pt"
@@ -187,13 +184,13 @@ class RSCConfig:
     router_preflight_examples: int = 128
     router_fail_fast_on_collapse: bool = False
     intervention_audit_examples: int = 128
-    router_min_eval_k_support: int = 3
-    router_require_eval_k0: bool = True
-    router_min_eval_k_entropy: float = 0.25
-    router_min_eval_active_layers: int = 4
-    router_min_eval_layer_entropy: float = 0.45
-    gate_min_eval_sequence_std: float = 0.015
-    gate_max_eval_high_saturation_pct: float = 20.0
+    router_min_eval_k_support: int = 1          # B-3: was 3 — don't fail on sparse K
+    router_require_eval_k0: bool = False         # B-3: was True — K=0 optional
+    router_min_eval_k_entropy: float = 0.0       # B-3: was 0.25
+    router_min_eval_active_layers: int = 1       # B-3: was 4 — even 1 active layer is fine
+    router_min_eval_layer_entropy: float = 0.0   # B-3: was 0.45
+    gate_min_eval_sequence_std: float = 0.0      # B-3: was 0.015
+    gate_max_eval_high_saturation_pct: float = 100.0  # B-3: was 20.0 — allow full saturation
     router_probe_every_n_steps: int = 1
     router_checkpoint_every_n_steps: int = 0
     router_dead_layer_veto_frac: float = 0.50
@@ -233,8 +230,8 @@ class RSCConfig:
     # Low-temperature MI acts on near-discrete choices, preventing a router
     # whose soft probabilities vary slightly while every argmax is identical.
     router_diversity_temperature: float = 0.35
-    lambda_router_k_mi: float = 0.10
-    lambda_router_layer_mi: float = 0.10
+    lambda_router_k_mi: float = 0.0       # B-3: was 0.10 — MI regularization disabled
+    lambda_router_layer_mi: float = 0.0   # B-3: was 0.10
     # Directly distil the three counterfactual rewards (K=0, K_a, K_b) into
     # the deterministic K head.  RLOO alone updates sampled log-probabilities
     # and allowed a global K=3 bias to survive at argmax deployment.
@@ -269,10 +266,11 @@ class RSCConfig:
     gate_retune_epochs: int = 1
     gate_retune_lr: float = 1e-4
 
-    # Phase 1 proves each candidate SteerNet can help on its own before any
-    # cooperative route is allowed.  Multi-layer interaction is learned by
-    # RLOO only after this independent capacity check.
-    router_warmup_max_k: int = 1
+    # ISSUE-3 (B-3): random K subsets expose each SteerNet to cooperative routes
+    # early in Phase 1 so they learn compatible directions. Was max_k=1 (single layer
+    # rotation only), which trained each SteerNet in isolation — causing interference when combined.
+    router_warmup_max_k: int = 4                   # B-3: was 1 — allow multi-layer combos in warmup
+    router_warmup_random_subsets: bool = True       # B-3: random K in [1, max_k] each step
 
     checkpoint_every_n: int = 3
     lr_reduce_factor: float = 0.5

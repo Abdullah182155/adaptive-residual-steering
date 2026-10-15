@@ -5,7 +5,6 @@ from .losses import (
     compute_l1_gate,
     compute_antisat_gate,
     compute_gate_diversity_loss,
-    compute_invariance_loss,
     compute_pg_loss,
     compute_pg_loss_lite,
     compute_pg_advantage_lite,
@@ -23,6 +22,8 @@ from .trainer import (
     train_streamlined_ars,
     save_steer_weights,
     load_steer_weights,
+    split_steer_router,
+    _trim_batch,
 )
 
 __all__ = [
@@ -32,7 +33,6 @@ __all__ = [
     "compute_l1_gate",
     "compute_antisat_gate",
     "compute_gate_diversity_loss",
-    "compute_invariance_loss",
     "compute_contrastive_gate_loss",
     "compute_pg_loss",
     "compute_pg_loss_lite",
@@ -48,4 +48,6 @@ __all__ = [
     "train_streamlined_ars",
     "save_steer_weights",
     "load_steer_weights",
+    "split_steer_router",
+    "_trim_batch",
 ]

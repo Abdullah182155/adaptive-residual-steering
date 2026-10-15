@@ -373,12 +373,18 @@ class Phi2WithRSC(nn.Module):
         K_max = self.cfg.max_active_layers
 
         if self._router_warmup:
-            warmup_max_k = int(getattr(self.cfg, "router_warmup_max_k", 1))
-            width = 1 + (self._warmup_cursor % max(1, min(K_max, warmup_max_k)))
-            stride = max(1, n_candidates // width)
-            pos = self._warmup_width_visits[width - 1]
-            forced_indices = {self.target_layers[(pos + j * stride) % n_candidates] for j in range(width)}
-            self._warmup_width_visits[width - 1] += 1
+            warmup_max_k = int(getattr(self.cfg, "router_warmup_max_k", 4))
+            if getattr(self.cfg, "router_warmup_random_subsets", True):
+                import random as _random
+                k_max = min(K_max, warmup_max_k, n_candidates)
+                width = _random.randint(1, max(1, k_max))
+                forced_indices = set(_random.sample(self.target_layers, width))
+            else:
+                width = 1 + (self._warmup_cursor % max(1, min(K_max, warmup_max_k)))
+                stride = max(1, n_candidates // width)
+                pos = self._warmup_width_visits[width - 1]
+                forced_indices = {self.target_layers[(pos + j * stride) % n_candidates] for j in range(width)}
+                self._warmup_width_visits[width - 1] += 1
             selected_matrix = torch.tensor(
                 [idx in forced_indices for idx in self.target_layers], device=h.device, dtype=torch.bool
             ).unsqueeze(0).expand(h.shape[0], -1)

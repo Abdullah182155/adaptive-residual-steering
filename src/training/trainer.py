@@ -18,7 +18,6 @@ from src.training.losses import (
     compute_l1_gate,
     compute_antisat_gate,
     compute_gate_diversity_loss,
-    compute_invariance_loss,
     compute_pg_advantage_lite,
     compute_pg_gate_loss_from_live_alphas,
     log_gpu_memory,
@@ -64,6 +63,66 @@ def _answer_aware_loss(logits: torch.Tensor, labels: torch.Tensor, cfg: RSCConfi
         answer_tail_tokens=getattr(cfg, "answer_tail_tokens", 0),
         answer_tail_weight=getattr(cfg, "answer_tail_weight", 1.0),
     ).mean()
+
+
+def split_steer_router(
+    rows: list,
+    router_fraction: float = 0.2,
+    seed: int = 42,
+) -> tuple:
+    """Split training rows into steer-set and router-set (ISSUE-4 data split).
+
+    SteerNets and Phase 2A use steer_data (80%).
+    Router/Gate (Phase 1.5, 2B/C/D) use router_data (20%).
+    This prevents the router from seeing the same examples used to train the
+    SteerNets, reducing data leakage in the routing objective.
+
+    Args:
+        rows: Full list of training feature dicts.
+        router_fraction: Fraction of rows reserved for router/gate training.
+        seed: Random seed for reproducibility.
+
+    Returns:
+        (steer_data, router_data) tuple of lists.
+    """
+    import random as _random
+    rng = _random.Random(seed)
+    indices = list(range(len(rows)))
+    rng.shuffle(indices)
+    split = int(len(rows) * (1 - router_fraction))
+    steer_idx = indices[:split]
+    router_idx = indices[split:]
+    return [rows[i] for i in steer_idx], [rows[i] for i in router_idx]
+
+
+def _trim_batch(
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    lbls: torch.Tensor,
+    shield: torch.Tensor = None,
+) -> tuple:
+    """Trim trailing padding from a right-padded micro-batch (P6 speed fix).
+
+    GSM8K sequences are ~150-300 tokens but are padded to max_tok_len=512.
+    Trimming to the longest real sequence in the batch cuts forward/backward
+    compute by ~2x without changing gradient direction.
+
+    Args:
+        ids:    input_ids   [B, T]
+        mask:   attn_mask   [B, T]
+        lbls:   labels      [B, T]
+        shield: prompt_shield [B, T] or None
+
+    Returns:
+        (ids, mask, lbls, shield) trimmed to length of longest non-padding token.
+    """
+    keep = int(mask.sum(dim=1).max().item())
+    ids = ids[:, :keep]
+    mask = mask[:, :keep]
+    lbls = lbls[:, :keep]
+    if shield is not None:
+        shield = shield[:, :keep]
+    return ids, mask, lbls, shield
 
 
 def save_steer_weights(
@@ -1168,16 +1227,6 @@ def run_staged_phase(
                 scaler.scale(micro_loss).backward()
             del out
 
-            if train_steer and accum_count == 0 and global_step % cfg.invariance_every_n_steps == 0:
-                inv_loss = compute_invariance_loss(
-                    model, tokenizer,
-                    [train_data[i]["question"] for i in batch_idx],
-                    [train_data[i]["steps_list"] for i in batch_idx],
-                    [train_data[i]["final_num"] for i in batch_idx],
-                    cfg, device, seed_offset=global_step,
-                )
-                if torch.isfinite(inv_loss) and inv_loss.requires_grad:
-                    scaler.scale(cfg.lambda_invariance * inv_loss).backward()
 
             # BUG-08 fix: trigger RLOO only at the last micro-batch of the accumulation window
             # (i.e. just before the optimizer.step()). Previously triggered at accum_count==0

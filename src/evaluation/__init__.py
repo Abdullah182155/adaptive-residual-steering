@@ -25,6 +25,17 @@ from .multi_benchmark_runner import (
     format_benchmark_summary_table,
     export_latex_summary_table,
 )
+from .deployment import (
+    paired_delta_ci,
+    format_benchmark_cell,
+    finalize_deployment,
+)
+from .answers import (
+    cut_continuation,
+    should_stop_on_repeat,
+    has_answer_marker,
+    truncate_at_answer,
+)
 
 __all__ = [
     "extract_and_verify_equations",
@@ -48,5 +59,12 @@ __all__ = [
     "run_fair_multishot_benchmark",
     "format_benchmark_summary_table",
     "export_latex_summary_table",
+    "paired_delta_ci",
+    "format_benchmark_cell",
+    "finalize_deployment",
+    "cut_continuation",
+    "should_stop_on_repeat",
+    "has_answer_marker",
+    "truncate_at_answer",
 ]
 

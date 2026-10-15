@@ -35,7 +35,13 @@ class RSCSteerNet(nn.Module):
         self.act2 = nn.GELU()
         self.drop2 = nn.Dropout(dropout)
         self.up = nn.Linear(rank, hidden_dim, bias=False)
-        
+
+        # Per-token magnitude head for 'direct' magnitude mode (ISSUE-5).
+        # log_magnitude is retained for 'decoupled' mode backward compat.
+        self.mag_head = nn.Linear(rank, 1)
+        nn.init.zeros_(self.mag_head.weight)
+        nn.init.constant_(self.mag_head.bias, -6.0)  # sigmoid(-6) ≈ 0.0025 -> near-zero start
+
         # K-conditioning projection: input is active_k normalized to [0, 1]
         self.k_proj = nn.Linear(1, rank)
         nn.init.zeros_(self.k_proj.weight)
@@ -47,8 +53,12 @@ class RSCSteerNet(nn.Module):
         # Learnable log-magnitude for decoupled mode
         self.log_magnitude = nn.Parameter(torch.zeros(1))
 
-        for lin in [self.down1, self.mid, self.up]:
+        for lin in [self.down1, self.mid]:
             nn.init.xavier_uniform_(lin.weight, gain=0.02)
+        # Zero-init the projection-up layer so delta=0 at init (ISSUE-5 identity init).
+        # This ensures the SteerNet starts as a perfect pass-through (baseline identity)
+        # and the task loss must earn any nonzero intervention from scratch.
+        nn.init.zeros_(self.up.weight)
 
     def forward(self, h: torch.Tensor, active_k: torch.Tensor = None) -> torch.Tensor:
         h_flt = h.float()
@@ -57,7 +67,8 @@ class RSCSteerNet(nn.Module):
         if active_k is not None:
             k_norm = (active_k.to(dtype=x.dtype) / 4.0).view(-1, 1, 1)
             x = x + self.k_proj(k_norm)
-        mid = self.drop2(self.act2(self.mid(x)))
+        mid_pre_drop = self.act2(self.mid(x))
+        mid = self.drop2(mid_pre_drop)
         x = x + mid
         delta = self.up(x)
 
@@ -66,6 +77,10 @@ class RSCSteerNet(nn.Module):
             direction = delta / d_norm
             mag = torch.exp(self.log_magnitude).clamp(max=self.max_magnitude)
             delta = direction * mag * self.scale.to(x.dtype)
+        elif self.magnitude_mode == "direct":
+            # Per-token sigmoid gate on magnitude (near-zero at init via bias=-6)
+            mag = torch.sigmoid(self.mag_head(mid_pre_drop))
+            delta = delta * mag * self.scale.to(x.dtype)
         else:
             delta = delta * self.scale.to(x.dtype)
 

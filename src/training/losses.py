@@ -203,42 +203,6 @@ def compute_antisat_gate(model, threshold: float = 0.92) -> torch.Tensor:
         count += 1
     return total / max(1, count)
 
-def compute_invariance_loss(model, tokenizer, questions, steps_lists, final_answers, cfg, device, seed_offset=0):
-    """Paraphrase-invariance loss pulling steered representations together across two template views."""
-    last_layer_idx = max(int(k) for k in model.steer_nets.keys())
-    pooled = {}
-
-    def grab_hook(module, args, output):
-        pooled["cur"] = output[0]
-
-    h = model.base_model.model.layers[last_layer_idx].register_forward_hook(grab_hook)
-    try:
-        def encode(texts):
-            enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True, max_length=cfg.max_tok_len).to(device)
-            model._attn_mask_cache = enc["attention_mask"]
-            # WARN-2 fix: backbone is frozen; no backward graph needed through Phi-2.
-            # Gradient for the invariance cosine loss flows only through the pooled z vectors.
-            with torch.no_grad():
-                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                    model(input_ids=enc["input_ids"], attention_mask=enc["attention_mask"], use_cache=False)
-            hs = pooled["cur"].float()
-            mask = enc["attention_mask"].unsqueeze(-1).float()
-            mean_pool = (hs * mask).sum(1) / mask.sum(1).clamp(min=1)
-            return F.normalize(mean_pool, dim=-1)
-
-
-        view1, view2 = [], []
-        for j, (q, steps, ans) in enumerate(zip(questions, steps_lists, final_answers)):
-            v1, v2 = PromptTemplateBank.two_views(q, steps, ans, seed=cfg.seed + seed_offset + j)
-            view1.append(v1)
-            view2.append(v2)
-
-        z1 = encode(view1)
-        z2 = encode(view2)
-        return (1.0 - (z1 * z2).sum(-1)).mean()
-    finally:
-        h.remove()
-
 def log_gpu_memory(label: str, cfg=None, reset_peak: bool = True):
     """Memory diagnostic reporting CUDA peak allocated/reserved."""
     if cfg is not None and not getattr(cfg, "log_gpu_memory", True):

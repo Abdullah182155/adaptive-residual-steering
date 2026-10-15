@@ -27,9 +27,12 @@ class RSCUsefulnessGate(nn.Module):
         self.drop = nn.Dropout(cfg.gate_dropout)
 
         # Causal Context Window (k=3) for local syntax & reasoning step awareness
+        # True identity (current-token tap at index 2), causal alignment (ISSUE-17)
         self.causal_conv = nn.Conv1d(gate_dim, gate_dim, kernel_size=3, padding=2, groups=gate_dim)
-        nn.init.dirac_(self.causal_conv.weight)
-        nn.init.zeros_(self.causal_conv.bias)
+        with torch.no_grad():
+            self.causal_conv.weight.zero_()
+            self.causal_conv.weight[:, 0, 2] = 1.0
+            self.causal_conv.bias.zero_()
 
         self.fc2 = nn.Linear(gate_dim, 1)
 
@@ -142,9 +145,10 @@ class RSCUsefulnessGate(nn.Module):
                 x = x + self.drop(self.act(conv_out[:, -1:, :]))
                 self._conv_cache = x_cat[:, 1:, :].detach()
             else:
-                x_conv = self.causal_conv(x.transpose(1, 2))[:, :, :1].transpose(1, 2)
-                x = x + self.drop(self.act(x_conv))
-                self._conv_cache = x.detach().repeat(1, 2, 1)
+                pre = x  # pre-conv features of this token
+                x_conv = self.causal_conv(pre.transpose(1, 2))[:, :, :1].transpose(1, 2)
+                x = pre + self.drop(self.act(x_conv))
+                self._conv_cache = torch.cat([torch.zeros_like(pre), pre], dim=1).detach()  # [pad, token0]
 
         gate_logit = torch.clamp(self.fc2(x), min=-10.0, max=10.0)
         alpha = torch.sigmoid(gate_logit)  # (B, T, 1)
