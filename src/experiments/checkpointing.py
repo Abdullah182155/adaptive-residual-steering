@@ -182,6 +182,9 @@ def load_ars_checkpoint_strict(
     if failed or result.unexpected_keys:
         raise RuntimeError(f"PyTorch did not apply all saved ARS tensors: missing={failed}, unexpected={result.unexpected_keys}")
     manifest = load_checkpoint_manifest(path)
-    if manifest is not None and manifest.get("state_sha256") != state_sha256(saved):
-        raise RuntimeError(f"ARS checkpoint hash disagrees with its manifest: {Path(path).with_suffix(Path(path).suffix + '.manifest.json')}")
+    if manifest is not None:
+        if manifest.get("state_sha256") != state_sha256(saved):
+            raise RuntimeError(f"ARS checkpoint hash disagrees with its manifest: {Path(path).with_suffix(Path(path).suffix + '.manifest.json')}")
+        if hasattr(model, "deployment_disabled"):
+            model.deployment_disabled = (manifest.get("deployment_mode") == "baseline")
     return {"saved_ars_tensors": len(saved), "manifest": manifest, "non_ars_missing": len(result.missing_keys)}

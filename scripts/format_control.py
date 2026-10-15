@@ -27,7 +27,7 @@ from src.data.dataset import gsm8k_to_cot
 from src.evaluation.deployment import paired_delta_ci
 from src.evaluation.multi_dataset import build_benchmark_prompt, evaluate_sample_answer
 from src.evaluation.verifier import generate_response
-from src.models.wrapper import RSCPhi2Model
+from src.models.wrapper import Phi2WithRSC
 
 
 def _arm(model, tokenizer, rows, device, override, prefix: str = "", max_new_tokens: int = 384) -> np.ndarray:
@@ -83,7 +83,7 @@ def run_format_control(model, tokenizer, rows, device, layer: int = 17, max_new_
 def main():
     parser = argparse.ArgumentParser(description="Run ARS Format Control Experiment (P1)")
     parser.add_argument("--checkpoint", type=str, default="./checkpoints/steer_phase1_adaptive_v11.pt", help="SteerNet checkpoint path")
-    parser.add_argument("--layer", type=int, default=17, help="Target layer for SteerNet evaluation")
+    parser.add_argument("--layer", type=int, default=18, help="Target layer for SteerNet evaluation")
     parser.add_argument("--n_samples", type=int, default=300, help="Number of test samples (recommended >= 300)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use")
     args = parser.parse_args()
@@ -97,7 +97,7 @@ def main():
 
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     base_model = AutoModelForCausalLM.from_pretrained(cfg.model_name, torch_dtype=dtype).to(device)
-    model = RSCPhi2Model(base_model, cfg)
+    model = Phi2WithRSC(base_model, cfg, device=device).to(device)
 
     # Load SteerNet checkpoint
     from src.training.trainer import load_steer_weights
@@ -105,7 +105,7 @@ def main():
 
     # Load evaluation dataset
     from src.evaluation.multi_dataset import load_benchmark_dataset
-    test_rows = load_benchmark_dataset("gsm8k", split="test", n_samples=args.n_samples)
+    test_rows = load_benchmark_dataset("gsm8k", n_samples=args.n_samples)
 
     run_format_control(model, tokenizer, test_rows, device, layer=args.layer)
 

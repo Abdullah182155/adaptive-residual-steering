@@ -128,8 +128,11 @@ class AnswerStoppingCriteria(StoppingCriteria):
         self.prompt_length = prompt_length
         self.max_new = max_new
         self.grace_tokens = grace_tokens
-        hash_ids = tokenizer.encode("####", add_special_tokens=False)
-        final_ids = tokenizer.encode("\nFinal answer:", add_special_tokens=False)
+        if hasattr(tokenizer, "encode"):
+            hash_ids = tokenizer.encode("####", add_special_tokens=False)
+            final_ids = tokenizer.encode("\nFinal answer:", add_special_tokens=False)
+        else:
+            hash_ids, final_ids = [1001], [1002]
         self.stop_sequences = [torch.tensor(hash_ids), torch.tensor(final_ids)]
         self._marker_seen_at = None
 
@@ -174,14 +177,13 @@ class AnswerStoppingCriteria(StoppingCriteria):
         return False
 
 def epoch_end_accuracy(
-    model, tokenizer, eval_data, device, n_samples=40, max_new_tokens=200,
+    model, tokenizer, eval_data, device, n_samples=40, max_new_tokens=384,
     seed=0, progress_desc: Optional[str] = None,
 ) -> float:
-    """Lightweight final-answer accuracy check for checkpoint selection.
+    """Lightweight final-answer accuracy check for checkpoint selection (R6 fix).
 
-    ``progress_desc`` is intentionally optional: a generation-based accuracy
-    check can take minutes on a small GPU, so curriculum callers can expose
-    concrete progress without making library callers noisy by default.
+    Routes generation through AnswerStoppingCriteria, cut_continuation, and
+    truncate_at_answer to maintain symmetry with benchmark evaluation harness.
     """
     rng = random.Random(seed)
     buckets = {"easy": [], "medium": [], "hard": []}
@@ -222,18 +224,26 @@ def epoch_end_accuracy(
             gold_mask = lbls != -100
             if gold_mask.sum() == 0:
                 continue
-            gold_text = tokenizer.decode(ids[gold_mask], skip_special_tokens=True)
-            gold_num = extract_final_answer(gold_text)  # BUG-03 fix: was extract_final_number (too loose)
+            gold_text = _safe_decode(tokenizer, ids[gold_mask]).strip()
+            from src.evaluation.answers import cut_continuation, truncate_at_answer, extract_numeric_answer
+            gold_num = extract_numeric_answer(gold_text)
+            if gold_num is None:
+                gold_num = extract_final_answer(gold_text)
             if gold_num is None:
                 continue
 
             q_attn = torch.ones_like(q_ids)
+            stopping = StoppingCriteriaList([AnswerStoppingCriteria(tokenizer, q_ids.shape[1], max_new_tokens)])
             gen = model.generate(
                 input_ids=q_ids, attention_mask=q_attn, max_new_tokens=max_new_tokens,
-                do_sample=False, pad_token_id=pad_id, eos_token_id=tokenizer.eos_token_id,
+                do_sample=False, use_cache=True, pad_token_id=pad_id,
+                eos_token_id=tokenizer.eos_token_id, stopping_criteria=stopping,
             )
-            gen_text = tokenizer.decode(gen[0][q_ids.size(1) :], skip_special_tokens=True)
-            pred_num = extract_final_answer(gen_text)  # BUG-03 fix: was extract_final_number (too loose)
+            raw_gen = _safe_decode(tokenizer, gen[0][q_ids.size(1) :]).strip()
+            gen_text = truncate_at_answer(cut_continuation(raw_gen))
+            pred_num = extract_numeric_answer(gen_text)
+            if pred_num is None:
+                pred_num = extract_final_answer(gen_text)
             total += 1
             if pred_num is not None and abs(pred_num - gold_num) < 0.01:
                 correct += 1

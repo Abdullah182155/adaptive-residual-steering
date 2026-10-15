@@ -15,12 +15,16 @@ from typing import Optional
 
 _NUM = r"-?\d[\d,]*(?:\.\d+)?"
 
-# Markers that indicate hallucinated follow-up questions — cut here
+# Markers that indicate hallucinated follow-up questions / discussion — cut here
 _STOP_MARKERS = (
     r"\n\s*Question\s*:",
     r"\n\s*Q\s*:",
     r"\n\s*Problem\s*:",
     r"<\|endoftext\|>",
+    r"\n\s*Topic\s*:",
+    r"\n\s*Follow-?up[^\n]*:",
+    r"\n\s*Complete detailed[^\n]*",
+    r"\n\s*(?:Discussion|Exercise|Ph\.?D\.?-level[^\n]*)\s*:?",
 )
 
 # Priority-ordered explicit answer markers (must capture group 1 = the number)

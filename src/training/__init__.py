@@ -24,6 +24,7 @@ from .trainer import (
     load_steer_weights,
     split_steer_router,
     _trim_batch,
+    gate_is_degenerate,
 )
 
 __all__ = [
@@ -50,4 +51,5 @@ __all__ = [
     "load_steer_weights",
     "split_steer_router",
     "_trim_batch",
+    "gate_is_degenerate",
 ]

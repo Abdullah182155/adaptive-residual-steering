@@ -21,12 +21,15 @@ class RSCSteerNet(nn.Module):
         max_magnitude: float = 2.0,
         max_relative_norm: float = 0.15,
         orthogonal_projection: bool = False,
+        k_max: int = 4,
     ):
         super().__init__()
+        self.k_max = max(1, int(k_max))
         self.magnitude_mode = magnitude_mode
         self.max_magnitude = max_magnitude
         self.max_relative_norm = max_relative_norm
         self.orthogonal_projection = orthogonal_projection
+        self._clip_stats = 0.0
         self.norm = nn.LayerNorm(hidden_dim)
         self.down1 = nn.Linear(hidden_dim, rank, bias=False)
         self.act1 = nn.GELU()
@@ -36,11 +39,11 @@ class RSCSteerNet(nn.Module):
         self.drop2 = nn.Dropout(dropout)
         self.up = nn.Linear(rank, hidden_dim, bias=False)
 
-        # Per-token magnitude head for 'direct' magnitude mode (ISSUE-5).
+        # Per-token magnitude head for 'direct' magnitude mode (ISSUE-5 / R2).
         # log_magnitude is retained for 'decoupled' mode backward compat.
         self.mag_head = nn.Linear(rank, 1)
         nn.init.zeros_(self.mag_head.weight)
-        nn.init.constant_(self.mag_head.bias, -6.0)  # sigmoid(-6) ≈ 0.0025 -> near-zero start
+        nn.init.zeros_(self.mag_head.bias)  # R2: 0 init (sigmoid=0.5); identity is guaranteed by up.weight=0
 
         # K-conditioning projection: input is active_k normalized to [0, 1]
         self.k_proj = nn.Linear(1, rank)
@@ -65,7 +68,7 @@ class RSCSteerNet(nn.Module):
         x = self.norm(h_flt)
         x = self.drop1(self.act1(self.down1(x)))
         if active_k is not None:
-            k_norm = (active_k.to(dtype=x.dtype) / 4.0).view(-1, 1, 1)
+            k_norm = (active_k.to(dtype=x.dtype) / float(self.k_max)).view(-1, 1, 1)
             x = x + self.k_proj(k_norm)
         mid_pre_drop = self.act2(self.mid(x))
         mid = self.drop2(mid_pre_drop)
@@ -78,20 +81,23 @@ class RSCSteerNet(nn.Module):
             mag = torch.exp(self.log_magnitude).clamp(max=self.max_magnitude)
             delta = direction * mag * self.scale.to(x.dtype)
         elif self.magnitude_mode == "direct":
-            # Per-token sigmoid gate on magnitude (near-zero at init via bias=-6)
+            # Per-token sigmoid gate on magnitude
             mag = torch.sigmoid(self.mag_head(mid_pre_drop))
             delta = delta * mag * self.scale.to(x.dtype)
         else:
             delta = delta * self.scale.to(x.dtype)
 
-        # Bounded Relative Perturbation Envelope:
-        # Prevents residual explosion: ||delta|| <= beta * ||h||
+        # Smooth Saturation Envelope (R2 fix):
+        # f(n) = n * c / sqrt(n^2 + c^2), bounded strictly by cap while preserving
+        # relative token-wise magnitude dynamics (unlike a hard clamp).
         if self.max_relative_norm > 0:
             h_norm = torch.norm(h_flt, dim=-1, keepdim=True) + 1e-7
             delta_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
-            max_allowed = self.max_relative_norm * h_norm
-            scale_factor = torch.clamp(max_allowed / delta_norm, max=1.0)
-            delta = delta * scale_factor
+            cap = self.max_relative_norm * h_norm
+            soft = cap / torch.sqrt(delta_norm.square() + cap.square())
+            if self.training is False:
+                self._clip_stats = (delta_norm > cap).float().mean().item()
+            delta = delta * soft
 
         # Orthogonal Steering Projection (optional):
         # Projects delta onto the orthogonal complement of h so steering strictly

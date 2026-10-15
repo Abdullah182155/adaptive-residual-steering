@@ -371,6 +371,7 @@ class TestARSModules(unittest.TestCase):
         tokenizer = type("Tokenizer", (), {
             "pad_token_id": 0, "eos_token_id": 1,
             "decode": lambda *a, **k: "#### 42",
+            "encode": lambda *a, **k: [1, 2],
         })()
 
         # 1. train_router=False (must NOT raise UnboundLocalError)
@@ -669,3 +670,62 @@ class TestGateStreamingTrainedConv(unittest.TestCase):
         gate.reset_conv_cache()
         streamed = torch.cat([gate(h[:, i:i + 1], delta[:, i:i + 1]).detach() for i in range(h.shape[1])], dim=1)
         self.assertTrue(torch.allclose(prefill, streamed, atol=1e-5, rtol=1e-4))
+
+
+class TestGateDegeneracyAndSaturation(unittest.TestCase):
+    """R2/R3/R5: Tests for smooth saturation envelope, gate degeneracy detection, and trim_batch."""
+
+    def test_gate_is_degenerate_detection(self):
+        from src.training.trainer import gate_is_degenerate
+        # Degenerate: alpha saturated with negligible variance
+        diag_degen = {
+            "gate": {
+                "18": {"intervened_tokens": 100, "token_std": 0.0001, "high_saturation_pct": 99.8},
+                "20": {"intervened_tokens": 100, "token_std": 0.0002, "high_saturation_pct": 100.0},
+            }
+        }
+        self.assertTrue(gate_is_degenerate(diag_degen))
+
+        # Healthy: lower saturation and real variance
+        diag_healthy = {
+            "gate": {
+                "18": {"intervened_tokens": 100, "token_std": 0.05, "high_saturation_pct": 40.0},
+                "20": {"intervened_tokens": 100, "token_std": 0.08, "high_saturation_pct": 35.0},
+            }
+        }
+        self.assertFalse(gate_is_degenerate(diag_healthy))
+
+    def test_steernet_smooth_saturation_envelope(self):
+        from src.steering.steernet import RSCSteerNet
+        steer = RSCSteerNet(hidden_dim=64, rank=8, lora_alpha=16.0, max_relative_norm=0.04, magnitude_mode="direct")
+        steer.eval()
+        # Set nonzero weights so delta is large
+        with torch.no_grad():
+            steer.up.weight.normal_(0, 1.0)
+            steer.mag_head.bias.fill_(5.0)  # large magnitude
+            h = torch.randn(2, 10, 64)
+            delta = steer(h, active_k=torch.tensor([1, 1]))
+            h_norm = torch.norm(h.float(), dim=-1, keepdim=True)
+            delta_norm = torch.norm(delta.float(), dim=-1, keepdim=True)
+            ratio = delta_norm / (h_norm + 1e-7)
+            # Smooth saturation must keep ratio strictly bounded below max_relative_norm (0.04)
+            self.assertLess(ratio.max().item(), 0.0401)
+            # Telemetry _clip_stats should record clipped tokens
+            self.assertGreater(steer._clip_stats, 0.0)
+
+    def test_trim_batch(self):
+        from src.training.trainer import _trim_batch
+        # Batch of 2 items, max length 10, real length 4
+        ids = torch.zeros((2, 10), dtype=torch.long)
+        mask = torch.zeros((2, 10), dtype=torch.long)
+        lbls = torch.full((2, 10), -100, dtype=torch.long)
+        shield = torch.zeros((2, 10), dtype=torch.long)
+        # Item 0 has length 3, Item 1 has length 4
+        mask[0, :3] = 1
+        mask[1, :4] = 1
+        t_ids, t_mask, t_lbls, t_shield = _trim_batch(ids, mask, lbls, shield)
+        self.assertEqual(t_ids.shape[1], 4)
+        self.assertEqual(t_mask.shape[1], 4)
+        self.assertEqual(t_lbls.shape[1], 4)
+        self.assertEqual(t_shield.shape[1], 4)
+

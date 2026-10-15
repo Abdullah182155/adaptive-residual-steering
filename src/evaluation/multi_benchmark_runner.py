@@ -73,7 +73,7 @@ def evaluate_model_condition(
             model.set_gate_freeze(True, 1.0)
     elif cond == "ars":
         if hasattr(model, "set_routing_override"):
-            model.set_routing_override(None)
+            model.set_routing_override("none" if getattr(model, "deployment_disabled", False) else None)
         if hasattr(model, "set_gate_freeze"):
             model.set_gate_freeze(False)
 
@@ -241,6 +241,7 @@ def run_fair_multishot_benchmark(
     benchmark_tree: Dict[str, Dict[str, Dict[str, Optional[float]]]] = {}
     metrics_summary: List[Dict[str, Any]] = []
     all_details: List[Dict[str, Any]] = []
+    per_item_correct: Dict[Tuple[str, str, int], List[int]] = {}
 
     for ds_name in eval_datasets:
         norm_ds = ds_name.lower().replace("-", "_")
@@ -278,6 +279,8 @@ def run_fair_multishot_benchmark(
                 benchmark_tree[norm_ds][cond][shot_key] = acc
                 metrics_summary.append(summ)
                 all_details.extend(res["detailed_results"])
+                per_item = [int(item["correct"]) for item in res["detailed_results"]]
+                per_item_correct[(norm_ds, cond, shot)] = per_item
 
                 if verbose:
                     print(
@@ -302,12 +305,13 @@ def run_fair_multishot_benchmark(
                     )
 
     if verbose:
-        print("\n" + format_benchmark_summary_table(benchmark_tree))
+        print("\n" + format_benchmark_summary_table(benchmark_tree, per_item_correct=per_item_correct))
 
     return {
         "benchmark_results": benchmark_tree,
         "metrics_summary": metrics_summary,
         "all_details": all_details,
+        "per_item_correct": per_item_correct,
     }
 
 
@@ -315,12 +319,19 @@ def run_fair_multishot_benchmark(
 # 3. Formatting & Publication Output Helpers
 # ==============================================================================
 
-def format_benchmark_summary_table(benchmark_results: Dict[str, Any]) -> str:
-    """Format all controls without mislabelling Router+SteerNet as SteerNet-only."""
+def format_benchmark_summary_table(
+    benchmark_results: Dict[str, Any],
+    per_item_correct: Optional[Dict[Tuple[str, str, int], List[int]]] = None,
+) -> str:
+    """Format all controls without mislabelling Router+SteerNet as SteerNet-only.
+
+    When per_item_correct is provided, computes paired bootstrap 95% CIs
+    against baseline and marks significant gains with *.
+    """
     lines = [
-        "=" * 124,
-        f"{'Dataset':<14} | {'Shots':<6} | {'Baseline':<10} | {'Fixed SteerNet':<15} | {'Router+SteerNet':<17} | {'Full ARS':<12} | {'ARS Δ':<10}",
-        "-" * 124,
+        "=" * 135,
+        f"{'Dataset':<12} | {'Shots':<6} | {'Baseline':<10} | {'Fixed SteerNet':<15} | {'Router+SteerNet':<17} | {'Full ARS':<35} | {'ARS Δ':<16}",
+        "-" * 135,
     ]
 
     for ds_name, conds in benchmark_results.items():
@@ -336,6 +347,7 @@ def format_benchmark_summary_table(benchmark_results: Dict[str, Any]) -> str:
 
         for shot_k in all_shots:
             shot_num = shot_k.split("_")[0]
+            shot_int = int(shot_num) if shot_num.isdigit() else 0
             b_val = base_dict.get(shot_k)
             f_val = fixed_dict.get(shot_k)
             s_val = steer_dict.get(shot_k)
@@ -346,18 +358,33 @@ def format_benchmark_summary_table(benchmark_results: Dict[str, Any]) -> str:
             s_str = f"{s_val:.2f}%" if s_val is not None else "--"
             a_str = f"{a_val:.2f}%" if a_val is not None else "--"
 
-            if a_val is not None and b_val is not None:
-                diff = a_val - b_val
-                gain_str = f"+{diff:.2f}%" if diff >= 0 else f"{diff:.2f}%"
+            if per_item_correct is not None and (ds_name, "baseline", shot_int) in per_item_correct:
+                base_flags = per_item_correct[(ds_name, "baseline", shot_int)]
+                from src.evaluation.deployment import format_benchmark_cell, paired_delta_ci
+                if a_val is not None and (ds_name, "ars", shot_int) in per_item_correct:
+                    ars_flags = per_item_correct[(ds_name, "ars", shot_int)]
+                    a_str = format_benchmark_cell(base_flags, ars_flags)
+                    d, lo, hi = paired_delta_ci(base_flags, ars_flags)
+                    sig = "*" if lo > 0 else ""
+                    gain_str = f"{d * 100:+.1f}pp{sig} [{lo * 100:+.1f}, {hi * 100:+.1f}]"
+                elif a_val is not None and b_val is not None:
+                    diff = a_val - b_val
+                    gain_str = f"+{diff:.2f}%" if diff >= 0 else f"{diff:.2f}%"
+                else:
+                    gain_str = "--"
             else:
-                gain_str = "--"
+                if a_val is not None and b_val is not None:
+                    diff = a_val - b_val
+                    gain_str = f"+{diff:.2f}%" if diff >= 0 else f"{diff:.2f}%"
+                else:
+                    gain_str = "--"
 
             lines.append(
-                f"{ds_name.upper():<14} | {shot_num + '-shot':<6} | {b_str:<10} | {f_str:<15} | {s_str:<17} | {a_str:<12} | {gain_str:<10}"
+                f"{ds_name.upper():<12} | {shot_num + '-shot':<6} | {b_str:<10} | {f_str:<15} | {s_str:<17} | {a_str:<35} | {gain_str:<16}"
             )
-        lines.append("-" * 92)
+        lines.append("-" * 135)
 
-    lines.append("=" * 92)
+    lines.append("=" * 135)
     return "\n".join(lines)
 
 
@@ -365,6 +392,7 @@ def export_latex_summary_table(
     benchmark_results: Dict[str, Any],
     caption: str = "Multi-dataset reasoning benchmark results across few-shot evaluations.",
     label: str = "tab:ars_multishot_benchmarks",
+    per_item_correct: Optional[Dict[Tuple[str, str, int], List[int]]] = None,
 ) -> str:
     """Generates a publication-grade LaTeX booktabs table for research papers."""
     latex_lines = [
@@ -391,6 +419,7 @@ def export_latex_summary_table(
         for i, shot_k in enumerate(all_shots):
             ds_col = f"\\textbf{{{ds_name.upper()}}}" if i == 0 else ""
             shot_num = shot_k.split("_")[0] + "-shot"
+            shot_int = int(shot_k.split("_")[0]) if shot_k.split("_")[0].isdigit() else 0
             b_val = base_dict.get(shot_k)
             f_val = fixed_dict.get(shot_k)
             s_val = steer_dict.get(shot_k)
@@ -418,7 +447,15 @@ def export_latex_summary_table(
             s_str = render(s_val)
             a_str = render(a_val)
 
-            if a_val is not None and b_val is not None:
+            if per_item_correct is not None and (ds_name, "baseline", shot_int) in per_item_correct and (ds_name, "ars", shot_int) in per_item_correct:
+                from src.evaluation.deployment import paired_delta_ci
+                base_flags = per_item_correct[(ds_name, "baseline", shot_int)]
+                ars_flags = per_item_correct[(ds_name, "ars", shot_int)]
+                d, lo, hi = paired_delta_ci(base_flags, ars_flags)
+                diff = a_val - b_val if (a_val is not None and b_val is not None) else d * 100
+                diff_text = f"+{diff:.2f}\\%" if diff >= 0 else f"{diff:.2f}\\%"
+                gain_str = f"\\textbf{{{diff_text}}}" if lo > 0 else diff_text
+            elif a_val is not None and b_val is not None:
                 diff = a_val - b_val
                 gain_str = f"\\textbf{{+{diff:.2f}\\%}}" if diff >= 0 else f"{diff:.2f}\\%"
             else:

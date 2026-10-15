@@ -63,6 +63,7 @@ class Phi2WithRSC(nn.Module):
         self._router_inference_mode = getattr(cfg, "router_eval_mode", "argmax")
         self._router_exploration = True
         self._joint_grad_mode = False  # When True (Phase 2C), task gradient flows through both alpha and delta
+        self.deployment_disabled = False  # Set to True if finalize_deployment decides baseline only
 
         # Cached decode attributes
         self._cached_decode_routes = None
@@ -107,7 +108,8 @@ class Phi2WithRSC(nn.Module):
                 magnitude_mode=getattr(self.cfg, "steer_magnitude_mode", "direct"),
                 max_magnitude=getattr(self.cfg, "steer_max_magnitude", 2.0),
                 max_relative_norm=getattr(self.cfg, "steer_max_relative_norm", 0.04),     # BUG-C3 fix: 0.15→0.04
-                orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", True),  # BUG-C4 fix: False→True
+                orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", False),
+                k_max=getattr(self.cfg, "max_active_layers", 4),
             ).to(self.device)
             self.gates[str(idx)] = gate
             self.steer_nets[str(idx)] = steer

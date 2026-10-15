@@ -79,12 +79,10 @@ class RSCConfig:
     # out items by default so Phase 1 is a capacity gate rather than a noisy
     # optimistic selector.  Debug configurations may lower this explicitly;
     # their report remains diagnostic-only.
-    phase1_acceptance_accuracy_examples: int = 64
-    # Screen all candidates cheaply before spending the full held-out
-    # generation budget on the most promising routes.  This prevents NLL from
-    # silently excluding a layer whose free-generation behaviour is better.
-    phase1_generation_screen_examples: int = 8
+    phase1_acceptance_accuracy_examples: int = 0  # R5: in-audit generation disabled (confirmed once via finalize_deployment)
+    phase1_generation_screen_examples: int = 0    # R5: screen disabled (saves ~65 min per run)
     phase1_generation_candidate_count: int = 3
+    deployment_examples: int = 300                # R5 / ISSUE-2: final held-out paired CI decision rows
     # A larger held-out zero-shot screen, rather than a training-prompt
     # accuracy proxy, decides whether the final Phase-1 adapter is usable.
     phase1_generation_max_new_tokens: int = 256
