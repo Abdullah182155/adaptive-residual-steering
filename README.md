@@ -5,7 +5,7 @@
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1+-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests: 86 Passing](https://img.shields.io/badge/tests-86%20passing%20(100%25)-brightgreen.svg)](tests/)
+[![Tests: 87 Passing](https://img.shields.io/badge/tests-87%20passing%20(100%25)-brightgreen.svg)](tests/)
 [![Architecture: Verified](https://img.shields.io/badge/architecture-verified-orange.svg)](diagrams/)
 [![Release: v1.4.0](https://img.shields.io/badge/version-1.4.0-blueviolet.svg)](CHANGELOG.md)
 
@@ -124,7 +124,7 @@ adaptive-residual-steering/
 │   ├── generate_architecture_diagrams.py # Automated vector diagram generator
 │   ├── audit_checkpoint_steering.py      # Weights inspection and norm telemetry
 │   └── diagnose_router_inputs.py         # Router feature distribution diagnostics
-├── tests/                    # Comprehensive unit and behavioral test suite (86 tests)
+├── tests/                    # Comprehensive unit and behavioral test suite (87 tests)
 ├── CHANGELOG.md              # Semantic versioning release history & run scorecards
 └── requirements.txt          # Python runtime dependencies
 ```
@@ -140,7 +140,7 @@ cd adaptive-residual-steering
 pip install -r requirements.txt
 ```
 
-### Run Test Suite (86 Tests)
+### Run Test Suite (87 Tests)
 ```bash
 pytest tests/ -q --tb=short
 ```

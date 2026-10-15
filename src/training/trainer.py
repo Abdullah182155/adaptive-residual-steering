@@ -1710,23 +1710,53 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     def _eval_deployment_flags(target_model, target_tokenizer, rows, target_device):
         flags = []
         for r in rows:
-            prompt_text = build_benchmark_prompt("gsm8k", r["question"], n_shot=0)
+            q = None
+            if isinstance(r, dict):
+                q = r.get("question")
+            elif hasattr(r, "__getitem__"):
+                try:
+                    q = r["question"]
+                except (KeyError, IndexError, TypeError):
+                    pass
+            if not q:
+                continue
+            prompt_text = build_benchmark_prompt("gsm8k", q, n_shot=0)
             resp = generate_response(target_model, target_tokenizer, prompt_text, target_device, max_new_tokens=384)
-            res = evaluate_sample_answer("gsm8k", resp, r.get("final_num"))
+            final_num = None
+            if isinstance(r, dict):
+                final_num = r.get("final_num")
+            elif hasattr(r, "__getitem__"):
+                try:
+                    final_num = r["final_num"]
+                except (KeyError, IndexError, TypeError):
+                    pass
+            res = evaluate_sample_answer("gsm8k", resp, final_num)
             flags.append(int(res["correct"]))
         return flags
 
-    deployment_n = max(16, min(len(eval_data), int(getattr(cfg, "deployment_examples", 300))))
-    confirm_rows = [eval_data[i] for i in range(len(eval_data) - deployment_n, len(eval_data))]
-    print(f"\n  [deployment] Evaluating {len(confirm_rows)} held-out confirmation rows for final deployment decision...")
-    model.eval()
-    model.set_gate_freeze(False)
-    model.set_routing_override("none")
-    base_flags = _eval_deployment_flags(model, tokenizer, confirm_rows, device)
-    model.set_routing_override(None)
-    ars_flags = _eval_deployment_flags(model, tokenizer, confirm_rows, device)
+    deployment_n = min(len(eval_data), int(getattr(cfg, "deployment_examples", 300)))
+    start_idx = max(0, len(eval_data) - deployment_n)
+    confirm_rows = [eval_data[i] for i in range(start_idx, len(eval_data))]
 
-    dep_mode = finalize_deployment(base_flags, ars_flags, cfg.phase2_save_path, min_n=16)
+    if len(confirm_rows) > 0:
+        print(f"\n  [deployment] Evaluating {len(confirm_rows)} held-out confirmation rows for final deployment decision...")
+        model.eval()
+        model.set_gate_freeze(False)
+        model.set_routing_override("none")
+        base_flags = _eval_deployment_flags(model, tokenizer, confirm_rows, device)
+        model.set_routing_override(None)
+        ars_flags = _eval_deployment_flags(model, tokenizer, confirm_rows, device)
+
+        if len(base_flags) > 0 and len(base_flags) == len(ars_flags):
+            dep_mode = finalize_deployment(base_flags, ars_flags, cfg.phase2_save_path, min_n=16)
+        else:
+            print("  [deployment] No valid evaluated confirmation items; defaulting to BASELINE deployment.")
+            dep_mode = "baseline"
+    else:
+        print("\n  [deployment] No held-out confirmation rows available; defaulting to BASELINE deployment.")
+        dep_mode = "baseline"
+        base_flags, ars_flags = [], []
+
     logs["deployment_mode"] = dep_mode
     logs["deployment_flags"] = {"baseline": base_flags, "ars": ars_flags}
     if hasattr(model, "deployment_disabled"):

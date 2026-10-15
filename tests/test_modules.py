@@ -729,3 +729,21 @@ class TestGateDegeneracyAndSaturation(unittest.TestCase):
         self.assertEqual(t_lbls.shape[1], 4)
         self.assertEqual(t_shield.shape[1], 4)
 
+    def test_deployment_confirmation_bounds_small_eval(self):
+        # Regression test for IndexError when len(eval_data) < 16 (e.g. 4)
+        eval_data = [
+            {"input_ids": torch.tensor([1, 2]), "attention_mask": torch.tensor([1, 1])}
+            for _ in range(4)
+        ]
+        deployment_n = min(len(eval_data), 300)
+        start_idx = max(0, len(eval_data) - deployment_n)
+        confirm_rows = [eval_data[i] for i in range(start_idx, len(eval_data))]
+        self.assertEqual(len(confirm_rows), 4)
+
+        # Empty eval_data
+        empty_data = []
+        deployment_n_empty = min(len(empty_data), 300)
+        start_idx_empty = max(0, len(empty_data) - deployment_n_empty)
+        confirm_rows_empty = [empty_data[i] for i in range(start_idx_empty, len(empty_data))]
+        self.assertEqual(len(confirm_rows_empty), 0)
+
