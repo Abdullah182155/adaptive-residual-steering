@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.7.0] - 2026-10-17
+
+### 🚀 Engine v2: Outcome-Supervised ARS & Mathematical Execution Alignment
+Directly attacks the empirical ML gaps observed in Runs 1–4 (Router collapse, Token-gate saturation, Few-shot degradation) by replacing teacher-forced conversational prose objectives with exact calculation execution supervision:
+- **Calculation Token Classification & Masking (`src/data/dataset.py`):**
+  - Implemented cached token classifier `_is_calc_token_id` and exported `calc_mask` across all tokenized datasets. Separates arithmetic/calculation tokens (`0-9`, `+ - * / = $ % #`) from conversational English prose ("Step", "Indras has", "Together they have"), preventing SteerNets from taking prose format shortcuts.
+- **Outcome Execution Reward in Router Policy (`src/routing/rloo.py`):**
+  - Implemented `per_example_execution_reward` rewarding exact token prediction on calculation steps and answer tail ($\text{Reward} \in [-1.0, +1.0]$) minus NLL penalty.
+  - Wired `compute_router_rloo_loss` to evaluate counterfactual routes via `counterfactual_score` when `router_reward_type="execution"`.
+  - Established the **$K=0$ Competitive Advantage**: When Baseline solves the calculation correctly ($R_0 \approx +1.0$), steered routes receive a per-layer cost penalty, driving $K \to 0$ on easy problems and training the router to intervene strictly where the unsteered baseline fails.
+- **Calculation-Targeted SteerNet Loss (`src/training/trainer.py`):**
+  - Updated `_answer_aware_loss` and `_eval_val_nll` to support `calc_mask` and `calc_target_mode="calculation"`, focusing adapter gradients on numerical calculations.
+  - Updated `_trim_batch` with variadic support `*extras` to trim `calc_mask` seamlessly without breaking existing callers.
+- **Selective Gate Budget Sparsity & Router MI Diversity (`src/configs/config.py`, `src/training/losses.py`):**
+  - Added `compute_gate_budget_loss(model, target_sparsity=0.20)` penalizing mean alpha deviation from target sparsity ($0.20$).
+  - Configured `gate_target_sparsity=0.20`, `lambda_gate_budget=0.50`, and re-enabled L1 sparsity `lambda_l1_gate=0.05`.
+  - Re-enabled low-temperature mutual information exploration (`lambda_router_k_mi=0.15`, `lambda_router_layer_mi=0.15`) to eliminate argmax router collapse.
+- **Comprehensive Unit Testing:**
+  - Added `TestEngineV2OutcomeSupervision` in `tests/test_modules.py` covering token classification, execution rewards, calculation-mode NLL, quadratic budget loss, and variadic batch trimming.
+  - All **102 / 102 unit tests passing (100% OK)**.
+
+---
+
 ## [1.6.0] - 2026-10-16
 
 ### 🎯 Forensic Review & Diagnostic Hardening (Run 4: n=100 GSM8K, Microsoft Phi-2)

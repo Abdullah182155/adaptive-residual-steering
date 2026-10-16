@@ -975,3 +975,131 @@ class TestRun4HardeningAndDiagnostics(unittest.TestCase):
         self.assertNotIn(r"\textbf{60.00\%}", latex_tbl)
 
 
+class TestEngineV2OutcomeSupervision(unittest.TestCase):
+    """Engine v2: Outcome-supervised ARS, calculation masks, execution rewards, and gate budget."""
+
+    def test_is_calc_token_id(self):
+        """Digits and math symbols should be classified as 1; English words and Step as 0."""
+        from src.data.dataset import _is_calc_token_id
+
+        class MockTokenizer:
+            def decode(self, token_ids):
+                mapping = {
+                    10: "Step",
+                    11: "Indras",
+                    12: "42",
+                    13: "+",
+                    14: "=",
+                    15: "apples",
+                    16: "$100",
+                }
+                return mapping.get(token_ids[0], "")
+
+        tok = MockTokenizer()
+        self.assertEqual(_is_calc_token_id(tok, 10), 0)  # "Step"
+        self.assertEqual(_is_calc_token_id(tok, 11), 0)  # "Indras"
+        self.assertEqual(_is_calc_token_id(tok, 12), 1)  # "42"
+        self.assertEqual(_is_calc_token_id(tok, 13), 1)  # "+"
+        self.assertEqual(_is_calc_token_id(tok, 14), 1)  # "="
+        self.assertEqual(_is_calc_token_id(tok, 15), 0)  # "apples"
+        self.assertEqual(_is_calc_token_id(tok, 16), 1)  # "$100"
+
+    def test_per_example_execution_reward_distinguishes_correctness(self):
+        """Execution reward must be higher for correct predictions on calculation tokens than incorrect ones."""
+        from src.routing.rloo import per_example_execution_reward
+
+        B, T, V = 2, 8, 20
+        # Row 0: correct predictions; Row 1: incorrect predictions
+        labels = torch.tensor([
+            [-100, -100, 5, 6, 7, 8, 9, 10],
+            [-100, -100, 5, 6, 7, 8, 9, 10],
+        ], dtype=torch.long)
+        calc_mask = torch.tensor([
+            [0, 0, 1, 1, 1, 1, 1, 1],
+            [0, 0, 1, 1, 1, 1, 1, 1],
+        ], dtype=torch.long)
+
+        # Logits for row 0 predict target labels; row 1 predicts 0 (wrong)
+        logits = torch.zeros(B, T, V)
+        for t in range(T - 1):
+            lbl0 = labels[0, t + 1].item()
+            if lbl0 != -100:
+                logits[0, t, lbl0] = 10.0
+            logits[1, t, 0] = 10.0  # wrong prediction
+
+        rewards = per_example_execution_reward(
+            logits, labels, calc_mask=calc_mask, outcome_weight=1.0, nll_weight=0.1
+        )
+        self.assertEqual(rewards.shape, (2,))
+        self.assertGreater(rewards[0].item(), rewards[1].item())
+        self.assertGreater(rewards[0].item(), 0.5)
+        self.assertLess(rewards[1].item(), 0.0)
+
+    def test_per_example_answer_nll_calc_mode(self):
+        """When calc_target_mode == 'calculation', non-calc tokens should not contribute to NLL."""
+        from src.routing.rloo import per_example_answer_nll
+
+        B, T, V = 1, 6, 10
+        labels = torch.tensor([[-100, 2, 3, 4, 5, 6]], dtype=torch.long)
+        # Only tokens 4 and 5 are calculation tokens
+        calc_mask = torch.tensor([[0, 0, 0, 1, 1, 0]], dtype=torch.long)
+
+        # Logits that are perfect on calc tokens (4 and 5) but terrible on tokens 2, 3, 6
+        logits = torch.zeros(B, T, V)
+        logits[0, 2, 4] = 20.0  # perfect on token index 3 (value 4)
+        logits[0, 3, 5] = 20.0  # perfect on token index 4 (value 5)
+        # Tokens 2 and 3 and 6 predict index 0
+        logits[0, 0, 0] = 20.0
+        logits[0, 1, 0] = 20.0
+        logits[0, 4, 0] = 20.0
+
+        nll_calc = per_example_answer_nll(
+            logits, labels, calc_mask=calc_mask, calc_target_mode="calculation"
+        )
+        # Since calc tokens are perfectly predicted, nll_calc should be near 0
+        self.assertLess(nll_calc.item(), 0.05)
+
+    def test_compute_gate_budget_loss(self):
+        """Budget loss pulls mean alpha towards target_sparsity (e.g. 0.20)."""
+        from src.training.losses import compute_gate_budget_loss
+
+        class DummyGate(nn.Module):
+            def __init__(self, alpha_val):
+                super().__init__()
+                self.p = nn.Parameter(torch.tensor(1.0))
+                self._alpha_for_aux = torch.full((2, 10, 1), alpha_val)
+                self._valid_mask = torch.ones(2, 10, dtype=torch.bool)
+
+        class DummyModel(nn.Module):
+            def __init__(self, alpha_val):
+                super().__init__()
+                self.gates = nn.ModuleDict({"11": DummyGate(alpha_val)})
+
+        # Perfect target alpha = 0.20 -> loss ≈ 0
+        m_ideal = DummyModel(0.20)
+        loss_ideal = compute_gate_budget_loss(m_ideal, target_sparsity=0.20)
+        self.assertAlmostEqual(loss_ideal.item(), 0.0, places=4)
+
+        # Saturated alpha = 1.0 -> loss = (1.0 - 0.20)^2 = 0.64
+        m_sat = DummyModel(1.0)
+        loss_sat = compute_gate_budget_loss(m_sat, target_sparsity=0.20)
+        self.assertAlmostEqual(loss_sat.item(), 0.64, places=4)
+
+    def test_trim_batch_with_calc_mask(self):
+        """_trim_batch trims both standard tensors and calc_mask to the same sequence length."""
+        from src.training.trainer import _trim_batch
+
+        ids = torch.ones(2, 10, dtype=torch.long)
+        mask = torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0, 0, 0],
+                             [1, 1, 1, 0, 0, 0, 0, 0, 0, 0]], dtype=torch.long)
+        lbls = torch.ones(2, 10, dtype=torch.long)
+        shield = torch.zeros(2, 10, dtype=torch.long)
+        calc_mask = torch.ones(2, 10, dtype=torch.long)
+
+        # Max real sequence length is 4
+        ids_t, mask_t, lbls_t, shield_t, calc_t = _trim_batch(ids, mask, lbls, shield, calc_mask)
+        self.assertEqual(ids_t.shape[1], 4)
+        self.assertEqual(calc_t.shape[1], 4)
+        self.assertEqual(mask_t.shape[1], 4)
+
+

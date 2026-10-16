@@ -141,6 +141,26 @@ def gsm8k_to_cot(
         score = ops_count * 2 + distinct_nums + chain_len / 100.0
         return {"difficulty_score": score}
 
+_CALC_TOKEN_CACHE: Dict[int, int] = {}
+
+def _is_calc_token_id(tokenizer, token_id: int) -> int:
+    """Classify token as math/calculation/outcome token vs English prose."""
+    if token_id in _CALC_TOKEN_CACHE:
+        return _CALC_TOKEN_CACHE[token_id]
+    try:
+        s = tokenizer.decode([token_id])
+    except Exception:
+        s = ""
+    if "Step" in s:
+        res = 0
+    elif re.search(r"[\d\+\-\*\/=\$\%#]", s):
+        res = 1
+    else:
+        res = 0
+    _CALC_TOKEN_CACHE[token_id] = res
+    return res
+
+
     ds = ds.map(get_difficulty)
     ds = ds.sort("difficulty_score", reverse=False)
     ds = ds.remove_columns(["difficulty_score"])
@@ -154,6 +174,7 @@ def gsm8k_to_cot(
         )
         labels = []
         shield_masks = []
+        calc_masks = []
         for row, (text, target_start, shield_char_end, fallback_text, fallback_target_start, ids) in enumerate(zip(
             examples["text"], examples["target_start"], examples["shield_char_end"],
             examples["fallback_text"], examples["fallback_target_start"], out["input_ids"]
@@ -192,15 +213,28 @@ def gsm8k_to_cot(
             while shield_len and list(ids[:shield_len]) != shield_ids[:shield_len]:
                 shield_len -= 1
             shield_masks.append([1 if j < shield_len else 0 for j in range(len(ids))])
+
+            # Engine v2: Compute calculation/outcome token mask
+            calc_mask = [0] * len(lbl)
+            for j in range(len(lbl)):
+                if lbl[j] != -100:
+                    calc_mask[j] = _is_calc_token_id(tokenizer, int(ids[j]))
+            if sum(calc_mask) == 0:
+                valid_indices = [j for j, l in enumerate(lbl) if l != -100]
+                for idx in valid_indices[-8:]:
+                    calc_mask[idx] = 1
+            calc_masks.append(calc_mask)
+
         out["labels"] = labels
         out["prompt_shield_mask"] = shield_masks
+        out["calc_mask"] = calc_masks
         return out
 
     keep_raw_cols = ["question", "steps_list", "final_num"]
     remove_cols = [c for c in ds.column_names if c not in keep_raw_cols]
     ds = ds.map(tokenize_fn, batched=True, remove_columns=remove_cols)
     ds.set_format(
-        "torch", columns=["input_ids", "attention_mask", "labels", "prompt_shield_mask"], output_all_columns=True
+        "torch", columns=["input_ids", "attention_mask", "labels", "prompt_shield_mask", "calc_mask"], output_all_columns=True
     )
 
     splits = ds.train_test_split(test_size=split_ratio, seed=cfg.seed)

@@ -16,6 +16,7 @@ from src.training.losses import (
     CheckpointManager,
     GradientMonitor,
     compute_l1_gate,
+    compute_gate_budget_loss,
     compute_antisat_gate,
     compute_gate_diversity_loss,
     compute_pg_advantage_lite,
@@ -55,13 +56,21 @@ def _optimizer_has_gradients(parameters) -> bool:
     return any(parameter.grad is not None for parameter in parameters)
 
 
-def _answer_aware_loss(logits: torch.Tensor, labels: torch.Tensor, cfg: RSCConfig) -> torch.Tensor:
-    """Differentiable completion loss that gives the final answer tail real weight."""
+def _answer_aware_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    cfg: RSCConfig,
+    calc_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Differentiable completion loss targeting calculation/outcome tokens and final answer tail (Engine v2)."""
     return per_example_answer_nll(
         logits,
         labels,
         answer_tail_tokens=getattr(cfg, "answer_tail_tokens", 0),
         answer_tail_weight=getattr(cfg, "answer_tail_weight", 1.0),
+        calc_mask=calc_mask,
+        calc_target_mode=getattr(cfg, "steer_loss_target", "calculation"),
+        calc_weight=getattr(cfg, "calc_token_weight", 3.0),
     ).mean()
 
 
@@ -100,21 +109,24 @@ def _trim_batch(
     mask: torch.Tensor,
     lbls: torch.Tensor,
     shield: torch.Tensor = None,
+    *extras: Optional[torch.Tensor],
 ) -> tuple:
     """Trim trailing padding from a right-padded micro-batch (P6 speed fix).
 
     GSM8K sequences are ~150-300 tokens but are padded to max_tok_len=512.
     Trimming to the longest real sequence in the batch cuts forward/backward
-    compute by ~2x without changing gradient direction.
+    compute by ~2x without changing gradient direction. Supports optional extra
+    sequence tensors (e.g. calc_mask).
 
     Args:
         ids:    input_ids   [B, T]
         mask:   attn_mask   [B, T]
         lbls:   labels      [B, T]
         shield: prompt_shield [B, T] or None
+        *extras: optional tensors with shape [B, T]
 
     Returns:
-        (ids, mask, lbls, shield) trimmed to length of longest non-padding token.
+        (ids, mask, lbls, shield, *trimmed_extras) trimmed to length of longest non-padding token.
     """
     keep = int(mask.sum(dim=1).max().item())
     ids = ids[:, :keep]
@@ -122,6 +134,9 @@ def _trim_batch(
     lbls = lbls[:, :keep]
     if shield is not None:
         shield = shield[:, :keep]
+    if extras:
+        trimmed_extras = [ex[:, :keep] if ex is not None else None for ex in extras]
+        return (ids, mask, lbls, shield, *trimmed_extras)
     return ids, mask, lbls, shield
 
 
@@ -193,8 +208,11 @@ def evaluate_loss(
         shield = None
         if "prompt_shield_mask" in data[batch_idx[0]]:
             shield = torch.stack([data[i]["prompt_shield_mask"] for i in batch_idx]).to(device)
+        calc_mask = None
+        if "calc_mask" in data[batch_idx[0]]:
+            calc_mask = torch.stack([data[i]["calc_mask"] for i in batch_idx]).to(device)
 
-        ids, mask, lbls, shield = _trim_batch(ids, mask, lbls, shield)
+        ids, mask, lbls, shield, calc_mask = _trim_batch(ids, mask, lbls, shield, calc_mask)
 
         if hasattr(model, "_attn_mask_cache"):
             model._attn_mask_cache = mask
@@ -206,7 +224,7 @@ def evaluate_loss(
         n_tokens = (lbls != -100).sum().item()
         if n_tokens > 0:
             if answer_aware:
-                batch_nll = _answer_aware_loss(out.logits, lbls, cfg).item()
+                batch_nll = _answer_aware_loss(out.logits, lbls, cfg, calc_mask=calc_mask).item()
                 batch_weight = ids.shape[0]
             else:
                 batch_nll = out.loss.item()
@@ -820,13 +838,16 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
             shield = None
             if "prompt_shield_mask" in train_data[batch_idx[0]]:
                 shield = torch.stack([train_data[i]["prompt_shield_mask"] for i in batch_idx]).to(device)
-            ids, mask, lbls, shield = _trim_batch(ids, mask, lbls, shield)
+            calc_mask = None
+            if "calc_mask" in train_data[batch_idx[0]]:
+                calc_mask = torch.stack([train_data[i]["calc_mask"] for i in batch_idx]).to(device)
+            ids, mask, lbls, shield, calc_mask = _trim_batch(ids, mask, lbls, shield, calc_mask)
             model._attn_mask_cache = mask
             _set_batch_context(model, mask, lbls, shield)
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(input_ids=ids, attention_mask=mask, use_cache=False)
-                loss = _answer_aware_loss(out.logits, lbls, cfg) / cfg.grad_accum
+                loss = _answer_aware_loss(out.logits, lbls, cfg, calc_mask=calc_mask) / cfg.grad_accum
 
             if not torch.isfinite(loss):
                 continue
@@ -991,7 +1012,10 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             shield = None
             if "prompt_shield_mask" in train_data[batch_indices[0]]:
                 shield = torch.stack([train_data[i]["prompt_shield_mask"] for i in batch_indices]).to(device)
-            ids, mask, lbls, shield = _trim_batch(ids, mask, lbls, shield)
+            calc_mask = None
+            if "calc_mask" in train_data[batch_indices[0]]:
+                calc_mask = torch.stack([train_data[i]["calc_mask"] for i in batch_indices]).to(device)
+            ids, mask, lbls, shield, calc_mask = _trim_batch(ids, mask, lbls, shield, calc_mask)
             model._attn_mask_cache = mask
 
             _set_batch_context(model, mask, lbls, shield)
@@ -1001,7 +1025,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
 
             # --- Step 1: RLOO router loss (router params + SteerNet compat gradient) ---
             loss, rloo_diag = compute_router_rloo_loss(
-                model, ids, mask, lbls, cfg, prompt_mask=prompt_mask, shield_mask=shield
+                model, ids, mask, lbls, cfg, prompt_mask=prompt_mask, shield_mask=shield, calc_mask=calc_mask
             )
             if not torch.isfinite(loss):
                 continue
@@ -1031,6 +1055,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                 s_mask = mask[:1]
                 s_lbls = lbls[:1]
                 s_shield = shield[:1] if shield is not None else None
+                s_calc = calc_mask[:1] if calc_mask is not None else None
                 k2_mask = torch.zeros(1, n_cands, dtype=torch.bool, device=device)
                 if layer_i in model.target_layers:
                     k2_mask[:, model.target_layers.index(layer_i)] = True
@@ -1055,6 +1080,9 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                             s_lbls,
                             answer_tail_tokens=int(getattr(cfg, "answer_tail_tokens", 0)),
                             answer_tail_weight=float(getattr(cfg, "answer_tail_weight", 1.0)),
+                            calc_mask=s_calc,
+                            calc_target_mode=getattr(cfg, "steer_loss_target", "calculation"),
+                            calc_weight=getattr(cfg, "calc_token_weight", 3.0),
                         ).mean()
                     if torch.isfinite(joint_nll):
                         (lambda_joint * joint_nll).backward()
@@ -1215,7 +1243,10 @@ def run_staged_phase(
             shield = None
             if "prompt_shield_mask" in train_data[batch_idx[0]]:
                 shield = torch.stack([train_data[i]["prompt_shield_mask"] for i in batch_idx]).to(device)
-            ids, mask, lbls, shield = _trim_batch(ids, mask, lbls, shield)
+            calc_mask = None
+            if "calc_mask" in train_data[batch_idx[0]]:
+                calc_mask = torch.stack([train_data[i]["calc_mask"] for i in batch_idx]).to(device)
+            ids, mask, lbls, shield, calc_mask = _trim_batch(ids, mask, lbls, shield, calc_mask)
             model._attn_mask_cache = mask
             _set_batch_context(model, mask, lbls, shield)
 
@@ -1244,12 +1275,13 @@ def run_staged_phase(
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(input_ids=ids, attention_mask=mask, use_cache=False)
-                task_loss = _answer_aware_loss(out.logits, lbls, cfg)
+                task_loss = _answer_aware_loss(out.logits, lbls, cfg, calc_mask=calc_mask)
 
             micro_loss = (task_loss / cfg.grad_accum) if (torch.isfinite(task_loss) and task_loss.requires_grad) else None
 
             if train_gate:
                 l1_loss = compute_l1_gate(model)
+                budget_loss = compute_gate_budget_loss(model, target_sparsity=getattr(cfg, "gate_target_sparsity", 0.20))
                 asat_loss = compute_antisat_gate(model, threshold=0.85)
                 contrast_loss = compute_contrastive_gate_loss(model, ids, lbls, tokenizer, device)
                 diversity_loss = compute_gate_diversity_loss(model, floor=cfg.gate_diversity_floor)
@@ -1260,6 +1292,7 @@ def run_staged_phase(
                 n_gate_aux_steps += 1
                 aux_loss = (
                     cfg.lambda_l1_gate * l1_loss
+                    + getattr(cfg, "lambda_gate_budget", 0.50) * budget_loss
                     + cfg.lambda_gate_antisat * asat_loss
                     + cfg.lambda_gate_usefulness * contrast_loss
                     + cfg.lambda_gate_diversity * diversity_loss
@@ -1299,12 +1332,19 @@ def run_staged_phase(
                 probe_shield = None
                 if "prompt_shield_mask" in train_data[probe_idx[0]]:
                     probe_shield = torch.stack([train_data[i]["prompt_shield_mask"] for i in probe_idx]).to(device)
+                probe_calc = None
+                if "calc_mask" in train_data[probe_idx[0]]:
+                    probe_calc = torch.stack([train_data[i]["calc_mask"] for i in probe_idx]).to(device)
+                probe_ids, probe_mask, probe_lbls, probe_shield, probe_calc = _trim_batch(
+                    probe_ids, probe_mask, probe_lbls, probe_shield, probe_calc
+                )
                 prompt_mask = probe_mask.bool() & probe_lbls.eq(-100) & ~(
                     probe_shield.bool() if probe_shield is not None else torch.zeros_like(probe_mask, dtype=torch.bool)
                 )
                 router_loss, rloo_diag = compute_router_rloo_loss(
                     model, probe_ids, probe_mask, probe_lbls, cfg,
                     prompt_mask=prompt_mask, shield_mask=probe_shield,
+                    calc_mask=probe_calc,
                 )
                 if torch.isfinite(router_loss) and router_loss.requires_grad:
                     scaler.scale(router_loss).backward()

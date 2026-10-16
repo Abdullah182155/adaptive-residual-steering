@@ -7,13 +7,15 @@ def per_example_answer_nll(
     labels: torch.Tensor,
     answer_tail_tokens: int = 0,
     answer_tail_weight: float = 1.0,
+    calc_mask: Optional[torch.Tensor] = None,
+    calc_target_mode: str = "all",
+    calc_weight: float = 1.0,
 ) -> torch.Tensor:
-    """Mean answer NLL, optionally emphasizing each completion's final tail.
+    """Mean answer NLL, optionally emphasizing calculation tokens and completion tail.
 
-    The final numerical answer is at the end of the supervised completion in
-    the GSM8K curriculum.  Uniform token NLL can reward copied prose while
-    the generated answer gets worse, so the tail is weighted explicitly.
-    Defaults preserve the ordinary mean-NLL behaviour for existing callers.
+    Engine v2: When calc_target_mode == 'calculation', non-calculation tokens
+    are zero-weighted so that SteerNets optimize solely for numerical and
+    arithmetic correctness rather than conversational English prose.
     """
     shift_logits = logits[:, :-1, :].float()
     shift_labels = labels[:, 1:]
@@ -22,13 +24,82 @@ def per_example_answer_nll(
     )
     valid = shift_labels.ne(-100)
     weights = valid.to(token_nll.dtype)
+
+    if calc_mask is not None:
+        shift_calc = calc_mask[:, 1:].bool() if calc_mask.shape[1] > 1 else calc_mask.bool()
+        min_len = min(weights.shape[1], shift_calc.shape[1])
+        if calc_target_mode == "calculation":
+            weights[:, :min_len] = weights[:, :min_len] * shift_calc[:, :min_len].to(weights.dtype)
+            if weights.shape[1] > min_len:
+                weights[:, min_len:] = 0.0
+            zero_weights = weights.sum(dim=1).eq(0)
+            if zero_weights.any():
+                weights[zero_weights] = valid[zero_weights].to(token_nll.dtype)
+        elif calc_target_mode == "calculation_weighted":
+            weights[:, :min_len] = torch.where(
+                shift_calc[:, :min_len] & valid[:, :min_len],
+                weights[:, :min_len] * float(calc_weight),
+                weights[:, :min_len],
+            )
+
     tail_count = max(0, int(answer_tail_tokens))
     if tail_count and float(answer_tail_weight) != 1.0:
         for row in range(valid.shape[0]):
             positions = valid[row].nonzero(as_tuple=False).flatten()
             if positions.numel():
-                weights[row, positions[-tail_count:]] = float(answer_tail_weight)
+                weights[row, positions[-tail_count:]] = weights[row, positions[-tail_count:]] * float(answer_tail_weight)
     return (token_nll * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1)
+
+
+def per_example_execution_reward(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    calc_mask: Optional[torch.Tensor] = None,
+    answer_tail_tokens: int = 8,
+    outcome_weight: float = 1.0,
+    nll_weight: float = 0.2,
+) -> torch.Tensor:
+    """Execution outcome reward for RLOO counterfactual evaluation (Engine v2).
+
+    Instead of purely minimizing prose NLL (which caused router collapse), rewards
+    exact token prediction on calculation steps and the final answer tail.
+    A route only wins if it achieves correct execution on math/outcome tokens.
+    """
+    shift_logits = logits[:, :-1, :].float()
+    shift_labels = labels[:, 1:]
+    valid = shift_labels.ne(-100)
+    preds = shift_logits.argmax(dim=-1)
+    tok_correct = (preds == shift_labels) & valid
+
+    if calc_mask is not None:
+        shift_calc = calc_mask[:, 1:].bool() if calc_mask.shape[1] > 1 else calc_mask.bool()
+        min_len = min(valid.shape[1], shift_calc.shape[1])
+        target_mask = valid.clone()
+        target_mask[:, :min_len] = target_mask[:, :min_len] & shift_calc[:, :min_len]
+        zero_rows = target_mask.sum(dim=1).eq(0)
+        if zero_rows.any():
+            for row in range(valid.shape[0]):
+                if zero_rows[row]:
+                    pos = valid[row].nonzero(as_tuple=False).flatten()
+                    if pos.numel():
+                        target_mask[row, pos[-answer_tail_tokens:]] = True
+    else:
+        target_mask = torch.zeros_like(valid)
+        for row in range(valid.shape[0]):
+            pos = valid[row].nonzero(as_tuple=False).flatten()
+            if pos.numel():
+                target_mask[row, pos[-answer_tail_tokens:]] = True
+
+    denom = target_mask.float().sum(dim=1).clamp(min=1.0)
+    acc = (tok_correct & target_mask).float().sum(dim=1) / denom
+
+    token_nll = F.cross_entropy(
+        shift_logits.transpose(1, 2), shift_labels, ignore_index=-100, reduction="none"
+    )
+    nll = (token_nll * target_mask.float()).sum(dim=1) / denom
+
+    acc_reward = (2.0 * acc - 1.0) * float(outcome_weight)
+    return acc_reward - float(nll_weight) * nll
 
 def sample_subset_plackett_luce(
     logits: torch.Tensor,
@@ -160,9 +231,16 @@ def counterfactual_k_preference_loss(
     target = F.softmax(target_scores, dim=-1)
     return -(target * F.log_softmax(k_logits, dim=-1)).sum(dim=-1).mean()
 
-def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
-                              labels: torch.Tensor, cfg, prompt_mask: torch.Tensor = None,
-                              shield_mask: torch.Tensor = None) -> Tuple[torch.Tensor, Dict[str, float]]:
+def compute_router_rloo_loss(
+    model,
+    ids: torch.Tensor,
+    mask: torch.Tensor,
+    labels: torch.Tensor,
+    cfg,
+    prompt_mask: torch.Tensor = None,
+    shield_mask: torch.Tensor = None,
+    calc_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
     """RLOO subset selection loss for training cooperative router policy with leave-one-out advantage."""
     if prompt_mask is None:
         prompt_mask = mask.bool() & labels.eq(-100)
@@ -215,29 +293,51 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         subset_logprobs.append(route_logprob)
 
     old_override = model._routing_override
+    use_execution_reward = (getattr(cfg, "router_reward_type", "nll") == "execution")
+    outcome_weight = float(getattr(cfg, "router_outcome_reward_weight", 1.0))
+    calc_target_mode = getattr(cfg, "steer_loss_target", "calculation")
+    calc_weight = float(getattr(cfg, "calc_token_weight", 3.0))
 
-    def counterfactual_nll(route_mask: torch.Tensor) -> torch.Tensor:
-        """Evaluate one fixed route with the same prompt/shield contract."""
-        model.set_routing_override("matrix", route_mask.detach())
+    def counterfactual_score(route_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate one route (or baseline if None). Returns (reward, nll)."""
+        if route_mask is None:
+            model.set_routing_override("none")
+        else:
+            model.set_routing_override("matrix", route_mask.detach())
         model.set_router_context_mask(prompt_mask)
         if hasattr(model, "set_prompt_shield_mask"):
             model.set_prompt_shield_mask(shield_mask)
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                return per_example_answer_nll(
-                    model(input_ids=ids, attention_mask=mask, use_cache=False).logits,
+                out = model(input_ids=ids, attention_mask=mask, use_cache=False)
+                nll = per_example_answer_nll(
+                    out.logits,
                     labels,
                     answer_tail_tokens=getattr(cfg, "answer_tail_tokens", 0),
                     answer_tail_weight=getattr(cfg, "answer_tail_weight", 1.0),
+                    calc_mask=calc_mask,
+                    calc_target_mode=calc_target_mode,
+                    calc_weight=calc_weight,
                 )
+                if use_execution_reward:
+                    reward = per_example_execution_reward(
+                        out.logits,
+                        labels,
+                        calc_mask=calc_mask,
+                        answer_tail_tokens=getattr(cfg, "answer_tail_tokens", 8),
+                        outcome_weight=outcome_weight,
+                    )
+                else:
+                    reward = -nll
+                return reward, nll
 
-    def deterministic_counterfactual_nll(route_mask: torch.Tensor) -> torch.Tensor:
+    def deterministic_counterfactual_score(route_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Score one auxiliary counterfactual without dropout noise."""
         modes = {module: module.training for module in model.modules()}
         prior_override = model._routing_override
         model.eval()
         try:
-            return counterfactual_nll(route_mask)
+            return counterfactual_score(route_mask)
         finally:
             if prior_override is None:
                 model.set_routing_override(None)
@@ -248,20 +348,17 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
 
     try:
         model.eval()
-        arm_nll = torch.stack([counterfactual_nll(route_mask) for route_mask in subset_masks], dim=1)
+        arm_rewards_list = []
+        arm_nlls_list = []
+        for route_mask in subset_masks:
+            rew, nll_val = counterfactual_score(route_mask)
+            arm_rewards_list.append(rew)
+            arm_nlls_list.append(nll_val)
+        arm_rewards = torch.stack(arm_rewards_list, dim=1)
+        arm_nll = torch.stack(arm_nlls_list, dim=1)
+
         # Arm 0: Ground-truth unsteered baseline anchor
-        model.set_routing_override("none")
-        model.set_router_context_mask(prompt_mask)
-        if hasattr(model, "set_prompt_shield_mask"):
-            model.set_prompt_shield_mask(shield_mask)
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                nll_0 = per_example_answer_nll(
-                    model(input_ids=ids, attention_mask=mask, use_cache=False).logits,
-                    labels,
-                    answer_tail_tokens=getattr(cfg, "answer_tail_tokens", 0),
-                    answer_tail_weight=getattr(cfg, "answer_tail_weight", 1.0),
-                )
+        reward_0, nll_0 = counterfactual_score(None)
     finally:
         if old_override is None:
             model.set_routing_override(None)
@@ -270,7 +367,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         for module, was_training in module_modes.items():
             module.train(was_training)
 
-    reward_0 = (-nll_0).detach()
+    reward_0 = reward_0.detach()
     # A fixed K tariff is scale-blind: with answer NLL around one nat, the
     # former 0.025 cost was too small to ever offset a teacher-forced gain and
     # made K=4 the default policy.  Price each extra residual against the
@@ -282,7 +379,7 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
         torch.full_like(nll_0, absolute_cost),
         nll_0.detach() * relative_cost,
     )
-    action_rewards = (-arm_nll - per_layer_cost.unsqueeze(1) * k_actions.float()).detach()
+    action_rewards = (arm_rewards - per_layer_cost.unsqueeze(1) * k_actions.float()).detach()
 
     # Anchor-grounded leave-one-out advantage for each sampled subset.  K
     # itself is evaluated exhaustively and receives direct action-value
@@ -320,10 +417,10 @@ def compute_router_rloo_loss(model, ids: torch.Tensor, mask: torch.Tensor,
             singleton_i.scatter_(1, first.unsqueeze(-1), True)
             singleton_j.scatter_(1, second.unsqueeze(-1), True)
             pair_mask = singleton_i | singleton_j
-            nll_i = deterministic_counterfactual_nll(singleton_i)
-            nll_j = deterministic_counterfactual_nll(singleton_j)
-            nll_pair = deterministic_counterfactual_nll(pair_mask)
-            interaction = (-nll_pair + nll_i + nll_j - nll_0).detach()
+            rew_i, _ = deterministic_counterfactual_score(singleton_i)
+            rew_j, _ = deterministic_counterfactual_score(singleton_j)
+            rew_pair, _ = deterministic_counterfactual_score(pair_mask)
+            interaction = (rew_pair - rew_i - rew_j + reward_0).detach()
             pair_syn = synergy[torch.arange(ids.shape[0], device=ids.device), first, second]
             target_scale = max(float(getattr(cfg, "router_synergy_target_scale", 0.10)), 1e-4)
             interaction_target = torch.tanh(interaction / target_scale)

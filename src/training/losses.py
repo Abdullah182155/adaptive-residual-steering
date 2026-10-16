@@ -154,6 +154,26 @@ def compute_l1_gate(model) -> torch.Tensor:
         count += 1
     return total / max(1, count)
 
+def compute_gate_budget_loss(model, target_sparsity: float = 0.20) -> torch.Tensor:
+    """Quadratic budget penalty pulling mean gate activation towards target_sparsity (Engine v2)."""
+    device = next(iter(p for g in model.gates.values() for p in g.parameters()), torch.tensor(0.0)).device
+    total = torch.tensor(0.0, device=device)
+    count = 0
+    for gate in model.gates.values():
+        alpha = gate._alpha_for_aux
+        if alpha is None:
+            continue
+        a = alpha.float().squeeze(-1)
+        vm = gate._valid_mask
+        if vm is not None and vm.shape == a.shape:
+            denom = vm.sum().clamp(min=1)
+            mean_a = (a * vm.float()).sum() / denom
+        else:
+            mean_a = a.mean()
+        total = total + (mean_a - float(target_sparsity)).pow(2)
+        count += 1
+    return total / max(1, count)
+
 def compute_gate_diversity_loss(model, floor: float = 0.05) -> torch.Tensor:
     """Penalize low per-sequence gate variance, excluding single max token."""
     device = next(iter(p for g in model.gates.values() for p in g.parameters()), torch.tensor(0.0)).device

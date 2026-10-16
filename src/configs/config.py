@@ -52,6 +52,11 @@ class RSCConfig:
     # Keep a modest answer emphasis and let held-out generation decide whether
     # a Phase-1 checkpoint is usable.
     answer_tail_weight: float = 2.0
+    # Engine v2: Outcome-Supervised calculation token targeting
+    steer_loss_target: str = "calculation"  # 'calculation' (focus on math/outcome tokens), 'calculation_weighted', or 'all'
+    calc_token_weight: float = 3.0          # Multiplier for calculation tokens when in 'calculation_weighted' mode
+    router_reward_type: str = "execution"   # 'execution' (reward exact calculation tokens) or 'nll' (legacy)
+    router_outcome_reward_weight: float = 1.0
 
     # Data
     n_samples: int = 7000
@@ -134,7 +139,9 @@ class RSCConfig:
     # toward saturation.  The differentiable answer-aware task loss provides
     # the correct local gate signal; generation PG remains opt-in research.
     lambda_pg: float = 0.0
-    lambda_l1_gate: float = 0.0          # B-3: disabled (was 0.001)
+    lambda_l1_gate: float = 0.05          # Engine v2: re-enabled L1 sparsity
+    lambda_gate_budget: float = 0.50      # Engine v2: quadratic budget pulling mean alpha to target_sparsity
+    gate_target_sparsity: float = 0.20     # Engine v2: target average gate activation
     lambda_gate_usefulness: float = 0.0   # B-3: disabled (was 0.30)
     lambda_gate_antisat: float = 0.0      # B-3: disabled (was 0.25)
     lambda_gate_diversity: float = 0.0    # B-3: disabled (was 0.5)
@@ -229,8 +236,8 @@ class RSCConfig:
     # Low-temperature MI acts on near-discrete choices, preventing a router
     # whose soft probabilities vary slightly while every argmax is identical.
     router_diversity_temperature: float = 0.35
-    lambda_router_k_mi: float = 0.0       # B-3: was 0.10 — MI regularization disabled
-    lambda_router_layer_mi: float = 0.0   # B-3: was 0.10
+    lambda_router_k_mi: float = 0.15       # Engine v2: re-enabled MI diversity for K
+    lambda_router_layer_mi: float = 0.15   # Engine v2: re-enabled MI diversity for Layer
     # Directly distil the three counterfactual rewards (K=0, K_a, K_b) into
     # the deterministic K head.  RLOO alone updates sampled log-probabilities
     # and allowed a global K=3 bias to survive at argmax deployment.
