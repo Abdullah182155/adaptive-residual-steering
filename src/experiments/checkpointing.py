@@ -137,10 +137,16 @@ def save_ars_checkpoint(
     destination.parent.mkdir(parents=True, exist_ok=True)
     state = ars_state_dict(model, prefixes=prefixes)
     torch.save(state, destination)
+    deployment_mode = (
+        extra_metadata.get("deployment_mode")
+        if extra_metadata and "deployment_mode" in extra_metadata
+        else ("baseline" if getattr(model, "deployment_disabled", False) else "ars")
+    )
     manifest = {
         "format": "ars-checkpoint-manifest-v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "phase": phase,
+        "deployment_mode": deployment_mode,
         "git_commit": _git_commit(),
         "state_sha256": state_sha256(state),
         "tensor_count": len(state),

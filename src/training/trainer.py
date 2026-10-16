@@ -136,6 +136,19 @@ def gate_is_degenerate(intervention_diag: dict, std_tol: float = 1e-2, sat_pct: 
     )
 
 
+def collect_pre_cap_ratio(model: torch.nn.Module) -> dict:
+    """Collect the latest SteerNet pre-cap norm saturation ratio across candidate layers (R4)."""
+    ratios = {}
+    steer_nets = getattr(model, "steer_nets", {})
+    if isinstance(steer_nets, torch.nn.ModuleDict):
+        for k, sn in steer_nets.items():
+            ratio = getattr(sn, "_last_pre_cap_ratio", None)
+            if ratio is not None:
+                val = float(ratio.item()) if hasattr(ratio, "item") else float(ratio)
+                ratios[int(k) if str(k).isdigit() else k] = round(val, 4)
+    return ratios
+
+
 def save_steer_weights(
     model, path: str, cfg: Optional[RSCConfig] = None, phase: str = "ars", prefixes=None
 ):
@@ -413,8 +426,9 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "gate_scale": 1.0,
             "accuracy": best["heldout_generation_accuracy"],
             "answer_present": best["heldout_answer_present"],
+            "measured": generation_n > 0 and screen_n > 0,
         }]
-        if generation_n > 0:
+        if generation_n > 0 and screen_n > 0 and len(scale_grid) > 1:
             print(f"  [calibration] L{best['layer']} residual intensity grid: {scale_grid}")
             for scale in scale_grid:
                 if abs(scale - 1.0) < 1e-8:
@@ -427,18 +441,20 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                     "gate_scale": scale,
                     "accuracy": calibrated["accuracy"],
                     "answer_present": calibrated["answer_present"],
+                    "measured": True,
                 })
                 print(
                     f"          alpha={scale:.2f}: heldout_acc={calibrated['accuracy']:.1%} "
                     f"answer_present={calibrated['answer_present']:.1%}"
                 )
-        best_scale = max(scale_results, key=lambda row: (row["accuracy"], row["gate_scale"]))
+        measured = [r for r in scale_results if r.get("measured", False)] or scale_results
+        best_scale = max(measured, key=lambda row: (row["accuracy"], row["gate_scale"]))
         selected_val_acc = best_scale["accuracy"]
         nll_reduction = (base_train_nll - best["train_nll"]) / max(base_train_nll, 1e-8)
         val_nll_reduction = (base_val_nll - best["val_nll"]) / max(base_val_nll, 1e-8)
         acc_gain = selected_val_acc - base_val_acc
         cfg.fixed_steer_eval_layers = [best["layer"]]
-        cfg.fixed_steer_eval_gate_scale = float(best_scale["gate_scale"])
+        cfg.fixed_steer_eval_gate_scale = float(best_scale["gate_scale"]) if len(measured) > 1 else 1.0
         report = {
             "baseline_train_nll": base_train_nll,
             "baseline_val_nll": base_val_nll,
@@ -1476,12 +1492,23 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     # ISSUE-4: Split training rows into steer-set (80%) and router-set (20%)
     steer_data, router_data = split_steer_router(list(train_data), router_fraction=0.2, seed=cfg.seed)
 
-    # PHASE 1: Pure SteerNet (uses steer_data)
-    best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(model, steer_data, eval_data, cfg, device)
+    # R6: Reserve held-out confirmation rows (up to deployment_examples or half of eval_data)
+    # exclusively for the final deployment decision so selection and audits are strictly uncontaminated.
+    n_dep = min(int(getattr(cfg, "deployment_examples", 300)), len(eval_data) // 2) if len(eval_data) >= 4 else 0
+    eval_sel = [eval_data[i] for i in range(len(eval_data) - n_dep)]
+    confirm_rows = [eval_data[i] for i in range(len(eval_data) - n_dep, len(eval_data))]
+    print(f"  [eval split] eval_data split: {len(eval_sel)} for selection/audits, {len(confirm_rows)} reserved for deployment confirmation.")
+
+    # PHASE 1: Pure SteerNet (uses steer_data, eval_sel)
+    best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(model, steer_data, eval_sel, cfg, device)
     logs.update(p1_logs)
     logs["phase1_acceptance"] = phase1_steernet_acceptance(
-        model, tokenizer, steer_data, eval_data, cfg, device
+        model, tokenizer, steer_data, eval_sel, cfg, device
     )
+    p1_pre_cap = collect_pre_cap_ratio(model)
+    if p1_pre_cap:
+        print(f"  [telemetry] Phase 1 SteerNet pre-cap norm ratios (delta_norm / cap): {p1_pre_cap}")
+        logs["phase1_pre_cap_ratios"] = p1_pre_cap
 
     # A router cannot repair a SteerNet that has already failed held-out free
     # generation.  Continuing Phase 2 in that state merely turns an NLL-only
@@ -1520,10 +1547,10 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print(f"   Final saved checkpoint        : {cfg.phase2_save_path}")
         return logs, best_val_p1, best_val_p1
 
-    # PHASE 1.5: Router Bootstrap (uses router_data; RC-5: returns steer_snapshot for safe restore)
-    _, best_p15, steer_snapshot_p15 = train_router_bootstrap(model, router_data, eval_data, cfg, device)
+    # PHASE 1.5: Router Bootstrap (uses router_data, eval_sel; RC-5: returns steer_snapshot for safe restore)
+    _, best_p15, steer_snapshot_p15 = train_router_bootstrap(model, router_data, eval_sel, cfg, device)
     logs["router_bootstrap_loss"] = best_p15
-    logs["router_bootstrap_preflight"] = audit_router_policy_health(model, eval_data, cfg, device)
+    logs["router_bootstrap_preflight"] = audit_router_policy_health(model, eval_sel, cfg, device)
     router_report = logs["router_bootstrap_preflight"]
     if (
         not router_report["passed"]
@@ -1569,7 +1596,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         model.set_router_warmup(True)
 
         global_step, best_p2a_val, best_p2a_acc = run_staged_phase(
-            model, tokenizer, steer_data, eval_data, cfg, device,
+            model, tokenizer, steer_data, eval_sel, cfg, device,
             stage_name="PHASE 2A: SteerNet Fine-tune (exhaustive rotation, gate=1.0)",
             epochs=cfg.steer_finetune_epochs,
             param_groups=[{"params": steer_params_ft, "lr": cfg.steer_finetune_lr}],
@@ -1594,7 +1621,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # PHASE 2B: Gate-only Training (uses router_data)
+    # PHASE 2B: Gate-only Training (uses router_data, eval_sel)
     for p in steer_params_ft:
         p.requires_grad = False
     model.set_gate_freeze(False)
@@ -1610,7 +1637,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
             gate_params_ft.append(p)
 
     global_step, best_p2b_val, best_p2b_acc = run_staged_phase(
-        model, tokenizer, router_data, eval_data, cfg, device,
+        model, tokenizer, router_data, eval_sel, cfg, device,
         stage_name="PHASE 2B: Gate-only Training (SteerNet + Router frozen)",
         epochs=cfg.gate_only_epochs,
         param_groups=[{"params": gate_params_ft, "lr": cfg.gate_only_lr}],
@@ -1635,7 +1662,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # PHASE 2C: Coordinated Joint Fine-tune (uses router_data; SteerNet strictly FROZEN to preserve learned steering direction)
+    # PHASE 2C: Coordinated Joint Fine-tune (uses router_data, eval_sel; SteerNet strictly FROZEN)
     for p in steer_params_ft:
         p.requires_grad = False
     for p in gate_params_ft:
@@ -1654,7 +1681,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     ]
 
     global_step, best_val_p2, best_acc_p2 = run_staged_phase(
-        model, tokenizer, router_data, eval_data, cfg, device,
+        model, tokenizer, router_data, eval_sel, cfg, device,
         stage_name="PHASE 2C: Coordinated Gate+Router Fine-tune (SteerNet Frozen)",
         epochs=cfg.joint_finetune_epochs,
         param_groups=joint_groups,
@@ -1666,8 +1693,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     model._joint_grad_mode = False  # Restore detached mode for Phase 2D
     logs["p2_val"] = [best_val_p2]
 
-    # PHASE 2D: Gate Re-tune (uses router_data). Reload the globally best Phase-2 state, rather
-    # than continuing from the final (possibly non-improving) Phase-2C step.
+    # PHASE 2D: Gate Re-tune (uses router_data, eval_sel)
     load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
     for p in model.router.parameters():
         p.requires_grad = False
@@ -1679,7 +1705,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         p.requires_grad = True
 
     global_step, best_p2d_val, best_p2d_acc = run_staged_phase(
-        model, tokenizer, router_data, eval_data, cfg, device,
+        model, tokenizer, router_data, eval_sel, cfg, device,
         stage_name="PHASE 2D: Gate Re-tune (against final router)",
         epochs=cfg.gate_retune_epochs,
         param_groups=[{"params": gate_params_ft, "lr": cfg.gate_retune_lr}],
@@ -1694,7 +1720,12 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     if os.path.exists(cfg.phase2_save_path):
         load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
         print(f"  ✅ Loaded final joint+gate-retune checkpoint from {cfg.phase2_save_path}")
-    logs["ars_intervention_audit"] = audit_ars_intervention_health(model, eval_data, cfg, device)
+    logs["ars_intervention_audit"] = audit_ars_intervention_health(model, eval_sel, cfg, device)
+
+    p2_pre_cap = collect_pre_cap_ratio(model)
+    if p2_pre_cap:
+        print(f"  [telemetry] Final SteerNet pre-cap norm ratios (delta_norm / cap): {p2_pre_cap}")
+        logs["final_pre_cap_ratios"] = p2_pre_cap
 
     if gate_is_degenerate(logs["ars_intervention_audit"]):
         print("  ⚠️ Gate is constant (alpha≈1 everywhere): 'Full ARS' is identical to Router+SteerNet; do not report a gate effect.")
@@ -1702,12 +1733,15 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     else:
         logs["gate_degenerate"] = False
 
-    # ISSUE-2: finalize deployment mode using held-out confirmation examples
-    from src.evaluation.deployment import finalize_deployment
+    # ISSUE-2 / R6: finalize deployment mode using reserved confirmation rows across 0-shot and 2-shot
+    from src.evaluation.deployment import finalize_deployment, paired_delta_ci
     from src.evaluation.multi_dataset import build_benchmark_prompt, evaluate_sample_answer
     from src.evaluation.verifier import generate_response
 
-    def _eval_deployment_flags(target_model, target_tokenizer, rows, target_device):
+    def _eval_deployment_flags(target_model, target_tokenizer, rows, target_device, override="none", n_shot=0):
+        target_model.eval()
+        target_model.set_gate_freeze(False)
+        target_model.set_routing_override(override)
         flags = []
         for r in rows:
             q = None
@@ -1720,7 +1754,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
                     pass
             if not q:
                 continue
-            prompt_text = build_benchmark_prompt("gsm8k", q, n_shot=0)
+            prompt_text = build_benchmark_prompt("gsm8k", q, n_shot=n_shot)
             resp = generate_response(target_model, target_tokenizer, prompt_text, target_device, max_new_tokens=384)
             final_num = None
             if isinstance(r, dict):
@@ -1734,20 +1768,21 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
             flags.append(int(res["correct"]))
         return flags
 
-    deployment_n = min(len(eval_data), int(getattr(cfg, "deployment_examples", 300)))
-    start_idx = max(0, len(eval_data) - deployment_n)
-    confirm_rows = [eval_data[i] for i in range(start_idx, len(eval_data))]
-
     if len(confirm_rows) > 0:
-        print(f"\n  [deployment] Evaluating {len(confirm_rows)} held-out confirmation rows for final deployment decision...")
-        model.eval()
-        model.set_gate_freeze(False)
-        model.set_routing_override("none")
-        base_flags = _eval_deployment_flags(model, tokenizer, confirm_rows, device)
-        model.set_routing_override(None)
-        ars_flags = _eval_deployment_flags(model, tokenizer, confirm_rows, device)
+        print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across 0-shot and 2-shot...")
+        base_flags = []
+        ars_flags = []
+        for n_shot in (0, 2):
+            bf = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override="none", n_shot=n_shot)
+            af = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override=None, n_shot=n_shot)
+            base_flags.extend(bf)
+            ars_flags.extend(af)
+            if len(bf) > 0:
+                print(f"    {n_shot}-shot: Base={sum(bf)}/{len(bf)} ({sum(bf)/len(bf):.1%}) | ARS={sum(af)}/{len(af)} ({sum(af)/len(af):.1%})")
 
         if len(base_flags) > 0 and len(base_flags) == len(ars_flags):
+            d, lo, hi = paired_delta_ci(base_flags, ars_flags)
+            print(f"  [deployment] Multi-shot (0+2 pooled) Δ = {d*100:+.2f}pp, 95% CI = [{lo*100:+.2f}, {hi*100:+.2f}]pp (n={len(base_flags)})")
             dep_mode = finalize_deployment(base_flags, ars_flags, cfg.phase2_save_path, min_n=16)
         else:
             print("  [deployment] No valid evaluated confirmation items; defaulting to BASELINE deployment.")
@@ -1774,7 +1809,5 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     print(f"   Deployment mode decision               : {dep_mode.upper()}")
     print(f"   Final saved checkpoint                 : {cfg.phase2_save_path}")
     print("=" * 80)
-
-    return logs, best_val_p1, best_val_p2
 
     return logs, best_val_p1, best_val_p2

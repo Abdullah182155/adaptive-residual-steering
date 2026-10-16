@@ -24,6 +24,7 @@ from .multi_benchmark_runner import (
     run_fair_multishot_benchmark,
     format_benchmark_summary_table,
     export_latex_summary_table,
+    route_entropy_by_shot,
 )
 from .deployment import (
     paired_delta_ci,
@@ -35,6 +36,8 @@ from .answers import (
     should_stop_on_repeat,
     has_answer_marker,
     truncate_at_answer,
+    rescore_answers,
+    extract_numeric_answer_lenient,
 )
 
 __all__ = [
@@ -51,6 +54,7 @@ __all__ = [
     "EvalBenchmarkConfig",
     "build_benchmark_prompt",
     "extract_numeric_answer",
+    "extract_numeric_answer_lenient",
     "extract_choice_answer",
     "evaluate_sample_answer",
     "load_benchmark_dataset",
@@ -59,6 +63,7 @@ __all__ = [
     "run_fair_multishot_benchmark",
     "format_benchmark_summary_table",
     "export_latex_summary_table",
+    "route_entropy_by_shot",
     "paired_delta_ci",
     "format_benchmark_cell",
     "finalize_deployment",
@@ -66,5 +71,6 @@ __all__ = [
     "should_stop_on_repeat",
     "has_answer_marker",
     "truncate_at_answer",
+    "rescore_answers",
 ]
 

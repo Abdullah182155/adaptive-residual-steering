@@ -99,7 +99,7 @@ def truncate_at_answer(text: str) -> str:
     return text[: m.end()].strip() if m else text
 
 
-def extract_numeric_answer(text: str) -> Optional[float]:
+def extract_numeric_answer(text: str, lenient: bool = False) -> Optional[float]:
     """Return the numeric answer from text, or None if not found.
 
     Priority:
@@ -107,7 +107,9 @@ def extract_numeric_answer(text: str) -> Optional[float]:
       2. 'Final answer: <words>' line — last number anywhere in that line
          (handles 'Final answer: Indras has 6 letters and her sister has 13 letters' → 13)
       3. Last '= N' in text ('=' only — never 'is' to avoid 'this'/'his' false matches)
-      4. 'therefore ...' heuristic — last resort only
+      4. 'therefore ...' heuristic
+      5. If lenient=True: last non-empty line — last number in that line (for plain
+         concluding statements e.g. 'Together, they have 13 letters.')
     """
     text = cut_continuation(text)
 
@@ -131,11 +133,44 @@ def extract_numeric_answer(text: str) -> Optional[float]:
     if last is not None:
         return _to_float(last)
 
-    # 4. 'therefore' heuristic — least reliable, last resort
+    # 4. 'therefore' heuristic — least reliable
     m = re.search(r"[Tt]herefore[^.\n]*", text)
     if m:
         nums = re.findall(_NUM, m.group(0))
         if nums:
             return _to_float(nums[-1])
 
+    # 5. Lenient fallback: Last non-empty line — last number in that line (concluding statements)
+    if lenient:
+        lines = [ln for ln in text.strip().split("\n") if ln.strip()]
+        if lines:
+            nums = re.findall(_NUM, lines[-1])
+            if nums:
+                return _to_float(nums[-1])
+
     return None
+
+
+def extract_numeric_answer_lenient(text: str) -> Optional[float]:
+    """Lenient extractor fallback: includes last non-empty line fallback (R7)."""
+    return extract_numeric_answer(text, lenient=True)
+
+
+def rescore_answers(all_details: list, extractor=None, lenient: bool = False) -> dict:
+    """Rescore benchmark responses using a specified or lenient extractor."""
+    import collections
+    if extractor is None:
+        extractor = extract_numeric_answer_lenient if lenient else extract_numeric_answer
+    acc = collections.defaultdict(list)
+    for d in all_details:
+        try:
+            gold = float(str(d["gold"]).replace(",", "").replace("$", "").strip())
+        except (ValueError, TypeError):
+            continue
+        pred = extractor(d.get("response", ""))
+        acc[(d.get("condition", "unknown"), d.get("n_shot", 0))].append(
+            int(pred is not None and abs(pred - gold) <= 0.01)
+        )
+    return {k: 100.0 * sum(v) / max(1, len(v)) for k, v in acc.items()}
+
+

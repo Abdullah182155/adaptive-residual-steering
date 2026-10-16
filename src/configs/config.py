@@ -89,7 +89,7 @@ class RSCConfig:
     # Select residual intensity on validation free generation after selecting
     # a candidate layer.  This is a bounded calibration of the model's own
     # learned direction, not a test-set threshold or a hidden override.
-    phase1_gate_scale_grid: Tuple[float, ...] = (0.25, 0.50, 0.75, 1.0)
+    phase1_gate_scale_grid: Tuple[float, ...] = (1.0,)
     phase1_min_train_nll_reduction: float = 0.05
     phase1_min_val_nll_reduction: float = 0.05
     # Do not promote an adapter merely because it does not regress on a tiny
@@ -176,7 +176,8 @@ class RSCConfig:
     # so they learn complementary directions. A differentiable K=2 joint-NLL correction
     # (run after each RLOO step through the top-synergy pair) provides the direct
     # gradient that RLOO's no_grad cannot. See train_router_bootstrap docstring.
-    bootstrap_steer_compat_lr_scale: float = 0.05   # SteerNet LR = 5% of router LR
+    # R10 fix: 0.0 disables SteerNet updates on router rows to strictly preserve data split.
+    bootstrap_steer_compat_lr_scale: float = 0.0   # was 0.05 — frozen SteerNets during bootstrap
     bootstrap_joint_nll_weight: float = 0.3          # weight of K=2 joint-NLL correction
     router_rloo_batch_size: int = 8  # enables batch-level policy diversity, unlike a B=1 RLOO probe
     router_preflight_examples: int = 128

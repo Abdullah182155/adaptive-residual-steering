@@ -747,3 +747,86 @@ class TestGateDegeneracyAndSaturation(unittest.TestCase):
         confirm_rows_empty = [empty_data[i] for i in range(start_idx_empty, len(empty_data))]
         self.assertEqual(len(confirm_rows_empty), 0)
 
+
+class TestP0HardeningAndDiagnostics(unittest.TestCase):
+    """P0 unit tests for Run 3 forensic fixes."""
+
+    def test_lenient_concluding_statement_extraction(self):
+        from src.evaluation.answers import (
+            extract_numeric_answer,
+            extract_numeric_answer_lenient,
+            rescore_answers,
+        )
+        text = "Step 5: Together, they have 13 letters."
+        # Strict mode must return None (no equality or final answer marker)
+        self.assertIsNone(extract_numeric_answer(text, lenient=False))
+        # Lenient mode must extract 13 from the last non-empty line
+        self.assertEqual(extract_numeric_answer(text, lenient=True), 13.0)
+        self.assertEqual(extract_numeric_answer_lenient(text), 13.0)
+
+        # Rescore test
+        details = [
+            {"condition": "steernet", "n_shot": 0, "response": text, "gold": 13},
+            {"condition": "steernet", "n_shot": 0, "response": "She has no letters.", "gold": 13},
+        ]
+        strict_scores = rescore_answers(details, lenient=False)
+        self.assertEqual(strict_scores[("steernet", 0)], 0.0)
+        lenient_scores = rescore_answers(details, lenient=True)
+        self.assertEqual(lenient_scores[("steernet", 0)], 50.0)
+
+    def test_reserved_confirmation_split_isolation(self):
+        # 100 eval items, deployment_examples=30
+        eval_data = list(range(100))
+        n_dep = min(30, len(eval_data) // 2)
+        eval_sel = [eval_data[i] for i in range(len(eval_data) - n_dep)]
+        confirm_rows = [eval_data[i] for i in range(len(eval_data) - n_dep, len(eval_data))]
+
+        self.assertEqual(len(eval_sel), 70)
+        self.assertEqual(len(confirm_rows), 30)
+        # Sets must be strictly disjoint
+        self.assertTrue(set(eval_sel).isdisjoint(set(confirm_rows)))
+
+    def test_route_entropy_calculation(self):
+        from src.evaluation.multi_benchmark_runner import route_entropy_by_shot
+        # 1. Collapsed routes (100% same route) -> entropy 0.0
+        collapsed_details = [
+            {"condition": "steernet", "n_shot": 0, "route": (11, 13)},
+            {"condition": "steernet", "n_shot": 0, "route": (11, 13)},
+            {"condition": "steernet", "n_shot": 0, "route": (11, 13)},
+        ]
+        ent_collapsed = route_entropy_by_shot(collapsed_details, condition="steernet")
+        self.assertEqual(ent_collapsed[0], 0.0)
+
+        # 2. Diverse routes (50% route A, 50% route B) -> entropy 1.0 bit
+        diverse_details = [
+            {"condition": "steernet", "n_shot": 2, "route": (11, 13)},
+            {"condition": "steernet", "n_shot": 2, "route": (18, 20)},
+        ]
+        ent_diverse = route_entropy_by_shot(diverse_details, condition="steernet")
+        self.assertAlmostEqual(ent_diverse[2], 1.0, places=3)
+
+    def test_pre_cap_norm_ratio_tracking_without_sync(self):
+        import torch
+        from src.steering.steernet import RSCSteerNet
+        from src.training.trainer import collect_pre_cap_ratio
+
+        steer = RSCSteerNet(hidden_dim=32, rank=4, lora_alpha=8.0, max_relative_norm=0.04)
+        steer.eval()
+        with torch.no_grad():
+            steer.up.weight.normal_(0, 1.0)
+            steer.mag_head.bias.fill_(6.0)
+            h = torch.randn(2, 5, 32)
+            delta = steer(h, active_k=torch.tensor([1, 1]))
+
+        # _last_pre_cap_ratio must be populated
+        self.assertIsNotNone(steer._last_pre_cap_ratio)
+        self.assertGreater(steer._last_pre_cap_ratio.item(), 1.0)
+
+        # Test model-level collector
+        dummy_model = torch.nn.Module()
+        dummy_model.steer_nets = torch.nn.ModuleDict({"11": steer})
+        ratios = collect_pre_cap_ratio(dummy_model)
+        self.assertIn(11, ratios)
+        self.assertGreater(ratios[11], 1.0)
+
+

@@ -160,11 +160,19 @@ class ExperimentRun:
         self.data["benchmark_results"][dataset][stage_name][shot_key] = entry
         self.save()
 
-    def save_weights(self, model: nn.Module, filename: str = "final_ars_weights.pt") -> str:
+    def save_weights(
+        self,
+        model: nn.Module,
+        filename: str = "final_ars_weights.pt",
+        extra_metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
         """Saves trainable ARS steering/gate/router weights inside the isolated run directory."""
         dest_path = os.path.join(self.run_dir, "checkpoints", filename)
+        meta = extra_metadata.copy() if extra_metadata else {}
+        if hasattr(model, "deployment_disabled"):
+            meta.setdefault("deployment_mode", "baseline" if model.deployment_disabled else "ars")
         if hasattr(model, "cfg"):
-            save_ars_checkpoint(model, dest_path, phase="experiment-final", cfg=model.cfg)
+            save_ars_checkpoint(model, dest_path, phase="experiment-final", cfg=model.cfg, extra_metadata=meta)
         else:
             # Registry remains usable for generic experiment models; strict ARS
             # serialization is selected only for an actual ARS wrapper.

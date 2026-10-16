@@ -254,7 +254,11 @@ def epoch_end_accuracy(
         model.train()
     return correct / max(1, total)
 
-def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512, collect_trace: bool = False) -> str:
+def generate_response(
+    model, tokenizer, prompt: str, device, max_new_tokens=512,
+    collect_trace: bool = False,
+    collect_routing_trace: bool = False,
+) -> str:
     """Generate without silently truncating a benchmark's final question.
 
     A few-shot result is invalid if the prompt plus requested completion does
@@ -293,7 +297,7 @@ def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512,
 
     if collect_trace and hasattr(model, "set_gate_trace"):
         model.set_gate_trace(True)
-    if collect_trace and hasattr(model, "set_routing_trace"):
+    if (collect_trace or collect_routing_trace) and hasattr(model, "set_routing_trace"):
         model.set_routing_trace(True)
     try:
         with torch.no_grad():
@@ -311,14 +315,14 @@ def generate_response(model, tokenizer, prompt: str, device, max_new_tokens=512,
                 use_cache=True,
             )
     finally:
-        if collect_trace:
+        if collect_trace or collect_routing_trace:
             # Copy before disabling collection, whose public setter clears
             # transient state.  The resulting object is JSON-safe and can be
             # attached to the qualitative result without retaining tensors.
             gate_trace = {
                 int(layer): list(values)
                 for layer, values in (getattr(model, "last_gate_trace", None) or {}).items()
-            }
+            } if collect_trace else {}
             routing_trace = {
                 int(layer): dict(values)
                 for layer, values in (getattr(model, "last_routing_trace", None) or {}).items()

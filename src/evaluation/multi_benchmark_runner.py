@@ -39,9 +39,9 @@ def evaluate_model_condition(
     identical routing; ``ars`` enables both learned router and learned gate.
     """
     cond = condition.lower()
-    if cond not in {"baseline", "fixed_steernet", "steernet", "ars"}:
+    if cond not in {"baseline", "fixed_steernet", "steernet", "ars", "ars_raw"}:
         raise ValueError(
-            f"Unknown condition '{condition}'. Must be baseline, fixed_steernet, steernet, or ars."
+            f"Unknown condition '{condition}'. Must be baseline, fixed_steernet, steernet, ars, or ars_raw."
         )
 
     # Benchmark numbers must not vary because the router samples K.  Preserve
@@ -76,6 +76,12 @@ def evaluate_model_condition(
             model.set_routing_override("none" if getattr(model, "deployment_disabled", False) else None)
         if hasattr(model, "set_gate_freeze"):
             model.set_gate_freeze(False)
+    elif cond == "ars_raw":
+        # Unconditionally evaluate the learned ARS model without deployment safety fallback
+        if hasattr(model, "set_routing_override"):
+            model.set_routing_override(None)
+        if hasattr(model, "set_gate_freeze"):
+            model.set_gate_freeze(False)
 
     correct_count = 0
     total_time = 0.0
@@ -94,9 +100,11 @@ def evaluate_model_condition(
             prompt_token_counts.append(prompt_tokens)
             t0 = time.time()
             collect_trace = idx < max(0, int(display_examples))
+            collect_route = cond in {"steernet", "ars", "ars_raw"}
             resp = generate_response(
                 model, tokenizer, prompt, device, max_new_tokens=max_new_tokens,
                 collect_trace=collect_trace,
+                collect_routing_trace=collect_route,
             )
             elapsed = time.time() - t0
             total_time += elapsed
@@ -108,6 +116,16 @@ def evaluate_model_condition(
 
             n_tok = len(tokenizer.encode(resp, add_special_tokens=False)) if tokenizer else 0
             total_tokens += n_tok
+
+            # Extract chosen layer route for telemetry
+            r_trace = (
+                getattr(model, "last_generation_trace", {}).get("routing", {})
+                if (collect_trace or collect_route) else {}
+            )
+            route_tuple = tuple(sorted(
+                int(layer) for layer, trace in r_trace.items()
+                if (trace.get("selected", [False])[0] if isinstance(trace.get("selected"), list) else trace.get("selected"))
+            ))
 
             item = {
                 "idx": idx,
@@ -124,9 +142,8 @@ def evaluate_model_condition(
                 "time_sec": elapsed,
                 "tokens": n_tok,
                 "prompt_tokens": prompt_tokens,
-                "routing_trace": (
-                    getattr(model, "last_generation_trace", {}).get("routing", {}) if collect_trace else {}
-                ),
+                "route": route_tuple,
+                "routing_trace": r_trace if collect_trace else {},
                 "gate_trace": (
                     getattr(model, "last_generation_trace", {}).get("gate", {}) if collect_trace else {}
                 ),
@@ -195,6 +212,42 @@ def evaluate_model_condition(
     }
 
     return {"summary": summary, "detailed_results": detailed_results}
+
+
+def route_entropy_by_shot(all_details: List[Dict[str, Any]], condition: str = "steernet") -> Dict[int, float]:
+    """Calculate empirical Shannon entropy (bits) of chosen routes per shot for a condition (R2)."""
+    import math
+    from collections import Counter
+
+    shot_routes: Dict[int, List[Any]] = {}
+    for item in all_details:
+        if item.get("condition") != condition:
+            continue
+        shot = item.get("n_shot", 0)
+        route = item.get("route")
+        if not route:
+            # Fallback to extracting from routing_trace if route not directly populated
+            r_trace = item.get("routing_trace") or {}
+            if r_trace:
+                route = tuple(sorted(
+                    int(l) for l, tr in r_trace.items()
+                    if (tr.get("selected", [False])[0] if isinstance(tr.get("selected"), list) else tr.get("selected"))
+                ))
+        if route is not None:
+            shot_routes.setdefault(shot, []).append(route)
+
+    entropies = {}
+    for shot, routes in shot_routes.items():
+        if not routes:
+            continue
+        counts = Counter(routes)
+        n = len(routes)
+        h = -sum((cnt / n) * math.log2(cnt / n) for cnt in counts.values())
+        entropies[shot] = round(h, 4)
+        if h == 0.0:
+            top_route = routes[0] if routes else ()
+            print(f"  ⚠️ ROUTE-COLLAPSED: Router selected identical route {top_route} across 100% of {n} items ({shot}-shot, {condition}).")
+    return entropies
 
 
 # ==============================================================================
@@ -307,6 +360,43 @@ def run_fair_multishot_benchmark(
     if verbose:
         print("\n" + format_benchmark_summary_table(benchmark_tree, per_item_correct=per_item_correct))
 
+        # R8: Print 3-way paired comparisons with 95% bootstrap CI
+        from src.evaluation.deployment import paired_delta_ci
+        print("\n" + "=" * 90)
+        print("  PAIRED BENCHMARK COMPARISONS (95% Bootstrap CI)")
+        print("=" * 90)
+        for ds_name in eval_datasets:
+            norm_ds = ds_name.lower().replace("-", "_")
+            for shot in eval_shots:
+                print(f"\n--- {norm_ds.upper()} ({shot}-Shot) ---")
+                pairs = [
+                    ("Fixed SteerNet vs Baseline", "baseline", "fixed_steernet"),
+                    ("Router+SteerNet vs Fixed SteerNet", "fixed_steernet", "steernet"),
+                    ("Full ARS vs Router+SteerNet", "steernet", "ars"),
+                    ("Full ARS vs Baseline", "baseline", "ars"),
+                ]
+                if (norm_ds, "ars_raw", shot) in per_item_correct:
+                    pairs.append(("ARS (Raw) vs Router+SteerNet", "steernet", "ars_raw"))
+                    pairs.append(("ARS (Raw) vs Baseline", "baseline", "ars_raw"))
+
+                for label, c_a, c_b in pairs:
+                    if (norm_ds, c_a, shot) in per_item_correct and (norm_ds, c_b, shot) in per_item_correct:
+                        fa = per_item_correct[(norm_ds, c_a, shot)]
+                        fb = per_item_correct[(norm_ds, c_b, shot)]
+                        d, lo, hi = paired_delta_ci(fa, fb)
+                        sig = " *SIGNIFICANT*" if lo > 0 else ""
+                        print(f"  {label:<35}: Δ = {d*100:+.2f}pp, 95% CI = [{lo*100:+.2f}, {hi*100:+.2f}]pp (n={len(fa)}){sig}")
+
+        # R2: Calculate route entropy per shot and check for route collapse
+        print("\n" + "-" * 90)
+        print("  ROUTER POLICY DIVERSITY TELEMETRY")
+        print("-" * 90)
+        for cond_check in ("steernet", "ars", "ars_raw"):
+            if cond_check in conditions:
+                entropies = route_entropy_by_shot(all_details, condition=cond_check)
+                if entropies:
+                    print(f"  Route entropy by shot ({cond_check}): {entropies} bits")
+
     return {
         "benchmark_results": benchmark_tree,
         "metrics_summary": metrics_summary,
@@ -328,10 +418,16 @@ def format_benchmark_summary_table(
     When per_item_correct is provided, computes paired bootstrap 95% CIs
     against baseline and marks significant gains with *.
     """
+    has_ars_raw = any("ars_raw" in conds for conds in benchmark_results.values())
+    hdr = f"{'Dataset':<12} | {'Shots':<6} | {'Baseline':<10} | {'Fixed SteerNet':<15} | {'Router+SteerNet':<17} | {'Full ARS':<35} | {'ARS Δ':<16}"
+    if has_ars_raw:
+        hdr += f" | {'Full ARS (Raw)':<35}"
+    table_width = len(hdr)
+
     lines = [
-        "=" * 135,
-        f"{'Dataset':<12} | {'Shots':<6} | {'Baseline':<10} | {'Fixed SteerNet':<15} | {'Router+SteerNet':<17} | {'Full ARS':<35} | {'ARS Δ':<16}",
-        "-" * 135,
+        "=" * table_width,
+        hdr,
+        "-" * table_width,
     ]
 
     for ds_name, conds in benchmark_results.items():
@@ -339,9 +435,10 @@ def format_benchmark_summary_table(
         fixed_dict = conds.get("fixed_steernet", {})
         steer_dict = conds.get("steernet", {})
         ars_dict = conds.get("ars", {})
+        ars_raw_dict = conds.get("ars_raw", {})
 
         all_shots = sorted(
-            list(set(list(base_dict.keys()) + list(fixed_dict.keys()) + list(steer_dict.keys()) + list(ars_dict.keys()))),
+            list(set(list(base_dict.keys()) + list(fixed_dict.keys()) + list(steer_dict.keys()) + list(ars_dict.keys()) + list(ars_raw_dict.keys()))),
             key=lambda s: int(s.split("_")[0]) if "_" in s and s.split("_")[0].isdigit() else 0,
         )
 
@@ -352,11 +449,13 @@ def format_benchmark_summary_table(
             f_val = fixed_dict.get(shot_k)
             s_val = steer_dict.get(shot_k)
             a_val = ars_dict.get(shot_k)
+            ar_val = ars_raw_dict.get(shot_k)
 
             b_str = f"{b_val:.2f}%" if b_val is not None else "--"
             f_str = f"{f_val:.2f}%" if f_val is not None else "--"
             s_str = f"{s_val:.2f}%" if s_val is not None else "--"
             a_str = f"{a_val:.2f}%" if a_val is not None else "--"
+            ar_str = f"{ar_val:.2f}%" if ar_val is not None else "--"
 
             if per_item_correct is not None and (ds_name, "baseline", shot_int) in per_item_correct:
                 base_flags = per_item_correct[(ds_name, "baseline", shot_int)]
@@ -372,6 +471,10 @@ def format_benchmark_summary_table(
                     gain_str = f"+{diff:.2f}%" if diff >= 0 else f"{diff:.2f}%"
                 else:
                     gain_str = "--"
+
+                if ar_val is not None and (ds_name, "ars_raw", shot_int) in per_item_correct:
+                    ars_raw_flags = per_item_correct[(ds_name, "ars_raw", shot_int)]
+                    ar_str = format_benchmark_cell(base_flags, ars_raw_flags)
             else:
                 if a_val is not None and b_val is not None:
                     diff = a_val - b_val
@@ -379,12 +482,15 @@ def format_benchmark_summary_table(
                 else:
                     gain_str = "--"
 
-            lines.append(
+            row_line = (
                 f"{ds_name.upper():<12} | {shot_num + '-shot':<6} | {b_str:<10} | {f_str:<15} | {s_str:<17} | {a_str:<35} | {gain_str:<16}"
             )
-        lines.append("-" * 135)
+            if has_ars_raw:
+                row_line += f" | {ar_str:<35}"
+            lines.append(row_line)
+        lines.append("-" * table_width)
 
-    lines.append("=" * 135)
+    lines.append("=" * table_width)
     return "\n".join(lines)
 
 
@@ -439,8 +545,10 @@ def export_latex_summary_table(
                     return "--"
                 text = f"{value:.2f}\\%"
                 # A publication table must never make ARS look best merely
-                # because it is the proposed method.  Ties are all bolded.
-                return f"\\textbf{{{text}}}" if value == best_value else text
+                # because it is the proposed method. Never bold non-gain ties with baseline.
+                if value == best_value and (b_val is None or best_value > b_val):
+                    return f"\\textbf{{{text}}}"
+                return text
 
             b_str = render(b_val)
             f_str = render(f_val)
@@ -454,10 +562,11 @@ def export_latex_summary_table(
                 d, lo, hi = paired_delta_ci(base_flags, ars_flags)
                 diff = a_val - b_val if (a_val is not None and b_val is not None) else d * 100
                 diff_text = f"+{diff:.2f}\\%" if diff >= 0 else f"{diff:.2f}\\%"
-                gain_str = f"\\textbf{{{diff_text}}}" if lo > 0 else diff_text
+                gain_str = f"\\textbf{{{diff_text}}}" if (lo > 0 and diff > 0) else diff_text
             elif a_val is not None and b_val is not None:
                 diff = a_val - b_val
-                gain_str = f"\\textbf{{+{diff:.2f}\\%}}" if diff >= 0 else f"{diff:.2f}\\%"
+                diff_text = f"+{diff:.2f}\\%" if diff >= 0 else f"{diff:.2f}\\%"
+                gain_str = f"\\textbf{{{diff_text}}}" if diff > 0 else diff_text
             else:
                 gain_str = "--"
 
@@ -477,3 +586,4 @@ def export_latex_summary_table(
     ])
 
     return "\n".join(latex_lines)
+

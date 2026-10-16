@@ -30,6 +30,7 @@ class RSCSteerNet(nn.Module):
         self.max_relative_norm = max_relative_norm
         self.orthogonal_projection = orthogonal_projection
         self._clip_stats = 0.0
+        self._last_pre_cap_ratio = None
         self.norm = nn.LayerNorm(hidden_dim)
         self.down1 = nn.Linear(hidden_dim, rank, bias=False)
         self.act1 = nn.GELU()
@@ -87,16 +88,18 @@ class RSCSteerNet(nn.Module):
         else:
             delta = delta * self.scale.to(x.dtype)
 
-        # Smooth Saturation Envelope (R2 fix):
+        # Smooth Saturation Envelope (R2 / R4 fix):
         # f(n) = n * c / sqrt(n^2 + c^2), bounded strictly by cap while preserving
-        # relative token-wise magnitude dynamics (unlike a hard clamp).
+        # relative token-wise magnitude dynamics.
         if self.max_relative_norm > 0:
             h_norm = torch.norm(h_flt, dim=-1, keepdim=True) + 1e-7
             delta_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
             cap = self.max_relative_norm * h_norm
             soft = cap / torch.sqrt(delta_norm.square() + cap.square())
-            if self.training is False:
-                self._clip_stats = (delta_norm > cap).float().mean().item()
+            if not self.training:
+                # Retain tensor on device — no .item() host sync during autoregressive decode (R4)
+                self._last_pre_cap_ratio = (delta_norm / cap).detach().mean()
+                self._clip_stats = (delta_norm > cap).detach().float().mean()
             delta = delta * soft
 
         # Orthogonal Steering Projection (optional):

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.5.0] - 2026-10-16
+
+### 🎯 Forensic Review & Diagnostic Hardening (Run 3: n=200 GSM8K, Microsoft Phi-2)
+Comprehensive stabilization and diagnostic hardening based on Claude's deep forensic review of Run 3 (`0142a47` → `73a8de9`):
+- **Safety Net Verification:** Confirmed `finalize_deployment` correctly triggered `BASELINE` fallback when empirical evidence showed 0-shot regression (-14.5 pp) and route collapse ($K=2$ `{L11, L13}`).
+- **Resolved P0 Artifacts & Arm Mismatches:**
+  1. **Arm-Matched Intensity (R5):** Set `phase1_gate_scale_grid = (1.0,)` and bypassed noisy generation sweep, guaranteeing Fixed SteerNet and Router+SteerNet evaluate at the identical $\alpha=1.0$ intensity.
+  2. **Reserved Confirmation Split (R6):** Bifurcated `eval_data` into `eval_sel` (for early stopping, audits, and selection) and strictly reserved `confirm_rows` (evaluated pooled across 0-shot and 2-shot) to prevent validation contamination.
+  3. **Raw ARS Condition & Paired 3-Way Reporting (R6, R8):** Added `ars_raw` condition to multi-benchmark runner to expose raw unmasked ARS performance alongside safe deployment. Implemented paired bootstrap comparisons across all control arms (Base vs Fixed, Fixed vs Router, Router vs ARS, Base vs ARS) and gated LaTeX table bolding to statistically significant improvements only ($lo > 0$ and $diff > 0$).
+  4. **Lenient Fallback Extraction & Rescoring (R7):** Added fallback extraction for plain concluding statements (`Together, they have 13 letters.`) and exported `rescore_answers` / `extract_numeric_answer_lenient` for zero-compute post-hoc analysis.
+  5. **Pre-Cap Norm Saturation Telemetry (R4):** Replaced synchronous `.item()` clipping statistics in `RSCSteerNet` with non-blocking tensor tracking (`_last_pre_cap_ratio`), exposing pre-cap perturbation inflation without CPU sync overhead during autoregressive generation.
+  6. **Data Leakage Elimination (R10):** Set `bootstrap_steer_compat_lr_scale = 0.0` in Phase 1.5 to guarantee SteerNet parameters remain strictly frozen on router data rows; purged dead configuration overrides (`router_balance_weight`, `lambda_k_center`) in `kaggle_ars_runner.ipynb`.
+  7. **Per-Shot Route Entropy Telemetry (R2):** Implemented `route_entropy_by_shot` measuring empirical Shannon entropy of selected routes per shot, emitting an explicit `ROUTE-COLLAPSED` warning if route entropy reaches 0.0 bits.
+
+### 🧪 Verified
+- Full pytest test suite expanded to **91 / 91 tests passing (100% OK)** in 112.4s.
+- Architecture diagram synchronization and hash integrity verified via `scripts/check_architecture_diagrams.py`.
+
+---
+
 ## [1.4.0] - 2026-10-16
 
 ### 🎯 Empirical Run: `exp_20261015_211528_ars_phi2_kaggle`
