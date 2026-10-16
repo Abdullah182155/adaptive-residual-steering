@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.6.0] - 2026-10-16
+
+### 🎯 Forensic Review & Diagnostic Hardening (Run 4: n=100 GSM8K, Microsoft Phi-2)
+Comprehensive diagnostic hardening and forensic roadmap execution based on Claude's deep review of Run 4 (`360067e`):
+- **WP1: True Whole-Evaluation Pre-Cap Norm Saturation Telemetry (R2):**
+  - Replaced single micro-batch `_last_pre_cap_ratio` snapshot with GPU tensor accumulation (`_pre_cap_sum`, `_pre_cap_n`, `_pre_cap_max`) across all forward passes in `RSCSteerNet.forward`.
+  - Added `reset_pre_cap_stats()` on `RSCSteerNet` and exported `pre_cap_report(model, reset=True)` in `src/steering/` to measure genuine token-level pre-cap perturbation inflation without per-token CPU host sync.
+- **WP2: Dual-Extractor Transparency & Reasoning Diagnostics (R4, R5, R7):**
+  - Added lenient answer extraction tracking in `evaluate_sample_answer` (`src/evaluation/multi_dataset.py`) and recorded `lenient_correct` and `accuracy_lenient` in benchmark summaries (`src/evaluation/multi_benchmark_runner.py`).
+  - Added `format_dual_extractor_table` displaying strict vs lenient comparisons side-by-side to directly assess scoring asymmetry.
+  - Implemented `chain_stats(all_details)` and `format_chain_stats_table` to evaluate the reasoning chain compression hypothesis (mean steps, character lengths, tokens, and accuracy per condition/shot).
+  - Implemented `alpha_jitter_floor(...)` in `src/evaluation/deployment.py` to quantify the empirical greedy decode / fp16 flip noise floor across tiny alpha perturbations ($\alpha \in \{1.0, 0.999, 0.998\}$).
+  - Created standalone diagnostic script [`scripts/rescore_run.py`](file:///d:/projects/Adaptive%20Residual%20Steering%20(ARS)/scripts/rescore_run.py) for immediate offline E0 analysis.
+- **WP3: Telemetry Hardening, Labeling & Notebook Integration (R6):**
+  - Clamped Shannon entropy to non-negative floats in `route_entropy_by_shot` (`max(0.0, float(h))`), eliminating negative zero (`-0.0`) formatting artifacts.
+  - Guarded route collapse warning for deployed baseline mode (`top_route == ()`), and explicitly labeled deployed condition as `Full ARS (Deployed=Baseline)` in paired benchmark tables.
+  - Added per-shot (0-shot and 2-shot) paired bootstrap CIs alongside pooled confirmation delta in `train_rsc` (`src/training/trainer.py`).
+  - Updated `notebooks/kaggle_ars_runner.ipynb`:
+    - Wired `per_item_correct=benchmark_output.get("per_item_correct")` to `export_latex_summary_table`, guaranteeing non-significant cells ($lo \le 0$) are never bolded in research tables.
+    - Added `ars_raw` logging to experiment registry and multishot scaling plots.
+    - Clamped K entropy in diagnostics dashboard to positive zero.
+- **WP4: Architecture Verification & Test Coverage:**
+  - Expanded unit test suite in `tests/test_modules.py` with `TestRun4HardeningAndDiagnostics` covering pre-cap accumulation, route entropy clamping, chain dynamics, dual extractor formatting, alpha jitter floor, and significance-based LaTeX bolding.
+  - Regenerated architecture diagram drawio and publication PNG artifacts; synchronized `.arch_hash` cache.
+
+### 🧪 Verified
+- Full pytest test suite expanded to **97 / 97 tests passing (100% OK)** in 82.1s.
+- Architecture diagram synchronization and hash integrity verified via `scripts/check_architecture_diagrams.py`.
+
+---
+
 ## [1.5.0] - 2026-10-16
 
 ### 🎯 Forensic Review & Diagnostic Hardening (Run 3: n=200 GSM8K, Microsoft Phi-2)

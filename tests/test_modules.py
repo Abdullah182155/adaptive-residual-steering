@@ -827,6 +827,151 @@ class TestP0HardeningAndDiagnostics(unittest.TestCase):
         dummy_model.steer_nets = torch.nn.ModuleDict({"11": steer})
         ratios = collect_pre_cap_ratio(dummy_model)
         self.assertIn(11, ratios)
-        self.assertGreater(ratios[11], 1.0)
+        val = ratios[11]["mean"] if isinstance(ratios[11], dict) else ratios[11]
+        self.assertGreater(val, 1.0)
+
+
+class TestRun4HardeningAndDiagnostics(unittest.TestCase):
+    """Forensic verification tests for Run 4 hardening and telemetry (WP1, WP2, WP3)."""
+
+    def test_pre_cap_report_accumulation_and_reset(self):
+        """WP1: pre_cap_report accumulates across multiple forwards and resets cleanly."""
+        from src.steering.steernet import RSCSteerNet, pre_cap_report
+        steer = RSCSteerNet(hidden_dim=32, rank=4, lora_alpha=8.0, max_relative_norm=0.04)
+        steer.eval()
+        dummy_model = torch.nn.Module()
+        dummy_model.steer_nets = torch.nn.ModuleDict({"11": steer})
+
+        with torch.no_grad():
+            steer.up.weight.normal_(0, 1.0)
+            steer.mag_head.bias.fill_(6.0)
+            h1 = torch.randn(2, 5, 32)
+            _ = steer(h1, active_k=torch.tensor([1, 1]))
+            h2 = torch.randn(3, 4, 32)
+            _ = steer(h2, active_k=torch.tensor([1, 1, 1]))
+
+        report = pre_cap_report(dummy_model, reset=True)
+        self.assertIn(11, report)
+        self.assertEqual(report[11]["tokens"], 2 * 5 + 3 * 4)
+        self.assertGreater(report[11]["mean"], 0.0)
+        self.assertGreaterEqual(report[11]["max"], report[11]["mean"])
+
+        # Reset should have cleared stats
+        empty_report = pre_cap_report(dummy_model, reset=False)
+        self.assertEqual(empty_report, {})
+
+    def test_route_entropy_negative_zero_clamp_and_empty_route(self):
+        """WP3: route_entropy_by_shot clamps -0.0 to 0.0 and suppresses collapse on empty deployed route."""
+        from src.evaluation.multi_benchmark_runner import route_entropy_by_shot
+        details = [
+            {"condition": "steernet", "n_shot": 0, "route": (11, 15)},
+            {"condition": "steernet", "n_shot": 0, "route": (11, 15)},
+            {"condition": "steernet", "n_shot": 2, "route": (11, 15)},
+            {"condition": "ars", "n_shot": 0, "route": ()},
+            {"condition": "ars", "n_shot": 0, "route": ()},
+        ]
+        entropies = route_entropy_by_shot(details, condition="steernet")
+        self.assertIn(0, entropies)
+        self.assertEqual(entropies[0], 0.0)
+        # Verify it is positive zero, not -0.0
+        self.assertFalse(str(entropies[0]).startswith("-"))
+
+        # ARS with empty route (deployed mode) should have entropy 0.0 without crash
+        ars_entropies = route_entropy_by_shot(details, condition="ars")
+        self.assertEqual(ars_entropies.get(0), 0.0)
+
+    def test_chain_stats_and_formatting(self):
+        """WP2: chain_stats computes steps, characters, tokens, and strict vs lenient accuracy."""
+        from src.evaluation.multi_benchmark_runner import chain_stats, format_chain_stats_table
+        details = [
+            {
+                "condition": "baseline",
+                "n_shot": 0,
+                "steps": 3,
+                "chars": 150,
+                "tokens": 40,
+                "correct": True,
+                "lenient_correct": True,
+            },
+            {
+                "condition": "baseline",
+                "n_shot": 0,
+                "steps": 4,
+                "chars": 200,
+                "tokens": 50,
+                "correct": False,
+                "lenient_correct": True,  # Concluding statement saved under lenient
+            },
+        ]
+        stats = chain_stats(details)
+        self.assertIn(("baseline", 0), stats)
+        b_stat = stats[("baseline", 0)]
+        self.assertEqual(b_stat["count"], 2)
+        self.assertEqual(b_stat["mean_steps"], 3.5)
+        self.assertEqual(b_stat["mean_chars"], 175.0)
+        self.assertEqual(b_stat["mean_tokens"], 45.0)
+        self.assertEqual(b_stat["accuracy_strict"], 50.0)
+        self.assertEqual(b_stat["accuracy_lenient"], 100.0)
+
+        tbl = format_chain_stats_table(stats)
+        self.assertIn("baseline", tbl)
+        self.assertIn("0-shot", tbl)
+        self.assertIn("50.0%", tbl)
+        self.assertIn("100.0%", tbl)
+
+    def test_dual_extractor_table_formatting(self):
+        """WP2: format_dual_extractor_table computes difference between strict and lenient."""
+        from src.evaluation.multi_benchmark_runner import format_dual_extractor_table
+        p_strict = {("gsm8k", "baseline", 0): [1, 0, 0, 0]}
+        p_lenient = {("gsm8k", "baseline", 0): [1, 1, 0, 0]}
+        tbl = format_dual_extractor_table(p_strict, p_lenient)
+        self.assertIn("GSM8K", tbl)
+        self.assertIn("25.00%", tbl)
+        self.assertIn("50.00%", tbl)
+        self.assertIn("+25.00pp", tbl)
+
+    def test_alpha_jitter_floor_with_flags_fn(self):
+        """WP2: alpha_jitter_floor measures decoding flip rate under tiny alpha jitter."""
+        from src.evaluation.deployment import alpha_jitter_floor
+        # Reference alpha=1.0: 100 items all 1
+        # alpha=0.999: item 0 flipped to 0 (1 flip = 1.0% flip rate)
+        # alpha=0.998: items 0 and 1 flipped to 0 (2 flips = 2.0% flip rate)
+        def mock_flags(alpha):
+            if alpha == 1.0:
+                return [1] * 100
+            elif alpha == 0.999:
+                return [0] + [1] * 99
+            elif alpha == 0.998:
+                return [0, 0] + [1] * 98
+            return [1] * 100
+
+        res = alpha_jitter_floor(flags_fn=mock_flags, alphas=(1.0, 0.999, 0.998))
+        self.assertIn("flip_rates", res)
+        self.assertEqual(res["flip_rates"][(1.0, 0.999)], 0.01)
+        self.assertEqual(res["flip_rates"][(1.0, 0.998)], 0.02)
+        self.assertEqual(res["noise_floor_pp"], 2.0)
+
+    def test_export_latex_summary_table_respects_significance(self):
+        """WP3: export_latex_summary_table does not bold non-significant cells when per_item_correct is provided."""
+        from src.evaluation.multi_benchmark_runner import export_latex_summary_table
+        tree = {
+            "gsm8k": {
+                "baseline": {"0_shot": 56.0},
+                "fixed_steernet": {"0_shot": 60.0},
+                "steernet": {"0_shot": 53.0},
+                "ars": {"0_shot": 60.0},  # Tied with fixed_steernet, but difference vs baseline has lo <= 0
+            }
+        }
+        # Baseline: 56 ones, 44 zeros
+        # ARS: 60 ones, 40 zeros, but overlapping such that CI contains 0
+        base_flags = [1] * 56 + [0] * 44
+        ars_flags = [1] * 54 + [0] * 2 + [1] * 6 + [0] * 38  # delta +4, but CI [-5, +13] contains 0
+        per_item = {
+            ("gsm8k", "baseline", 0): base_flags,
+            ("gsm8k", "ars", 0): ars_flags,
+        }
+        latex_tbl = export_latex_summary_table(tree, per_item_correct=per_item)
+        # Since CI contains 0 (lo <= 0), ARS cell '60.00%' must NOT be bolded
+        self.assertNotIn(r"\textbf{60.00\%}", latex_tbl)
 
 

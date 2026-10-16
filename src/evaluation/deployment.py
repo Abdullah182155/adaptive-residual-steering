@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Sequence, Tuple, Dict, Any, List, Callable
 
 import numpy as np
 
@@ -129,3 +129,90 @@ def finalize_deployment(
         logger.warning("Manifest not found at %s; deployment_mode not persisted.", manifest_path)
 
     return mode
+
+
+def alpha_jitter_floor(
+    model: Optional[Any] = None,
+    tokenizer: Optional[Any] = None,
+    rows: Optional[Sequence[Dict[str, Any]]] = None,
+    device: Optional[Any] = None,
+    flags_fn: Optional[Callable[[float], Sequence[int | float]]] = None,
+    alphas: Sequence[float] = (1.0, 0.999, 0.998),
+    dataset_name: str = "gsm8k",
+    n_shot: int = 0,
+    max_new_tokens: int = 512,
+) -> Dict[str, Any]:
+    """Measure the greedy decoding flip rate (noise floor) induced by tiny alpha perturbations.
+
+    Router+SteerNet (alpha=1.0) and ARS raw (alpha≈0.999) differ by only ~0.1% in scale.
+    Any difference in accuracy between them that is smaller than the jitter flip rate
+    is indistinguishable from greedy decode / fp16 chaos rather than genuine reasoning.
+
+    Args:
+        model: ARS model wrapper (optional if flags_fn is provided).
+        tokenizer: Tokenizer for text generation.
+        rows: Dataset rows to evaluate.
+        device: Torch device.
+        flags_fn: Callable(alpha) -> Sequence[0/1] for testing or custom evaluation.
+        alphas: Sequence of alpha values to evaluate (default: (1.0, 0.999, 0.998)).
+        dataset_name: Dataset name for prompt building and evaluation.
+        n_shot: Number of exemplar shots.
+        max_new_tokens: Maximum tokens to generate per sample.
+
+    Returns:
+        Dict containing:
+            - "per_alpha_acc": {alpha: float_accuracy}
+            - "flip_rates": {(ref_alpha, target_alpha): float_flip_rate}
+            - "max_flip_rate": float
+            - "noise_floor_pp": float (max flip rate in percentage points)
+    """
+    per_alpha_flags: Dict[float, List[int]] = {}
+
+    if flags_fn is not None:
+        for a in alphas:
+            per_alpha_flags[a] = [int(x) for x in flags_fn(a)]
+    elif model is not None and tokenizer is not None and rows is not None:
+        from src.evaluation.verifier import generate_response
+        from src.evaluation.multi_dataset import build_benchmark_prompt, evaluate_sample_answer
+
+        ref_override = getattr(model, "_routing_override", None)
+        try:
+            if hasattr(model, "set_routing_override"):
+                model.set_routing_override(None)
+            for a in alphas:
+                if hasattr(model, "set_gate_freeze"):
+                    model.set_gate_freeze(True, float(a))
+                flags = []
+                for sample in rows:
+                    prompt = build_benchmark_prompt(dataset_name, sample["question"], n_shot=n_shot)
+                    resp = generate_response(model, tokenizer, prompt, device, max_new_tokens=max_new_tokens)
+                    ev = evaluate_sample_answer(dataset_name, resp, sample["gold"])
+                    flags.append(int(ev["correct"]))
+                per_alpha_flags[a] = flags
+        finally:
+            if hasattr(model, "set_routing_override"):
+                model.set_routing_override(ref_override)
+            if hasattr(model, "set_gate_freeze"):
+                model.set_gate_freeze(False)
+    else:
+        raise ValueError("alpha_jitter_floor requires either flags_fn or (model, tokenizer, rows).")
+
+    ref_alpha = alphas[0]
+    ref_flags = np.asarray(per_alpha_flags.get(ref_alpha, []), dtype=int)
+    flip_rates: Dict[Tuple[float, float], float] = {}
+    per_alpha_acc: Dict[float, float] = {}
+
+    for a, flags in per_alpha_flags.items():
+        arr = np.asarray(flags, dtype=float)
+        per_alpha_acc[a] = float(arr.mean()) if len(arr) > 0 else 0.0
+        if a != ref_alpha and len(ref_flags) == len(arr) and len(arr) > 0:
+            flips = float((ref_flags != arr).mean())
+            flip_rates[(ref_alpha, a)] = round(flips, 4)
+
+    max_flip = max(flip_rates.values()) if flip_rates else 0.0
+    return {
+        "per_alpha_acc": per_alpha_acc,
+        "flip_rates": flip_rates,
+        "max_flip_rate": max_flip,
+        "noise_floor_pp": round(max_flip * 100.0, 2),
+    }

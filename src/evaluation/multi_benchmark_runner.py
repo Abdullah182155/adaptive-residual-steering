@@ -84,6 +84,7 @@ def evaluate_model_condition(
             model.set_gate_freeze(False)
 
     correct_count = 0
+    lenient_correct_count = 0
     total_time = 0.0
     total_tokens = 0
     prompt_token_counts = []
@@ -113,6 +114,9 @@ def evaluate_model_condition(
             is_corr = eval_res["correct"]
             if is_corr:
                 correct_count += 1
+            is_lenient_corr = eval_res.get("lenient_correct", is_corr)
+            if is_lenient_corr:
+                lenient_correct_count += 1
 
             n_tok = len(tokenizer.encode(resp, add_special_tokens=False)) if tokenizer else 0
             total_tokens += n_tok
@@ -136,9 +140,12 @@ def evaluate_model_condition(
                 "gold": gold,
                 "response": resp,
                 "extracted": eval_res["extracted"],
+                "lenient_extracted": eval_res.get("lenient_extracted", eval_res["extracted"]),
                 "correct": is_corr,
+                "lenient_correct": is_lenient_corr,
                 "has_answer": eval_res["has_answer"],
                 "steps": eval_res["steps"],
+                "chars": len(resp),
                 "time_sec": elapsed,
                 "tokens": n_tok,
                 "prompt_tokens": prompt_tokens,
@@ -191,6 +198,7 @@ def evaluate_model_condition(
             model.set_router_inference_mode(previous_mode)
 
     accuracy = 100.0 * correct_count / max(1, n_samples)
+    accuracy_lenient = 100.0 * lenient_correct_count / max(1, n_samples)
     ans_present = 100.0 * sum(r["has_answer"] for r in detailed_results) / max(1, n_samples)
     step_cov = 100.0 * sum(r["steps"] > 0 for r in detailed_results) / max(1, n_samples)
     tok_per_sec = total_tokens / max(1e-5, total_time)
@@ -202,6 +210,8 @@ def evaluate_model_condition(
         "n_samples": n_samples,
         "correct": correct_count,
         "accuracy": round(accuracy, 2),
+        "lenient_correct": lenient_correct_count,
+        "accuracy_lenient": round(accuracy_lenient, 2),
         "answer_present": round(ans_present, 2),
         "step_coverage": round(step_cov, 2),
         "avg_time_sec": round(total_time / max(1, n_samples), 3),
@@ -243,11 +253,95 @@ def route_entropy_by_shot(all_details: List[Dict[str, Any]], condition: str = "s
         counts = Counter(routes)
         n = len(routes)
         h = -sum((cnt / n) * math.log2(cnt / n) for cnt in counts.values())
-        entropies[shot] = round(h, 4)
-        if h == 0.0:
+        entropies[shot] = round(max(0.0, float(h)), 4)
+        if h <= 0.0:
             top_route = routes[0] if routes else ()
-            print(f"  ⚠️ ROUTE-COLLAPSED: Router selected identical route {top_route} across 100% of {n} items ({shot}-shot, {condition}).")
+            if top_route == () or condition == "baseline":
+                # Empty route indicates baseline passthrough (e.g. ARS deployed mode fallback)
+                pass
+            else:
+                print(f"  ⚠️ ROUTE-COLLAPSED: Router selected identical route {top_route} across 100% of {n} items ({shot}-shot, {condition}).")
     return entropies
+
+
+def chain_stats(all_details: List[Dict[str, Any]]) -> Dict[Tuple[str, int], Dict[str, float]]:
+    """Compute reasoning chain diagnostics across conditions and shots (R5 / R7).
+
+    Tests whether SteerNets compress reasoning (fewer steps/tokens) or cause premature stopping.
+    Returns per-(condition, shot) statistics:
+      - mean_steps: average reasoning steps
+      - mean_chars: average response character length
+      - mean_tokens: average generated tokens
+      - accuracy_strict: strict extraction accuracy (%)
+      - accuracy_lenient: lenient extraction accuracy (%)
+      - count: number of samples
+    """
+    import numpy as np
+    groups: Dict[Tuple[str, int], List[Dict[str, Any]]] = {}
+    for item in all_details:
+        cond = item.get("condition", "unknown")
+        shot = item.get("n_shot", 0)
+        groups.setdefault((cond, shot), []).append(item)
+
+    stats: Dict[Tuple[str, int], Dict[str, float]] = {}
+    for (cond, shot), items in groups.items():
+        n = len(items)
+        if n == 0:
+            continue
+        m_steps = float(np.mean([it.get("steps", 0) for it in items]))
+        m_chars = float(np.mean([it.get("chars", len(it.get("response", ""))) for it in items]))
+        m_toks = float(np.mean([it.get("tokens", 0) for it in items]))
+        acc_s = 100.0 * float(np.mean([int(it.get("correct", False)) for it in items]))
+        acc_l = 100.0 * float(np.mean([int(it.get("lenient_correct", it.get("correct", False))) for it in items]))
+
+        stats[(cond, shot)] = {
+            "mean_steps": round(m_steps, 2),
+            "mean_chars": round(m_chars, 1),
+            "mean_tokens": round(m_toks, 1),
+            "accuracy_strict": round(acc_s, 2),
+            "accuracy_lenient": round(acc_l, 2),
+            "count": n,
+        }
+    return stats
+
+
+def format_chain_stats_table(stats: Dict[Tuple[str, int], Dict[str, float]]) -> str:
+    """Format chain_stats dictionary into a human-readable table (R5)."""
+    hdr = f"{'Condition':<18} | {'Shots':<8} | {'Strict Acc':<12} | {'Lenient Acc':<12} | {'Mean Steps':<11} | {'Mean Chars':<11} | {'Mean Tokens':<11}"
+    lines = ["=" * len(hdr), hdr, "-" * len(hdr)]
+    for (cond, shot) in sorted(stats.keys(), key=lambda x: (x[1], x[0])):
+        st = stats[(cond, shot)]
+        row = (
+            f"{cond:<18} | {f'{shot}-shot':<8} | {st['accuracy_strict']:>9.1f}% | {st['accuracy_lenient']:>9.1f}% | "
+            f"{st['mean_steps']:>10.2f} | {st['mean_chars']:>10.1f} | {st['mean_tokens']:>10.1f}"
+        )
+        lines.append(row)
+    lines.append("=" * len(hdr))
+    return "\n".join(lines)
+
+
+def format_dual_extractor_table(
+    per_item_strict: Dict[Tuple[str, str, int], List[int]],
+    per_item_lenient: Dict[Tuple[str, str, int], List[int]],
+) -> str:
+    """Format side-by-side comparison of strict vs lenient accuracy per condition and shot (R4)."""
+    import numpy as np
+    keys = sorted(
+        list(set(per_item_strict.keys()).intersection(set(per_item_lenient.keys()))),
+        key=lambda x: (x[0], x[2], x[1]),
+    )
+    hdr = f"{'Dataset':<10} | {'Condition':<16} | {'Shots':<6} | {'Strict Acc':<12} | {'Lenient Acc':<12} | {'Extractor Δ':<12}"
+    lines = ["=" * len(hdr), hdr, "-" * len(hdr)]
+    for (ds, cond, shot) in keys:
+        s_arr = np.asarray(per_item_strict[(ds, cond, shot)], dtype=float)
+        l_arr = np.asarray(per_item_lenient[(ds, cond, shot)], dtype=float)
+        s_acc = float(s_arr.mean() * 100.0) if len(s_arr) > 0 else 0.0
+        l_acc = float(l_arr.mean() * 100.0) if len(l_arr) > 0 else 0.0
+        diff = l_acc - s_acc
+        row = f"{ds.upper():<10} | {cond:<16} | {f'{shot}-shot':<6} | {s_acc:>10.2f}% | {l_acc:>10.2f}% | {diff:>+10.2f}pp"
+        lines.append(row)
+    lines.append("=" * len(hdr))
+    return "\n".join(lines)
 
 
 # ==============================================================================
@@ -295,6 +389,7 @@ def run_fair_multishot_benchmark(
     metrics_summary: List[Dict[str, Any]] = []
     all_details: List[Dict[str, Any]] = []
     per_item_correct: Dict[Tuple[str, str, int], List[int]] = {}
+    per_item_lenient: Dict[Tuple[str, str, int], List[int]] = {}
 
     for ds_name in eval_datasets:
         norm_ds = ds_name.lower().replace("-", "_")
@@ -333,7 +428,9 @@ def run_fair_multishot_benchmark(
                 metrics_summary.append(summ)
                 all_details.extend(res["detailed_results"])
                 per_item = [int(item["correct"]) for item in res["detailed_results"]]
+                per_item_len = [int(item["lenient_correct"]) for item in res["detailed_results"]]
                 per_item_correct[(norm_ds, cond, shot)] = per_item
+                per_item_lenient[(norm_ds, cond, shot)] = per_item_len
 
                 if verbose:
                     print(
@@ -360,11 +457,26 @@ def run_fair_multishot_benchmark(
     if verbose:
         print("\n" + format_benchmark_summary_table(benchmark_tree, per_item_correct=per_item_correct))
 
+        # R4: Dual Extractor Comparison (Strict vs Lenient)
+        print("\n" + "=" * 90)
+        print("  DUAL EXTRACTOR COMPARISON: STRICT vs LENIENT ACCURACY (R4)")
+        print("=" * 90)
+        print(format_dual_extractor_table(per_item_correct, per_item_lenient))
+
+        # R5 / R7: Reasoning Chain Dynamics Table
+        print("\n" + "=" * 90)
+        print("  REASONING CHAIN DYNAMICS & COMPRESSION DIAGNOSTICS (R5)")
+        print("=" * 90)
+        c_stats = chain_stats(all_details)
+        print(format_chain_stats_table(c_stats))
+
         # R8: Print 3-way paired comparisons with 95% bootstrap CI
         from src.evaluation.deployment import paired_delta_ci
         print("\n" + "=" * 90)
         print("  PAIRED BENCHMARK COMPARISONS (95% Bootstrap CI)")
         print("=" * 90)
+        is_deployed_baseline = getattr(model, "deployment_disabled", False)
+        ars_label = "Full ARS (Deployed=Baseline)" if is_deployed_baseline else "Full ARS"
         for ds_name in eval_datasets:
             norm_ds = ds_name.lower().replace("-", "_")
             for shot in eval_shots:
@@ -372,8 +484,8 @@ def run_fair_multishot_benchmark(
                 pairs = [
                     ("Fixed SteerNet vs Baseline", "baseline", "fixed_steernet"),
                     ("Router+SteerNet vs Fixed SteerNet", "fixed_steernet", "steernet"),
-                    ("Full ARS vs Router+SteerNet", "steernet", "ars"),
-                    ("Full ARS vs Baseline", "baseline", "ars"),
+                    (f"{ars_label} vs Router+SteerNet", "steernet", "ars"),
+                    (f"{ars_label} vs Baseline", "baseline", "ars"),
                 ]
                 if (norm_ds, "ars_raw", shot) in per_item_correct:
                     pairs.append(("ARS (Raw) vs Router+SteerNet", "steernet", "ars_raw"))
@@ -402,6 +514,8 @@ def run_fair_multishot_benchmark(
         "metrics_summary": metrics_summary,
         "all_details": all_details,
         "per_item_correct": per_item_correct,
+        "per_item_lenient": per_item_lenient,
+        "chain_stats": chain_stats(all_details),
     }
 
 
@@ -540,20 +654,36 @@ def export_latex_summary_table(
             observed = [value for value in row_values.values() if value is not None]
             best_value = max(observed) if observed else None
 
-            def render(value):
+            def render(cond_name, value):
                 if value is None:
                     return "--"
                 text = f"{value:.2f}\\%"
-                # A publication table must never make ARS look best merely
-                # because it is the proposed method. Never bold non-gain ties with baseline.
+                # When per_item_correct is provided, only bold if improvement over baseline is statistically significant (lo > 0)
+                if per_item_correct is not None:
+                    if (
+                        cond_name in {"ars", "steernet", "fixed_steernet"}
+                        and (ds_name, "baseline", shot_int) in per_item_correct
+                        and (ds_name, cond_name, shot_int) in per_item_correct
+                    ):
+                        from src.evaluation.deployment import paired_delta_ci
+                        base_flags = per_item_correct[(ds_name, "baseline", shot_int)]
+                        cond_flags = per_item_correct[(ds_name, cond_name, shot_int)]
+                        _, lo, _ = paired_delta_ci(base_flags, cond_flags)
+                        if lo > 0 and (b_val is None or value > b_val):
+                            return f"\\textbf{{{text}}}"
+                        return text
+                    # If per_item_correct is provided for the run, do not bold unverified conditions
+                    return text
+
+                # Fallback: A publication table must never make a method look best merely by aggregate tie. Never bold non-gain ties.
                 if value == best_value and (b_val is None or best_value > b_val):
                     return f"\\textbf{{{text}}}"
                 return text
 
-            b_str = render(b_val)
-            f_str = render(f_val)
-            s_str = render(s_val)
-            a_str = render(a_val)
+            b_str = render("baseline", b_val)
+            f_str = render("fixed_steernet", f_val)
+            s_str = render("steernet", s_val)
+            a_str = render("ars", a_val)
 
             if per_item_correct is not None and (ds_name, "baseline", shot_int) in per_item_correct and (ds_name, "ars", shot_int) in per_item_correct:
                 from src.evaluation.deployment import paired_delta_ci

@@ -136,8 +136,13 @@ def gate_is_degenerate(intervention_diag: dict, std_tol: float = 1e-2, sat_pct: 
     )
 
 
-def collect_pre_cap_ratio(model: torch.nn.Module) -> dict:
-    """Collect the latest SteerNet pre-cap norm saturation ratio across candidate layers (R4)."""
+def collect_pre_cap_ratio(model: torch.nn.Module, reset: bool = True) -> dict:
+    """Collect SteerNet pre-cap norm saturation statistics across candidate layers (R2 / R4)."""
+    from src.steering.steernet import pre_cap_report
+    report = pre_cap_report(model, reset=reset)
+    if report:
+        return report
+    # Fallback to last-forward mean if no accumulation was active
     ratios = {}
     steer_nets = getattr(model, "steer_nets", {})
     if isinstance(steer_nets, torch.nn.ModuleDict):
@@ -145,7 +150,7 @@ def collect_pre_cap_ratio(model: torch.nn.Module) -> dict:
             ratio = getattr(sn, "_last_pre_cap_ratio", None)
             if ratio is not None:
                 val = float(ratio.item()) if hasattr(ratio, "item") else float(ratio)
-                ratios[int(k) if str(k).isdigit() else k] = round(val, 4)
+                ratios[int(k) if str(k).isdigit() else k] = {"mean": round(val, 4)}
     return ratios
 
 
@@ -1777,8 +1782,13 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
             af = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override=None, n_shot=n_shot)
             base_flags.extend(bf)
             ars_flags.extend(af)
-            if len(bf) > 0:
-                print(f"    {n_shot}-shot: Base={sum(bf)}/{len(bf)} ({sum(bf)/len(bf):.1%}) | ARS={sum(af)}/{len(af)} ({sum(af)/len(af):.1%})")
+            if len(bf) > 0 and len(af) == len(bf):
+                d_s, lo_s, hi_s = paired_delta_ci(bf, af)
+                print(
+                    f"    {n_shot}-shot: Base={sum(bf)}/{len(bf)} ({sum(bf)/len(bf):.1%}) | "
+                    f"ARS={sum(af)}/{len(af)} ({sum(af)/len(af):.1%}) | "
+                    f"Δ={d_s*100:+.2f}pp, 95% CI=[{lo_s*100:+.2f}, {hi_s*100:+.2f}]pp (n={len(bf)})"
+                )
 
         if len(base_flags) > 0 and len(base_flags) == len(ars_flags):
             d, lo, hi = paired_delta_ci(base_flags, ars_flags)

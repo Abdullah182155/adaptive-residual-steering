@@ -234,14 +234,14 @@ def build_benchmark_prompt(dataset_name: str, question: str, n_shot: int = 0) ->
 # 4. Answer Extraction & Equivalence Verifiers
 # ==============================================================================
 
-def extract_numeric_answer(text: str) -> Optional[float]:
+def extract_numeric_answer(text: str, lenient: bool = False) -> Optional[float]:
     """Extract numeric answer. Alias of answers.extract_numeric_answer (ISSUE-13 unified extractor).
 
     The old implementation used r'(?:=|is)\\s*\\$?...' which matched 'is' inside
     'this'/'his', producing wrong answers. The unified extractor uses '=' only.
     """
     from src.evaluation.answers import extract_numeric_answer as _extract
-    return _extract(text)
+    return _extract(text, lenient=lenient)
 
 
 
@@ -297,9 +297,12 @@ def evaluate_sample_answer(
         norm_gold = digit_to_letter.get(gold_str, gold_str)
         norm_extracted = digit_to_letter.get(str(extracted), str(extracted)) if extracted else None
         correct = (norm_extracted is not None and norm_extracted == norm_gold)
+        lenient_extracted = extracted
+        lenient_correct = correct
         has_answer = extracted is not None
     else:
-        extracted = extract_numeric_answer(response)
+        extracted = extract_numeric_answer(response, lenient=False)
+        lenient_extracted = extract_numeric_answer(response, lenient=True)
         try:
             gold_num = float(gold_answer) if gold_answer is not None else None
         except (ValueError, TypeError):
@@ -310,11 +313,18 @@ def evaluate_sample_answer(
             and gold_num is not None
             and abs(extracted - gold_num) <= tolerance
         )
+        lenient_correct = (
+            lenient_extracted is not None
+            and gold_num is not None
+            and abs(lenient_extracted - gold_num) <= tolerance
+        )
         has_answer = extracted is not None
 
     return {
         "correct": bool(correct),
+        "lenient_correct": bool(lenient_correct),
         "extracted": extracted,
+        "lenient_extracted": lenient_extracted,
         "gold": gold_answer,
         "has_answer": has_answer,
         "steps": step_count,

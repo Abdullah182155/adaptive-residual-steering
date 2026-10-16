@@ -31,6 +31,9 @@ class RSCSteerNet(nn.Module):
         self.orthogonal_projection = orthogonal_projection
         self._clip_stats = 0.0
         self._last_pre_cap_ratio = None
+        self._pre_cap_sum = None
+        self._pre_cap_n = 0
+        self._pre_cap_max = None
         self.norm = nn.LayerNorm(hidden_dim)
         self.down1 = nn.Linear(hidden_dim, rank, bias=False)
         self.act1 = nn.GELU()
@@ -98,7 +101,16 @@ class RSCSteerNet(nn.Module):
             soft = cap / torch.sqrt(delta_norm.square() + cap.square())
             if not self.training:
                 # Retain tensor on device — no .item() host sync during autoregressive decode (R4)
-                self._last_pre_cap_ratio = (delta_norm / cap).detach().mean()
+                r = (delta_norm / cap).detach().float().flatten()
+                if self._pre_cap_sum is None:
+                    self._pre_cap_sum = r.sum()
+                    self._pre_cap_n = r.numel()
+                    self._pre_cap_max = r.max()
+                else:
+                    self._pre_cap_sum = self._pre_cap_sum + r.sum()
+                    self._pre_cap_n = self._pre_cap_n + r.numel()
+                    self._pre_cap_max = torch.maximum(self._pre_cap_max, r.max())
+                self._last_pre_cap_ratio = r.mean()
                 self._clip_stats = (delta_norm > cap).detach().float().mean()
             delta = delta * soft
 
@@ -111,4 +123,30 @@ class RSCSteerNet(nn.Module):
             delta = delta - proj
 
         return delta
+
+    def reset_pre_cap_stats(self):
+        """Reset accumulated pre-cap norm saturation statistics."""
+        self._pre_cap_sum = None
+        self._pre_cap_n = 0
+        self._pre_cap_max = None
+
+
+def pre_cap_report(model: torch.nn.Module, reset: bool = True) -> dict:
+    """Read true token-aggregated pre-cap norm saturation statistics once per evaluation (R2)."""
+    out = {}
+    steer_nets = getattr(model, "steer_nets", {})
+    if isinstance(steer_nets, torch.nn.ModuleDict):
+        for k, sn in steer_nets.items():
+            n = getattr(sn, "_pre_cap_n", 0)
+            if n and getattr(sn, "_pre_cap_sum", None) is not None:
+                mean_val = float((sn._pre_cap_sum / n).item())
+                max_val = float(sn._pre_cap_max.item())
+                out[int(k) if str(k).isdigit() else k] = {
+                    "mean": round(mean_val, 4),
+                    "max": round(max_val, 4),
+                    "tokens": int(n),
+                }
+            if reset and hasattr(sn, "reset_pre_cap_stats"):
+                sn.reset_pre_cap_stats()
+    return out
 

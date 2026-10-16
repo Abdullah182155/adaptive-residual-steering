@@ -25,11 +25,15 @@ from .multi_benchmark_runner import (
     format_benchmark_summary_table,
     export_latex_summary_table,
     route_entropy_by_shot,
+    chain_stats,
+    format_chain_stats_table,
+    format_dual_extractor_table,
 )
 from .deployment import (
     paired_delta_ci,
     format_benchmark_cell,
     finalize_deployment,
+    alpha_jitter_floor,
 )
 from .answers import (
     cut_continuation,
@@ -64,9 +68,13 @@ __all__ = [
     "format_benchmark_summary_table",
     "export_latex_summary_table",
     "route_entropy_by_shot",
+    "chain_stats",
+    "format_chain_stats_table",
+    "format_dual_extractor_table",
     "paired_delta_ci",
     "format_benchmark_cell",
     "finalize_deployment",
+    "alpha_jitter_floor",
     "cut_continuation",
     "should_stop_on_repeat",
     "has_answer_marker",
