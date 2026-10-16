@@ -55,6 +55,26 @@ class PromptTemplateBank:
             cls.render(question, steps, final_answer, r2),
         )
 
+_CALC_TOKEN_CACHE: Dict[int, int] = {}
+
+def _is_calc_token_id(tokenizer, token_id: int) -> int:
+    """Classify token as math/calculation/outcome token vs English prose."""
+    if token_id in _CALC_TOKEN_CACHE:
+        return _CALC_TOKEN_CACHE[token_id]
+    try:
+        s = tokenizer.decode([token_id])
+    except Exception:
+        s = ""
+    if "Step" in s:
+        res = 0
+    elif re.search(r"[\d\+\-\*\/=\$\%#]", s):
+        res = 1
+    else:
+        res = 0
+    _CALC_TOKEN_CACHE[token_id] = res
+    return res
+
+
 def gsm8k_to_cot(
     tokenizer,
     cfg: Optional[RSCConfig] = None,
@@ -74,7 +94,13 @@ def gsm8k_to_cot(
         cfg.seed = seed
     split_ratio = val_split if val_split is not None else getattr(cfg, "val_split", 0.08)
 
-    ds = load_dataset("openai/gsm8k", "main", split="train")
+    try:
+        ds = load_dataset("openai/gsm8k", "main", split="train")
+    except Exception:
+        try:
+            ds = load_dataset("openai/gsm8k", "main", split="train", verification_mode="no_checks")
+        except Exception:
+            ds = load_dataset("gsm8k", "main", split="train")
     if cfg.n_samples < len(ds):
         ds = ds.shuffle(seed=cfg.seed).select(range(cfg.n_samples))
 
@@ -140,26 +166,6 @@ def gsm8k_to_cot(
         chain_len = len(text[target_start:]) if target_start > 0 else 0
         score = ops_count * 2 + distinct_nums + chain_len / 100.0
         return {"difficulty_score": score}
-
-_CALC_TOKEN_CACHE: Dict[int, int] = {}
-
-def _is_calc_token_id(tokenizer, token_id: int) -> int:
-    """Classify token as math/calculation/outcome token vs English prose."""
-    if token_id in _CALC_TOKEN_CACHE:
-        return _CALC_TOKEN_CACHE[token_id]
-    try:
-        s = tokenizer.decode([token_id])
-    except Exception:
-        s = ""
-    if "Step" in s:
-        res = 0
-    elif re.search(r"[\d\+\-\*\/=\$\%#]", s):
-        res = 1
-    else:
-        res = 0
-    _CALC_TOKEN_CACHE[token_id] = res
-    return res
-
 
     ds = ds.map(get_difficulty)
     ds = ds.sort("difficulty_score", reverse=False)

@@ -1102,4 +1102,32 @@ class TestEngineV2OutcomeSupervision(unittest.TestCase):
         self.assertEqual(calc_t.shape[1], 4)
         self.assertEqual(mask_t.shape[1], 4)
 
+    def test_gsm8k_to_cot_returns_splits(self):
+        """gsm8k_to_cot must return a tuple (train_split, test_split) containing calc_mask."""
+        from src.data.dataset import gsm8k_to_cot
+        from src.configs.config import RSCConfig
+
+        class MockTokenizer:
+            pad_token_id = 0
+            eos_token_id = 1
+            def __call__(self, texts, truncation=True, max_length=128, padding="max_length"):
+                if isinstance(texts, str):
+                    texts = [texts]
+                ids = [[10, 11, 12, 13, 0] + [0] * (max_length - 5) for _ in texts]
+                masks = [[1, 1, 1, 1, 1] + [0] * (max_length - 5) for _ in texts]
+                return {"input_ids": ids, "attention_mask": masks}
+            def encode(self, text, add_special_tokens=False):
+                return [10, 11, 12]
+            def decode(self, token_ids, skip_special_tokens=True):
+                return "Step 1: 42"
+
+        cfg = RSCConfig()
+        cfg.n_samples = 5
+        train_d, eval_d = gsm8k_to_cot(tokenizer=MockTokenizer(), cfg=cfg, n_samples=5)
+        self.assertIsNotNone(train_d)
+        self.assertIsNotNone(eval_d)
+        self.assertGreater(len(train_d), 0)
+        self.assertIn("calc_mask", train_d[0])
+
+
 
