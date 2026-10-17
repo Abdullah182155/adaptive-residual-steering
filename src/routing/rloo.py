@@ -256,10 +256,12 @@ def compute_router_rloo_loss(
     # this function is called from a mixed-mode staged curriculum.
     module_modes = {module: module.training for module in model.modules()}
     try:
-        # Train exactly the deterministic utility function that deployment
-        # uses.  A training-only layer-dropout mask otherwise creates apparent
-        # route diversity which disappears under eval/argmax.
-        model.router.eval()
+        # Train against the same deterministic representation used at
+        # deployment.  Keeping only the router in eval mode left a frozen
+        # backbone's dropout (or future stochastic modules) active while
+        # constructing the detached policy state, even though every reward
+        # arm below was evaluated deterministically.
+        model.eval()
         model.set_routing_override(None)
         model.set_router_context_mask(prompt_mask)
         if hasattr(model, "set_prompt_shield_mask"):

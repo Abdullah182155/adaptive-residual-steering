@@ -133,6 +133,40 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(report["accuracy_comparison_baseline"], 0.5)
         self.assertEqual(report["validation_accuracy_gain"], 0.0)
 
+    def test_phase1_rejects_shortened_completion_candidates(self):
+        """A candidate below the CoT retention floor cannot win the screen."""
+        class ScreenOnlyModel:
+            target_layers = [11]
+            _routing_override = None
+
+            def set_routing_override(self, mode=None, layers=None):
+                self._routing_override = None if mode is None else (mode, layers)
+
+            def set_gate_freeze(self, freeze, value=1.0):
+                pass
+
+        cfg = RSCConfig(
+            phase1_acceptance_examples=16,
+            phase1_acceptance_accuracy_examples=0,
+            phase1_generation_screen_examples=16,
+            phase1_generation_candidate_count=1,
+            continue_on_diagnostic_failure=True,
+        )
+        rows = [{"question": "q", "final_num": 1.0}] * 16
+        baseline = {"accuracy": 0.5, "answer_present": 1.0, "median_tokens": 100.0}
+        truncated = {"accuracy": 1.0, "answer_present": 1.0, "median_tokens": 84.0}
+        with patch("src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8]), patch(
+            "src.training.trainer._phase1_zero_shot_generation_probe",
+            side_effect=[baseline, truncated],
+        ):
+            report = phase1_steernet_acceptance(
+                ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["status"], "FAIL_TRUNCATED_COT")
+        self.assertEqual(report["truncation_rejected_layers"], [11])
+
     def test_router_mutual_information_diversity(self):
         # Input-dependent, confident decisions must score better than one
         # globally collapsed route under the batch diversity objective.
@@ -666,6 +700,32 @@ class TestPairedCI(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.ci([1, 0], [1, 0, 1])
 
+    def test_clustered_views_preserve_point_estimate(self):
+        # Two shots of the same questions are correlated.  The clustered path
+        # must retain the pooled point estimate while resampling questions.
+        baseline = [[0, 1], [1, 0], [0, 0], [1, 1]]
+        ars = [[1, 1], [1, 0], [1, 0], [1, 1]]
+        d, lo, hi = self.ci(baseline, ars, n_boot=500, seed=7)
+        self.assertAlmostEqual(d, 0.25)
+        self.assertLessEqual(lo, d)
+        self.assertGreaterEqual(hi, d)
+
+    def test_clustered_shape_mismatch_raises(self):
+        with self.assertRaises(ValueError):
+            self.ci([[1, 0]], [[1], [0]])
+
+
+class TestRun8FailClosedDefaults(unittest.TestCase):
+    """Run 8 must not silently continue after an invalid routing diagnostic."""
+
+    def test_decision_defaults_fail_closed(self):
+        cfg = RSCConfig()
+        self.assertFalse(cfg.continue_on_diagnostic_failure)
+        self.assertTrue(cfg.skip_adaptive_phases_when_phase1_fails)
+        self.assertTrue(cfg.skip_adaptive_phases_when_router_fails)
+        self.assertTrue(cfg.router_fail_fast_on_collapse)
+        self.assertEqual(cfg.deployment_min_examples, 120)
+
 
 class TestSteerNetIdentityInit(unittest.TestCase):
     """ISSUE-5: SteerNet must produce near-zero delta at initialization."""
@@ -1162,7 +1222,15 @@ class TestEngineV2OutcomeSupervision(unittest.TestCase):
 
         cfg = RSCConfig()
         cfg.n_samples = 5
-        train_d, eval_d = gsm8k_to_cot(tokenizer=MockTokenizer(), cfg=cfg, n_samples=5)
+        # Dataset formatting is unit-tested against an in-memory fixture so
+        # the suite never depends on Hub availability or a local cache.
+        from datasets import Dataset
+        fixture = Dataset.from_dict({
+            "question": [f"Question {i}" for i in range(5)],
+            "answer": ["Step 1: 1 + 1 = 2. #### 2" for _ in range(5)],
+        })
+        with patch("src.data.dataset.load_dataset", return_value=fixture):
+            train_d, eval_d = gsm8k_to_cot(tokenizer=MockTokenizer(), cfg=cfg, n_samples=5)
         self.assertIsNotNone(train_d)
         self.assertIsNotNone(eval_d)
         self.assertGreater(len(train_d), 0)

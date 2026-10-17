@@ -27,11 +27,15 @@ def paired_delta_ci(
     n_boot: int = 4000,
     seed: int = 42,
 ) -> Tuple[float, float, float]:
-    """Bootstrap 95% CI for mean(flags_b) - mean(flags_a), paired by item.
+    """Bootstrap a paired accuracy delta, preserving optional question clusters.
 
     Args:
-        flags_a: Per-item correctness for arm A (0/1 ints or floats).
-        flags_b: Per-item correctness for arm B (0/1 ints or floats).
+        flags_a: Per-item correctness for arm A.  A one-dimensional sequence
+            represents ordinary paired items.  A two-dimensional sequence of
+            shape ``(questions, views)`` represents repeated views of each
+            question (for example 0- and 2-shot); bootstrap samples questions,
+            never the correlated views independently.
+        flags_b: Matching correctness outcomes for arm B.
         n_boot:  Number of bootstrap resamples.
         seed:    Random seed for reproducibility.
 
@@ -43,13 +47,22 @@ def paired_delta_ci(
     rng = np.random.default_rng(seed)
     a = np.asarray(flags_a, dtype=float)
     b = np.asarray(flags_b, dtype=float)
-    if len(a) != len(b):
-        raise ValueError(f"paired_delta_ci: len(a)={len(a)} != len(b)={len(b)}")
-    if len(a) == 0:
+    if a.shape != b.shape:
+        raise ValueError(f"paired_delta_ci: shape(a)={a.shape} != shape(b)={b.shape}")
+    if a.ndim not in {1, 2}:
+        raise ValueError(f"paired_delta_ci expects 1D items or 2D question clusters, got shape {a.shape}")
+    if a.size == 0 or a.shape[0] == 0:
         return 0.0, -1.0, 1.0
 
     d_obs = float(b.mean() - a.mean())
-    diffs = b - a  # per-item differences
+    # For clustered input, average views within each question before
+    # resampling.  This keeps the point estimate equal to the pooled mean but
+    # preserves the within-question dependence in the uncertainty estimate.
+    diffs = b - a
+    if a.ndim == 2:
+        if a.shape[1] == 0:
+            return 0.0, -1.0, 1.0
+        diffs = diffs.mean(axis=1)
     boot_means = np.array([
         rng.choice(diffs, size=len(diffs), replace=True).mean()
         for _ in range(n_boot)
@@ -97,7 +110,16 @@ def finalize_deployment(
         'ars' if ARS is significantly better (lo_ci > 0), else 'baseline'.
         Writes deployment_mode to the manifest JSON file.
     """
-    n = len(per_item_baseline)
+    baseline = np.asarray(per_item_baseline, dtype=float)
+    ars = np.asarray(per_item_ars, dtype=float)
+    if baseline.shape != ars.shape:
+        raise ValueError(
+            "finalize_deployment: baseline and ARS outcomes must have matching shapes, "
+            f"got {baseline.shape} and {ars.shape}"
+        )
+    if baseline.ndim not in {1, 2}:
+        raise ValueError("finalize_deployment expects 1D paired items or 2D question clusters")
+    n = int(baseline.shape[0])
     if n < min_n:
         logger.warning(
             "finalize_deployment: only %d examples (< %d). "
@@ -106,7 +128,7 @@ def finalize_deployment(
         )
         mode = "baseline"
     else:
-        d, lo, hi = paired_delta_ci(per_item_baseline, per_item_ars, n_boot=n_boot)
+        d, lo, hi = paired_delta_ci(baseline, ars, n_boot=n_boot)
         mode = "ars" if lo > 0 else "baseline"
         logger.info(
             "finalize_deployment: Δ=%.3f CI=[%.3f, %.3f] n=%d → mode=%s",
@@ -122,6 +144,8 @@ def finalize_deployment(
         except (json.JSONDecodeError, OSError):
             manifest = {}
         manifest["deployment_mode"] = mode
+        manifest["deployment_confirmation_questions"] = n
+        manifest["deployment_confirmation_views"] = int(baseline.shape[1]) if baseline.ndim == 2 else 1
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         logger.info("Updated manifest %s → deployment_mode=%s", manifest_path, mode)

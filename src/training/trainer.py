@@ -441,10 +441,54 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 effective_acc = r["screen_generation_accuracy"] * trunc_penalty
                 return (-effective_acc, r["val_nll"])
 
-            shortlist_n = max(1, min(int(getattr(cfg, "phase1_generation_candidate_count", 2)), len(candidates)))
-            shortlist = sorted(candidates, key=_screen_sort_key)[:shortlist_n]
+            # A length collapse is a direct autoregressive regression, not a
+            # soft ranking preference.  Do not let a numerically lucky but
+            # prematurely truncated candidate enter the full-generation
+            # shortlist or pass the Phase-1 capacity gate.
+            eligible_candidates = [
+                row for row in candidates
+                if row["completion_len_ratio"] >= min_len_ratio
+            ]
+            rejected_layers = [
+                int(row["layer"]) for row in candidates
+                if row not in eligible_candidates
+            ]
+            if not eligible_candidates:
+                report = {
+                    "baseline_train_nll": base_train_nll,
+                    "baseline_val_nll": base_val_nll,
+                    "baseline_validation_accuracy": base_val_acc,
+                    "baseline_screen_accuracy": base_screen_acc,
+                    "candidates": candidates,
+                    "selected_layer": None,
+                    "selected_validation_accuracy": 0.0,
+                    "accuracy_comparison": "generation_screen",
+                    "accuracy_comparison_baseline": base_screen_acc,
+                    "fixed_steer_gate_scale": 1.0,
+                    "gate_scale_candidates": [],
+                    "train_relative_nll_reduction": 0.0,
+                    "val_relative_nll_reduction": 0.0,
+                    "validation_accuracy_gain": 0.0,
+                    "validation_examples": val_n,
+                    "reliability_waived": small_run_waiver,
+                    "passed": False,
+                    "status": "FAIL_TRUNCATED_COT",
+                    "truncation_rejected_layers": rejected_layers,
+                }
+                warning = (
+                    "  ⚠️ Phase-1 acceptance FAILED: every candidate shortened the completion below "
+                    f"the {min_len_ratio:.0%} retention floor (layers={rejected_layers})."
+                )
+                print(warning)
+                if not getattr(cfg, "continue_on_diagnostic_failure", True):
+                    raise RuntimeError(warning)
+                return report
+
+            shortlist_n = max(1, min(int(getattr(cfg, "phase1_generation_candidate_count", 2)), len(eligible_candidates)))
+            shortlist = sorted(eligible_candidates, key=_screen_sort_key)[:shortlist_n]
             shortlist_labels = [f"L{row['layer']}" for row in shortlist]
-            print(f"  [5/5] Full held-out generation shortlist: {shortlist_labels}...")
+            rejected_note = f"; rejected short-CoT layers={rejected_layers}" if rejected_layers else ""
+            print(f"  [5/5] Full held-out generation shortlist: {shortlist_labels}{rejected_note}...")
             if generation_n > 0:
                 for row in shortlist:
                     generation = _phase1_zero_shot_generation_probe(
@@ -546,6 +590,10 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "validation_accuracy_gain": acc_gain,
             "validation_examples": val_n,
             "reliability_waived": small_run_waiver,
+            "truncation_rejected_layers": [
+                int(row["layer"]) for row in candidates
+                if row.get("completion_len_ratio", 1.0) < float(getattr(cfg, "phase1_min_completion_len_ratio", 0.85))
+            ],
             "passed": (
                 nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
                 and val_nll_reduction >= float(cfg.phase1_min_val_nll_reduction)
@@ -1074,11 +1122,22 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
     print(f"           steer_compat_lr={compat_lr:.2e}  joint_nll_weight={lambda_joint}")
     print("=" * 80)
 
+    compatibility_required = lambda_joint > 0.0 and bool(steer_params) and len(model.target_layers) >= 2
+    compatibility_telemetry = {
+        "required": compatibility_required,
+        "attempts": 0,
+        "successful_steps": 0,
+        "nonzero_gradient_steps": 0,
+    }
+    # Keep a live dictionary on the model so a raised correction failure still
+    # leaves forensic evidence for the caller or an interactive notebook.
+    model._last_router_bootstrap_compatibility = compatibility_telemetry
     for epoch in range(cfg.router_bootstrap_epochs):
         random.shuffle(subset_idx)
         model.train()
         running, n_steps = 0.0, 0
         running_joint_nll, n_joint_steps = 0.0, 0
+        joint_attempts_epoch, joint_grad_steps_epoch = 0, 0
         counterfactual_k_actions = None
         rloo_batch_size = max(2, int(getattr(cfg, "router_rloo_batch_size", 8)))
         pbar = tqdm(
@@ -1122,6 +1181,8 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             # OOM FIX: run on a single example (ids[:1]) instead of the full batch.
             # Full-batch logits.float() = [B,T,V] fp32 → ~800 MB at B=8; single = ~100 MB.
             if lambda_joint > 0.0 and steer_params and len(model.target_layers) >= 2:
+                joint_attempts_epoch += 1
+                compatibility_telemetry["attempts"] += 1
                 coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
                 top_pairs = coop.get("top_synergy_pairs", [])
                 # Use best positive-synergy pair; fall back to first two candidate layers
@@ -1165,12 +1226,20 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                             calc_target_mode=getattr(cfg, "steer_loss_target", "calculation"),
                             calc_weight=getattr(cfg, "calc_token_weight", 3.0),
                         ).mean()
-                    if torch.isfinite(joint_nll):
-                        (lambda_joint * joint_nll).backward()
-                        running_joint_nll += joint_nll.item()
-                        n_joint_steps += 1
-                except Exception:
-                    pass  # never let correction crash the training loop
+                    if not torch.isfinite(joint_nll):
+                        raise FloatingPointError("non-finite K=2 compatibility joint-NLL")
+                    (lambda_joint * joint_nll).backward()
+                    has_steer_gradient = any(
+                        p.grad is not None and torch.isfinite(p.grad).all() and p.grad.detach().abs().sum().item() > 0.0
+                        for p in steer_params
+                    )
+                    if not has_steer_gradient:
+                        raise RuntimeError("K=2 compatibility correction produced no SteerNet gradient")
+                    running_joint_nll += joint_nll.item()
+                    n_joint_steps += 1
+                    joint_grad_steps_epoch += 1
+                    compatibility_telemetry["successful_steps"] += 1
+                    compatibility_telemetry["nonzero_gradient_steps"] += 1
                 finally:
                     model.set_routing_override(None)
 
@@ -1212,7 +1281,11 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             ) if rloo_diag else ""
         )
         syn_str = f" | top synergy: [{top_syn_str}]" if top_syn_str else ""
-        joint_str = f" | joint_nll={avg_joint:.4f}" if n_joint_steps > 0 else ""
+        joint_str = (
+            f" | joint_nll={avg_joint:.4f} "
+            f"(K2={n_joint_steps}/{joint_attempts_epoch}, grad={joint_grad_steps_epoch})"
+            if joint_attempts_epoch > 0 else ""
+        )
         print(
             f"  RouterBootstrap Epoch {epoch + 1}: loss={avg_loss:.4f}"
             f"{win_str}{k_pref_str}{k_argmax_str}"
@@ -1230,6 +1303,16 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             patience_ctr += 1
         if patience_ctr >= cfg.router_bootstrap_patience:
             break
+
+    if compatibility_required and (
+        compatibility_telemetry["attempts"] == 0
+        or compatibility_telemetry["successful_steps"] == 0
+        or compatibility_telemetry["nonzero_gradient_steps"] == 0
+    ):
+        raise RuntimeError(
+            "Router bootstrap completed without a valid K=2 SteerNet compatibility correction: "
+            f"{compatibility_telemetry}"
+        )
 
     if best_state:
         model.load_state_dict(best_state, strict=False)
@@ -1620,7 +1703,16 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
 
     # R6: Reserve held-out confirmation rows (up to deployment_examples or half of eval_data)
     # exclusively for the final deployment decision so selection and audits are strictly uncontaminated.
+    # A deployment decision is invalid without the configured number of
+    # independent questions, even though each question is viewed at two shots.
     n_dep = min(int(getattr(cfg, "deployment_examples", 300)), len(eval_data) // 2) if len(eval_data) >= 4 else 0
+    min_deployment_questions = int(getattr(cfg, "deployment_min_examples", 120))
+    if n_dep < min_deployment_questions:
+        raise RuntimeError(
+            "Insufficient held-out evaluation rows for a deployment decision: "
+            f"need {min_deployment_questions} independent confirmation questions plus an equal-sized "
+            f"selection split, got eval_data={len(eval_data)} and confirmation_rows={n_dep}."
+        )
     eval_sel = [eval_data[i] for i in range(len(eval_data) - n_dep)]
     confirm_rows = [eval_data[i] for i in range(len(eval_data) - n_dep, len(eval_data))]
     print(f"  [eval split] eval_data split: {len(eval_sel)} for selection/audits, {len(confirm_rows)} reserved for deployment confirmation.")
@@ -1676,6 +1768,9 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     # PHASE 1.5: Router Bootstrap (uses router_data, eval_sel; RC-5: returns steer_snapshot for safe restore)
     _, best_p15, steer_snapshot_p15 = train_router_bootstrap(model, router_data, eval_sel, cfg, device)
     logs["router_bootstrap_loss"] = best_p15
+    logs["router_bootstrap_compatibility"] = dict(
+        getattr(model, "_last_router_bootstrap_compatibility", {})
+    )
     logs["router_bootstrap_preflight"] = audit_router_policy_health(model, eval_sel, cfg, device)
     router_report = logs["router_bootstrap_preflight"]
     if (
@@ -1859,7 +1954,9 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     else:
         logs["gate_degenerate"] = False
 
-    # ISSUE-2 / R6: finalize deployment mode using reserved confirmation rows across 0-shot and 2-shot
+    # ISSUE-2 / R8: finalize deployment mode using reserved confirmation rows
+    # across 0-shot and 2-shot.  Each question is one bootstrap cluster; its
+    # two shot outcomes are intentionally never treated as independent rows.
     from src.evaluation.deployment import finalize_deployment, paired_delta_ci
     from src.evaluation.multi_dataset import build_benchmark_prompt, evaluate_sample_answer
     from src.evaluation.verifier import generate_response
@@ -1898,9 +1995,19 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across 0-shot and 2-shot...")
         base_flags = []
         ars_flags = []
+        base_flags_by_shot = []
+        ars_flags_by_shot = []
+        base_clusters, ars_clusters = [], []
         for n_shot in (0, 2):
             bf = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override="none", n_shot=n_shot)
             af = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override=None, n_shot=n_shot)
+            if len(bf) != len(confirm_rows) or len(af) != len(confirm_rows) or len(bf) != len(af):
+                raise RuntimeError(
+                    "Deployment confirmation did not produce one paired outcome per reserved question: "
+                    f"shot={n_shot}, baseline={len(bf)}, ars={len(af)}, expected={len(confirm_rows)}"
+                )
+            base_flags_by_shot.append(bf)
+            ars_flags_by_shot.append(af)
             base_flags.extend(bf)
             ars_flags.extend(af)
             if len(bf) > 0 and len(af) == len(bf):
@@ -1911,10 +2018,21 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
                     f"Δ={d_s*100:+.2f}pp, 95% CI=[{lo_s*100:+.2f}, {hi_s*100:+.2f}]pp (n={len(bf)})"
                 )
 
-        if len(base_flags) > 0 and len(base_flags) == len(ars_flags):
-            d, lo, hi = paired_delta_ci(base_flags, ars_flags)
-            print(f"  [deployment] Multi-shot (0+2 pooled) Δ = {d*100:+.2f}pp, 95% CI = [{lo*100:+.2f}, {hi*100:+.2f}]pp (n={len(base_flags)})")
-            dep_mode = finalize_deployment(base_flags, ars_flags, cfg.phase2_save_path, min_n=16)
+        if len(base_flags_by_shot) == 2 and len(ars_flags_by_shot) == 2:
+            base_clusters = [list(values) for values in zip(*base_flags_by_shot)]
+            ars_clusters = [list(values) for values in zip(*ars_flags_by_shot)]
+            d, lo, hi = paired_delta_ci(base_clusters, ars_clusters)
+            print(
+                "  [deployment] Multi-shot (0+2 clustered by question) "
+                f"Δ = {d*100:+.2f}pp, 95% CI = [{lo*100:+.2f}, {hi*100:+.2f}]pp "
+                f"(questions={len(base_clusters)}, views={len(base_flags_by_shot)})"
+            )
+            dep_mode = finalize_deployment(
+                base_clusters,
+                ars_clusters,
+                cfg.phase2_save_path,
+                min_n=min_deployment_questions,
+            )
         else:
             print("  [deployment] No valid evaluated confirmation items; defaulting to BASELINE deployment.")
             dep_mode = "baseline"
@@ -1922,9 +2040,15 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print("\n  [deployment] No held-out confirmation rows available; defaulting to BASELINE deployment.")
         dep_mode = "baseline"
         base_flags, ars_flags = [], []
+        base_clusters, ars_clusters = [], []
 
     logs["deployment_mode"] = dep_mode
-    logs["deployment_flags"] = {"baseline": base_flags, "ars": ars_flags}
+    logs["deployment_flags"] = {
+        "baseline": base_flags,
+        "ars": ars_flags,
+        "baseline_clusters": base_clusters if len(confirm_rows) > 0 else [],
+        "ars_clusters": ars_clusters if len(confirm_rows) > 0 else [],
+    }
     if hasattr(model, "deployment_disabled"):
         model.deployment_disabled = (dep_mode == "baseline")
     print(f"  [deployment] Final deployment mode decided: {dep_mode.upper()} (deployment_disabled={getattr(model, 'deployment_disabled', False)})")

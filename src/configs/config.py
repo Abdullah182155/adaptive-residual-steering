@@ -89,7 +89,12 @@ class RSCConfig:
     phase1_generation_screen_examples: int = 16   # Engine v2.1: fast 16-row screen to prevent selecting CoT-shortcutting adapters
     phase1_generation_candidate_count: int = 2
     phase1_min_completion_len_ratio: float = 0.85 # Engine v2.1: reject candidate if median CoT length collapses below 85% of baseline
-    deployment_examples: int = 300                # R5 / ISSUE-2: final held-out paired CI decision rows
+    deployment_examples: int = 300                # Upper bound for final held-out paired CI decision rows
+    # Run 8 requires at least 120 *questions* for the deployment decision.
+    # Each question is evaluated at both 0- and 2-shot, and the bootstrap
+    # resamples questions as clusters rather than treating those two outcomes
+    # as independent observations.
+    deployment_min_examples: int = 120
     # A larger held-out zero-shot screen, rather than a training-prompt
     # accuracy proxy, decides whether the final Phase-1 adapter is usable.
     phase1_generation_max_new_tokens: int = 256
@@ -114,15 +119,13 @@ class RSCConfig:
     # reported as INCONCLUSIVE rather than terminating the notebook.
     min_reliable_validation_examples: int = 16
     allow_inconclusive_small_runs: bool = True
-    # Diagnostic gates always record a failed scientific condition, but a
-    # Kaggle run continues to save checkpoints, plots, and audit evidence.
-    # This must never turn a warning into a claimed PASS.
-    continue_on_diagnostic_failure: bool = True
-    # P2 (run-analysis fix): always train adaptive phases. The old hard gate
-    # on a noisy 32-item accuracy delta caused random pipeline truncation.
-    # Deployment is decided at the end with finalize_deployment (ISSUE-2).
-    skip_adaptive_phases_when_phase1_fails: bool = False   # was True
-    skip_adaptive_phases_when_router_fails: bool = False   # was True
+    # A decision run must fail closed: training an adaptive policy after its
+    # fixed SteerNet or deterministic router has failed produces an artefact,
+    # not valid ARS evidence.  Smoke tests may opt into diagnostic continuation
+    # explicitly, but production defaults never spend Phase 2 budget this way.
+    continue_on_diagnostic_failure: bool = False
+    skip_adaptive_phases_when_phase1_fails: bool = True
+    skip_adaptive_phases_when_router_fails: bool = True
 
     # Phase 2 staged parameters
     phase2_warmup_ratio: float = 0.03
@@ -191,7 +194,7 @@ class RSCConfig:
     bootstrap_joint_nll_weight: float = 0.3          # weight of K=2 joint-NLL correction
     router_rloo_batch_size: int = 8  # enables batch-level policy diversity, unlike a B=1 RLOO probe
     router_preflight_examples: int = 128
-    router_fail_fast_on_collapse: bool = False
+    router_fail_fast_on_collapse: bool = True
     intervention_audit_examples: int = 128
     router_min_eval_k_support: int = 1          # B-3: was 3 — don't fail on sparse K
     router_require_eval_k0: bool = False         # B-3: was True — K=0 optional
