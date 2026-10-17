@@ -249,6 +249,9 @@ def compute_steer_norm_loss(
                 loss_sn = F.huber_loss(excess, torch.zeros_like(excess), delta=float(huber_delta), reduction="mean")
                 losses.append(loss_sn)
                 q_all.append(q_valid.detach())
+    for sn in nets:
+        sn.last_pre_cap_q = None
+        sn._last_valid_mask = None
     if not losses:
         return torch.tensor(0.0, device=device), {"q_mean": 0.0, "q_p95": 0.0, "q_max": 0.0, "pct_above_1": 0.0}
     total_loss = torch.stack(losses).mean()

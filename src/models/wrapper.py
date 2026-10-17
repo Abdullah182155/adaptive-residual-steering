@@ -81,6 +81,7 @@ class Phi2WithRSC(nn.Module):
         self.last_gate_trace = None
         self._trace_cached_decode = False
         self._steering_telemetry = {}
+        self._active_pre_cap_records = []
 
         self.register_buffer(
             "routing_k_hist",
@@ -177,6 +178,8 @@ class Phi2WithRSC(nn.Module):
                         g._valid_mask = steer_mask
                         valid = steer_mask & selected.view(-1, 1)
                         s._last_valid_mask = valid
+                        if valid.any() and getattr(s, "last_pre_cap_q", None) is not None:
+                            wrapper._active_pre_cap_records.append((s, s.last_pre_cap_q, valid))
                         if wrapper._routing_override is None:
                             if valid.any():
                                 raw_ratio = (delta.norm(dim=-1) / h_fp.norm(dim=-1).clamp_min(1e-6))[valid]
@@ -223,6 +226,10 @@ class Phi2WithRSC(nn.Module):
             if self._collect_gate_trace and not is_cached_decode:
                 self.last_gate_trace = {int(layer): [] for layer in self.target_layers}
             self._selected_counts = torch.zeros(batch, dtype=torch.long, device=next(self.gates.parameters()).device)
+            self._active_pre_cap_records = []
+            for sn in self.steer_nets.values():
+                sn.last_pre_cap_q = None
+                sn._last_valid_mask = None
 
             if is_cached_decode and self._cached_decode_routes is not None:
                 self._precomputed_routes = self._cached_decode_routes
@@ -597,16 +604,34 @@ class Phi2WithRSC(nn.Module):
         """Compute Huber penalty on pre-squash norm ratios exceeding q_hi for active SteerNets (Engine v2.1)."""
         losses = []
         q_all = []
+        records = getattr(self, "_active_pre_cap_records", [])
+        if records:
+            for sn, q, valid in records:
+                if q is not None and valid is not None and valid.any():
+                    q_valid = q.squeeze(-1)[valid]
+                    excess = torch.relu(q_valid - float(q_hi))
+                    if excess.numel() > 0:
+                        loss_sn = F.huber_loss(excess, torch.zeros_like(excess), delta=float(huber_delta), reduction="mean")
+                        losses.append(loss_sn)
+                        q_all.append(q_valid.detach())
+        else:
+            for sn in self.steer_nets.values():
+                q = getattr(sn, "last_pre_cap_q", None)
+                valid = getattr(sn, "_last_valid_mask", None)
+                if q is not None and valid is not None and valid.any():
+                    q_valid = q.squeeze(-1)[valid]
+                    excess = torch.relu(q_valid - float(q_hi))
+                    if excess.numel() > 0:
+                        loss_sn = F.huber_loss(excess, torch.zeros_like(excess), delta=float(huber_delta), reduction="mean")
+                        losses.append(loss_sn)
+                        q_all.append(q_valid.detach())
+
+        # Clear records and stale references immediately to prevent graph leakage across micro-batches
+        self._active_pre_cap_records = []
         for sn in self.steer_nets.values():
-            q = getattr(sn, "last_pre_cap_q", None)
-            valid = getattr(sn, "_last_valid_mask", None)
-            if q is not None and valid is not None and valid.any():
-                q_valid = q.squeeze(-1)[valid]
-                excess = torch.relu(q_valid - float(q_hi))
-                if excess.numel() > 0:
-                    loss_sn = F.huber_loss(excess, torch.zeros_like(excess), delta=float(huber_delta), reduction="mean")
-                    losses.append(loss_sn)
-                    q_all.append(q_valid.detach())
+            sn.last_pre_cap_q = None
+            sn._last_valid_mask = None
+
         if not losses:
             return torch.tensor(0.0, device=self.device), {"q_mean": 0.0, "q_p95": 0.0, "q_max": 0.0, "pct_above_1": 0.0}
         total_loss = torch.stack(losses).mean()

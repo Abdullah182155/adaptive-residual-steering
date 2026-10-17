@@ -1210,6 +1210,51 @@ class TestEngineV21NormAndK0(unittest.TestCase):
         self.assertEqual(cfg.answer_tail_weight, 1.10)
         self.assertEqual(cfg.lora_dropout, 0.0)
 
+    def test_multi_step_gradient_accumulation_no_graph_leakage(self):
+        """Phase 1 multi-step accumulation with varying layer subsets must not retain backward graphs."""
+        from src.models.wrapper import Phi2WithRSC
+        from src.configs.config import RSCConfig
+
+        class DummyLayer(nn.Module):
+            def forward(self, h, *args, **kwargs):
+                return h
+
+        class DummyModel(nn.Module):
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": hidden_dim})()
+                self.embed = nn.Embedding(50, hidden_dim)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer() for _ in range(10)])})()
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h})()
+
+        cfg = RSCConfig(router_warmup_random_subsets=True, router_warmup_max_k=2)
+        dummy = DummyModel(hidden_dim=32)
+        wrapper = Phi2WithRSC(dummy, cfg, device=torch.device("cpu"))
+        wrapper.train()
+        wrapper.set_gate_freeze(True, 1.0)
+        wrapper._router_warmup = True
+
+        # Ensure SteerNet up.weight is non-zero so norm loss is active
+        for sn in wrapper.steer_nets.values():
+            with torch.no_grad():
+                sn.up.weight.fill_(1.0)
+
+        # Simulate 3 microbatches of gradient accumulation without optimizer.zero_grad()
+        for step in range(3):
+            ids = torch.randint(0, 50, (2, 8))
+            mask = torch.ones(2, 8, dtype=torch.bool)
+            out = wrapper(input_ids=ids, attention_mask=mask)
+            loss_norm, _ = wrapper.compute_active_steer_norm_loss(q_hi=0.75, huber_delta=0.10)
+            loss = out.logits.sum() + loss_norm
+            # If graph leakage occurs across microbatches, this raises RuntimeError on step 1 or 2
+            loss.backward()
+
+
 
 
 
