@@ -1,0 +1,22 @@
+{
+  "experiment_id": "exp_20261017_210351_ars_phi2_kaggle",
+  "tag": "ars_phi2_kaggle_run7_fixed_steernet_milestone",
+  "created_at": "2026-10-17T21:03:51+03:00",
+  "status": "completed_diagnostic_router_k0_collapse",
+  "git_commit": "53de522",
+  "dataset": "GSM8K",
+  "evaluation": {
+    "examples_per_condition": 100,
+    "shots": [0, 2, 8],
+    "baseline_accuracy": {"0": 0.56, "2": 0.58, "8": 0.61},
+    "fixed_steernet_accuracy": {"0": 0.62, "2": 0.54, "8": 0.58},
+    "fixed_steernet_0shot_delta_pp": 6.0,
+    "fixed_steernet_0shot_ci_pp": [1.0, 12.0]
+  },
+  "routing_diagnostics": {
+    "realized_k_distribution": {"0": 1.0, "1": 0.0, "2": 0.0, "3": 0.0, "4": 0.0},
+    "active_layers": 0,
+    "router_status": "collapsed_to_k0"
+  },
+  "notes": "Run 7 baseline archived before Engine v2.2. Fixed SteerNet established a significant 0-shot improvement; adaptive conditions were no-op due to K=0 collapse."
+}

@@ -47,6 +47,14 @@
       "status": "completed",
       "git_commit": "214227e",
       "record_path": "experiments/runs/exp_20261015_211528_ars_phi2_kaggle/experiment_record.json"
+    },
+    {
+      "experiment_id": "exp_20261017_210351_ars_phi2_kaggle",
+      "tag": "ars_phi2_kaggle_run7_fixed_steernet_milestone",
+      "created_at": "2026-10-17T21:03:51+03:00",
+      "status": "completed_diagnostic_router_k0_collapse",
+      "git_commit": "53de522",
+      "record_path": "experiments/runs/exp_20261017_210351_ars_phi2_kaggle/experiment_record.json"
     }
   ]
 }

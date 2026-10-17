@@ -39,9 +39,10 @@ class RSCConfig:
     steer_max_relative_norm: float = 0.02
     steer_orthogonal_projection: bool = False  # ISSUE-6: disabled (was True)
     # A route has one shared intervention budget.  Each selected layer receives
-    # K**(-power) of its own bounded delta. Engine v2.1: power=1.0 enforces a strict
-    # constant cumulative route budget so adding layers cannot multiply perturbation energy.
-    steer_route_budget_power: float = 1.0
+    # K**(-power) of its own bounded delta.  A square-root route budget keeps
+    # K=2 corrections viable while still preventing linear growth in aggregate
+    # intervention energy.
+    steer_route_budget_power: float = 0.5
     # Cap-aware constrained SteerNet norm regularisation (Engine v2.1)
     lambda_steer_norm: float = 0.15         # Huber loss weight on raw pre-cap ratio excess above q_hi
     steer_norm_q_hi: float = 0.75           # Pre-cap ratio threshold above which norm penalty activates
@@ -145,7 +146,7 @@ class RSCConfig:
     gate_target_sparsity: float = 0.20     # Engine v2: target average gate activation
     lambda_gate_usefulness: float = 0.0   # B-3: disabled (was 0.30)
     lambda_gate_antisat: float = 0.0      # B-3: disabled (was 0.25)
-    lambda_gate_diversity: float = 0.0    # B-3: disabled (was 0.5)
+    lambda_gate_diversity: float = 0.20   # Engine v2.2: require token-selective gates
     gate_diversity_floor: float = 0.05
     pg_n_samples: int = 4
     pg_baseline_momentum: float = 0.8
@@ -184,8 +185,9 @@ class RSCConfig:
     # so they learn complementary directions. A differentiable K=2 joint-NLL correction
     # (run after each RLOO step through the top-synergy pair) provides the direct
     # gradient that RLOO's no_grad cannot. See train_router_bootstrap docstring.
-    # R10 fix: 0.0 disables SteerNet updates on router rows to strictly preserve data split.
-    bootstrap_steer_compat_lr_scale: float = 0.0   # was 0.05 — frozen SteerNets during bootstrap
+    # A small compatibility update lets independently trained K=1 residuals
+    # learn complementary K>=2 directions on the router split.
+    bootstrap_steer_compat_lr_scale: float = 0.05
     bootstrap_joint_nll_weight: float = 0.3          # weight of K=2 joint-NLL correction
     router_rloo_batch_size: int = 8  # enables batch-level policy diversity, unlike a B=1 RLOO probe
     router_preflight_examples: int = 128
@@ -244,7 +246,9 @@ class RSCConfig:
     # and allowed a global K=3 bias to survive at argmax deployment.
     lambda_router_k_preference: float = 0.25
     router_k_preference_temperature: float = 0.10
-    router_k0_margin: float = 0.05          # Engine v2.1: margin advantage for K=0 when steered gains do not clearly exceed baseline
+    # Retained in checkpoint-visible configuration for compatibility.  Engine
+    # v2.2 uses symmetric K-value distillation, so the neutral value is 0.0.
+    router_k0_margin: float = 0.0
     # Subset sampling and measured counterfactuals provide exploration.  Do
     # not mask utilities only during training: that produces a policy which
     # differs from deterministic deployment and can fake diversity.

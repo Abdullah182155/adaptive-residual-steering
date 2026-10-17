@@ -1,6 +1,7 @@
 import sys
 import os
 import unittest
+from unittest.mock import patch
 import torch
 import torch.nn as nn
 
@@ -28,7 +29,11 @@ from src.training import (
     load_steer_weights,
     run_pg_loss,
 )
-from src.training.trainer import _small_run_waiver, _optimizer_has_gradients
+from src.training.trainer import (
+    _small_run_waiver,
+    _optimizer_has_gradients,
+    phase1_steernet_acceptance,
+)
 
 class TestARSModules(unittest.TestCase):
     def setUp(self):
@@ -93,6 +98,40 @@ class TestARSModules(unittest.TestCase):
         subset_mask, logp_sub = sample_subset_plackett_luce(u, k)
         self.assertEqual(subset_mask.shape, (self.batch_size, 4))
         self.assertEqual(logp_sub.shape, (self.batch_size,))
+
+    def test_phase1_screen_uses_matched_baseline_accuracy(self):
+        """Screen-only Phase 1 telemetry must not compare a candidate to 0.0."""
+        class ScreenOnlyModel:
+            target_layers = [11]
+            _routing_override = None
+
+            def set_routing_override(self, mode=None, layers=None):
+                self._routing_override = None if mode is None else (mode, layers)
+
+            def set_gate_freeze(self, freeze, value=1.0):
+                pass
+
+        cfg = RSCConfig(
+            phase1_acceptance_examples=16,
+            phase1_acceptance_accuracy_examples=0,
+            phase1_generation_screen_examples=16,
+            phase1_generation_candidate_count=1,
+            phase1_min_train_nll_reduction=0.05,
+            phase1_min_val_nll_reduction=0.05,
+        )
+        rows = [{"question": "q", "final_num": 1.0}] * 16
+        screen = {"accuracy": 0.5, "answer_present": 1.0, "median_tokens": 10.0}
+        with patch("src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8]), patch(
+            "src.training.trainer._phase1_zero_shot_generation_probe",
+            side_effect=[screen, screen],
+        ):
+            report = phase1_steernet_acceptance(
+                ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
+            )
+
+        self.assertEqual(report["accuracy_comparison"], "generation_screen")
+        self.assertEqual(report["accuracy_comparison_baseline"], 0.5)
+        self.assertEqual(report["validation_accuracy_gain"], 0.0)
 
     def test_router_mutual_information_diversity(self):
         # Input-dependent, confident decisions must score better than one
@@ -1178,19 +1217,19 @@ class TestEngineV21NormAndK0(unittest.TestCase):
         self.assertIsNotNone(sn.up.weight.grad)
         self.assertFalse(torch.all(sn.up.weight.grad == 0))
 
-    def test_k0_margin_preference(self):
-        """When steered routes do not beat baseline by margin, loss penalizes steered K logits."""
+    def test_symmetric_k0_preference(self):
+        """K=0 wins only because its measured reward is larger, without a margin hinge."""
         from src.routing.rloo import counterfactual_k_preference_loss
         torch.manual_seed(42)
         B, n_actions = 4, 5
         k_logits = torch.zeros(B, n_actions, requires_grad=True)
         k_actions = torch.tensor([[1, 2, 3, 4]] * B, dtype=torch.long)
-        # Baseline reward = 1.0, steered rewards = 0.9 (worse than baseline)
+        # Baseline reward = 1.0, steered rewards = 0.9 (worse than baseline).
         reward_0 = torch.ones(B)
         action_rewards = torch.full((B, 4), 0.9)
 
         loss = counterfactual_k_preference_loss(
-            k_logits, k_actions, reward_0, action_rewards, temperature=0.10, k0_margin=0.05
+            k_logits, k_actions, reward_0, action_rewards, temperature=0.10
         )
         self.assertGreater(loss.item(), 0.0)
         loss.backward()
@@ -1199,16 +1238,33 @@ class TestEngineV21NormAndK0(unittest.TestCase):
         # Gradient on steered actions should be positive (pushing them down)
         self.assertGreater(k_logits.grad[:, 1:].mean().item(), 0.0)
 
-    def test_strict_route_budget_power_1(self):
-        """steer_route_budget_power=1.0 scales active_k by 1/K."""
+    def test_equal_k_counterfactual_rewards_have_no_k0_bias(self):
+        """Equal action values keep the symmetric distillation gradient neutral."""
+        k_logits = torch.zeros(2, 5, requires_grad=True)
+        k_actions = torch.tensor([[1, 2, 3, 4]] * 2, dtype=torch.long)
+        loss = counterfactual_k_preference_loss(
+            k_logits,
+            k_actions,
+            reward_0=torch.ones(2),
+            action_rewards=torch.ones(2, 4),
+            temperature=0.10,
+        )
+        loss.backward()
+        self.assertTrue(torch.allclose(k_logits.grad, torch.zeros_like(k_logits.grad), atol=1e-6))
+
+    def test_balanced_route_budget_power(self):
+        """Engine v2.2 keeps multi-layer residuals viable with K**(-0.5)."""
         from src.configs.config import RSCConfig
         cfg = RSCConfig()
-        self.assertEqual(cfg.steer_route_budget_power, 1.0)
+        self.assertEqual(cfg.steer_route_budget_power, 0.5)
         self.assertEqual(cfg.steer_max_relative_norm, 0.02)
         self.assertEqual(cfg.steer_loss_target, "calculation_weighted")
         self.assertEqual(cfg.calc_token_weight, 1.35)
         self.assertEqual(cfg.answer_tail_weight, 1.10)
         self.assertEqual(cfg.lora_dropout, 0.0)
+        self.assertEqual(cfg.bootstrap_steer_compat_lr_scale, 0.05)
+        self.assertEqual(cfg.router_k0_margin, 0.0)
+        self.assertEqual(cfg.lambda_gate_diversity, 0.20)
 
     def test_multi_step_gradient_accumulation_no_graph_leakage(self):
         """Phase 1 multi-step accumulation with varying layer subsets must not retain backward graphs."""

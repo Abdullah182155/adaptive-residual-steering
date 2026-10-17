@@ -209,44 +209,28 @@ def counterfactual_k_preference_loss(
     reward_0: torch.Tensor,
     action_rewards: torch.Tensor,
     temperature: float = 0.10,
-    k0_margin: float = 0.05,
 ) -> torch.Tensor:
-    """Distil measured K-action rewards into deterministic K logits with K=0 margin preference (Engine v2.1).
+    """Distil measured K-action rewards into deterministic K logits.
 
     ``k_actions`` has shape ``(B, A)`` and may contain any evaluated subset of
     ``{1, ..., K_max}``; the unsteered K=0 reward is always included.
-    When max_{k>0} Q_k <= Q_0 + margin, K=0 is given explicit preference so that
-    easy or baseline-solved problems preserve unperturbed backbone representations.
+    K=0 competes symmetrically with every measured steered action.  The
+    steered rewards already include their proportional route tariff, so no
+    additional baseline margin or aggregate-logit hinge is applied here.
     """
     B, n_actions = k_logits.shape
     rewards_sum = torch.zeros(B, n_actions, device=k_logits.device, dtype=k_logits.dtype)
     counts = torch.zeros_like(rewards_sum)
     zero = torch.zeros(B, 1, device=k_logits.device, dtype=torch.long)
     actions = torch.cat([zero, k_actions.long()], dim=1).clamp(0, n_actions - 1)
-    adj_reward_0 = reward_0.to(k_logits.dtype) + float(k0_margin)
-    rewards = torch.cat([adj_reward_0.unsqueeze(1), action_rewards.to(k_logits.dtype)], dim=1)
+    rewards = torch.cat([reward_0.to(k_logits.dtype).unsqueeze(1), action_rewards.to(k_logits.dtype)], dim=1)
     rewards_sum.scatter_add_(1, actions, rewards)
     counts.scatter_add_(1, actions, torch.ones_like(rewards))
     observed = counts > 0
     mean_reward = rewards_sum / counts.clamp_min(1)
     target_scores = (mean_reward / max(float(temperature), 1e-4)).masked_fill(~observed, float("-inf"))
     target = F.softmax(target_scores, dim=-1)
-    distill_loss = -(target * F.log_softmax(k_logits, dim=-1)).sum(dim=-1).mean()
-
-    # K=0 Rollout Margin Hinge Loss:
-    # If the best steered route's reward does not exceed raw baseline by at least margin m,
-    # penalize logsumexp(z_{k>0}) - z_0 + m to push argmax to K=0.
-    max_steered = action_rewards.max(dim=1).values
-    baseline_adequate = (max_steered <= (reward_0.to(max_steered.dtype) + float(k0_margin)))
-    if baseline_adequate.any() and n_actions > 1:
-        z_steered = k_logits[:, 1:]
-        z_0 = k_logits[:, 0]
-        lse_steered = torch.logsumexp(z_steered, dim=-1)
-        k0_hinge = F.relu(lse_steered - z_0 + float(k0_margin))[baseline_adequate].mean()
-    else:
-        k0_hinge = torch.tensor(0.0, device=k_logits.device)
-
-    return distill_loss + 0.5 * k0_hinge
+    return -(target * F.log_softmax(k_logits, dim=-1)).sum(dim=-1).mean()
 
 def compute_router_rloo_loss(
     model,
@@ -470,7 +454,6 @@ def compute_router_rloo_loss(
     k_preference_loss = counterfactual_k_preference_loss(
         k_logits_fresh, k_actions, reward_0, action_rewards,
         temperature=float(getattr(cfg, "router_k_preference_temperature", 0.10)),
-        k0_margin=float(getattr(cfg, "router_k0_margin", 0.05)),
     )
     lambda_k_preference = float(getattr(cfg, "lambda_router_k_preference", 0.25))
     synergy_prior_loss = model.router.synergy_prior_loss(synergy) if synergy is not None else torch.zeros((), device=ids.device)

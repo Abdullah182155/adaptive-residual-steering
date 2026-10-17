@@ -366,6 +366,10 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
         base_train_nll = evaluate_loss(model, train_probe, cfg, device, "Acceptance baseline train NLL", answer_aware=True)
         base_val_nll = evaluate_loss(model, val_probe, cfg, device, "Acceptance baseline val NLL", answer_aware=True)
         generation_n = min(int(getattr(cfg, "phase1_acceptance_accuracy_examples", 0)), val_n)
+        # A screen-only acceptance run has no full held-out baseline probe.  Keep
+        # this separate from ``base_val_acc`` so a candidate screen score is
+        # never accidentally compared to the 0.0 sentinel used below.
+        base_screen_acc = None
         if generation_n > 0:
             print("  [2/5] Baseline held-out generation accuracy...")
             base_generation = _phase1_zero_shot_generation_probe(
@@ -504,16 +508,37 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
         selected_val_acc = best_scale["accuracy"]
         nll_reduction = (base_train_nll - best["train_nll"]) / max(base_train_nll, 1e-8)
         val_nll_reduction = (base_val_nll - best["val_nll"]) / max(base_val_nll, 1e-8)
-        acc_gain = selected_val_acc - base_val_acc
+        # A full held-out probe is the preferred comparison.  If it is
+        # deliberately disabled, compare the selected candidate only against
+        # the matched baseline screen--never against the disabled-probe 0.0
+        # sentinel.  This preserves screen selection while preventing false
+        # positive generation deltas in the acceptance telemetry.
+        if generation_n > 0:
+            comparison_base_acc = base_val_acc
+            accuracy_comparison = "heldout_generation"
+        elif base_screen_acc is not None:
+            comparison_base_acc = base_screen_acc
+            accuracy_comparison = "generation_screen"
+        else:
+            comparison_base_acc = None
+            accuracy_comparison = "unmeasured"
+        acc_gain = (
+            selected_val_acc - comparison_base_acc
+            if comparison_base_acc is not None
+            else 0.0
+        )
         cfg.fixed_steer_eval_layers = [best["layer"]]
         cfg.fixed_steer_eval_gate_scale = float(best_scale["gate_scale"]) if len(measured) > 1 else 1.0
         report = {
             "baseline_train_nll": base_train_nll,
             "baseline_val_nll": base_val_nll,
             "baseline_validation_accuracy": base_val_acc,
+            "baseline_screen_accuracy": base_screen_acc,
             "candidates": candidates,
             "selected_layer": best["layer"],
             "selected_validation_accuracy": selected_val_acc,
+            "accuracy_comparison": accuracy_comparison,
+            "accuracy_comparison_baseline": comparison_base_acc,
             "fixed_steer_gate_scale": cfg.fixed_steer_eval_gate_scale,
             "gate_scale_candidates": scale_results,
             "train_relative_nll_reduction": nll_reduction,
@@ -539,9 +564,16 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
         print(
             "  Phase-1 acceptance: "
             f"layer=L{best['layer']} | train/val NLL Δ={nll_reduction * 100:+.1f}%/{val_nll_reduction * 100:+.1f}% "
-            f"| alpha={cfg.fixed_steer_eval_gate_scale:.2f} | held-out generation Δ={acc_gain * 100:+.1f}pp "
+            f"| alpha={cfg.fixed_steer_eval_gate_scale:.2f} | "
+            f"{accuracy_comparison} Δ={acc_gain * 100:+.1f}pp "
             f"| {status_label}"
         )
+        if base_screen_acc is not None:
+            print(
+                "        screen comparison: "
+                f"candidate screen_acc={best.get('screen_generation_accuracy', 0.0):.1%} "
+                f"vs base_screen_acc={base_screen_acc:.1%}"
+            )
         if acc_gain < float(getattr(cfg, "phase1_accuracy_warning_gain", 0.05)) and generation_n > 0:
             print(
                 "  ⚠️ Generation improvement is below the reporting target; NLL capacity is accepted, "
