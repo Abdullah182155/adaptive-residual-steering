@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.9.0] - 2026-10-18
+
+### 🚀 Engine v2.2: Unblocking Router K-Policy & Multi-Layer Cooperation
+- **Symmetric K Distillation (`src/routing/rloo.py`):**
+  - Removed `k0_hinge = relu(logsumexp(z_{1..4}) - z_0 + margin)` which mathematically forced $P(K=0) \ge 51.25\%$ and caused 100% argmax K=0 collapse in Run 7.
+  - Removed artificial baseline margin `adj_reward_0 = reward_0 + k0_margin`. Restored symmetric counterfactual distillation against natural layer costs.
+- **Multi-Layer Cooperation Restoration (`src/configs/config.py`):**
+  - Re-enabled compatibility learning rate during router bootstrap (`bootstrap_steer_compat_lr_scale = 0.05`) so SteerNets learn non-interfering, complementary residual directions for $K \ge 2$.
+  - Adjusted cumulative route budget power from $1.0$ to $0.5$ (`steer_route_budget_power = 0.5`), keeping $K=2$ residual intensity viable ($\approx 0.71$ scale per layer).
+  - Re-enabled token gate diversity regularization (`lambda_gate_diversity = 0.20`).
+- **Telemetry & Acceptance Correction (`src/training/trainer.py`):**
+  - Resolved false positive generation gain (+43.8pp) when `phase1_acceptance_accuracy_examples = 0` by comparing candidate screen accuracy strictly against matched `base_screen_acc`.
+- **Notebook Alignment (`notebooks/kaggle_ars_runner.ipynb`):**
+  - Removed duplicate overwrite `CFG.steer_loss_target = "calculation"` in Cell 3, strictly preserving `calculation_weighted` to protect multi-step reasoning prose from premature truncation.
+
+---
+
+## [1.8.0] - 2026-10-17
+
+### 🎯 Empirical Milestone: Run 7 Benchmark (GSM8K, Microsoft Phi-2)
+- **First Statistically Significant SteerNet Gain:**
+  - **Fixed SteerNet (L22, $\alpha=1.0$):** Reached **62.00%** vs Baseline **56.00%** on 0-shot GSM8K (**$\Delta = +6.00$ pp, 95% Bootstrap CI: [+1.00, +12.00] pp**).
+  - Statistically significant improvement ($p < 0.05$) without altering backbone weights.
+- **Pre-Cap Huber Norm Regularization (Engine v2.1):**
+  - Solved the Run 5 pre-cap norm explosion ($7.39\times$ mean, $26.4\times$ max) using Huber penalty on excess ratio above $q_{\text{hi}}=0.75$, stabilizing pre-cap ratios at $1.35\times - 1.45\times$.
+  - Preserved reasoning chain length at 91.5% of baseline (164.8 tokens vs 180.0), eliminating premature EOS truncation.
+- **Micro-Batch Computation Graph Isolation (`src/models/wrapper.py`):**
+  - Isolated active pre-cap records per micro-batch to prevent PyTorch backward graph leakage during gradient accumulation across varying layer subsets.
+- Full details archived in `experiments/runs/exp_20261017_210351_ars_phi2_kaggle/experiment_record.json`.
+
+---
+
 ## [1.7.0] - 2026-10-17
 
 ### 🚀 Engine v2: Outcome-Supervised ARS & Mathematical Execution Alignment
