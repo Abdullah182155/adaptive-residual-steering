@@ -222,6 +222,44 @@ def compute_antisat_gate(model, threshold: float = 0.92) -> torch.Tensor:
             total = total + over.mean()
         count += 1
     return total / max(1, count)
+ 
+def compute_steer_norm_loss(
+    model,
+    q_hi: float = 0.75,
+    huber_delta: float = 0.10,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Cap-aware Huber penalty on pre-squash SteerNet norm ratios exceeding q_hi (Engine v2.1)."""
+    if hasattr(model, "compute_active_steer_norm_loss"):
+        return model.compute_active_steer_norm_loss(q_hi=q_hi, huber_delta=huber_delta)
+    steer_nets = getattr(model, "steer_nets", {})
+    nets = list(steer_nets.values()) if hasattr(steer_nets, "values") else []
+    if not nets:
+        device = torch.device("cpu")
+        return torch.tensor(0.0, device=device), {"q_mean": 0.0, "q_p95": 0.0, "q_max": 0.0, "pct_above_1": 0.0}
+    device = next(iter(p for sn in nets for p in sn.parameters()), torch.tensor(0.0)).device
+    losses = []
+    q_all = []
+    for sn in nets:
+        q = getattr(sn, "last_pre_cap_q", None)
+        valid = getattr(sn, "_last_valid_mask", None)
+        if q is not None and valid is not None and valid.any():
+            q_valid = q.squeeze(-1)[valid]
+            excess = F.relu(q_valid - float(q_hi))
+            if excess.numel() > 0:
+                loss_sn = F.huber_loss(excess, torch.zeros_like(excess), delta=float(huber_delta), reduction="mean")
+                losses.append(loss_sn)
+                q_all.append(q_valid.detach())
+    if not losses:
+        return torch.tensor(0.0, device=device), {"q_mean": 0.0, "q_p95": 0.0, "q_max": 0.0, "pct_above_1": 0.0}
+    total_loss = torch.stack(losses).mean()
+    q_cat = torch.cat(q_all)
+    stats = {
+        "q_mean": float(q_cat.mean().item()),
+        "q_p95": float(torch.quantile(q_cat, 0.95).item()) if q_cat.numel() > 1 else float(q_cat.max().item()),
+        "q_max": float(q_cat.max().item()),
+        "pct_above_1": float((q_cat > 1.0).float().mean().item() * 100.0),
+    }
+    return total_loss, stats
 
 def log_gpu_memory(label: str, cfg=None, reset_peak: bool = True):
     """Memory diagnostic reporting CUDA peak allocated/reserved."""

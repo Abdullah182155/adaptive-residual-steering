@@ -281,6 +281,7 @@ def _phase1_zero_shot_generation_probe(
             model.set_routing_override("only", [int(layer)])
             model.set_gate_freeze(True, float(gate_value))
 
+        token_lengths = []
         iterator = tqdm(rows, desc=progress_desc, unit="sample", leave=True) if progress_desc else rows
         for row in iterator:
             prompt = build_benchmark_prompt("gsm8k", row["question"], n_shot=0)
@@ -288,6 +289,7 @@ def _phase1_zero_shot_generation_probe(
                 model, tokenizer, prompt, device,
                 max_new_tokens=int(getattr(cfg, "phase1_generation_max_new_tokens", 256)),
             )
+            token_lengths.append(len(tokenizer.encode(response, add_special_tokens=False)))
             score = evaluate_sample_answer("gsm8k", response, row["final_num"])
             correct += int(score["correct"])
             answer_present += int(score["has_answer"])
@@ -311,9 +313,12 @@ def _phase1_zero_shot_generation_probe(
             model.train()
 
     total = len(details)
+    import numpy as _np
+    median_toks = float(_np.median(token_lengths)) if token_lengths else 0.0
     return {
         "accuracy": correct / max(1, total),
         "answer_present": answer_present / max(1, total),
+        "median_tokens": median_toks,
         "n_samples": total,
         "details": details,
     }
@@ -394,11 +399,20 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             print(f"          L{layer}: train_nll={candidate['train_nll']:.4f} val_nll={candidate['val_nll']:.4f}")
 
         screen_n = min(
-            generation_n,
+            val_n,
             max(0, int(getattr(cfg, "phase1_generation_screen_examples", 0))),
         )
         if screen_n > 0:
             print(f"  [4/5] Held-out generation screen across all {total_candidates} candidates ({screen_n} each)...")
+            base_screen = _phase1_zero_shot_generation_probe(
+                model, tokenizer, val_probe, cfg, device, screen_n, layer=None,
+                progress_desc="Acceptance baseline generation screen",
+            )
+            base_screen_acc = base_screen["accuracy"]
+            base_median_tokens = max(1.0, base_screen.get("median_tokens", 1.0))
+            print(f"        baseline screen: acc={base_screen_acc:.1%} median_tokens={base_median_tokens:.0f}")
+
+            min_len_ratio = float(getattr(cfg, "phase1_min_completion_len_ratio", 0.85))
             for row in candidates:
                 screen = _phase1_zero_shot_generation_probe(
                     model, tokenizer, val_probe, cfg, device, screen_n, layer=row["layer"],
@@ -406,32 +420,47 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 )
                 row["screen_generation_accuracy"] = screen["accuracy"]
                 row["screen_answer_present"] = screen["answer_present"]
+                row["screen_median_tokens"] = screen.get("median_tokens", 0.0)
+                len_ratio = row["screen_median_tokens"] / base_median_tokens
+                row["completion_len_ratio"] = len_ratio
+                trunc_warn = ""
+                if len_ratio < min_len_ratio:
+                    trunc_warn = f" ⚠️ TRUNCATED ({len_ratio:.1%} < {min_len_ratio:.0%})"
                 print(
                     f"          L{row['layer']}: screen_acc={screen['accuracy']:.1%} "
-                    f"answer_present={screen['answer_present']:.1%}"
+                    f"tokens={row['screen_median_tokens']:.0f} (ratio {len_ratio:.2f}){trunc_warn}"
                 )
-            shortlist_n = max(1, min(int(getattr(cfg, "phase1_generation_candidate_count", 3)), len(candidates)))
-            shortlist = sorted(
-                candidates,
-                key=lambda row: (-row["screen_generation_accuracy"], row["val_nll"]),
-            )[:shortlist_n]
+
+            def _screen_sort_key(r):
+                ratio = r.get("completion_len_ratio", 1.0)
+                trunc_penalty = min(1.0, ratio / min_len_ratio) if ratio < min_len_ratio else 1.0
+                effective_acc = r["screen_generation_accuracy"] * trunc_penalty
+                return (-effective_acc, r["val_nll"])
+
+            shortlist_n = max(1, min(int(getattr(cfg, "phase1_generation_candidate_count", 2)), len(candidates)))
+            shortlist = sorted(candidates, key=_screen_sort_key)[:shortlist_n]
             shortlist_labels = [f"L{row['layer']}" for row in shortlist]
             print(f"  [5/5] Full held-out generation shortlist: {shortlist_labels}...")
-            for row in shortlist:
-                generation = _phase1_zero_shot_generation_probe(
-                    model, tokenizer, val_probe, cfg, device, generation_n, layer=row["layer"],
-                    progress_desc=f"Acceptance L{row['layer']} held-out generation",
+            if generation_n > 0:
+                for row in shortlist:
+                    generation = _phase1_zero_shot_generation_probe(
+                        model, tokenizer, val_probe, cfg, device, generation_n, layer=row["layer"],
+                        progress_desc=f"Acceptance L{row['layer']} held-out generation",
+                    )
+                    row["heldout_generation_accuracy"] = generation["accuracy"]
+                    row["heldout_answer_present"] = generation["answer_present"]
+                    print(
+                        f"          L{row['layer']}: heldout_acc={generation['accuracy']:.1%} "
+                        f"answer_present={generation['answer_present']:.1%}"
+                    )
+                best = max(
+                    shortlist,
+                    key=lambda row: (row["heldout_generation_accuracy"], -row["val_nll"]),
                 )
-                row["heldout_generation_accuracy"] = generation["accuracy"]
-                row["heldout_answer_present"] = generation["answer_present"]
-                print(
-                    f"          L{row['layer']}: heldout_acc={generation['accuracy']:.1%} "
-                    f"answer_present={generation['answer_present']:.1%}"
-                )
-            best = max(
-                shortlist,
-                key=lambda row: (row["heldout_generation_accuracy"], -row["val_nll"]),
-            )
+            else:
+                best = min(shortlist, key=_screen_sort_key)
+                best["heldout_generation_accuracy"] = best["screen_generation_accuracy"]
+                best["heldout_answer_present"] = best["screen_answer_present"]
         else:
             print("  [4/5] & [5/5] Generation screening disabled; selecting best candidate by validation NLL.")
             best = min(candidates, key=lambda row: row["val_nll"])
@@ -847,7 +876,13 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
 
             with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 out = model(input_ids=ids, attention_mask=mask, use_cache=False)
-                loss = _answer_aware_loss(out.logits, lbls, cfg, calc_mask=calc_mask) / cfg.grad_accum
+                loss_task = _answer_aware_loss(out.logits, lbls, cfg, calc_mask=calc_mask)
+                loss_norm, norm_stats = model.compute_active_steer_norm_loss(
+                    q_hi=getattr(cfg, "steer_norm_q_hi", 0.75),
+                    huber_delta=getattr(cfg, "steer_norm_huber_delta", 0.10),
+                )
+                lambda_norm = float(getattr(cfg, "lambda_steer_norm", 0.15))
+                loss = (loss_task + lambda_norm * loss_norm) / cfg.grad_accum
 
             if not torch.isfinite(loss):
                 continue
@@ -872,7 +907,11 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
                 n_optimizer_steps += 1
 
             epoch_loss += loss.item() * cfg.grad_accum
-            pbar.set_postfix(loss=f"{loss.item() * cfg.grad_accum:.4f}")
+            pbar.set_postfix(
+                loss=f"{loss.item() * cfg.grad_accum:.4f}",
+                q_p95=f"{norm_stats['q_p95']:.2f}",
+                q_max=f"{norm_stats['q_max']:.2f}",
+            )
 
         avg_loss = epoch_loss / max(1, n_optimizer_steps * cfg.grad_accum)
         val_loss = evaluate_loss(model, eval_data, cfg, device, answer_aware=True)
@@ -911,6 +950,16 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
     )
     grad_mon_p1.summary()
     print(f"\n✅ Phase 1 complete — best_val = {best_val_p1:.4f}")
+
+    if hasattr(model, "pre_cap_norm_diagnostics"):
+        ratios = model.pre_cap_norm_diagnostics()
+        print(f"  Phase 1 SteerNet pre-cap norm ratios: {ratios}")
+        max_ratio = max(ratios.values()) if ratios else 0.0
+        thresh = float(getattr(cfg, "phase1_max_eval_p95_norm_ratio", 1.0))
+        if max_ratio > thresh:
+            print(f"  ⚠️ SteerNet saturation notice: max pre-cap ratio = {max_ratio:.2f} > {thresh:.2f}")
+        else:
+            print(f"  ✅ SteerNet norm control healthy: max pre-cap ratio = {max_ratio:.2f} <= {thresh:.2f}")
 
     model.set_router_warmup(False)
     model.reset_routing_diagnostics()

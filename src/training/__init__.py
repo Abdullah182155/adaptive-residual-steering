@@ -12,6 +12,7 @@ from .losses import (
     compute_pg_gate_loss_from_live_alphas,
     run_pg_loss,
     log_gpu_memory,
+    compute_steer_norm_loss,
 )
 from .contrastive import compute_contrastive_gate_loss
 from .trainer import (
@@ -44,6 +45,7 @@ __all__ = [
     "compute_pg_gate_loss_from_live_alphas",
     "run_pg_loss",
     "log_gpu_memory",
+    "compute_steer_norm_loss",
     "evaluate_loss",
     "train_phase1_steernet",
     "train_router_bootstrap",

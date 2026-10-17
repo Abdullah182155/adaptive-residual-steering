@@ -29,32 +29,32 @@ class RSCConfig:
     # SteerNet
     lora_rank: int = 16
     lora_alpha: float = 32.0
-    lora_dropout: float = 0.05
+    lora_dropout: float = 0.0   # Engine v2.1: 0.0 eliminates train vs eval/generation adapter dropout discrepancy
     steer_magnitude_mode: str = "direct"  # ISSUE-5: direct per-token magnitude (was 'decoupled')
     steer_max_magnitude: float = 2.0
     # A residual perturbation is an angular intervention, not a new radial
     # feature.  Orthogonal projection is disabled (ISSUE-6/7) — the per-token
     # magnitude head in 'direct' mode handles magnitude control instead.
-    steer_max_relative_norm: float = 0.04
+    # Engine v2.1: envelope tightened from 0.04 to 0.02 once norm regularisation is active.
+    steer_max_relative_norm: float = 0.02
     steer_orthogonal_projection: bool = False  # ISSUE-6: disabled (was True)
     # A route has one shared intervention budget.  Each selected layer receives
-    # K**(-power) of its own bounded delta, so adding layers cannot linearly
-    # multiply the residual displacement.  K=1 remains unchanged.
-    steer_route_budget_power: float = 0.5
+    # K**(-power) of its own bounded delta. Engine v2.1: power=1.0 enforces a strict
+    # constant cumulative route budget so adding layers cannot multiply perturbation energy.
+    steer_route_budget_power: float = 1.0
+    # Cap-aware constrained SteerNet norm regularisation (Engine v2.1)
+    lambda_steer_norm: float = 0.15         # Huber loss weight on raw pre-cap ratio excess above q_hi
+    steer_norm_q_hi: float = 0.75           # Pre-cap ratio threshold above which norm penalty activates
+    steer_norm_huber_delta: float = 0.10    # Transition delta for smooth Huber norm penalty
+    phase1_max_eval_p95_norm_ratio: float = 1.0  # Telemetry alert threshold for saturation
     # Teacher forcing can reduce the loss of boilerplate reasoning tokens
-    # while making the generated final answer worse.  Give the final answer
-    # tail a larger, explicitly auditable weight in every trainable ARS
-    # objective and in router counterfactual rewards.
+    # while making the generated final answer worse.
     answer_tail_tokens: int = 8
-    # A completion is evaluated autoregressively, not under a supplied gold
-    # prefix.  A very large tail multiplier can therefore overfit the final
-    # answer marker under teacher forcing while degrading free generation.
-    # Keep a modest answer emphasis and let held-out generation decide whether
-    # a Phase-1 checkpoint is usable.
-    answer_tail_weight: float = 2.0
-    # Engine v2: Outcome-Supervised calculation token targeting
-    steer_loss_target: str = "calculation"  # 'calculation' (focus on math/outcome tokens), 'calculation_weighted', or 'all'
-    calc_token_weight: float = 3.0          # Multiplier for calculation tokens when in 'calculation_weighted' mode
+    # Engine v2.1: modest tail weight (1.10 down from 2.0) to preserve full multi-step CoT reasoning
+    answer_tail_weight: float = 1.10
+    # Engine v2.1: calculation_weighted preserves supervision on reasoning prose (1.0) while boosting math (1.35)
+    steer_loss_target: str = "calculation_weighted"  # 'calculation_weighted', 'calculation', or 'all'
+    calc_token_weight: float = 1.35          # Multiplier for calculation tokens when in 'calculation_weighted' mode
     router_reward_type: str = "execution"   # 'execution' (reward exact calculation tokens) or 'nll' (legacy)
     router_outcome_reward_weight: float = 1.0
 
@@ -84,9 +84,10 @@ class RSCConfig:
     # out items by default so Phase 1 is a capacity gate rather than a noisy
     # optimistic selector.  Debug configurations may lower this explicitly;
     # their report remains diagnostic-only.
-    phase1_acceptance_accuracy_examples: int = 0  # R5: in-audit generation disabled (confirmed once via finalize_deployment)
-    phase1_generation_screen_examples: int = 0    # R5: screen disabled (saves ~65 min per run)
-    phase1_generation_candidate_count: int = 3
+    phase1_acceptance_accuracy_examples: int = 0  # In-audit final probe disabled (confirmed via finalize_deployment)
+    phase1_generation_screen_examples: int = 16   # Engine v2.1: fast 16-row screen to prevent selecting CoT-shortcutting adapters
+    phase1_generation_candidate_count: int = 2
+    phase1_min_completion_len_ratio: float = 0.85 # Engine v2.1: reject candidate if median CoT length collapses below 85% of baseline
     deployment_examples: int = 300                # R5 / ISSUE-2: final held-out paired CI decision rows
     # A larger held-out zero-shot screen, rather than a training-prompt
     # accuracy proxy, decides whether the final Phase-1 adapter is usable.
@@ -243,6 +244,7 @@ class RSCConfig:
     # and allowed a global K=3 bias to survive at argmax deployment.
     lambda_router_k_preference: float = 0.25
     router_k_preference_temperature: float = 0.10
+    router_k0_margin: float = 0.05          # Engine v2.1: margin advantage for K=0 when steered gains do not clearly exceed baseline
     # Subset sampling and measured counterfactuals provide exploration.  Do
     # not mask utilities only during training: that produces a policy which
     # differs from deterministic deployment and can fake diversity.

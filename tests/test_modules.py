@@ -1130,4 +1130,86 @@ class TestEngineV2OutcomeSupervision(unittest.TestCase):
         self.assertIn("calc_mask", train_d[0])
 
 
+class TestEngineV21NormAndK0(unittest.TestCase):
+    """Engine v2.1 tests: cap-aware norm penalty, route budget power 1.0, and K=0 margin preference."""
+
+    def test_steernet_pre_cap_norm_differentiability(self):
+        """Pre-cap ratio tensor last_pre_cap_q must be differentiable and shape [B, T, 1]."""
+        from src.steering.steernet import RSCSteerNet
+        torch.manual_seed(42)
+        sn = RSCSteerNet(hidden_dim=32, rank=4, lora_alpha=8.0, max_relative_norm=0.02)
+        sn.train()
+        h = torch.randn(2, 5, 32, requires_grad=True)
+        # Ensure delta is non-zero by nudging up.weight
+        with torch.no_grad():
+            sn.up.weight.fill_(0.1)
+        delta = sn(h)
+        self.assertIsNotNone(sn.last_pre_cap_q)
+        self.assertEqual(sn.last_pre_cap_q.shape, (2, 5, 1))
+        self.assertTrue(sn.last_pre_cap_q.requires_grad)
+
+    def test_compute_steer_norm_loss_penalizes_excess(self):
+        """Excess ratio q > q_hi must produce positive Huber loss and backpropagate to weights."""
+        from src.steering.steernet import RSCSteerNet
+        from src.training.losses import compute_steer_norm_loss
+        torch.manual_seed(42)
+
+        class MockModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.steer_nets = nn.ModuleDict({
+                    "11": RSCSteerNet(hidden_dim=32, rank=4, lora_alpha=8.0, max_relative_norm=0.02)
+                })
+
+        model = MockModel()
+        sn = model.steer_nets["11"]
+        sn.train()
+        h = torch.randn(2, 5, 32)
+        # Force raw norm to be large so q > q_hi (e.g. q ~ 2.0)
+        with torch.no_grad():
+            sn.up.weight.fill_(1.5)
+        _ = sn(h)
+        sn._last_valid_mask = torch.ones(2, 5, dtype=torch.bool)
+
+        loss, stats = compute_steer_norm_loss(model, q_hi=0.75, huber_delta=0.10)
+        self.assertGreater(loss.item(), 0.0)
+        self.assertGreater(stats["q_mean"], 0.75)
+        loss.backward()
+        self.assertIsNotNone(sn.up.weight.grad)
+        self.assertFalse(torch.all(sn.up.weight.grad == 0))
+
+    def test_k0_margin_preference(self):
+        """When steered routes do not beat baseline by margin, loss penalizes steered K logits."""
+        from src.routing.rloo import counterfactual_k_preference_loss
+        torch.manual_seed(42)
+        B, n_actions = 4, 5
+        k_logits = torch.zeros(B, n_actions, requires_grad=True)
+        k_actions = torch.tensor([[1, 2, 3, 4]] * B, dtype=torch.long)
+        # Baseline reward = 1.0, steered rewards = 0.9 (worse than baseline)
+        reward_0 = torch.ones(B)
+        action_rewards = torch.full((B, 4), 0.9)
+
+        loss = counterfactual_k_preference_loss(
+            k_logits, k_actions, reward_0, action_rewards, temperature=0.10, k0_margin=0.05
+        )
+        self.assertGreater(loss.item(), 0.0)
+        loss.backward()
+        # Gradient on k_logits[:, 0] (z_0) should be negative (pushing z_0 higher to lower loss)
+        self.assertLess(k_logits.grad[:, 0].mean().item(), 0.0)
+        # Gradient on steered actions should be positive (pushing them down)
+        self.assertGreater(k_logits.grad[:, 1:].mean().item(), 0.0)
+
+    def test_strict_route_budget_power_1(self):
+        """steer_route_budget_power=1.0 scales active_k by 1/K."""
+        from src.configs.config import RSCConfig
+        cfg = RSCConfig()
+        self.assertEqual(cfg.steer_route_budget_power, 1.0)
+        self.assertEqual(cfg.steer_max_relative_norm, 0.02)
+        self.assertEqual(cfg.steer_loss_target, "calculation_weighted")
+        self.assertEqual(cfg.calc_token_weight, 1.35)
+        self.assertEqual(cfg.answer_tail_weight, 1.10)
+        self.assertEqual(cfg.lora_dropout, 0.0)
+
+
+
 

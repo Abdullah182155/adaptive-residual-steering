@@ -34,6 +34,8 @@ class RSCSteerNet(nn.Module):
         self._pre_cap_sum = None
         self._pre_cap_n = 0
         self._pre_cap_max = None
+        self.last_pre_cap_q = None
+        self._last_valid_mask = None
         self.norm = nn.LayerNorm(hidden_dim)
         self.down1 = nn.Linear(hidden_dim, rank, bias=False)
         self.act1 = nn.GELU()
@@ -98,10 +100,12 @@ class RSCSteerNet(nn.Module):
             h_norm = torch.norm(h_flt, dim=-1, keepdim=True) + 1e-7
             delta_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
             cap = self.max_relative_norm * h_norm
+            # Differentiable pre-cap norm ratio tensor [B, T, 1] (Engine v2.1)
+            self.last_pre_cap_q = delta_norm / (cap + 1e-7)
             soft = cap / torch.sqrt(delta_norm.square() + cap.square())
             if not self.training:
                 # Retain tensor on device — no .item() host sync during autoregressive decode (R4)
-                r = (delta_norm / cap).detach().float().flatten()
+                r = self.last_pre_cap_q.detach().float().flatten()
                 if self._pre_cap_sum is None:
                     self._pre_cap_sum = r.sum()
                     self._pre_cap_n = r.numel()
@@ -113,6 +117,8 @@ class RSCSteerNet(nn.Module):
                 self._last_pre_cap_ratio = r.mean()
                 self._clip_stats = (delta_norm > cap).detach().float().mean()
             delta = delta * soft
+        else:
+            self.last_pre_cap_q = None
 
         # Orthogonal Steering Projection (optional):
         # Projects delta onto the orthogonal complement of h so steering strictly
