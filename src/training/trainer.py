@@ -753,32 +753,37 @@ def _phase1_epoch_generation_screen(model, tokenizer, eval_data, cfg: RSCConfig,
     })
     if not scales:
         return None
-    baseline = _phase1_probe_with_norm(
-        model, tokenizer, rows, cfg, device, n_samples, None, 1.0,
-        "Phase1 epoch baseline generation screen",
-    )
-    base_median_tokens = max(1.0, float(baseline.get("median_tokens", 0.0)))
-    eligible = []
-    for layer in model.target_layers:
-        for scale in scales:
-            probe = _phase1_probe_with_norm(
-                model, tokenizer, rows, cfg, device, n_samples, layer, scale,
-                f"Phase1 epoch L{layer} alpha={scale:.2f}",
-            )
-            safe, completion_ratio, q_p95 = _phase1_pair_is_safe(probe, base_median_tokens, cfg)
-            if safe:
-                eligible.append({
-                    "layer": int(layer), "gate_scale": scale, "accuracy": probe["accuracy"],
-                    "answer_present": probe["answer_present"], "completion_len_ratio": completion_ratio,
-                    "pre_cap_q_p95": q_p95,
-                })
-    if not eligible:
-        return {"baseline": baseline, "eligible": [], "best": None}
-    best = max(
-        eligible,
-        key=lambda row: (row["accuracy"], row["answer_present"], -row["pre_cap_q_p95"], -row["gate_scale"]),
-    )
-    return {"baseline": baseline, "eligible": eligible, "best": best}
+    old_warmup = getattr(model, "_router_warmup", False)
+    model.set_router_warmup(False)
+    try:
+        baseline = _phase1_probe_with_norm(
+            model, tokenizer, rows, cfg, device, n_samples, None, 1.0,
+            "Phase1 epoch baseline generation screen",
+        )
+        base_median_tokens = max(1.0, float(baseline.get("median_tokens", 0.0)))
+        eligible = []
+        for layer in model.target_layers:
+            for scale in scales:
+                probe = _phase1_probe_with_norm(
+                    model, tokenizer, rows, cfg, device, n_samples, layer, scale,
+                    f"Phase1 epoch L{layer} alpha={scale:.2f}",
+                )
+                safe, completion_ratio, q_p95 = _phase1_pair_is_safe(probe, base_median_tokens, cfg)
+                if safe:
+                    eligible.append({
+                        "layer": int(layer), "gate_scale": scale, "accuracy": probe["accuracy"],
+                        "answer_present": probe["answer_present"], "completion_len_ratio": completion_ratio,
+                        "pre_cap_q_p95": q_p95,
+                    })
+        if not eligible:
+            return {"baseline": baseline, "eligible": [], "best": None}
+        best = max(
+            eligible,
+            key=lambda row: (row["accuracy"], row["answer_present"], -row["pre_cap_q_p95"], -row["gate_scale"]),
+        )
+        return {"baseline": baseline, "eligible": eligible, "best": best}
+    finally:
+        model.set_router_warmup(old_warmup)
 
 
 def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: torch.device, tokenizer=None):

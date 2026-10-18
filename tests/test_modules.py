@@ -364,6 +364,47 @@ class TestARSModules(unittest.TestCase):
         self.assertTrue(all(row["seen_forwards"] == 0 for row in diag.values()))
         self.assertTrue(all(row["selected_forwards"] == 0 for row in diag.values()))
 
+    def test_explicit_routing_override_beats_warmup(self):
+        """Audit controls must not be silently replaced by Phase-1 warmup routes."""
+        class DummyLayer(nn.Module):
+            def forward(self, h, *args, **kwargs):
+                return h
+
+        class DummyModel(nn.Module):
+            def __init__(self, hidden_dim):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": hidden_dim})()
+                self.embed = nn.Embedding(50, hidden_dim)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer() for _ in range(10)])})()
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h})()
+
+        wrapper = Phi2WithRSC(DummyModel(self.hidden_dim), RSCConfig(), device=torch.device("cpu")).eval()
+        wrapper.set_router_warmup(True)
+        wrapper.set_gate_freeze(True, 1.0)
+        ids = torch.tensor([[1, 2, 3, 4]])
+        attn = torch.ones_like(ids)
+        baseline = wrapper.base_model(input_ids=ids, attention_mask=attn).logits
+
+        wrapper.set_routing_override("none")
+        no_route = wrapper(input_ids=ids, attention_mask=attn).logits
+        self.assertEqual(int(wrapper._precomputed_routes.sum().item()), 0)
+        self.assertTrue(torch.equal(no_route, baseline))
+
+        selected_layer = wrapper.target_layers[0]
+        with torch.no_grad():
+            wrapper.steer_nets[str(selected_layer)].up.weight.fill_(0.1)
+        wrapper.set_routing_override("only", [selected_layer])
+        routed = wrapper(input_ids=ids, attention_mask=attn).logits
+        selected = wrapper._precomputed_routes[0]
+        self.assertEqual(int(selected.sum().item()), 1)
+        self.assertTrue(bool(selected[wrapper.target_layers.index(selected_layer)].item()))
+        self.assertFalse(torch.equal(routed, baseline))
+
     def test_cooperative_synergy(self):
         target_layers = [9, 11, 13, 15]
         router = JointLayerRouter(target_layers, hidden_dim=self.hidden_dim, n_layers=20, max_active_layers=4)

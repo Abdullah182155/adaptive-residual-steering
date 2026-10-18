@@ -382,7 +382,10 @@ class Phi2WithRSC(nn.Module):
         n_candidates = len(self.target_layers)
         K_max = self.cfg.max_active_layers
 
-        if self._router_warmup:
+        # An explicit route is an audit/benchmark contract.  It must win over
+        # background warmup coverage so a requested baseline remains truly
+        # unsteered and a requested single layer is actually the one measured.
+        if self._router_warmup and self._routing_override is None:
             warmup_max_k = int(getattr(self.cfg, "router_warmup_max_k", 4))
             if getattr(self.cfg, "router_warmup_random_subsets", True):
                 import random as _random
