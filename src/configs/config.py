@@ -95,7 +95,7 @@ class RSCConfig:
     # Search each (layer, residual-scale) pair on this compact, fixed
     # calibration partition.  It detects CoT collapse without making a T4
     # preflight prohibitively slow.
-    phase1_generation_screen_examples: int = 8
+    phase1_generation_screen_examples: int = 12
     # The selected pair alone is measured on this disjoint partition before
     # promotion.  This is deliberately independent of the calibration rows.
     phase1_generation_confirmation_examples: int = 16

@@ -351,6 +351,15 @@ def _phase1_pair_is_safe(result: Dict[str, Any], base_median_tokens: float, cfg:
     return safe, completion_ratio, q_p95
 
 
+def _phase1_calibration_rank_key(item: Tuple[Dict[str, Any], Dict[str, Any]]) -> Tuple[float, ...]:
+    """Rank safe Phase-1 pairs with every selection field made explicit."""
+    row, pair = item
+    return (
+        float(pair["accuracy"]), float(pair["answer_present"]), -float(row["val_nll"]),
+        -float(pair["pre_cap_q_p95"]), -float(pair["gate_scale"]),
+    )
+
+
 def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
     """Certify one independently useful, generation-safe Phase-1 intervention.
 
@@ -454,14 +463,27 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 raise RuntimeError(warning)
             return {"candidates": candidates, "passed": False, "status": "FAIL_NO_SAFE_PAIR", "truncation_rejected_layers": rejected_layers}
 
-        # Accuracy drives calibration selection; NLL only breaks a generation tie.
-        best, best_scale = max(
-            eligible_pairs,
-            key=lambda item: (
-                item[1]["accuracy"], item[1]["answer_present"], -item[0]["val_nll"],
-                -item[1]["pre_cap_q_p95"], -item[1]["gate_scale"],
-            ),
-        )
+        # Accuracy drives calibration selection; answer presence, NLL, raw-q
+        # and lower intensity are deterministic secondary tie-breakers.
+        ranked_pairs = sorted(eligible_pairs, key=_phase1_calibration_rank_key, reverse=True)
+        calibration_ranking = []
+        print("        eligible calibration ranking (acc, answer-present, val-NLL, CoT, q95, alpha):")
+        for rank, (row, pair) in enumerate(ranked_pairs, start=1):
+            ranked = {
+                "rank": rank, "layer": row["layer"], "gate_scale": pair["gate_scale"],
+                "accuracy": pair["accuracy"], "answer_present": pair["answer_present"],
+                "val_nll": row["val_nll"], "completion_len_ratio": pair["completion_len_ratio"],
+                "pre_cap_q_p95": pair["pre_cap_q_p95"],
+                "selection_key": list(_phase1_calibration_rank_key((row, pair))),
+            }
+            calibration_ranking.append(ranked)
+            print(
+                f"          #{rank}: L{row['layer']} alpha={pair['gate_scale']:.2f} "
+                f"acc={pair['accuracy']:.1%} present={pair['answer_present']:.1%} "
+                f"val_nll={row['val_nll']:.4f} CoT={pair['completion_len_ratio']:.2f} q95={pair['pre_cap_q_p95']:.2f}"
+            )
+        best, best_scale = ranked_pairs[0]
+        selection_reason = "accuracy > answer_present > lower_val_nll > lower_q95 > lower_alpha"
         print(f"  [4/4] Disjoint confirmation: L{best['layer']} alpha={best_scale['gate_scale']:.2f} ({confirmation_n} each)...")
         base_confirmation = _phase1_probe_with_norm(
             model, tokenizer, confirmation_rows, cfg, device, confirmation_n, None, 1.0,
@@ -491,6 +513,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "fixed_steer_gate_scale": cfg.fixed_steer_eval_gate_scale,
             "gate_scale_candidates": best["scale_screen"],
             "selected_calibration": best_scale,
+            "calibration_ranking": calibration_ranking,
+            "selection_reason": selection_reason,
             "confirmation": {
                 "baseline": base_confirmation, "candidate": candidate_confirmation,
                 "completion_len_ratio": confirm_ratio, "pre_cap_q_p95": confirm_q_p95, "safe": confirm_safe,
@@ -761,7 +785,7 @@ def _phase1_epoch_generation_screen(model, tokenizer, eval_data, cfg: RSCConfig,
             "Phase1 epoch baseline generation screen",
         )
         base_median_tokens = max(1.0, float(baseline.get("median_tokens", 0.0)))
-        eligible = []
+        safe_pairs = []
         for layer in model.target_layers:
             for scale in scales:
                 probe = _phase1_probe_with_norm(
@@ -770,18 +794,24 @@ def _phase1_epoch_generation_screen(model, tokenizer, eval_data, cfg: RSCConfig,
                 )
                 safe, completion_ratio, q_p95 = _phase1_pair_is_safe(probe, base_median_tokens, cfg)
                 if safe:
-                    eligible.append({
+                    safe_pairs.append({
                         "layer": int(layer), "gate_scale": scale, "accuracy": probe["accuracy"],
                         "answer_present": probe["answer_present"], "completion_len_ratio": completion_ratio,
                         "pre_cap_q_p95": q_p95,
                     })
+        # A checkpoint cannot win merely by avoiding CoT/norm failures: its
+        # best safe route must also not underperform the matched baseline.
+        eligible = [row for row in safe_pairs if row["accuracy"] >= baseline["accuracy"]]
         if not eligible:
-            return {"baseline": baseline, "eligible": [], "best": None}
+            return {
+                "baseline": baseline, "safe_pairs": safe_pairs, "eligible": [],
+                "best": None, "status": "NO_NONREGRESSING_SAFE_PAIR",
+            }
         best = max(
             eligible,
             key=lambda row: (row["accuracy"], row["answer_present"], -row["pre_cap_q_p95"], -row["gate_scale"]),
         )
-        return {"baseline": baseline, "eligible": eligible, "best": best}
+        return {"baseline": baseline, "safe_pairs": safe_pairs, "eligible": eligible, "best": best, "status": "SAFE_NONREGRESSING"}
     finally:
         model.set_router_warmup(old_warmup)
 
@@ -948,8 +978,15 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
             if tokenizer is None:
                 print("  ⚠️ Phase1 epoch generation screen skipped: tokenizer was not provided.")
         elif epoch_screen["best"] is None:
-            logs["p1_generation_screen"].append({"epoch": epoch + 1, "status": "NO_SAFE_PAIR"})
-            print("  ⚠️ Phase1 epoch generation screen found no CoT- and norm-safe pair.")
+            status = epoch_screen.get("status", "NO_SAFE_PAIR")
+            logs["p1_generation_screen"].append({"epoch": epoch + 1, "status": status})
+            if status == "NO_NONREGRESSING_SAFE_PAIR":
+                print(
+                    "  ⚠️ Phase1 epoch generation screen found safe routes, but none matched the baseline "
+                    "accuracy; retaining NLL checkpoint eligibility only."
+                )
+            else:
+                print("  ⚠️ Phase1 epoch generation screen found no CoT- and norm-safe pair.")
         else:
             choice = epoch_screen["best"]
             baseline_acc = epoch_screen["baseline"]["accuracy"]
@@ -985,6 +1022,8 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
     if best_generation_state_p1:
         best_val_p1 = best_generation_val
         print("  ✅ Restored generation-screen-selected Phase 1 checkpoint.")
+    else:
+        print("  ✅ No epoch met the matched generation baseline; restored the NLL-best Phase 1 checkpoint.")
     if best_state_p1:
         model.load_state_dict(best_state_p1, strict=False)
     save_steer_weights(

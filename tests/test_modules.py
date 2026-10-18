@@ -32,6 +32,7 @@ from src.training import (
 from src.training.trainer import (
     _small_run_waiver,
     _optimizer_has_gradients,
+    _phase1_epoch_generation_screen,
     _phase1_pair_is_safe,
     phase1_steernet_acceptance,
 )
@@ -206,6 +207,34 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(report["fixed_steer_gate_scale"], 0.2)
         self.assertTrue(report["selected_calibration"]["safe"])
         self.assertEqual(report["truncation_rejected_layers"], [])
+        self.assertEqual(report["calibration_ranking"][0]["layer"], 11)
+        self.assertIn("accuracy > answer_present", report["selection_reason"])
+
+    def test_epoch_screen_requires_matched_generation_baseline(self):
+        """A CoT-safe route that loses to baseline cannot select a checkpoint."""
+        class ProbeModel:
+            target_layers = [11]
+            _router_warmup = True
+
+            def set_router_warmup(self, enabled):
+                self._router_warmup = bool(enabled)
+
+        cfg = RSCConfig(
+            phase1_epoch_generation_screen_examples=6,
+            phase1_epoch_gate_scale_grid=(0.2,),
+        )
+        baseline = {"accuracy": 0.5, "answer_present": 1.0, "median_tokens": 100.0, "pre_cap_norm": {}}
+        regressing = {"accuracy": 1 / 3, "answer_present": 1.0, "median_tokens": 100.0, "pre_cap_norm": {"p95": 0.9}}
+        model = ProbeModel()
+        with patch("src.training.trainer._phase1_probe_with_norm", side_effect=[baseline, regressing]):
+            result = _phase1_epoch_generation_screen(
+                model, object(), [{"question": "q"}] * 6, cfg, torch.device("cpu")
+            )
+
+        self.assertEqual(result["status"], "NO_NONREGRESSING_SAFE_PAIR")
+        self.assertIsNone(result["best"])
+        self.assertEqual(len(result["safe_pairs"]), 1)
+        self.assertTrue(model._router_warmup)
 
     def test_phase1_pair_allows_bounded_q95_tail_and_rejects_runaway(self):
         """The 1.25 raw-q ceiling allows bounded tails but blocks saturation."""
@@ -220,6 +249,10 @@ class TestARSModules(unittest.TestCase):
             {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.26}}, 100.0, cfg
         )
         self.assertFalse(runaway)
+
+    def test_phase1_calibration_default_uses_twelve_rows(self):
+        """The joint search has enough calibration rows to reduce tie noise."""
+        self.assertEqual(RSCConfig().phase1_generation_screen_examples, 12)
 
     def test_router_mutual_information_diversity(self):
         # Input-dependent, confident decisions must score better than one

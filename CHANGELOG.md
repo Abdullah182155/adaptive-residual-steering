@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Independent capacity before cooperation:** Restored deterministic K=1 rotation in Phase 1. K>=2 complementarity remains the explicit responsibility of the Phase-1.5 compatibility correction.
 - **Raw norm safety telemetry (`src/steering/steernet.py`):** Added reset-scoped pre-cap q95 measurement and rejects calibration or confirmation routes whose q95 exceeds the hard safety ceiling.
 - **Bounded raw-q tails:** Set the Phase-1 promotion ceiling to `q95 <= 1.25`, allowing modest empirical tails when the selected gate bounds the realized residual while retaining runaway-norm rejection.
+- **Non-regressing epoch selection:** Phase-1 generation screens now require a CoT- and norm-safe route to match its paired baseline before it may select a checkpoint; otherwise Phase 1 restores the NLL-best state. Full calibration now uses 12 rows and logs every ranking field and tie-break decision.
 - **Audit-route precedence (`src/models/wrapper.py`):** Explicit routing overrides now take precedence over Phase-1 warmup; epoch generation screens also suspend and restore warmup defensively.
 
 ---
