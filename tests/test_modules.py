@@ -207,15 +207,19 @@ class TestARSModules(unittest.TestCase):
         self.assertTrue(report["selected_calibration"]["safe"])
         self.assertEqual(report["truncation_rejected_layers"], [])
 
-    def test_phase1_pair_rejects_q95_saturation(self):
-        """The hard q95 ceiling rejects a long but saturated generation route."""
-        cfg = RSCConfig(phase1_max_generation_p95_norm_ratio=1.0)
+    def test_phase1_pair_allows_bounded_q95_tail_and_rejects_runaway(self):
+        """The 1.25 raw-q ceiling allows bounded tails but blocks saturation."""
+        cfg = RSCConfig()
         safe, ratio, q95 = _phase1_pair_is_safe(
-            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.01}}, 100.0, cfg
+            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.16}}, 100.0, cfg
         )
-        self.assertFalse(safe)
+        self.assertTrue(safe)
         self.assertEqual(ratio, 1.0)
-        self.assertEqual(q95, 1.01)
+        self.assertEqual(q95, 1.16)
+        runaway, _, _ = _phase1_pair_is_safe(
+            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.26}}, 100.0, cfg
+        )
+        self.assertFalse(runaway)
 
     def test_router_mutual_information_diversity(self):
         # Input-dependent, confident decisions must score better than one

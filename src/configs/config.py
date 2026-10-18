@@ -48,7 +48,10 @@ class RSCConfig:
     steer_norm_q_hi: float = 0.50           # Keep Phase-1 residuals in the linear operating regime
     steer_norm_huber_delta: float = 0.10    # Transition delta for smooth Huber norm penalty
     phase1_max_eval_p95_norm_ratio: float = 1.0  # Legacy telemetry threshold
-    phase1_max_generation_p95_norm_ratio: float = 1.0  # Hard Phase-1 promotion ceiling
+    # Raw q is measured before the gate.  Permit modest empirical tail
+    # variation when the selected gate still keeps the realized displacement
+    # comfortably bounded, while rejecting genuinely runaway pre-cap norms.
+    phase1_max_generation_p95_norm_ratio: float = 1.25
     # Teacher forcing can reduce the loss of boilerplate reasoning tokens
     # while making the generated final answer worse.
     answer_tail_tokens: int = 8

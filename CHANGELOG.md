@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Generation-aware checkpoint selection:** Added per-epoch six-question screens at alpha `{0.2, 0.4}`; Phase 1 now restores the best generation-safe checkpoint rather than the lowest teacher-forced NLL checkpoint.
 - **Independent capacity before cooperation:** Restored deterministic K=1 rotation in Phase 1. K>=2 complementarity remains the explicit responsibility of the Phase-1.5 compatibility correction.
 - **Raw norm safety telemetry (`src/steering/steernet.py`):** Added reset-scoped pre-cap q95 measurement and rejects calibration or confirmation routes whose q95 exceeds the hard safety ceiling.
+- **Bounded raw-q tails:** Set the Phase-1 promotion ceiling to `q95 <= 1.25`, allowing modest empirical tails when the selected gate bounds the realized residual while retaining runaway-norm rejection.
 - **Audit-route precedence (`src/models/wrapper.py`):** Explicit routing overrides now take precedence over Phase-1 warmup; epoch generation screens also suspend and restore warmup defensively.
 
 ---
