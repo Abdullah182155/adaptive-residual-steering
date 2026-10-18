@@ -34,6 +34,10 @@ class RSCSteerNet(nn.Module):
         self._pre_cap_sum = None
         self._pre_cap_n = 0
         self._pre_cap_max = None
+        # Detached evaluation-only samples support an exact p95 safety check
+        # during the compact Phase-1 generation probes.  They are cleared by
+        # ``pre_cap_report(reset=True)`` and never retain an autograd graph.
+        self._pre_cap_values = []
         self.last_pre_cap_q = None
         self._last_valid_mask = None
         self.norm = nn.LayerNorm(hidden_dim)
@@ -114,6 +118,7 @@ class RSCSteerNet(nn.Module):
                     self._pre_cap_sum = self._pre_cap_sum + r.sum()
                     self._pre_cap_n = self._pre_cap_n + r.numel()
                     self._pre_cap_max = torch.maximum(self._pre_cap_max, r.max())
+                self._pre_cap_values.append(r)
                 self._last_pre_cap_ratio = r.mean()
                 self._clip_stats = (delta_norm > cap).detach().float().mean()
             delta = delta * soft
@@ -135,6 +140,7 @@ class RSCSteerNet(nn.Module):
         self._pre_cap_sum = None
         self._pre_cap_n = 0
         self._pre_cap_max = None
+        self._pre_cap_values = []
 
 
 def pre_cap_report(model: torch.nn.Module, reset: bool = True) -> dict:
@@ -147,8 +153,14 @@ def pre_cap_report(model: torch.nn.Module, reset: bool = True) -> dict:
             if n and getattr(sn, "_pre_cap_sum", None) is not None:
                 mean_val = float((sn._pre_cap_sum / n).item())
                 max_val = float(sn._pre_cap_max.item())
+                values = getattr(sn, "_pre_cap_values", [])
+                p95_val = (
+                    float(torch.quantile(torch.cat(values), 0.95).item())
+                    if values else mean_val
+                )
                 out[int(k) if str(k).isdigit() else k] = {
                     "mean": round(mean_val, 4),
+                    "p95": round(p95_val, 4),
                     "max": round(max_val, 4),
                     "tokens": int(n),
                 }

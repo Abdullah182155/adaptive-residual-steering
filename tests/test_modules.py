@@ -32,6 +32,7 @@ from src.training import (
 from src.training.trainer import (
     _small_run_waiver,
     _optimizer_has_gradients,
+    _phase1_pair_is_safe,
     phase1_steernet_acceptance,
 )
 
@@ -114,8 +115,9 @@ class TestARSModules(unittest.TestCase):
         cfg = RSCConfig(
             phase1_acceptance_examples=16,
             phase1_acceptance_accuracy_examples=0,
-            phase1_generation_screen_examples=16,
-            phase1_generation_candidate_count=1,
+            phase1_generation_screen_examples=8,
+            phase1_generation_confirmation_examples=8,
+            phase1_gate_scale_grid=(1.0,),
             phase1_min_train_nll_reduction=0.05,
             phase1_min_val_nll_reduction=0.05,
         )
@@ -123,13 +125,13 @@ class TestARSModules(unittest.TestCase):
         screen = {"accuracy": 0.5, "answer_present": 1.0, "median_tokens": 10.0}
         with patch("src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8]), patch(
             "src.training.trainer._phase1_zero_shot_generation_probe",
-            side_effect=[screen, screen],
+            side_effect=[screen, screen, screen, screen],
         ):
             report = phase1_steernet_acceptance(
                 ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
             )
 
-        self.assertEqual(report["accuracy_comparison"], "generation_screen")
+        self.assertEqual(report["accuracy_comparison"], "disjoint_generation_confirmation")
         self.assertEqual(report["accuracy_comparison_baseline"], 0.5)
         self.assertEqual(report["validation_accuracy_gain"], 0.0)
 
@@ -148,8 +150,9 @@ class TestARSModules(unittest.TestCase):
         cfg = RSCConfig(
             phase1_acceptance_examples=16,
             phase1_acceptance_accuracy_examples=0,
-            phase1_generation_screen_examples=16,
-            phase1_generation_candidate_count=1,
+            phase1_generation_screen_examples=8,
+            phase1_generation_confirmation_examples=8,
+            phase1_gate_scale_grid=(1.0,),
             continue_on_diagnostic_failure=True,
         )
         rows = [{"question": "q", "final_num": 1.0}] * 16
@@ -164,8 +167,55 @@ class TestARSModules(unittest.TestCase):
             )
 
         self.assertFalse(report["passed"])
-        self.assertEqual(report["status"], "FAIL_TRUNCATED_COT")
+        self.assertEqual(report["status"], "FAIL_NO_SAFE_PAIR")
         self.assertEqual(report["truncation_rejected_layers"], [11])
+
+    def test_phase1_joint_scale_search_keeps_safe_low_alpha_pair(self):
+        """A full-strength failure must not discard the same layer at a safe scale."""
+        class ScreenOnlyModel:
+            target_layers = [11]
+            _routing_override = None
+
+            def set_routing_override(self, mode=None, layers=None):
+                self._routing_override = None if mode is None else (mode, layers)
+
+            def set_gate_freeze(self, freeze, value=1.0):
+                pass
+
+        cfg = RSCConfig(
+            phase1_acceptance_examples=16,
+            phase1_generation_screen_examples=8,
+            phase1_generation_confirmation_examples=8,
+            phase1_gate_scale_grid=(0.2, 1.0),
+            continue_on_diagnostic_failure=False,
+        )
+        rows = [{"question": "q", "final_num": 1.0}] * 16
+        baseline = {"accuracy": 0.5, "answer_present": 1.0, "median_tokens": 100.0}
+        safe_low_alpha = {"accuracy": 0.5, "answer_present": 1.0, "median_tokens": 100.0}
+        unsafe_full_alpha = {"accuracy": 1.0, "answer_present": 1.0, "median_tokens": 84.0}
+        with patch("src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8]), patch(
+            "src.training.trainer._phase1_zero_shot_generation_probe",
+            side_effect=[baseline, safe_low_alpha, unsafe_full_alpha, baseline, safe_low_alpha],
+        ):
+            report = phase1_steernet_acceptance(
+                ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["selected_layer"], 11)
+        self.assertEqual(report["fixed_steer_gate_scale"], 0.2)
+        self.assertTrue(report["selected_calibration"]["safe"])
+        self.assertEqual(report["truncation_rejected_layers"], [])
+
+    def test_phase1_pair_rejects_q95_saturation(self):
+        """The hard q95 ceiling rejects a long but saturated generation route."""
+        cfg = RSCConfig(phase1_max_generation_p95_norm_ratio=1.0)
+        safe, ratio, q95 = _phase1_pair_is_safe(
+            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.01}}, 100.0, cfg
+        )
+        self.assertFalse(safe)
+        self.assertEqual(ratio, 1.0)
+        self.assertEqual(q95, 1.01)
 
     def test_router_mutual_information_diversity(self):
         # Input-dependent, confident decisions must score better than one
@@ -742,13 +792,13 @@ class TestSteerNetIdentityInit(unittest.TestCase):
             f"Expected near-zero delta at init, got max={delta.abs().max().item():.6f}"
         )
 
-    def test_route_width_config_fields_exist(self):
-        """ISSUE-3: Config must have router_warmup_random_subsets and router_warmup_max_k=4."""
+    def test_phase1_route_width_config_is_independent_k1(self):
+        """Phase 1 must establish independent capacity before K>=2 cooperation."""
         cfg = self.cfg if hasattr(self, 'cfg') else RSCConfig()
         self.assertTrue(hasattr(cfg, 'router_warmup_random_subsets'))
         self.assertTrue(hasattr(cfg, 'router_warmup_max_k'))
-        self.assertEqual(cfg.router_warmup_max_k, 4)
-        self.assertTrue(cfg.router_warmup_random_subsets)
+        self.assertEqual(cfg.router_warmup_max_k, 1)
+        self.assertFalse(cfg.router_warmup_random_subsets)
 
 
 class TestGateStreamingTrainedConv(unittest.TestCase):

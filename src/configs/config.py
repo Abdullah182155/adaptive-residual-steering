@@ -44,10 +44,11 @@ class RSCConfig:
     # intervention energy.
     steer_route_budget_power: float = 0.5
     # Cap-aware constrained SteerNet norm regularisation (Engine v2.1)
-    lambda_steer_norm: float = 0.15         # Huber loss weight on raw pre-cap ratio excess above q_hi
-    steer_norm_q_hi: float = 0.75           # Pre-cap ratio threshold above which norm penalty activates
+    lambda_steer_norm: float = 0.60         # Strongly penalise raw pre-cap ratio excess above q_hi
+    steer_norm_q_hi: float = 0.50           # Keep Phase-1 residuals in the linear operating regime
     steer_norm_huber_delta: float = 0.10    # Transition delta for smooth Huber norm penalty
-    phase1_max_eval_p95_norm_ratio: float = 1.0  # Telemetry alert threshold for saturation
+    phase1_max_eval_p95_norm_ratio: float = 1.0  # Legacy telemetry threshold
+    phase1_max_generation_p95_norm_ratio: float = 1.0  # Hard Phase-1 promotion ceiling
     # Teacher forcing can reduce the loss of boilerplate reasoning tokens
     # while making the generated final answer worse.
     answer_tail_tokens: int = 8
@@ -75,8 +76,8 @@ class RSCConfig:
     # regressions on this small-data regime.  This is intentionally a
     # conservative adapter learning rate; generation validation owns model
     # selection below.
-    phase1_lr: float = 5e-4
-    phase1_epochs: int = 4
+    phase1_lr: float = 3e-4
+    phase1_epochs: int = 3
     phase1_warmup_ratio: float = 0.06
     phase1_patience: int = 4
     phase1_acceptance_examples: int = 64
@@ -85,9 +86,21 @@ class RSCConfig:
     # out items by default so Phase 1 is a capacity gate rather than a noisy
     # optimistic selector.  Debug configurations may lower this explicitly;
     # their report remains diagnostic-only.
-    phase1_acceptance_accuracy_examples: int = 0  # In-audit final probe disabled (confirmed via finalize_deployment)
-    phase1_generation_screen_examples: int = 16   # Engine v2.1: fast 16-row screen to prevent selecting CoT-shortcutting adapters
-    phase1_generation_candidate_count: int = 2
+    # Legacy compatibility field.  Engine v2.3 always uses the explicit,
+    # disjoint ``phase1_generation_confirmation_examples`` partition below.
+    phase1_acceptance_accuracy_examples: int = 0
+    # Search each (layer, residual-scale) pair on this compact, fixed
+    # calibration partition.  It detects CoT collapse without making a T4
+    # preflight prohibitively slow.
+    phase1_generation_screen_examples: int = 8
+    # The selected pair alone is measured on this disjoint partition before
+    # promotion.  This is deliberately independent of the calibration rows.
+    phase1_generation_confirmation_examples: int = 16
+    # During training, screen every epoch on a smaller fixed partition and
+    # conservative scales only.  Full five-scale calibration happens once.
+    phase1_epoch_generation_screen_examples: int = 6
+    phase1_epoch_gate_scale_grid: Tuple[float, ...] = (0.2, 0.4)
+    phase1_generation_candidate_count: int = 2  # Legacy compatibility field; joint scale search uses all pairs.
     phase1_min_completion_len_ratio: float = 0.85 # Engine v2.1: reject candidate if median CoT length collapses below 85% of baseline
     deployment_examples: int = 300                # Upper bound for final held-out paired CI decision rows
     # Run 8 requires at least 120 *questions* for the deployment decision.
@@ -101,7 +114,7 @@ class RSCConfig:
     # Select residual intensity on validation free generation after selecting
     # a candidate layer.  This is a bounded calibration of the model's own
     # learned direction, not a test-set threshold or a hidden override.
-    phase1_gate_scale_grid: Tuple[float, ...] = (1.0,)
+    phase1_gate_scale_grid: Tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
     phase1_min_train_nll_reduction: float = 0.05
     phase1_min_val_nll_reduction: float = 0.05
     # Do not promote an adapter merely because it does not regress on a tiny
@@ -281,11 +294,12 @@ class RSCConfig:
     gate_retune_epochs: int = 1
     gate_retune_lr: float = 1e-4
 
-    # ISSUE-3 (B-3): random K subsets expose each SteerNet to cooperative routes
-    # early in Phase 1 so they learn compatible directions. Was max_k=1 (single layer
-    # rotation only), which trained each SteerNet in isolation — causing interference when combined.
-    router_warmup_max_k: int = 4                   # B-3: was 1 — allow multi-layer combos in warmup
-    router_warmup_random_subsets: bool = True       # B-3: random K in [1, max_k] each step
+    # Phase 1 establishes independent, generation-safe directions.  K>=2
+    # complementarity is learned later by the explicit Phase-1.5 correction,
+    # rather than co-adapting adapters before their single-layer capacity is
+    # known.
+    router_warmup_max_k: int = 1
+    router_warmup_random_subsets: bool = False
 
     checkpoint_every_n: int = 3
     lr_reduce_factor: float = 0.5

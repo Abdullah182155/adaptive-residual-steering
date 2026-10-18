@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.10.0] - 2026-10-18
+
+### 🛡️ Engine v2.3: Generation-Safe Phase 1 Selection
+- **Conservative residual regime (`src/configs/config.py`):** Increased Phase-1 norm pressure to `lambda_steer_norm = 0.60`, lowered the Huber onset to `q_hi = 0.50`, and reduced training to three epochs at `3e-4`.
+- **Joint layer/intensity search (`src/training/trainer.py`):** Replaced alpha=1-only screening with a compact search over every `(layer, alpha)` pair on eight calibration questions, followed by a 16-question disjoint confirmation of the selected pair.
+- **Generation-aware checkpoint selection:** Added per-epoch six-question screens at alpha `{0.2, 0.4}`; Phase 1 now restores the best generation-safe checkpoint rather than the lowest teacher-forced NLL checkpoint.
+- **Independent capacity before cooperation:** Restored deterministic K=1 rotation in Phase 1. K>=2 complementarity remains the explicit responsibility of the Phase-1.5 compatibility correction.
+- **Raw norm safety telemetry (`src/steering/steernet.py`):** Added reset-scoped pre-cap q95 measurement and rejects calibration or confirmation routes whose q95 exceeds the hard safety ceiling.
+
+---
+
 ## [1.9.0] - 2026-10-18
 
 ### 🚀 Engine v2.2: Unblocking Router K-Policy & Multi-Layer Cooperation

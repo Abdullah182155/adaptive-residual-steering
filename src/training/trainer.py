@@ -324,322 +324,200 @@ def _phase1_zero_shot_generation_probe(
     }
 
 
-def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
-    """Prove independent Phase-1 steering capacity before routing is trained.
+def _phase1_probe_with_norm(
+    model, tokenizer, rows, cfg: RSCConfig, device: torch.device, n_samples: int,
+    layer: Optional[int], gate_value: float, progress_desc: str,
+) -> Dict[str, Any]:
+    """Generate a Phase-1 route and attach reset-scoped raw norm statistics."""
+    collect_pre_cap_ratio(model, reset=True)
+    probe = _phase1_zero_shot_generation_probe(
+        model, tokenizer, rows, cfg, device, n_samples, layer=layer,
+        gate_value=gate_value, progress_desc=progress_desc,
+    )
+    norms = collect_pre_cap_ratio(model, reset=True)
+    probe["pre_cap_norm"] = norms.get(int(layer), {}) if layer is not None else {}
+    return probe
 
-    Each candidate is measured as a single-layer, gate=1 intervention.  The
-    Every candidate receives a small held-out generation screen, then the
-    screen leaders receive the full benchmark-format free-generation probe.
-    NLL is auxiliary and never allowed to overrule an autoregressive
-    regression.
+
+def _phase1_pair_is_safe(result: Dict[str, Any], base_median_tokens: float, cfg: RSCConfig) -> Tuple[bool, float, float]:
+    """Return whether a generation pair preserves CoT length and raw norm safety."""
+    completion_ratio = float(result.get("median_tokens", 0.0)) / max(1.0, base_median_tokens)
+    norm = result.get("pre_cap_norm", {})
+    q_p95 = float(norm.get("p95", norm.get("mean", 0.0)))
+    safe = (
+        completion_ratio >= float(getattr(cfg, "phase1_min_completion_len_ratio", 0.85))
+        and q_p95 <= float(getattr(cfg, "phase1_max_generation_p95_norm_ratio", 1.0))
+    )
+    return safe, completion_ratio, q_p95
+
+
+def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
+    """Certify one independently useful, generation-safe Phase-1 intervention.
+
+    The compact calibration partition jointly searches every ``(layer, alpha)``
+    pair.  A disjoint confirmation partition then decides promotion.  This
+    avoids both teacher-forced selection bias and the former alpha=1-only
+    screen that discarded safe low-intensity residuals before measuring them.
     """
     train_n = min(int(cfg.phase1_acceptance_examples), len(train_data))
     val_n = min(int(cfg.phase1_acceptance_examples), len(eval_data))
     small_run_waiver = _small_run_waiver(val_n, cfg)
-    train_probe = [train_data[i] for i in range(train_n)]
-    val_probe = [eval_data[i] for i in range(val_n)]
+    train_probe = list(train_data)[:train_n]
+    val_probe = list(eval_data)[:val_n]
+    screen_n = min(max(0, int(getattr(cfg, "phase1_generation_screen_examples", 0))), val_n)
+    confirmation_n = min(
+        max(0, int(getattr(cfg, "phase1_generation_confirmation_examples", 16))),
+        max(0, val_n - screen_n),
+    )
+    calibration_rows = val_probe[:screen_n]
+    confirmation_rows = val_probe[screen_n:screen_n + confirmation_n]
     old_override = model._routing_override
     old_layers = getattr(cfg, "fixed_steer_eval_layers", None)
     started_at = time.monotonic()
     try:
         print("\n" + "=" * 80)
-        print("PHASE 1 ACCEPTANCE AUDIT: Independent SteerNet Capacity")
+        print("PHASE 1 ACCEPTANCE AUDIT: Generation-Safe SteerNet Capacity")
         print(
-            f"         Measuring baseline + {len(model.target_layers)} single-layer candidates "
-            f"on {train_n} train / {val_n} validation examples."
-        )
-        print(
-            f"         Then generating {min(int(cfg.phase1_acceptance_accuracy_examples), val_n)} "
-            "held-out zero-shot answers for baseline and generation-screen leaders."
+            f"         NLL: {train_n} train / {val_n} validation; joint (layer, alpha) "
+            f"calibration: {screen_n}; disjoint confirmation: {confirmation_n}."
         )
         print("         Router and learned gate are disabled during this audit.")
         if small_run_waiver:
-            print(
-                f"         ⚠️ INCONCLUSIVE DEBUG RUN: validation={val_n} < "
-                f"min_reliable_validation_examples={cfg.min_reliable_validation_examples}. "
-                "Measurements will be logged, but failure will not stop the curriculum."
-            )
+            print("         ⚠️ INCONCLUSIVE DEBUG RUN: validation set is below the reliability floor.")
         print("=" * 80)
+        if screen_n <= 0 or confirmation_n <= 0:
+            raise RuntimeError(
+                "Phase-1 acceptance requires non-empty disjoint calibration and confirmation generation partitions."
+            )
+
         model.set_routing_override("none")
         model.set_gate_freeze(False)
-        print("  [1/5] Baseline answer-weighted teacher-forced NLL...")
+        print("  [1/4] Baseline answer-weighted teacher-forced NLL...")
         base_train_nll = evaluate_loss(model, train_probe, cfg, device, "Acceptance baseline train NLL", answer_aware=True)
         base_val_nll = evaluate_loss(model, val_probe, cfg, device, "Acceptance baseline val NLL", answer_aware=True)
-        generation_n = min(int(getattr(cfg, "phase1_acceptance_accuracy_examples", 0)), val_n)
-        # A screen-only acceptance run has no full held-out baseline probe.  Keep
-        # this separate from ``base_val_acc`` so a candidate screen score is
-        # never accidentally compared to the 0.0 sentinel used below.
-        base_screen_acc = None
-        if generation_n > 0:
-            print("  [2/5] Baseline held-out generation accuracy...")
-            base_generation = _phase1_zero_shot_generation_probe(
-                model, tokenizer, val_probe, cfg, device, generation_n,
-                progress_desc="Acceptance baseline held-out generation",
-            )
-            base_val_acc = base_generation["accuracy"]
-            print(
-                f"        baseline: train_nll={base_train_nll:.4f} val_nll={base_val_nll:.4f} "
-                f"heldout_acc={base_val_acc:.1%}"
-            )
-        else:
-            print("  [2/5] Baseline generation probe disabled (phase1_acceptance_accuracy_examples=0).")
-            base_generation = {"accuracy": 0.0, "answer_present": 0.0}
-            base_val_acc = 0.0
-            print(f"        baseline: train_nll={base_train_nll:.4f} val_nll={base_val_nll:.4f}")
 
         candidates = []
-        total_candidates = len(model.target_layers)
-        print(f"  [3/5] Single-layer NLL sweep across {total_candidates} SteerNets...")
-        for candidate_index, layer in enumerate(model.target_layers, start=1):
+        print(f"  [2/4] Single-layer NLL sweep across {len(model.target_layers)} SteerNets...")
+        for layer in model.target_layers:
             model.set_routing_override("only", [layer])
             model.set_gate_freeze(True, 1.0)
-            print(f"        candidate {candidate_index}/{total_candidates}: L{layer}...")
-            candidate = {
+            row = {
                 "layer": int(layer),
                 "train_nll": evaluate_loss(model, train_probe, cfg, device, f"Acceptance L{layer} train NLL", answer_aware=True),
                 "val_nll": evaluate_loss(model, val_probe, cfg, device, f"Acceptance L{layer} val NLL", answer_aware=True),
+                "scale_screen": [],
             }
-            candidates.append(candidate)
-            print(f"          L{layer}: train_nll={candidate['train_nll']:.4f} val_nll={candidate['val_nll']:.4f}")
+            candidates.append(row)
+            print(f"        L{layer}: train_nll={row['train_nll']:.4f} val_nll={row['val_nll']:.4f}")
 
-        screen_n = min(
-            val_n,
-            max(0, int(getattr(cfg, "phase1_generation_screen_examples", 0))),
+        scale_grid = sorted({min(1.0, max(0.0, float(scale))) for scale in getattr(cfg, "phase1_gate_scale_grid", (1.0,))})
+        if not scale_grid:
+            raise RuntimeError("phase1_gate_scale_grid must contain at least one scale.")
+        print(f"  [3/4] Joint generation calibration: {len(candidates)} layers × {scale_grid} ({screen_n} each)...")
+        base_screen = _phase1_probe_with_norm(
+            model, tokenizer, calibration_rows, cfg, device, screen_n, None, 1.0,
+            "Acceptance baseline calibration",
         )
-        if screen_n > 0:
-            print(f"  [4/5] Held-out generation screen across all {total_candidates} candidates ({screen_n} each)...")
-            base_screen = _phase1_zero_shot_generation_probe(
-                model, tokenizer, val_probe, cfg, device, screen_n, layer=None,
-                progress_desc="Acceptance baseline generation screen",
-            )
-            base_screen_acc = base_screen["accuracy"]
-            base_median_tokens = max(1.0, base_screen.get("median_tokens", 1.0))
-            print(f"        baseline screen: acc={base_screen_acc:.1%} median_tokens={base_median_tokens:.0f}")
+        base_screen_acc = base_screen["accuracy"]
+        base_median_tokens = max(1.0, float(base_screen.get("median_tokens", 0.0)))
+        print(f"        baseline calibration: acc={base_screen_acc:.1%} median_tokens={base_median_tokens:.0f}")
 
-            min_len_ratio = float(getattr(cfg, "phase1_min_completion_len_ratio", 0.85))
-            for row in candidates:
-                screen = _phase1_zero_shot_generation_probe(
-                    model, tokenizer, val_probe, cfg, device, screen_n, layer=row["layer"],
-                    progress_desc=f"Acceptance L{row['layer']} generation screen",
-                )
-                row["screen_generation_accuracy"] = screen["accuracy"]
-                row["screen_answer_present"] = screen["answer_present"]
-                row["screen_median_tokens"] = screen.get("median_tokens", 0.0)
-                len_ratio = row["screen_median_tokens"] / base_median_tokens
-                row["completion_len_ratio"] = len_ratio
-                trunc_warn = ""
-                if len_ratio < min_len_ratio:
-                    trunc_warn = f" ⚠️ TRUNCATED ({len_ratio:.1%} < {min_len_ratio:.0%})"
-                print(
-                    f"          L{row['layer']}: screen_acc={screen['accuracy']:.1%} "
-                    f"tokens={row['screen_median_tokens']:.0f} (ratio {len_ratio:.2f}){trunc_warn}"
-                )
-
-            def _screen_sort_key(r):
-                ratio = r.get("completion_len_ratio", 1.0)
-                trunc_penalty = min(1.0, ratio / min_len_ratio) if ratio < min_len_ratio else 1.0
-                effective_acc = r["screen_generation_accuracy"] * trunc_penalty
-                return (-effective_acc, r["val_nll"])
-
-            # A length collapse is a direct autoregressive regression, not a
-            # soft ranking preference.  Do not let a numerically lucky but
-            # prematurely truncated candidate enter the full-generation
-            # shortlist or pass the Phase-1 capacity gate.
-            eligible_candidates = [
-                row for row in candidates
-                if row["completion_len_ratio"] >= min_len_ratio
-            ]
-            rejected_layers = [
-                int(row["layer"]) for row in candidates
-                if row not in eligible_candidates
-            ]
-            if not eligible_candidates:
-                report = {
-                    "baseline_train_nll": base_train_nll,
-                    "baseline_val_nll": base_val_nll,
-                    "baseline_validation_accuracy": base_val_acc,
-                    "baseline_screen_accuracy": base_screen_acc,
-                    "candidates": candidates,
-                    "selected_layer": None,
-                    "selected_validation_accuracy": 0.0,
-                    "accuracy_comparison": "generation_screen",
-                    "accuracy_comparison_baseline": base_screen_acc,
-                    "fixed_steer_gate_scale": 1.0,
-                    "gate_scale_candidates": [],
-                    "train_relative_nll_reduction": 0.0,
-                    "val_relative_nll_reduction": 0.0,
-                    "validation_accuracy_gain": 0.0,
-                    "validation_examples": val_n,
-                    "reliability_waived": small_run_waiver,
-                    "passed": False,
-                    "status": "FAIL_TRUNCATED_COT",
-                    "truncation_rejected_layers": rejected_layers,
-                }
-                warning = (
-                    "  ⚠️ Phase-1 acceptance FAILED: every candidate shortened the completion below "
-                    f"the {min_len_ratio:.0%} retention floor (layers={rejected_layers})."
-                )
-                print(warning)
-                if not getattr(cfg, "continue_on_diagnostic_failure", True):
-                    raise RuntimeError(warning)
-                return report
-
-            shortlist_n = max(1, min(int(getattr(cfg, "phase1_generation_candidate_count", 2)), len(eligible_candidates)))
-            shortlist = sorted(eligible_candidates, key=_screen_sort_key)[:shortlist_n]
-            shortlist_labels = [f"L{row['layer']}" for row in shortlist]
-            rejected_note = f"; rejected short-CoT layers={rejected_layers}" if rejected_layers else ""
-            print(f"  [5/5] Full held-out generation shortlist: {shortlist_labels}{rejected_note}...")
-            if generation_n > 0:
-                for row in shortlist:
-                    generation = _phase1_zero_shot_generation_probe(
-                        model, tokenizer, val_probe, cfg, device, generation_n, layer=row["layer"],
-                        progress_desc=f"Acceptance L{row['layer']} held-out generation",
-                    )
-                    row["heldout_generation_accuracy"] = generation["accuracy"]
-                    row["heldout_answer_present"] = generation["answer_present"]
-                    print(
-                        f"          L{row['layer']}: heldout_acc={generation['accuracy']:.1%} "
-                        f"answer_present={generation['answer_present']:.1%}"
-                    )
-                best = max(
-                    shortlist,
-                    key=lambda row: (row["heldout_generation_accuracy"], -row["val_nll"]),
-                )
-            else:
-                best = min(shortlist, key=_screen_sort_key)
-                best["heldout_generation_accuracy"] = best["screen_generation_accuracy"]
-                best["heldout_answer_present"] = best["screen_answer_present"]
-        else:
-            print("  [4/5] & [5/5] Generation screening disabled; selecting best candidate by validation NLL.")
-            best = min(candidates, key=lambda row: row["val_nll"])
-            best["screen_generation_accuracy"] = 0.0
-            best["screen_answer_present"] = 0.0
-            best["heldout_generation_accuracy"] = 0.0
-            best["heldout_answer_present"] = 0.0
-            print(f"        Best SteerNet candidate: L{best['layer']} (val_nll={best['val_nll']:.4f})")
-
-        scale_grid = sorted({
-            min(1.0, max(0.0, float(scale)))
-            for scale in getattr(cfg, "phase1_gate_scale_grid", (1.0,))
-        })
-        scale_results = [{
-            "gate_scale": 1.0,
-            "accuracy": best["heldout_generation_accuracy"],
-            "answer_present": best["heldout_answer_present"],
-            "measured": generation_n > 0 and screen_n > 0,
-        }]
-        if generation_n > 0 and screen_n > 0 and len(scale_grid) > 1:
-            print(f"  [calibration] L{best['layer']} residual intensity grid: {scale_grid}")
+        eligible_pairs = []
+        for row in candidates:
             for scale in scale_grid:
-                if abs(scale - 1.0) < 1e-8:
-                    continue
-                calibrated = _phase1_zero_shot_generation_probe(
-                    model, tokenizer, val_probe, cfg, device, generation_n, layer=best["layer"], gate_value=scale,
-                    progress_desc=f"Acceptance L{best['layer']} alpha={scale:.2f}",
+                screen = _phase1_probe_with_norm(
+                    model, tokenizer, calibration_rows, cfg, device, screen_n, row["layer"], scale,
+                    f"Acceptance L{row['layer']} alpha={scale:.2f}",
                 )
-                scale_results.append({
-                    "gate_scale": scale,
-                    "accuracy": calibrated["accuracy"],
-                    "answer_present": calibrated["answer_present"],
-                    "measured": True,
-                })
+                safe, completion_ratio, q_p95 = _phase1_pair_is_safe(screen, base_median_tokens, cfg)
+                pair = {
+                    "layer": row["layer"], "gate_scale": scale,
+                    "accuracy": screen["accuracy"], "answer_present": screen["answer_present"],
+                    "median_tokens": screen.get("median_tokens", 0.0),
+                    "completion_len_ratio": completion_ratio, "pre_cap_q_p95": q_p95,
+                    "pre_cap_norm": screen.get("pre_cap_norm", {}), "safe": safe,
+                }
+                row["scale_screen"].append(pair)
+                if safe:
+                    eligible_pairs.append((row, pair))
+                status = "" if safe else " ⚠️ REJECTED"
                 print(
-                    f"          alpha={scale:.2f}: heldout_acc={calibrated['accuracy']:.1%} "
-                    f"answer_present={calibrated['answer_present']:.1%}"
+                    f"        L{row['layer']} alpha={scale:.2f}: acc={pair['accuracy']:.1%} "
+                    f"tokens={pair['median_tokens']:.0f} (ratio {completion_ratio:.2f}) q95={q_p95:.2f}{status}"
                 )
-        measured = [r for r in scale_results if r.get("measured", False)] or scale_results
-        best_scale = max(measured, key=lambda row: (row["accuracy"], row["gate_scale"]))
-        selected_val_acc = best_scale["accuracy"]
+
+        rejected_layers = [row["layer"] for row in candidates if not any(p["safe"] for p in row["scale_screen"])]
+        if not eligible_pairs:
+            warning = "  ⚠️ Phase-1 acceptance FAILED: no (layer, alpha) pair met CoT and norm safety constraints."
+            print(warning)
+            if not getattr(cfg, "continue_on_diagnostic_failure", True):
+                raise RuntimeError(warning)
+            return {"candidates": candidates, "passed": False, "status": "FAIL_NO_SAFE_PAIR", "truncation_rejected_layers": rejected_layers}
+
+        # Accuracy drives calibration selection; NLL only breaks a generation tie.
+        best, best_scale = max(
+            eligible_pairs,
+            key=lambda item: (
+                item[1]["accuracy"], item[1]["answer_present"], -item[0]["val_nll"],
+                -item[1]["pre_cap_q_p95"], -item[1]["gate_scale"],
+            ),
+        )
+        print(f"  [4/4] Disjoint confirmation: L{best['layer']} alpha={best_scale['gate_scale']:.2f} ({confirmation_n} each)...")
+        base_confirmation = _phase1_probe_with_norm(
+            model, tokenizer, confirmation_rows, cfg, device, confirmation_n, None, 1.0,
+            "Acceptance baseline confirmation",
+        )
+        candidate_confirmation = _phase1_probe_with_norm(
+            model, tokenizer, confirmation_rows, cfg, device, confirmation_n, best["layer"], best_scale["gate_scale"],
+            f"Acceptance L{best['layer']} alpha={best_scale['gate_scale']:.2f} confirmation",
+        )
+        confirm_safe, confirm_ratio, confirm_q_p95 = _phase1_pair_is_safe(
+            candidate_confirmation, max(1.0, float(base_confirmation.get("median_tokens", 0.0))), cfg
+        )
+        selected_val_acc = candidate_confirmation["accuracy"]
+        base_val_acc = base_confirmation["accuracy"]
+        acc_gain = selected_val_acc - base_val_acc
         nll_reduction = (base_train_nll - best["train_nll"]) / max(base_train_nll, 1e-8)
         val_nll_reduction = (base_val_nll - best["val_nll"]) / max(base_val_nll, 1e-8)
-        # A full held-out probe is the preferred comparison.  If it is
-        # deliberately disabled, compare the selected candidate only against
-        # the matched baseline screen--never against the disabled-probe 0.0
-        # sentinel.  This preserves screen selection while preventing false
-        # positive generation deltas in the acceptance telemetry.
-        if generation_n > 0:
-            comparison_base_acc = base_val_acc
-            accuracy_comparison = "heldout_generation"
-        elif base_screen_acc is not None:
-            comparison_base_acc = base_screen_acc
-            accuracy_comparison = "generation_screen"
-        else:
-            comparison_base_acc = None
-            accuracy_comparison = "unmeasured"
-        acc_gain = (
-            selected_val_acc - comparison_base_acc
-            if comparison_base_acc is not None
-            else 0.0
-        )
         cfg.fixed_steer_eval_layers = [best["layer"]]
-        cfg.fixed_steer_eval_gate_scale = float(best_scale["gate_scale"]) if len(measured) > 1 else 1.0
+        cfg.fixed_steer_eval_gate_scale = float(best_scale["gate_scale"])
         report = {
-            "baseline_train_nll": base_train_nll,
-            "baseline_val_nll": base_val_nll,
-            "baseline_validation_accuracy": base_val_acc,
-            "baseline_screen_accuracy": base_screen_acc,
-            "candidates": candidates,
-            "selected_layer": best["layer"],
+            "baseline_train_nll": base_train_nll, "baseline_val_nll": base_val_nll,
+            "baseline_screen_accuracy": base_screen_acc, "baseline_validation_accuracy": base_val_acc,
+            "candidates": candidates, "selected_layer": best["layer"],
             "selected_validation_accuracy": selected_val_acc,
-            "accuracy_comparison": accuracy_comparison,
-            "accuracy_comparison_baseline": comparison_base_acc,
+            "accuracy_comparison": "disjoint_generation_confirmation",
+            "accuracy_comparison_baseline": base_val_acc,
             "fixed_steer_gate_scale": cfg.fixed_steer_eval_gate_scale,
-            "gate_scale_candidates": scale_results,
-            "train_relative_nll_reduction": nll_reduction,
-            "val_relative_nll_reduction": val_nll_reduction,
-            "validation_accuracy_gain": acc_gain,
-            "validation_examples": val_n,
-            "reliability_waived": small_run_waiver,
-            "truncation_rejected_layers": [
-                int(row["layer"]) for row in candidates
-                if row.get("completion_len_ratio", 1.0) < float(getattr(cfg, "phase1_min_completion_len_ratio", 0.85))
-            ],
+            "gate_scale_candidates": best["scale_screen"],
+            "selected_calibration": best_scale,
+            "confirmation": {
+                "baseline": base_confirmation, "candidate": candidate_confirmation,
+                "completion_len_ratio": confirm_ratio, "pre_cap_q_p95": confirm_q_p95, "safe": confirm_safe,
+            },
+            "train_relative_nll_reduction": nll_reduction, "val_relative_nll_reduction": val_nll_reduction,
+            "validation_accuracy_gain": acc_gain, "validation_examples": val_n,
+            "calibration_examples": screen_n, "confirmation_examples": confirmation_n,
+            "reliability_waived": small_run_waiver, "truncation_rejected_layers": rejected_layers,
             "passed": (
-                nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
+                confirm_safe
+                and nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
                 and val_nll_reduction >= float(cfg.phase1_min_val_nll_reduction)
-                and acc_gain >= float(getattr(
-                    cfg,
-                    "phase1_min_validation_accuracy_gain",
-                    cfg.phase1_min_train_accuracy_gain,
-                ))
+                and acc_gain >= float(getattr(cfg, "phase1_min_validation_accuracy_gain", cfg.phase1_min_train_accuracy_gain))
             ),
         }
-        is_telemetry_only = (
-            float(getattr(cfg, "phase1_min_validation_accuracy_gain", 0.0)) <= 0.0
-            and float(getattr(cfg, "phase1_min_val_nll_reduction", 0.0)) <= 0.0
-        )
-        status_label = "TELEMETRY" if is_telemetry_only else ("PASS" if report["passed"] else "FAIL")
         print(
             "  Phase-1 acceptance: "
-            f"layer=L{best['layer']} | train/val NLL Δ={nll_reduction * 100:+.1f}%/{val_nll_reduction * 100:+.1f}% "
-            f"| alpha={cfg.fixed_steer_eval_gate_scale:.2f} | "
-            f"{accuracy_comparison} Δ={acc_gain * 100:+.1f}pp "
-            f"| {status_label}"
+            f"L{best['layer']} alpha={best_scale['gate_scale']:.2f} | train/val NLL Δ="
+            f"{nll_reduction * 100:+.1f}%/{val_nll_reduction * 100:+.1f}% | "
+            f"confirmation Δ={acc_gain * 100:+.1f}pp | CoT={confirm_ratio:.2f} q95={confirm_q_p95:.2f}"
         )
-        if base_screen_acc is not None:
-            print(
-                "        screen comparison: "
-                f"candidate screen_acc={best.get('screen_generation_accuracy', 0.0):.1%} "
-                f"vs base_screen_acc={base_screen_acc:.1%}"
-            )
-        if acc_gain < float(getattr(cfg, "phase1_accuracy_warning_gain", 0.05)) and generation_n > 0:
-            print(
-                "  ⚠️ Generation improvement is below the reporting target; NLL capacity is accepted, "
-                "but the final fixed-SteerNet benchmark must confirm a meaningful accuracy gain."
-            )
         print(f"  Acceptance audit finished in {(time.monotonic() - started_at) / 60:.1f} min.")
         if not report["passed"] and small_run_waiver:
             report["status"] = "INCONCLUSIVE"
-            print(
-                "  ⚠️ Phase-1 acceptance is INCONCLUSIVE, not PASS: the tiny validation holdout cannot "
-                "validate SteerNet capacity. Continuing only as a pipeline smoke test."
-            )
         elif not report["passed"]:
-            report["status"] = "FAIL_CONTINUED"
-            warning = (
-                "  ⚠️ Phase-1 SteerNet acceptance FAILED. Router/gate results are diagnostic-only because "
-                "independent steering capacity was not established. Continuing to preserve checkpoints and evidence."
-            )
+            report["status"] = "FAIL"
+            warning = "  ⚠️ Phase-1 SteerNet acceptance FAILED; failing closed before routing."
             print(warning)
             if not getattr(cfg, "continue_on_diagnostic_failure", True):
                 raise RuntimeError(warning)
@@ -652,8 +530,6 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             model.set_routing_override(None)
         else:
             model.set_routing_override(old_override[0], old_override[1])
-        # Preserve the chosen fixed ablation layer even if an earlier config
-        # had none; it is validation-selected above, not test-selected.
         if not getattr(cfg, "fixed_steer_eval_layers", None):
             cfg.fixed_steer_eval_layers = old_layers
 
@@ -863,7 +739,49 @@ def _evaluate_and_maybe_checkpoint(
     return best_acc, best_val, best_state, patience_ctr, improved, val_loss, acc
 
 
-def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: torch.device):
+def _phase1_epoch_generation_screen(model, tokenizer, eval_data, cfg: RSCConfig, device: torch.device) -> Optional[Dict[str, Any]]:
+    """Run the bounded per-epoch generation safety screen used for checkpoint selection."""
+    if tokenizer is None:
+        return None
+    n_samples = min(len(eval_data), max(0, int(getattr(cfg, "phase1_epoch_generation_screen_examples", 0))))
+    if n_samples <= 0:
+        return None
+    rows = list(eval_data)[:n_samples]
+    scales = sorted({
+        min(1.0, max(0.0, float(scale)))
+        for scale in getattr(cfg, "phase1_epoch_gate_scale_grid", (0.2, 0.4))
+    })
+    if not scales:
+        return None
+    baseline = _phase1_probe_with_norm(
+        model, tokenizer, rows, cfg, device, n_samples, None, 1.0,
+        "Phase1 epoch baseline generation screen",
+    )
+    base_median_tokens = max(1.0, float(baseline.get("median_tokens", 0.0)))
+    eligible = []
+    for layer in model.target_layers:
+        for scale in scales:
+            probe = _phase1_probe_with_norm(
+                model, tokenizer, rows, cfg, device, n_samples, layer, scale,
+                f"Phase1 epoch L{layer} alpha={scale:.2f}",
+            )
+            safe, completion_ratio, q_p95 = _phase1_pair_is_safe(probe, base_median_tokens, cfg)
+            if safe:
+                eligible.append({
+                    "layer": int(layer), "gate_scale": scale, "accuracy": probe["accuracy"],
+                    "answer_present": probe["answer_present"], "completion_len_ratio": completion_ratio,
+                    "pre_cap_q_p95": q_p95,
+                })
+    if not eligible:
+        return {"baseline": baseline, "eligible": [], "best": None}
+    best = max(
+        eligible,
+        key=lambda row: (row["accuracy"], row["answer_present"], -row["pre_cap_q_p95"], -row["gate_scale"]),
+    )
+    return {"baseline": baseline, "eligible": eligible, "best": best}
+
+
+def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: torch.device, tokenizer=None):
     """Phase 1: Pure SteerNet training with gates pinned at 1.0 and router in coverage warmup."""
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -871,7 +789,7 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
 
     print("\n" + "=" * 80)
     print("PHASE 1: Pure SteerNet Training (Hidden States)")
-    print("         Gates FIXED at 1.0 (disabled)")
+    print("         Gates FIXED at 1.0; deterministic K=1 rotation")
     print(f"         lr={cfg.phase1_lr}, epochs={cfg.phase1_epochs}")
     print("=" * 80)
 
@@ -915,9 +833,12 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
     grad_mon_p1 = GradientMonitor(cfg.grad_warn_threshold)
 
     best_val_p1 = float("inf")
-    best_state_p1 = None
+    best_nll_state_p1 = None
+    best_generation_state_p1 = None
+    best_generation_rank = None
+    best_generation_val = float("inf")
     p1_patience_ctr = 0
-    logs = {"p1_train": [], "p1_val": []}
+    logs = {"p1_train": [], "p1_val": [], "p1_generation_screen": []}
     scaler_p1 = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     for epoch in range(max(0, cfg.phase1_epochs)):
@@ -1002,7 +923,7 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
         if val_loss < best_val_p1 - cfg.early_stop_delta:
             best_val_p1 = val_loss
             p1_patience_ctr = 0
-            best_state_p1 = {
+            best_nll_state_p1 = {
                 k: v.clone()
                 for k, v in model.state_dict().items()
                 if "steer_net" in k or "router" in k
@@ -1016,6 +937,38 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
             f"  Phase1 Epoch {epoch+1}: train={avg_loss:.4f}  val={val_loss:.4f}  lr={lr_now:.2e}  {improved}"
         )
 
+        epoch_screen = _phase1_epoch_generation_screen(model, tokenizer, eval_data, cfg, device)
+        if epoch_screen is None:
+            logs["p1_generation_screen"].append({"epoch": epoch + 1, "status": "UNAVAILABLE"})
+            if tokenizer is None:
+                print("  ⚠️ Phase1 epoch generation screen skipped: tokenizer was not provided.")
+        elif epoch_screen["best"] is None:
+            logs["p1_generation_screen"].append({"epoch": epoch + 1, "status": "NO_SAFE_PAIR"})
+            print("  ⚠️ Phase1 epoch generation screen found no CoT- and norm-safe pair.")
+        else:
+            choice = epoch_screen["best"]
+            baseline_acc = epoch_screen["baseline"]["accuracy"]
+            rank = (
+                choice["accuracy"] - baseline_acc, choice["accuracy"], choice["answer_present"],
+                -choice["pre_cap_q_p95"], -choice["gate_scale"], -val_loss,
+            )
+            logs["p1_generation_screen"].append({
+                "epoch": epoch + 1, "status": "SAFE", "baseline_accuracy": baseline_acc, **choice,
+            })
+            print(
+                f"  Phase1 Epoch {epoch+1} generation screen: L{choice['layer']} alpha={choice['gate_scale']:.2f} "
+                f"acc={choice['accuracy']:.1%} vs base={baseline_acc:.1%} "
+                f"CoT={choice['completion_len_ratio']:.2f} q95={choice['pre_cap_q_p95']:.2f}"
+            )
+            if best_generation_rank is None or rank > best_generation_rank:
+                best_generation_rank = rank
+                best_generation_val = val_loss
+                best_generation_state_p1 = {
+                    k: v.clone()
+                    for k, v in model.state_dict().items()
+                    if "steer_net" in k or "router" in k
+                }
+
         if (epoch + 1) % cfg.checkpoint_every_n == 0:
             ckpt_p1.save(model, optimizer_p1, epoch, val_loss, "p1")
 
@@ -1023,6 +976,10 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
             print(f"  Phase1 early stopping (no improvement for {cfg.phase1_patience} epochs)")
             break
 
+    best_state_p1 = best_generation_state_p1 or best_nll_state_p1
+    if best_generation_state_p1:
+        best_val_p1 = best_generation_val
+        print("  ✅ Restored generation-screen-selected Phase 1 checkpoint.")
     if best_state_p1:
         model.load_state_dict(best_state_p1, strict=False)
     save_steer_weights(
@@ -1606,7 +1563,9 @@ def train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg: RSCConfi
     # Stage 1: Warmup
     orig_p1_epochs = cfg.phase1_epochs
     cfg.phase1_epochs = getattr(cfg, "streamlined_warmup_epochs", 3)
-    best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(model, train_data, eval_data, cfg, device)
+    best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(
+        model, train_data, eval_data, cfg, device, tokenizer=None
+    )
     cfg.phase1_epochs = orig_p1_epochs
     logs.update(p1_logs)
 
@@ -1718,7 +1677,9 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     print(f"  [eval split] eval_data split: {len(eval_sel)} for selection/audits, {len(confirm_rows)} reserved for deployment confirmation.")
 
     # PHASE 1: Pure SteerNet (uses steer_data, eval_sel)
-    best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(model, steer_data, eval_sel, cfg, device)
+    best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(
+        model, steer_data, eval_sel, cfg, device, tokenizer=tokenizer
+    )
     logs.update(p1_logs)
     logs["phase1_acceptance"] = phase1_steernet_acceptance(
         model, tokenizer, steer_data, eval_sel, cfg, device
