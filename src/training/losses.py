@@ -198,6 +198,32 @@ def compute_gate_diversity_loss(model, floor: float = 0.05) -> torch.Tensor:
             count += 1
     return total / max(1, count)
 
+
+def compute_gate_overlap_loss(model) -> torch.Tensor:
+    """Penalize simultaneous effective gate mass on the same routed token.
+
+    Only active gates expose ``_alpha_for_aux``.  This keeps the objective
+    neutral for K=0/K=1 while making K>=2 routes learn complementary token
+    roles instead of radial co-activation.
+    """
+    device = next(iter(p for g in model.gates.values() for p in g.parameters()), torch.tensor(0.0)).device
+    rows = []
+    for gate in model.gates.values():
+        alpha = getattr(gate, "_alpha_for_aux", None)
+        valid = getattr(gate, "_valid_mask", None)
+        if alpha is None or valid is None or valid.shape != alpha.shape[:2]:
+            continue
+        rows.append(alpha.float().squeeze(-1) * valid.float())
+    if len(rows) < 2:
+        return torch.zeros((), device=device)
+    stacked = torch.stack(rows, dim=0)
+    # sum_{i<j} a_i*a_j, normalized by valid token/layer pairs.
+    pair_mass = (stacked.sum(dim=0).square() - stacked.square().sum(dim=0)) * 0.5
+    valid_pairs = (stacked.gt(0).sum(dim=0) >= 2)
+    if not valid_pairs.any():
+        return torch.zeros((), device=device)
+    return pair_mass[valid_pairs].mean()
+
 def compute_antisat_gate(model, threshold: float = 0.92) -> torch.Tensor:
     """Penalise gate values above threshold to prevent saturation."""
     device = next(iter(p for g in model.gates.values() for p in g.parameters()), torch.tensor(0.0)).device
@@ -273,6 +299,11 @@ def log_gpu_memory(label: str, cfg=None, reset_peak: bool = True):
     alloc_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
     reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
     print(f"    [mem] {label}: peak_allocated={alloc_mb:,.0f}MB  peak_reserved={reserved_mb:,.0f}MB")
+    limit_mb = int(getattr(cfg, "cuda_reserved_memory_limit_mb", 0)) if cfg is not None else 0
+    if limit_mb > 0 and reserved_mb > limit_mb:
+        raise RuntimeError(
+            f"CUDA reserved-memory budget exceeded at {label}: peak={reserved_mb:.0f}MB limit={limit_mb}MB"
+        )
     if reset_peak:
         torch.cuda.reset_peak_memory_stats()
 

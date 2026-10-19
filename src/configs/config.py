@@ -80,7 +80,7 @@ class RSCConfig:
     # conservative adapter learning rate; generation validation owns model
     # selection below.
     phase1_lr: float = 3e-4
-    phase1_epochs: int = 3
+    phase1_epochs: int = 2  # Engine v3 Stage A: capacity before pair co-adaptation
     phase1_warmup_ratio: float = 0.06
     phase1_patience: int = 4
     phase1_acceptance_examples: int = 64
@@ -164,6 +164,11 @@ class RSCConfig:
     gate_init_alpha: float = 0.95  # B-3: near-open init; task loss must earn suppression
     gating_mode: str = "learned"  # 'learned' (MLP), 'constant' (fixed scalar), or 'step'
     gate_constant_value: float = 0.80
+    # Engine v3: for K>=2, token gates provide local strength while this
+    # masked-softmax allocation shares the route-level intervention budget.
+    factorized_gate_allocation: bool = True
+    gate_allocation_temperature: float = 0.70
+    lambda_gate_overlap: float = 0.10
 
     # Gate loss regularisation
     # Do not use one global ON/OFF reward to update every token gate.  That
@@ -192,6 +197,9 @@ class RSCConfig:
     # Monitoring
     verifier_every_n: int = 10
     log_gpu_memory: bool = True
+    # Fail before allocator fragmentation becomes an unrecoverable T4 OOM.
+    cuda_reserved_memory_limit_mb: int = 12288
+    pre_cap_telemetry_reservoir_size: int = 8192
 
     # Checkpoint selection
     use_accuracy_checkpoint: bool = True
@@ -223,13 +231,15 @@ class RSCConfig:
     router_preflight_examples: int = 128
     router_fail_fast_on_collapse: bool = True
     intervention_audit_examples: int = 128
-    router_min_eval_k_support: int = 1          # B-3: was 3 — don't fail on sparse K
-    router_require_eval_k0: bool = False         # B-3: was True — K=0 optional
-    router_min_eval_k_entropy: float = 0.0       # B-3: was 0.25
-    router_min_eval_active_layers: int = 1       # B-3: was 4 — even 1 active layer is fine
-    router_min_eval_layer_entropy: float = 0.0   # B-3: was 0.45
-    gate_min_eval_sequence_std: float = 0.0      # B-3: was 0.015
-    gate_max_eval_high_saturation_pct: float = 100.0  # B-3: was 20.0 — allow full saturation
+    router_min_eval_k_support: int = 2
+    router_require_eval_k0: bool = False
+    router_require_eval_k_ge2: bool = True
+    router_min_eval_k_ge2_rate: float = 0.02
+    router_min_eval_k_entropy: float = 0.20
+    router_min_eval_active_layers: int = 2
+    router_min_eval_layer_entropy: float = 0.25
+    gate_min_eval_sequence_std: float = 0.015
+    gate_max_eval_high_saturation_pct: float = 35.0
     router_probe_every_n_steps: int = 1
     router_checkpoint_every_n_steps: int = 0
     router_dead_layer_veto_frac: float = 0.50
@@ -306,6 +316,16 @@ class RSCConfig:
 
     # Phase 2D: Gate re-tuning against final router
     gate_retune_epochs: int = 1
+
+    # Engine v3 curriculum: after independent capacity is established, train
+    # a balanced pool of safe K=1/K=2 routes before router bootstrap.  The
+    # unified adaptive stage then replaces the former 2B->2C->2D sequence.
+    phase1b_coadapt_epochs: int = 1
+    phase1b_candidate_layers: int = 4
+    phase1b_lr: float = 5e-5
+    phase1b_joint_nll_weight: float = 1.0
+    unified_adaptive_phase: bool = True
+    unified_adaptive_epochs: int = 2
     gate_retune_lr: float = 1e-4
 
     # Phase 1 establishes independent, generation-safe directions.  K>=2

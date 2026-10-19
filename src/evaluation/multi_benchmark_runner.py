@@ -73,7 +73,10 @@ def evaluate_model_condition(
             model.set_gate_freeze(True, 1.0)
     elif cond == "ars":
         if hasattr(model, "set_routing_override"):
-            model.set_routing_override("none" if getattr(model, "deployment_disabled", False) else None)
+            per_shot = getattr(model, "deployment_modes_by_shot", {})
+            shot_mode = per_shot.get(str(n_shot), per_shot.get(n_shot)) if isinstance(per_shot, dict) else None
+            disabled = (shot_mode == "baseline") if shot_mode is not None else getattr(model, "deployment_disabled", False)
+            model.set_routing_override("none" if disabled else None)
         if hasattr(model, "set_gate_freeze"):
             model.set_gate_freeze(False)
     elif cond == "ars_raw":

@@ -154,6 +154,8 @@ def save_ars_checkpoint(
         "tensor_shapes": {name: list(value.shape) for name, value in sorted(state.items())},
         "config": _json_config(cfg),
     }
+    if hasattr(model, "deployment_modes_by_shot"):
+        manifest["deployment_modes_by_shot"] = dict(getattr(model, "deployment_modes_by_shot"))
     if extra_metadata:
         manifest["extra"] = extra_metadata
     manifest_path = destination.with_suffix(destination.suffix + ".manifest.json")
@@ -193,4 +195,6 @@ def load_ars_checkpoint_strict(
             raise RuntimeError(f"ARS checkpoint hash disagrees with its manifest: {Path(path).with_suffix(Path(path).suffix + '.manifest.json')}")
         if hasattr(model, "deployment_disabled"):
             model.deployment_disabled = (manifest.get("deployment_mode") == "baseline")
+        if hasattr(model, "deployment_modes_by_shot") and manifest.get("deployment_modes_by_shot"):
+            model.deployment_modes_by_shot = dict(manifest["deployment_modes_by_shot"])
     return {"saved_ars_tensors": len(saved), "manifest": manifest, "non_ars_missing": len(result.missing_keys)}

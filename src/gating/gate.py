@@ -2,6 +2,29 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def masked_route_allocation(
+    layer_logits: torch.Tensor,
+    selected: torch.Tensor,
+    temperature: float = 1.0,
+) -> torch.Tensor:
+    """Return a stable probability allocation over the selected route only.
+
+    The router chooses a sequence-level subset while gates choose token-level
+    strength.  This factor makes multi-layer routes share one intervention
+    budget instead of allowing every selected layer to inject a full residual.
+    K=1 is exactly one, and unselected layers are exactly zero.
+    """
+    if layer_logits.ndim != 2 or selected.shape != layer_logits.shape:
+        raise ValueError("layer_logits and selected must both have shape (B, L)")
+    temp = max(float(temperature), 1e-4)
+    masked = layer_logits.float().masked_fill(~selected.bool(), float("-inf"))
+    allocation = F.softmax(masked / temp, dim=-1)
+    # A K=0 row is all -inf and softmax would be NaN.  It is a valid abstain
+    # route, so represent it as all zeros.
+    allocation = torch.where(selected.any(dim=-1, keepdim=True), allocation, torch.zeros_like(allocation))
+    return allocation.to(dtype=layer_logits.dtype)
 from src.configs.config import RSCConfig
 
 class RSCUsefulnessGate(nn.Module):

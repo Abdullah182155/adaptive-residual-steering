@@ -155,6 +155,53 @@ def finalize_deployment(
     return mode
 
 
+def finalize_deployment_by_shot(
+    outcomes_by_shot: Dict[int | str, Tuple[Sequence[int | float], Sequence[int | float]]],
+    checkpoint_path: str,
+    n_boot: int = 4000,
+    min_n: int = 200,
+) -> Dict[str, str]:
+    """Make independent paired deployment decisions for each shot condition.
+
+    A dormant few-shot policy must not suppress an independently validated
+    zero-shot policy through a pooled confidence interval.  Each condition is
+    still evaluated only on held-out paired questions and uses the same strict
+    positive-lower-bound criterion as ``finalize_deployment``.
+    """
+    decisions: Dict[str, str] = {}
+    evidence: Dict[str, Dict[str, float | int | str]] = {}
+    for shot, (baseline, ars) in outcomes_by_shot.items():
+        key = str(shot)
+        base = np.asarray(baseline, dtype=float)
+        candidate = np.asarray(ars, dtype=float)
+        if base.shape != candidate.shape:
+            raise ValueError(f"shot {shot}: baseline and ARS shapes differ: {base.shape} vs {candidate.shape}")
+        n = int(base.shape[0]) if base.ndim else 0
+        if n < min_n:
+            mode, delta, lo, hi = "baseline", 0.0, -1.0, 1.0
+        else:
+            delta, lo, hi = paired_delta_ci(base, candidate, n_boot=n_boot)
+            mode = "ars" if lo > 0.0 else "baseline"
+        decisions[key] = mode
+        evidence[key] = {"mode": mode, "n": n, "delta": delta, "ci_low": lo, "ci_high": hi}
+
+    manifest_path = checkpoint_path + ".manifest.json"
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            manifest = {}
+        manifest["deployment_modes_by_shot"] = decisions
+        manifest["deployment_evidence_by_shot"] = evidence
+        # Legacy consumers still read one field.  It is ARS only when every
+        # explicitly evaluated shot was validated; callers should use the map.
+        manifest["deployment_mode"] = "ars" if decisions and all(v == "ars" for v in decisions.values()) else "baseline"
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+    return decisions
+
+
 def alpha_jitter_floor(
     model: Optional[Any] = None,
     tokenizer: Optional[Any] = None,

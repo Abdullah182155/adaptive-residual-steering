@@ -1635,6 +1635,108 @@ class TestEngineV21NormAndK0(unittest.TestCase):
             loss.backward()
 
 
+class TestEngineV3RoutingAndMemory(unittest.TestCase):
+    """Regression coverage for Engine v3 contracts."""
+
+    def test_masked_route_allocation_is_competitive_and_safe_for_k_zero(self):
+        from src.gating.gate import masked_route_allocation
+
+        logits = torch.tensor([[2.0, 1.0, -3.0], [1.0, 2.0, 3.0]])
+        selected = torch.tensor([[True, True, False], [False, False, False]])
+        allocation = masked_route_allocation(logits, selected, temperature=1.0)
+        self.assertTrue(torch.allclose(allocation[0, :2].sum(), torch.tensor(1.0)))
+        self.assertEqual(float(allocation[0, 2]), 0.0)
+        self.assertTrue(torch.equal(allocation[1], torch.zeros(3)))
+
+    def test_none_override_trace_reports_realized_k_zero(self):
+        """A baseline control must not be mislabeled as a K=1 route."""
+        class DummyLayer(nn.Module):
+            def forward(self, h, *args, **kwargs):
+                return h
+
+        class DummyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": 16})()
+                self.embed = nn.Embedding(32, 16)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer() for _ in range(10)])})()
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h})()
+
+        from src.models.wrapper import Phi2WithRSC
+        wrapper = Phi2WithRSC(DummyModel(), RSCConfig(), device=torch.device("cpu"))
+        wrapper.set_routing_trace(True)
+        wrapper.set_routing_override("none")
+        _ = wrapper(input_ids=torch.ones(1, 4, dtype=torch.long), attention_mask=torch.ones(1, 4, dtype=torch.long))
+        first = wrapper.last_routing_trace[wrapper.target_layers[0]]
+        self.assertEqual(first["desired_k"], [0])
+        self.assertEqual(first["realized_k"], [0])
+
+    def test_pre_cap_reservoir_is_bounded_and_cpu_resident(self):
+        from src.steering.steernet import RSCSteerNet, pre_cap_report
+
+        steer = RSCSteerNet(16, 4, 8.0, max_relative_norm=0.04, telemetry_reservoir_size=7)
+        steer.eval()
+        with torch.no_grad():
+            for _ in range(4):
+                steer(torch.randn(2, 6, 16), active_k=torch.tensor([1, 1]))
+        self.assertLessEqual(sum(value.numel() for value in steer._pre_cap_values), 7)
+        self.assertTrue(all(value.device.type == "cpu" for value in steer._pre_cap_values))
+        dummy = nn.Module()
+        dummy.steer_nets = nn.ModuleDict({"11": steer})
+        self.assertEqual(pre_cap_report(dummy)[11]["tokens"], 48)
+
+    def test_router_preflight_rejects_single_layer_without_k_two_support(self):
+        from src.training.trainer import audit_router_policy_health
+        from src.configs.config import RSCConfig
+
+        class FakeRouterModel:
+            _routing_override = None
+            _router_inference_mode = "argmax"
+            def reset_routing_diagnostics(self): pass
+            def eval(self): return self
+            def set_router_inference_mode(self, mode): self._router_inference_mode = mode
+            def set_routing_override(self, mode=None, layers=None): self._routing_override = None if mode is None else (mode, layers)
+            def set_prompt_shield_mask(self, mask): pass
+            def set_router_context_mask(self, mask): pass
+            def __call__(self, **kwargs): return None
+            def intervention_diagnostics(self):
+                return {
+                    "realized_k_distribution": {0: 0.90, 1: 0.10, 2: 0.0},
+                    "realized_k_support": 2, "realized_k_entropy": 0.20,
+                    "active_layer_count": 1, "layer_selection_entropy": 0.0,
+                    "gate": {}, "steering": {},
+                }
+
+        row = {"input_ids": torch.ones(4, dtype=torch.long), "attention_mask": torch.ones(4, dtype=torch.long), "labels": torch.tensor([-100, -100, 1, 2])}
+        cfg = RSCConfig(allow_inconclusive_small_runs=False, router_preflight_examples=2, continue_on_diagnostic_failure=True)
+        report = audit_router_policy_health(FakeRouterModel(), [row, row], cfg, torch.device("cpu"))
+        self.assertFalse(report["passed"])
+        self.assertTrue(any("K>=2" in failure for failure in report["failures"]))
+        self.assertTrue(any("active layers" in failure for failure in report["failures"]))
+
+    def test_per_shot_deployment_does_not_pool_a_winning_zero_shot_policy(self):
+        from src.evaluation.deployment import finalize_deployment_by_shot
+        import tempfile
+        import json
+        import os
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "ars.pt")
+            with open(path + ".manifest.json", "w", encoding="utf-8") as handle:
+                json.dump({}, handle)
+            # Identical paired improvements make the 0-shot lower CI positive;
+            # 2-shot remains tied and therefore baseline.
+            modes = finalize_deployment_by_shot(
+                {0: ([0] * 20, [1] * 20), 2: ([1] * 20, [1] * 20)}, path, n_boot=100, min_n=20,
+            )
+            self.assertEqual(modes["0"], "ars")
+            self.assertEqual(modes["2"], "baseline")
+
+
 
 
 

@@ -402,6 +402,7 @@ def compute_router_rloo_loss(
     reward_deltas = (action_rewards - reward_0.unsqueeze(1)).detach()
     pairwise_interaction_loss = torch.zeros((), device=ids.device)
     mean_pair_interaction = torch.zeros((), device=ids.device)
+    pair_utility = {}
     if synergy is not None:
         # K=2 is the first non-trivial pair route and therefore measures a
         # clean second-order interaction instead of an arbitrary pair inside
@@ -424,6 +425,16 @@ def compute_router_rloo_loss(
             rew_j, _ = deterministic_counterfactual_score(singleton_j)
             rew_pair, _ = deterministic_counterfactual_score(pair_mask)
             interaction = (rew_pair - rew_i - rew_j + reward_0).detach()
+            # Batch-local pair evidence is deliberately reported before it is
+            # collapsed into a scalar loss.  This makes positive synergy
+            # auditable against both its raw reward and the K=2 tariff.
+            for b in torch.nonzero(valid_pair, as_tuple=False).flatten().tolist():
+                key = f"L{int(model.target_layers[int(first[b].item())])}+L{int(model.target_layers[int(second[b].item())])}"
+                row = pair_utility.setdefault(key, {"observations": 0, "raw_reward_sum": 0.0, "net_reward_sum": 0.0, "interaction_sum": 0.0})
+                row["observations"] += 1
+                row["raw_reward_sum"] += float(rew_pair[b].item())
+                row["net_reward_sum"] += float((rew_pair[b] - 2.0 * per_layer_cost[b]).item())
+                row["interaction_sum"] += float(interaction[b].item())
             pair_syn = synergy[torch.arange(ids.shape[0], device=ids.device), first, second]
             target_scale = max(float(getattr(cfg, "router_synergy_target_scale", 0.10)), 1e-4)
             interaction_target = torch.tanh(interaction / target_scale)
@@ -431,6 +442,13 @@ def compute_router_rloo_loss(
                 pair_syn[valid_pair], interaction_target[valid_pair], beta=0.25,
             )
             mean_pair_interaction = interaction[valid_pair].mean()
+
+    for row in pair_utility.values():
+        n_obs = max(1, int(row.pop("observations")))
+        row["observations"] = n_obs
+        row["raw_reward"] = row.pop("raw_reward_sum") / n_obs
+        row["cost_adjusted_reward"] = row.pop("net_reward_sum") / n_obs
+        row["interaction"] = row.pop("interaction_sum") / n_obs
 
     h_k, h_subset = policy_entropy_bonus(u_fresh, k_logits_fresh, K_max)
     diversity_temp = float(getattr(cfg, "router_diversity_temperature", 1.0))
@@ -481,6 +499,34 @@ def compute_router_rloo_loss(
     )
 
     win_rate = (action_rewards > reward_0.unsqueeze(1)).float().mean().item()
+    # Keep reward accounting observable.  Without raw-versus-net values, a
+    # K=0 or single-layer collapse is indistinguishable from a genuine utility
+    # preference and cost hyperparameters become guesswork.
+    k_utility = {
+        0: {
+            "raw_reward": float(reward_0.mean().item()),
+            "cost_adjusted_reward": float(reward_0.mean().item()),
+            "nll": float(nll_0.mean().item()),
+            "cost": 0.0,
+        }
+    }
+    layer_utility = {}
+    for arm, k_value in enumerate(range(1, K_max + 1)):
+        k_utility[k_value] = {
+            "raw_reward": float(arm_rewards[:, arm].mean().item()),
+            "cost_adjusted_reward": float(action_rewards[:, arm].mean().item()),
+            "nll": float(arm_nll[:, arm].mean().item()),
+            "cost": float((per_layer_cost * float(k_value)).mean().item()),
+        }
+        selected = subset_masks[arm]
+        for pos, layer in enumerate(model.target_layers):
+            chosen = selected[:, pos]
+            if chosen.any():
+                layer_utility[int(layer)] = {
+                    "observations": int(chosen.sum().item()),
+                    "raw_reward": float(arm_rewards[chosen, arm].mean().item()),
+                    "cost_adjusted_reward": float(action_rewards[chosen, arm].mean().item()),
+                }
     diag = {
         "policy_loss": float(policy_loss.detach().item()),
         "synergy_align_loss": float(pairwise_interaction_loss.detach().item()),
@@ -503,5 +549,8 @@ def compute_router_rloo_loss(
             for k in range(k_logits_fresh.shape[-1])
         },
         "counterfactual_k_actions": list(range(1, K_max + 1)),
+        "counterfactual_utility_by_k": k_utility,
+        "counterfactual_utility_by_layer": layer_utility,
+        "counterfactual_utility_by_pair": pair_utility,
     }
     return loss, diag

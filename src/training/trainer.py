@@ -19,6 +19,7 @@ from src.training.losses import (
     compute_gate_budget_loss,
     compute_antisat_gate,
     compute_gate_diversity_loss,
+    compute_gate_overlap_loss,
     compute_pg_advantage_lite,
     compute_pg_gate_loss_from_live_alphas,
     log_gpu_memory,
@@ -54,6 +55,22 @@ def _small_run_waiver(n_validation_examples: int, cfg: RSCConfig) -> bool:
 def _optimizer_has_gradients(parameters) -> bool:
     """Whether this accumulation window actually called backward on an optimizer parameter."""
     return any(parameter.grad is not None for parameter in parameters)
+
+
+def enforce_gpu_memory_budget(label: str, cfg: RSCConfig) -> None:
+    """Fail before a T4 allocator peak becomes an unrecoverable OOM."""
+    if not torch.cuda.is_available():
+        return
+    limit_mb = int(getattr(cfg, "cuda_reserved_memory_limit_mb", 0))
+    if limit_mb <= 0:
+        return
+    current_mb = torch.cuda.memory_reserved() / (1024 ** 2)
+    peak_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
+    if max(current_mb, peak_mb) > limit_mb:
+        raise RuntimeError(
+            f"CUDA reserved-memory budget exceeded at {label}: current={current_mb:.0f}MB "
+            f"peak={peak_mb:.0f}MB limit={limit_mb}MB"
+        )
 
 
 def _answer_aware_loss(
@@ -709,6 +726,12 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
         k_dist = report["realized_k_distribution"]
         if cfg.router_require_eval_k0 and k_dist.get(0, 0.0) <= 0.0:
             failures.append("K=0 was never selected")
+        k_ge2_rate = sum(float(rate) for k, rate in k_dist.items() if int(k) >= 2)
+        report["realized_k_ge2_rate"] = k_ge2_rate
+        if bool(getattr(cfg, "router_require_eval_k_ge2", True)) and k_ge2_rate < float(getattr(cfg, "router_min_eval_k_ge2_rate", 0.02)):
+            failures.append(
+                f"K>=2 rate={k_ge2_rate:.3f} < {float(getattr(cfg, 'router_min_eval_k_ge2_rate', 0.02)):.3f}"
+            )
         if report["realized_k_support"] < int(cfg.router_min_eval_k_support):
             failures.append(f"K support={report['realized_k_support']} < {cfg.router_min_eval_k_support}")
         if report["realized_k_entropy"] < float(cfg.router_min_eval_k_entropy):
@@ -789,6 +812,12 @@ def audit_router_policy_health(model, eval_data, cfg: RSCConfig, device: torch.d
         k_dist = report["realized_k_distribution"]
         if cfg.router_require_eval_k0 and k_dist.get(0, 0.0) <= 0.0:
             failures.append("K=0 was never selected")
+        k_ge2_rate = sum(float(rate) for k, rate in k_dist.items() if int(k) >= 2)
+        report["realized_k_ge2_rate"] = k_ge2_rate
+        if bool(getattr(cfg, "router_require_eval_k_ge2", True)) and k_ge2_rate < float(getattr(cfg, "router_min_eval_k_ge2_rate", 0.02)):
+            failures.append(
+                f"K>=2 rate={k_ge2_rate:.3f} < {float(getattr(cfg, 'router_min_eval_k_ge2_rate', 0.02)):.3f}"
+            )
         if report["realized_k_support"] < int(cfg.router_min_eval_k_support):
             failures.append(f"K support={report['realized_k_support']} < {cfg.router_min_eval_k_support}")
         if report["realized_k_entropy"] < float(cfg.router_min_eval_k_entropy):
@@ -802,12 +831,12 @@ def audit_router_policy_health(model, eval_data, cfg: RSCConfig, device: torch.d
             "reliability_waived": waiver,
             "passed": not failures,
             "failures": failures,
-            "status": "PASS" if not failures else ("INCONCLUSIVE" if waiver else "FAIL_CONTINUED"),
+            "status": "PASS" if not failures else ("INCONCLUSIVE" if waiver else "FAIL"),
         })
         print(f"  Router deployment preflight: {report}")
         if failures and not waiver:
             warning = (
-                "  ⚠️ Router deployment preflight FAILED. Continuing with diagnostic-only Phase 2 results: "
+                "  ⚠️ Router deployment preflight FAILED. Failing closed before Phase 2: "
                 + "; ".join(failures)
             )
             print(warning)
@@ -1168,6 +1197,98 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
     return best_state_p1, best_val_p1, logs
 
 
+def train_phase1b_coadaptation(
+    model, train_data, acceptance_report: Dict[str, Any], cfg: RSCConfig, device: torch.device,
+) -> Dict[str, Any]:
+    """Teach a balanced safe K=1/K=2 pool before policy optimisation.
+
+    Phase 1 proves independent capacity.  This stage deliberately does *not*
+    ask the immature router to choose training pairs: it round-robins safe
+    candidate singletons and pairs with frozen gates, one trimmed micro-batch
+    at a time.  That is the memory-safe path to complementary residuals.
+    """
+    epochs = int(getattr(cfg, "phase1b_coadapt_epochs", 0))
+    if epochs <= 0:
+        return {"status": "SKIPPED", "candidate_layers": [], "steps": 0}
+    ranking = acceptance_report.get("calibration_ranking", [])
+    layers = []
+    for row in ranking:
+        layer = int(row.get("layer", -1))
+        if row.get("safe", False) and layer in model.target_layers and layer not in layers:
+            layers.append(layer)
+        if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
+            break
+    if len(layers) < 2:
+        raise RuntimeError("Phase 1B requires at least two independently safe candidate layers")
+    pairs = [(layers[i], layers[j]) for i in range(len(layers)) for j in range(i + 1, len(layers))]
+    schedule = [(layer,) for layer in layers] + pairs
+    params = [p for sn in model.steer_nets.values() for p in sn.parameters()]
+    for p in params:
+        p.requires_grad = True
+    for p in model.router.parameters():
+        p.requires_grad = False
+    optimizer = torch.optim.AdamW(params, lr=float(getattr(cfg, "phase1b_lr", 5e-5)), weight_decay=cfg.weight_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    steps, norm_total = 0, 0.0
+    model.base_model.eval()
+    model.set_gate_freeze(True, 1.0)
+    model.set_router_warmup(False)
+    print(f"\nPHASE 1B: Balanced K=1/K=2 Co-adaptation | layers={layers} pairs={len(pairs)}")
+    try:
+        for epoch in range(epochs):
+            order = list(range(len(train_data)))
+            random.Random(cfg.seed + epoch).shuffle(order)
+            for step, row_idx in enumerate(order):
+                row = train_data[row_idx]
+                ids = row["input_ids"].unsqueeze(0).to(device)
+                mask = row["attention_mask"].unsqueeze(0).to(device)
+                labels = row["labels"].unsqueeze(0).to(device)
+                shield = row.get("prompt_shield_mask")
+                shield = shield.unsqueeze(0).to(device) if shield is not None else None
+                calc = row.get("calc_mask")
+                calc = calc.unsqueeze(0).to(device) if calc is not None else None
+                ids, mask, labels, shield, calc = _trim_batch(ids, mask, labels, shield, calc)
+                chosen = schedule[step % len(schedule)]
+                route = torch.zeros(1, len(model.target_layers), dtype=torch.bool, device=device)
+                for layer in chosen:
+                    route[0, model.target_layers.index(layer)] = True
+                optimizer.zero_grad(set_to_none=True)
+                model.set_routing_override("matrix", route)
+                _set_batch_context(model, mask, labels, shield)
+                try:
+                    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                        out = model(input_ids=ids, attention_mask=mask, use_cache=False)
+                        task = _answer_aware_loss(out.logits, labels, cfg, calc_mask=calc)
+                        norm, _ = model.compute_active_steer_norm_loss(
+                            q_hi=cfg.steer_norm_q_hi, huber_delta=cfg.steer_norm_huber_delta,
+                        )
+                        loss = float(getattr(cfg, "phase1b_joint_nll_weight", 1.0)) * task + cfg.lambda_steer_norm * norm
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(params, cfg.clip_grad)
+                    scaler.step(optimizer)
+                    scaler.update()
+                    steps += 1
+                    norm_total += float(norm.detach().item())
+                finally:
+                    model.set_routing_override(None)
+                    del out
+                if steps % 50 == 0:
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    enforce_gpu_memory_budget(f"Phase 1B step {steps}", cfg)
+    finally:
+        model.set_routing_override(None)
+        model.set_gate_freeze(True, 1.0)
+        for p in params:
+            p.requires_grad = False
+    return {
+        "status": "COMPLETE", "candidate_layers": layers, "pair_count": len(pairs),
+        "steps": steps, "mean_norm_loss": norm_total / max(1, steps),
+    }
+
+
 def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device: torch.device):
     """Phase 1.5: Router Bootstrap with SteerNet compatibility correction (RC-5).
 
@@ -1397,6 +1518,18 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                 f"{k}:{v:.2f}" for k, v in rloo_diag.get("argmax_k_distribution", {}).items()
             ) if rloo_diag else ""
         )
+        utility_str = ""
+        if rloo_diag:
+            utilities = rloo_diag.get("counterfactual_utility_by_k", {})
+            pieces = []
+            for k in (0, 1, 2):
+                row = utilities.get(k, utilities.get(str(k)))
+                if row:
+                    pieces.append(
+                        f"K{k}:raw={row['raw_reward']:+.3f}/net={row['cost_adjusted_reward']:+.3f}"
+                    )
+            if pieces:
+                utility_str = " | utility[" + ", ".join(pieces) + "]"
         syn_str = f" | top synergy: [{top_syn_str}]" if top_syn_str else ""
         joint_str = (
             f" | joint_nll={avg_joint:.4f} "
@@ -1407,7 +1540,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             f"  RouterBootstrap Epoch {epoch + 1}: loss={avg_loss:.4f}"
             f"{win_str}{k_pref_str}{k_argmax_str}"
             f" | active layers={active_cnt}/{len(diag)}"
-            f"{syn_str}{joint_str}{k_cf_str}"
+            f"{syn_str}{joint_str}{utility_str}{k_cf_str}"
         )
         if avg_loss < best_loss - 1e-4:
             best_loss, patience_ctr = avg_loss, 0
@@ -1566,6 +1699,7 @@ def run_staged_phase(
                 asat_loss = compute_antisat_gate(model, threshold=0.85)
                 contrast_loss = compute_contrastive_gate_loss(model, ids, lbls, tokenizer, device)
                 diversity_loss = compute_gate_diversity_loss(model, floor=cfg.gate_diversity_floor)
+                overlap_loss = compute_gate_overlap_loss(model)
                 epoch_gate_l1 += l1_loss.item()
                 epoch_gate_div += diversity_loss.item()
                 epoch_gate_antisat += asat_loss.item()
@@ -1577,6 +1711,7 @@ def run_staged_phase(
                     + cfg.lambda_gate_antisat * asat_loss
                     + cfg.lambda_gate_usefulness * contrast_loss
                     + cfg.lambda_gate_diversity * diversity_loss
+                    + float(getattr(cfg, "lambda_gate_overlap", 0.0)) * overlap_loss
                 ) / cfg.grad_accum
                 if torch.isfinite(aux_loss) and aux_loss.requires_grad:
                     micro_loss = aux_loss if micro_loss is None else (micro_loss + aux_loss)
@@ -1668,6 +1803,7 @@ def run_staged_phase(
                     if global_step % 50 == 0:
                         gc.collect()
                         log_gpu_memory(f"run_staged_phase step {global_step}", cfg)
+                        enforce_gpu_memory_budget(f"{stage_name} step {global_step}", cfg)
 
                     if (
                         train_router
@@ -1886,6 +2022,22 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print(f"   Final saved checkpoint        : {cfg.phase2_save_path}")
         return logs, best_val_p1, best_val_p1
 
+    # Engine v3: establish pair compatibility before a learned router is
+    # allowed to score combinatorial routes.  This is deliberately after the
+    # strict single-layer acceptance gate, so weak adapters cannot hide in a
+    # pair during co-adaptation.
+    phase1_safe_snapshot = {
+        name: value.detach().clone()
+        for name, value in model.state_dict().items() if "steer_nets." in name
+    }
+    logs["phase1b_coadaptation"] = train_phase1b_coadaptation(
+        model, router_data, phase1_report, cfg, device,
+    )
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    enforce_gpu_memory_budget("after Phase 1B", cfg)
+
     # PHASE 1.5: Router Bootstrap (uses router_data, eval_sel; RC-5: returns steer_snapshot for safe restore)
     _, best_p15, steer_snapshot_p15 = train_router_bootstrap(model, router_data, eval_sel, cfg, device)
     logs["router_bootstrap_loss"] = best_p15
@@ -1904,9 +2056,9 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print("         Deployment argmax collapsed; Gate/Phase 2 cannot make this a valid ARS policy.")
         print("         Retaining Phase-1 and Router diagnostics; no Full-ARS checkpoint claim is produced.")
         # RC-5: restore Phase-1 SteerNet state so bootstrap didn't corrupt the best known checkpoint
-        if steer_snapshot_p15:
-            model.load_state_dict(steer_snapshot_p15, strict=False)
-            print("         ↩️  Phase-1 SteerNet weights restored (bootstrap did not improve preflight).")
+        if phase1_safe_snapshot:
+            model.load_state_dict(phase1_safe_snapshot, strict=False)
+            print("         ↩️  Original Phase-1 SteerNet weights restored (co-adaptation/bootstrap did not improve preflight).")
         print("=" * 80)
         logs["adaptive_phases_status"] = "SKIPPED_COLLAPSED_ROUTER"
         logs["ars_intervention_audit"] = {
@@ -1972,19 +2124,28 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     # deployed and validated.  Sampling routes here trained the gate against a
     # different intervention distribution from argmax evaluation.
     model.set_router_exploration(False)
+    unified_adaptive = bool(getattr(cfg, "unified_adaptive_phase", False))
+    for p in model.router.parameters():
+        p.requires_grad = unified_adaptive
     gate_params_ft = []
     for key in sorted(model.gates.keys(), key=lambda k: int(k)):
         for p in model.gates[key].parameters():
             p.requires_grad = True
             gate_params_ft.append(p)
 
+    gate_stage_groups = [{"params": gate_params_ft, "lr": cfg.gate_only_lr}]
+    if unified_adaptive:
+        gate_stage_groups.append({
+            "params": list(model.router.parameters()),
+            "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale,
+        })
     global_step, best_p2b_val, best_p2b_acc = run_staged_phase(
         model, tokenizer, router_data, eval_sel, cfg, device,
-        stage_name="PHASE 2B: Gate-only Training (SteerNet + Router frozen)",
-        epochs=cfg.gate_only_epochs,
-        param_groups=[{"params": gate_params_ft, "lr": cfg.gate_only_lr}],
+        stage_name=("PHASE 2: Unified Gate+Router Adaptation" if unified_adaptive else "PHASE 2B: Gate-only Training (SteerNet + Router frozen)"),
+        epochs=(int(getattr(cfg, "unified_adaptive_epochs", 2)) if unified_adaptive else cfg.gate_only_epochs),
+        param_groups=gate_stage_groups,
         save_path=cfg.gate_only_save_path,
-        train_steer=False, train_gate=True, train_router=False,
+        train_steer=False, train_gate=True, train_router=unified_adaptive,
         global_step=global_step, baseline_ema=[0.0], patience=cfg.phase2_patience,
     )
     logs["p2b_val"] = best_p2b_val
@@ -2004,59 +2165,56 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    # PHASE 2C: Coordinated Joint Fine-tune (uses router_data, eval_sel; SteerNet strictly FROZEN)
-    for p in steer_params_ft:
-        p.requires_grad = False
-    for p in gate_params_ft:
-        p.requires_grad = True
-    for p in model.router.parameters():
-        p.requires_grad = True
-    model.set_router_exploration(True)
-    model._joint_grad_mode = True  # Let task gradients flow through alpha to optimize gate directly
+    if unified_adaptive:
+        # The unified stage already trained the gate and router together under
+        # the deployment route.  Do not create zero-epoch legacy stages or
+        # overwrite their truthful metrics with infinity placeholders.
+        best_val_p2, best_acc_p2 = best_p2b_val, best_p2b_acc
+        best_p2d_val, best_p2d_acc = best_p2b_val, best_p2b_acc
+        logs["p2_val"] = [best_val_p2]
+        logs["p2d_val"] = best_p2d_val
+    else:
+        # PHASE 2C: Coordinated Joint Fine-tune (uses router_data, eval_sel; SteerNet strictly FROZEN)
+        for p in steer_params_ft:
+            p.requires_grad = False
+        for p in gate_params_ft:
+            p.requires_grad = True
+        for p in model.router.parameters():
+            p.requires_grad = True
+        model.set_router_exploration(True)
+        model._joint_grad_mode = True
+        joint_groups = [
+            {"params": gate_params_ft, "lr": cfg.gate_only_lr * cfg.joint_finetune_lr_scale},
+            {"params": list(model.router.parameters()), "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale},
+        ]
+        global_step, best_val_p2, best_acc_p2 = run_staged_phase(
+            model, tokenizer, router_data, eval_sel, cfg, device,
+            stage_name="PHASE 2C: Coordinated Gate+Router Fine-tune (SteerNet Frozen)",
+            epochs=cfg.joint_finetune_epochs, param_groups=joint_groups,
+            save_path=cfg.phase2_save_path, train_steer=False, train_gate=True, train_router=True,
+            global_step=global_step, baseline_ema=[0.0], patience=max(1, cfg.phase2_patience),
+            init_best_acc=best_p2b_acc, init_best_val=best_p2b_val,
+        )
+        model._joint_grad_mode = False
+        logs["p2_val"] = [best_val_p2]
 
-    joint_groups = [
-        {"params": gate_params_ft, "lr": cfg.gate_only_lr * cfg.joint_finetune_lr_scale},
-        {
-            "params": list(model.router.parameters()),
-            "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale,
-        },
-    ]
-
-    global_step, best_val_p2, best_acc_p2 = run_staged_phase(
-        model, tokenizer, router_data, eval_sel, cfg, device,
-        stage_name="PHASE 2C: Coordinated Gate+Router Fine-tune (SteerNet Frozen)",
-        epochs=cfg.joint_finetune_epochs,
-        param_groups=joint_groups,
-        save_path=cfg.phase2_save_path,
-        train_steer=False, train_gate=True, train_router=True,
-        global_step=global_step, baseline_ema=[0.0], patience=max(1, cfg.phase2_patience),
-        init_best_acc=best_p2b_acc, init_best_val=best_p2b_val,
-    )
-    model._joint_grad_mode = False  # Restore detached mode for Phase 2D
-    logs["p2_val"] = [best_val_p2]
-
-    # PHASE 2D: Gate Re-tune (uses router_data, eval_sel)
-    load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
-    for p in model.router.parameters():
-        p.requires_grad = False
-    for p in steer_params_ft:
-        p.requires_grad = False
-    model.set_gate_freeze(False)
-    model.set_router_exploration(False)
-    for p in gate_params_ft:
-        p.requires_grad = True
-
-    global_step, best_p2d_val, best_p2d_acc = run_staged_phase(
-        model, tokenizer, router_data, eval_sel, cfg, device,
-        stage_name="PHASE 2D: Gate Re-tune (against final router)",
-        epochs=cfg.gate_retune_epochs,
-        param_groups=[{"params": gate_params_ft, "lr": cfg.gate_retune_lr}],
-        save_path=cfg.phase2_save_path,
-        train_steer=False, train_gate=True, train_router=False,
-        global_step=global_step, baseline_ema=[0.0], patience=cfg.phase2_patience,
-        init_best_acc=best_acc_p2, init_best_val=best_val_p2,
-    )
-    logs["p2d_val"] = best_p2d_val
+        # PHASE 2D: Gate Re-tune (uses router_data, eval_sel)
+        load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
+        for p in model.router.parameters():
+            p.requires_grad = False
+        for p in steer_params_ft:
+            p.requires_grad = False
+        model.set_gate_freeze(False)
+        model.set_router_exploration(False)
+        global_step, best_p2d_val, best_p2d_acc = run_staged_phase(
+            model, tokenizer, router_data, eval_sel, cfg, device,
+            stage_name="PHASE 2D: Gate Re-tune (against final router)",
+            epochs=cfg.gate_retune_epochs, param_groups=[{"params": gate_params_ft, "lr": cfg.gate_retune_lr}],
+            save_path=cfg.phase2_save_path, train_steer=False, train_gate=True, train_router=False,
+            global_step=global_step, baseline_ema=[0.0], patience=cfg.phase2_patience,
+            init_best_acc=best_acc_p2, init_best_val=best_val_p2,
+        )
+        logs["p2d_val"] = best_p2d_val
     model.set_router_exploration(False)
 
     if os.path.exists(cfg.phase2_save_path):
@@ -2075,10 +2233,10 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     else:
         logs["gate_degenerate"] = False
 
-    # ISSUE-2 / R8: finalize deployment mode using reserved confirmation rows
-    # across 0-shot and 2-shot.  Each question is one bootstrap cluster; its
-    # two shot outcomes are intentionally never treated as independent rows.
-    from src.evaluation.deployment import finalize_deployment, paired_delta_ci
+    # Engine v3: decide each prompt format independently.  Correlated views
+    # remain visible as pooled diagnostics, but a dormant 2-shot policy cannot
+    # erase an independently validated 0-shot deployment decision.
+    from src.evaluation.deployment import finalize_deployment_by_shot, paired_delta_ci
     from src.evaluation.multi_dataset import build_benchmark_prompt, evaluate_sample_answer
     from src.evaluation.verifier import generate_response
 
@@ -2139,6 +2297,10 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
                     f"Δ={d_s*100:+.2f}pp, 95% CI=[{lo_s*100:+.2f}, {hi_s*100:+.2f}]pp (n={len(bf)})"
                 )
 
+        outcomes_by_shot = {shot: (base_flags_by_shot[i], ars_flags_by_shot[i]) for i, shot in enumerate((0, 2))}
+        dep_modes_by_shot = finalize_deployment_by_shot(
+            outcomes_by_shot, cfg.phase2_save_path, min_n=min_deployment_questions,
+        )
         if len(base_flags_by_shot) == 2 and len(ars_flags_by_shot) == 2:
             base_clusters = [list(values) for values in zip(*base_flags_by_shot)]
             ars_clusters = [list(values) for values in zip(*ars_flags_by_shot)]
@@ -2148,22 +2310,20 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
                 f"Δ = {d*100:+.2f}pp, 95% CI = [{lo*100:+.2f}, {hi*100:+.2f}]pp "
                 f"(questions={len(base_clusters)}, views={len(base_flags_by_shot)})"
             )
-            dep_mode = finalize_deployment(
-                base_clusters,
-                ars_clusters,
-                cfg.phase2_save_path,
-                min_n=min_deployment_questions,
-            )
+            dep_mode = "ars" if all(mode == "ars" for mode in dep_modes_by_shot.values()) else "baseline"
         else:
             print("  [deployment] No valid evaluated confirmation items; defaulting to BASELINE deployment.")
             dep_mode = "baseline"
+            dep_modes_by_shot = {"0": "baseline", "2": "baseline"}
     else:
         print("\n  [deployment] No held-out confirmation rows available; defaulting to BASELINE deployment.")
         dep_mode = "baseline"
+        dep_modes_by_shot = {"0": "baseline", "2": "baseline"}
         base_flags, ars_flags = [], []
         base_clusters, ars_clusters = [], []
 
     logs["deployment_mode"] = dep_mode
+    logs["deployment_modes_by_shot"] = dep_modes_by_shot
     logs["deployment_flags"] = {
         "baseline": base_flags,
         "ars": ars_flags,
@@ -2172,6 +2332,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     }
     if hasattr(model, "deployment_disabled"):
         model.deployment_disabled = (dep_mode == "baseline")
+        model.deployment_modes_by_shot = dep_modes_by_shot
     print(f"  [deployment] Final deployment mode decided: {dep_mode.upper()} (deployment_disabled={getattr(model, 'deployment_disabled', False)})")
 
     print("\n" + "=" * 80)

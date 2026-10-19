@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 from src.configs.config import RSCConfig
 from src.steering.steernet import RSCSteerNet
-from src.gating.gate import RSCUsefulnessGate
+from src.gating.gate import RSCUsefulnessGate, masked_route_allocation
 from src.routing.router import JointLayerRouter
 from src.routing.rloo import sample_k, sample_subset_plackett_luce
 
@@ -43,6 +43,7 @@ class Phi2WithRSC(nn.Module):
         self._router_probabilities = None
         self._router_logits = None
         self._router_margins = None
+        self._route_allocation = None
         self._last_inferred_k = None
         self._router_context_mask_pending = None
         self._router_context_mask_active = None
@@ -64,6 +65,7 @@ class Phi2WithRSC(nn.Module):
         self._router_exploration = True
         self._joint_grad_mode = False  # When True (Phase 2C), task gradient flows through both alpha and delta
         self.deployment_disabled = False  # Set to True if finalize_deployment decides baseline only
+        self.deployment_modes_by_shot = {}
 
         # Cached decode attributes
         self._cached_decode_routes = None
@@ -72,6 +74,7 @@ class Phi2WithRSC(nn.Module):
         self._cached_decode_logits = None
         self._cached_decode_margins = None
         self._cached_decode_active_k = None
+        self._cached_decode_allocation = None
         self._active_k_realized = None
         self._collect_routing_trace = False
         self.last_routing_trace = None
@@ -111,6 +114,7 @@ class Phi2WithRSC(nn.Module):
                 max_relative_norm=getattr(self.cfg, "steer_max_relative_norm", 0.04),     # BUG-C3 fix: 0.15→0.04
                 orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", False),
                 k_max=getattr(self.cfg, "max_active_layers", 4),
+                telemetry_reservoir_size=getattr(self.cfg, "pre_cap_telemetry_reservoir_size", 8192),
             ).to(self.device)
             self.gates[str(idx)] = gate
             self.steer_nets[str(idx)] = steer
@@ -138,6 +142,14 @@ class Phi2WithRSC(nn.Module):
                             wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
                         delta = s(h_fp, active_k=wrapper._active_k_realized)
                         alpha = g(h_fp, delta, global_context=wrapper.router._last_semantic_shared)
+                        # A route has one shared intervention budget.  Gates
+                        # retain token-level strength, while selected layers
+                        # receive a masked-softmax allocation instead of each
+                        # injecting a full residual on the same tokens.
+                        allocation = wrapper._route_allocation[:, layer_pos].to(alpha.dtype).view(-1, 1, 1)
+                        alpha = alpha * allocation
+                        g._alpha_for_aux = alpha
+                        g.last_alpha = alpha.detach()
                         if wrapper._collect_gate_trace:
                             if wrapper.last_gate_trace is None:
                                 wrapper.last_gate_trace = {int(layer): [] for layer in wrapper.target_layers}
@@ -238,6 +250,7 @@ class Phi2WithRSC(nn.Module):
                 self._router_logits = self._cached_decode_logits
                 self._router_margins = self._cached_decode_margins
                 self._active_k_realized = self._cached_decode_active_k
+                self._route_allocation = self._cached_decode_allocation
                 self._prompt_shield_mask_active = None
             else:
                 self._desired_k = None
@@ -246,6 +259,7 @@ class Phi2WithRSC(nn.Module):
                 self._router_logits = None
                 self._router_margins = None
                 self._active_k_realized = None
+                self._route_allocation = None
                 if not is_cached_decode:
                     self._cached_decode_routes = None
                     self._cached_decode_k = None
@@ -253,6 +267,7 @@ class Phi2WithRSC(nn.Module):
                     self._cached_decode_logits = None
                     self._cached_decode_margins = None
                     self._cached_decode_active_k = None
+                    self._cached_decode_allocation = None
                     self._prompt_shield_mask_active = self._prompt_shield_mask_pending
                     for g in self.gates.values():
                         if hasattr(g, "reset_conv_cache"):
@@ -486,12 +501,26 @@ class Phi2WithRSC(nn.Module):
                 eligible = torch.tensor([idx not in layers for idx in self.target_layers], device=h.device)
                 scores = u.masked_fill(~eligible.unsqueeze(0), float("-inf"))
                 selected_matrix = self._finalize_selection((scores > float("-inf")) & eligible.unsqueeze(0), scores)
-            self._desired_k = selected_matrix.long().sum(dim=-1).clamp(min=1, max=K_max)
+            # Overrides are measured controls: a "none" baseline requests and
+            # realizes K=0.  Do not clamp its telemetry to one.
+            self._desired_k = selected_matrix.long().sum(dim=-1).clamp(min=0, max=K_max)
 
         self.router._last_prediction = self._desired_k
         self._last_inferred_k = self._desired_k
         self._precomputed_routes = selected_matrix
         self._active_k_realized = selected_matrix.sum(dim=-1)
+        if self._routing_override is not None:
+            # Forced Phase-1B/audit routes are an intervention contract, not
+            # a chance for the immature router logits to attenuate one member
+            # of a deliberately balanced pair.
+            self._route_allocation = selected_matrix.to(dtype=self._router_logits.dtype) / self._active_k_realized.clamp_min(1).to(dtype=self._router_logits.dtype).unsqueeze(-1)
+        elif bool(getattr(self.cfg, "factorized_gate_allocation", True)):
+            self._route_allocation = masked_route_allocation(
+                self._router_logits, selected_matrix,
+                temperature=float(getattr(self.cfg, "gate_allocation_temperature", 0.70)),
+            )
+        else:
+            self._route_allocation = selected_matrix.to(dtype=self._router_logits.dtype)
 
         if h.shape[1] > 1:
             self._cached_decode_routes = selected_matrix.detach()
@@ -500,6 +529,7 @@ class Phi2WithRSC(nn.Module):
             self._cached_decode_logits = self._router_logits.detach()
             self._cached_decode_margins = self._router_margins.detach()
             self._cached_decode_active_k = self._active_k_realized.detach()
+            self._cached_decode_allocation = self._route_allocation.detach()
 
     def _select_layer(self, layer_idx: int, layer_pos: int, h: torch.Tensor, mask: torch.Tensor):
         if layer_idx == self.target_layers[0]:
@@ -523,6 +553,8 @@ class Phi2WithRSC(nn.Module):
                 "selected": selected.detach().cpu().tolist(),
                 "fallback": fallback.detach().cpu().tolist(),
                 "desired_k": self._desired_k.detach().cpu().tolist(),
+                "realized_k": self._active_k_realized.detach().cpu().tolist(),
+                "route_allocation": self._route_allocation[:, layer_pos].detach().float().cpu().tolist(),
                 "predicted_k": self.router._last_prediction.detach().cpu().tolist(),
             }
         self._selected_counts = self._selected_counts + selected.long()

@@ -22,6 +22,7 @@ class RSCSteerNet(nn.Module):
         max_relative_norm: float = 0.15,
         orthogonal_projection: bool = False,
         k_max: int = 4,
+        telemetry_reservoir_size: int = 8192,
     ):
         super().__init__()
         self.k_max = max(1, int(k_max))
@@ -31,13 +32,17 @@ class RSCSteerNet(nn.Module):
         self.orthogonal_projection = orthogonal_projection
         self._clip_stats = 0.0
         self._last_pre_cap_ratio = None
-        self._pre_cap_sum = None
+        # Norm telemetry must never retain one GPU tensor per evaluation
+        # forward.  RLOO evaluates several route arms per minibatch; the old
+        # unbounded list therefore held millions of detached CUDA scalars until
+        # the next report and could exhaust a T4 without retaining an autograd
+        # graph.  Keep exact count/sum/max plus a bounded CPU reservoir for
+        # quantiles instead.
+        self._pre_cap_sum = 0.0
         self._pre_cap_n = 0
-        self._pre_cap_max = None
-        # Detached evaluation-only samples support an exact p95 safety check
-        # during the compact Phase-1 generation probes.  They are cleared by
-        # ``pre_cap_report(reset=True)`` and never retain an autograd graph.
-        self._pre_cap_values = []
+        self._pre_cap_max = 0.0
+        self._pre_cap_reservoir_size = max(1, int(telemetry_reservoir_size))
+        self._pre_cap_values = []  # bounded CPU samples; retained name is compatibility-safe
         self.last_pre_cap_q = None
         self._last_valid_mask = None
         self.norm = nn.LayerNorm(hidden_dim)
@@ -108,18 +113,18 @@ class RSCSteerNet(nn.Module):
             self.last_pre_cap_q = delta_norm / (cap + 1e-7)
             soft = cap / torch.sqrt(delta_norm.square() + cap.square())
             if not self.training:
-                # Retain tensor on device — no .item() host sync during autoregressive decode (R4)
                 r = self.last_pre_cap_q.detach().float().flatten()
-                if self._pre_cap_sum is None:
-                    self._pre_cap_sum = r.sum()
-                    self._pre_cap_n = r.numel()
-                    self._pre_cap_max = r.max()
-                else:
-                    self._pre_cap_sum = self._pre_cap_sum + r.sum()
-                    self._pre_cap_n = self._pre_cap_n + r.numel()
-                    self._pre_cap_max = torch.maximum(self._pre_cap_max, r.max())
-                self._pre_cap_values.append(r)
-                self._last_pre_cap_ratio = r.mean()
+                # Scalar transfers are deliberate, bounded diagnostic work;
+                # they replace persistent CUDA storage and preserve exact
+                # count/mean/max across arbitrarily long evaluations.
+                self._pre_cap_sum += float(r.sum().item())
+                self._pre_cap_n += int(r.numel())
+                self._pre_cap_max = max(self._pre_cap_max, float(r.max().item()))
+                remaining = self._pre_cap_reservoir_size - sum(v.numel() for v in self._pre_cap_values)
+                if remaining > 0:
+                    stride = max(1, (r.numel() + remaining - 1) // remaining)
+                    self._pre_cap_values.append(r[::stride][:remaining].cpu())
+                self._last_pre_cap_ratio = r.mean().detach()
                 self._clip_stats = (delta_norm > cap).detach().float().mean()
             delta = delta * soft
         else:
@@ -137,9 +142,9 @@ class RSCSteerNet(nn.Module):
 
     def reset_pre_cap_stats(self):
         """Reset accumulated pre-cap norm saturation statistics."""
-        self._pre_cap_sum = None
+        self._pre_cap_sum = 0.0
         self._pre_cap_n = 0
-        self._pre_cap_max = None
+        self._pre_cap_max = 0.0
         self._pre_cap_values = []
 
 
@@ -150,9 +155,9 @@ def pre_cap_report(model: torch.nn.Module, reset: bool = True) -> dict:
     if isinstance(steer_nets, torch.nn.ModuleDict):
         for k, sn in steer_nets.items():
             n = getattr(sn, "_pre_cap_n", 0)
-            if n and getattr(sn, "_pre_cap_sum", None) is not None:
-                mean_val = float((sn._pre_cap_sum / n).item())
-                max_val = float(sn._pre_cap_max.item())
+            if n:
+                mean_val = float(sn._pre_cap_sum / n)
+                max_val = float(sn._pre_cap_max)
                 values = getattr(sn, "_pre_cap_values", [])
                 p95_val = (
                     float(torch.quantile(torch.cat(values), 0.95).item())

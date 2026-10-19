@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.13.0] - 2026-10-19
+
+### 🚀 Engine v3: Cooperative Routing, Honest Telemetry & Per-Shot Deployment
+- **Bounded pre-cap telemetry (`src/steering/steernet.py`):** Replaced unbounded detached CUDA q-value retention with exact scalar summaries plus a bounded CPU reservoir, eliminating the diagnostic allocation growth observed during RLOO evaluation.
+- **Route semantics & utility accounting (`src/models/wrapper.py`, `src/routing/rloo.py`):** Routing traces now distinguish requested from realized K and expose route allocation. Router diagnostics report raw reward, cost, cost-adjusted reward, singleton utility, and measured pair utility.
+- **Fail-closed router contract (`src/training/trainer.py`, `src/configs/config.py`):** Bootstrap preflight and final intervention audits require at least two active layers, positive K>=2 incidence, and K/layer entropy floors before adaptive training or deployment claims can proceed.
+- **Co-adaptation curriculum:** Added memory-safe Phase 1B balanced K=1/K=2 training over Phase-1-safe candidate layers, with frozen gates, per-microbatch trimming, norm regularization, rollback protection, and a 12 GiB CUDA reserved-memory budget.
+- **Factorized gate allocation (`src/gating/gate.py`):** Selected K>=2 routes now share a masked-softmax layer allocation under a route-level budget; an overlap penalty encourages complementary token use instead of co-activation.
+- **Lean adaptive and deployment paths:** Added a unified gate+router adaptive phase option and independent paired bootstrap deployment decisions per shot. A confirmed 0-shot policy can therefore deploy without a dormant few-shot policy suppressing it.
+- **Kaggle diagnostics:** The notebook’s token-gate heatmap now profiles the actively routed `ars_raw` arm rather than a possible fallback-baseline `ars` arm.
+
+---
+
+## [1.12.0] - 2026-10-19
+
+### 🧪 Run `exp_20261019_172330_ars_phi2_kaggle`: End-to-End ARS Milestone
+- **Pipeline integrity:** The complete Phi-2/GSM8K training, routing, gate, evaluation, and deployment pipeline completed on a Kaggle T4 without a crash or divergence. The run is registered in `experiments/registry.json`; the Kaggle-produced checkpoint remains externally archived rather than being represented as a locally verified binary.
+- **Generation-safe Phase 1:** The accepted L24 route at `alpha=0.40` preserved reasoning length (`CoT=1.07`), passed the multi-candidate confirmation contract, and reduced teacher-forced train/validation NLL by approximately 8.8%/9.6%.
+- **Raw 0-shot signal:** Experimental Full ARS (Raw) reached 59.0% versus a 56.0% baseline on the 100-item benchmark (`+3.0pp`, paired bootstrap CI `[0.0, +7.0]pp`). This is recorded as experimental evidence, not a deployment claim.
+- **Deployment safety:** The independent confirmation decision correctly retained baseline deployment because the 0-shot confirmation interval crossed zero and 2-shot ARS was dormant. The prior pooled decision is documented as a diagnostic limitation addressed by Engine v3.
+- **Forensic findings:** Router deployment was degenerate (`K=0` 93.91%, `K=1` 6.09%, no `K>=2`, L11-only). A black token-gate heatmap was traced to plotting the fallback `ars` condition instead of the actively routed `ars_raw` condition. Later-phase pre-cap telemetry also exposed unbounded detached GPU diagnostic retention and post-Phase-1 norm drift.
+
+---
+
 ## [1.11.0] - 2026-10-19
 
 ### 🧪 Phase-1 Confirmation Resilience
