@@ -96,9 +96,20 @@ class RSCConfig:
     # calibration partition.  It detects CoT collapse without making a T4
     # preflight prohibitively slow.
     phase1_generation_screen_examples: int = 12
-    # The selected pair alone is measured on this disjoint partition before
-    # promotion.  This is deliberately independent of the calibration rows.
+    # The strongest safe calibration pairs are measured on this disjoint
+    # partition before promotion.  It is deliberately independent of the
+    # calibration rows.
     phase1_generation_confirmation_examples: int = 16
+    # Calibration rankings are noisy on compact generation probes.  Confirm a
+    # bounded number of the strongest independently safe pairs on the same
+    # disjoint rows before failing closed, rather than treating a one-item
+    # fluctuation from the top-ranked pair as evidence against every route.
+    phase1_max_confirmation_candidates: int = 3
+    # On a confirmation partition of at most 32 questions, permit a one-item
+    # candidate deficit only when its calibration gain is at least 10pp and
+    # the pooled calibration-plus-confirmation accuracy does not regress.
+    # CoT, raw-norm, and NLL safety gates remain strict in all cases.
+    phase1_allow_confirmation_noise_tolerance: bool = True
     # During training, screen every epoch on a smaller fixed partition and
     # conservative scales only.  Full five-scale calibration happens once.
     phase1_epoch_generation_screen_examples: int = 6

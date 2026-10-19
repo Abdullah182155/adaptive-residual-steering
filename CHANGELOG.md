@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.11.0] - 2026-10-19
+
+### 🧪 Phase-1 Confirmation Resilience
+- **Top-K disjoint confirmation (`src/training/trainer.py`):** Phase 1 now measures the baseline once and confirms up to the three strongest safe `(layer, alpha)` calibration pairs, promoting the first route that meets the unchanged CoT, raw-norm, NLL, and accuracy gates.
+- **Bounded compact-screen tolerance:** On confirmation sets of 32 questions or fewer, a one-question candidate deficit is accepted only with a calibration gain of at least 10pp and non-negative pooled calibration-plus-confirmation gain; all safety and NLL constraints remain mandatory.
+- **Complete confirmation telemetry:** Acceptance reports now include `confirmation_trials` with candidate metrics, pass/fail verdicts, failure reasons, pooled gain, and whether the bounded tolerance was used.
+- **Kaggle alignment and regression coverage:** The execution notebook exposes the new controls; tests cover successful fallback, one-question tolerance, and strict fail-closed rejection when every candidate regresses.
+
+---
+
 ## [1.10.0] - 2026-10-18
 
 ### 🛡️ Engine v2.3: Generation-Safe Phase 1 Selection

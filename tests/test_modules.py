@@ -210,6 +210,134 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(report["calibration_ranking"][0]["layer"], 11)
         self.assertIn("accuracy > answer_present", report["selection_reason"])
 
+    def test_phase1_confirmation_falls_back_to_next_ranked_candidate(self):
+        """A failed top confirmation route must not discard the next safe route."""
+        class ScreenOnlyModel:
+            target_layers = [11, 13]
+            _routing_override = None
+
+            def set_routing_override(self, mode=None, layers=None):
+                self._routing_override = None if mode is None else (mode, layers)
+
+            def set_gate_freeze(self, freeze, value=1.0):
+                pass
+
+        cfg = RSCConfig(
+            phase1_acceptance_examples=16,
+            phase1_generation_screen_examples=8,
+            phase1_generation_confirmation_examples=8,
+            phase1_gate_scale_grid=(0.6,),
+            phase1_max_confirmation_candidates=2,
+            continue_on_diagnostic_failure=False,
+        )
+        rows = [{"question": "q", "final_num": 1.0}] * 16
+        baseline_calibration = {"accuracy": 0.50, "answer_present": 1.0, "median_tokens": 100.0}
+        top_calibration = {"accuracy": 0.75, "answer_present": 1.0, "median_tokens": 100.0}
+        fallback_calibration = {"accuracy": 0.625, "answer_present": 1.0, "median_tokens": 100.0}
+        baseline_confirmation = {"accuracy": 0.75, "answer_present": 1.0, "median_tokens": 100.0}
+        top_confirmation = {"accuracy": 0.50, "answer_present": 1.0, "median_tokens": 100.0}
+        fallback_confirmation = {"accuracy": 0.75, "answer_present": 1.0, "median_tokens": 100.0}
+        with patch(
+            "src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8, 0.8, 0.8]
+        ), patch(
+            "src.training.trainer._phase1_zero_shot_generation_probe",
+            side_effect=[
+                baseline_calibration, top_calibration, fallback_calibration,
+                baseline_confirmation, top_confirmation, fallback_confirmation,
+            ],
+        ):
+            report = phase1_steernet_acceptance(
+                ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertEqual(report["selected_layer"], 13)
+        self.assertEqual(len(report["confirmation_trials"]), 2)
+        self.assertFalse(report["confirmation_trials"][0]["passed"])
+        self.assertTrue(report["confirmation_trials"][1]["passed"])
+
+    def test_phase1_confirmation_allows_one_question_noise_with_positive_pool(self):
+        """A one-item compact-confirmation loss may pass only with corroborating gains."""
+        class ScreenOnlyModel:
+            target_layers = [11]
+            _routing_override = None
+
+            def set_routing_override(self, mode=None, layers=None):
+                self._routing_override = None if mode is None else (mode, layers)
+
+            def set_gate_freeze(self, freeze, value=1.0):
+                pass
+
+        cfg = RSCConfig(
+            phase1_acceptance_examples=40,
+            phase1_generation_screen_examples=20,
+            phase1_generation_confirmation_examples=20,
+            phase1_gate_scale_grid=(0.6,),
+            continue_on_diagnostic_failure=False,
+        )
+        rows = [{"question": "q", "final_num": 1.0}] * 40
+        baseline_calibration = {"accuracy": 0.45, "answer_present": 1.0, "median_tokens": 100.0}
+        candidate_calibration = {"accuracy": 0.60, "answer_present": 1.0, "median_tokens": 100.0}
+        baseline_confirmation = {"accuracy": 0.65, "answer_present": 1.0, "median_tokens": 100.0}
+        candidate_confirmation = {"accuracy": 0.60, "answer_present": 1.0, "median_tokens": 100.0}
+        with patch(
+            "src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8]
+        ), patch(
+            "src.training.trainer._phase1_zero_shot_generation_probe",
+            side_effect=[baseline_calibration, candidate_calibration, baseline_confirmation, candidate_confirmation],
+        ):
+            report = phase1_steernet_acceptance(
+                ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
+            )
+
+        self.assertTrue(report["passed"])
+        self.assertTrue(report["confirmation_trials"][0]["noise_tolerance_used"])
+        self.assertAlmostEqual(report["confirmation_trials"][0]["combined_accuracy_gain"], 0.05)
+
+    def test_phase1_confirmation_fails_closed_when_every_candidate_regresses(self):
+        """Fallback does not weaken fail-closed promotion when every route fails."""
+        class ScreenOnlyModel:
+            target_layers = [11, 13]
+            _routing_override = None
+
+            def set_routing_override(self, mode=None, layers=None):
+                self._routing_override = None if mode is None else (mode, layers)
+
+            def set_gate_freeze(self, freeze, value=1.0):
+                pass
+
+        cfg = RSCConfig(
+            phase1_acceptance_examples=16,
+            phase1_generation_screen_examples=8,
+            phase1_generation_confirmation_examples=8,
+            phase1_gate_scale_grid=(0.6,),
+            phase1_max_confirmation_candidates=2,
+            continue_on_diagnostic_failure=True,
+        )
+        rows = [{"question": "q", "final_num": 1.0}] * 16
+        calibration_baseline = {"accuracy": 0.50, "answer_present": 1.0, "median_tokens": 100.0}
+        first_calibration = {"accuracy": 0.75, "answer_present": 1.0, "median_tokens": 100.0}
+        second_calibration = {"accuracy": 0.625, "answer_present": 1.0, "median_tokens": 100.0}
+        confirmation_baseline = {"accuracy": 0.75, "answer_present": 1.0, "median_tokens": 100.0}
+        regression = {"accuracy": 0.50, "answer_present": 1.0, "median_tokens": 100.0}
+        with patch(
+            "src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8, 0.8, 0.8]
+        ), patch(
+            "src.training.trainer._phase1_zero_shot_generation_probe",
+            side_effect=[
+                calibration_baseline, first_calibration, second_calibration,
+                confirmation_baseline, regression, regression,
+            ],
+        ):
+            report = phase1_steernet_acceptance(
+                ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
+            )
+
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["status"], "FAIL")
+        self.assertEqual(len(report["confirmation_trials"]), 2)
+        self.assertTrue(all("confirmation_accuracy" in trial["failure_reasons"] for trial in report["confirmation_trials"]))
+
     def test_epoch_screen_requires_matched_generation_baseline(self):
         """A CoT-safe route that loses to baseline cannot select a checkpoint."""
         class ProbeModel:

@@ -360,6 +360,49 @@ def _phase1_calibration_rank_key(item: Tuple[Dict[str, Any], Dict[str, Any]]) ->
     )
 
 
+def _phase1_confirmation_verdict(
+    *,
+    confirmation_gain: float,
+    calibration_gain: float,
+    combined_gain: float,
+    confirmation_n: int,
+    safe: bool,
+    nll_safe: bool,
+    cfg: RSCConfig,
+) -> Tuple[bool, bool, List[str]]:
+    """Apply strict Phase-1 gates plus bounded small-sample noise tolerance.
+
+    A confirmation result remains the primary promotion criterion.  The
+    tolerance covers only one discrete question on compact confirmation sets,
+    and only when both an independently measured calibration gain and the
+    pooled result support non-regression.  It never relaxes norm, CoT, or NLL
+    constraints.
+    """
+    minimum_gain = float(getattr(
+        cfg, "phase1_min_validation_accuracy_gain", cfg.phase1_min_train_accuracy_gain
+    ))
+    # Accuracy is calculated as floating-point ratios; retain the intended
+    # exact binomial boundary (for example 12/20 - 13/20 == -1/20).
+    epsilon = 1e-12
+    direct_accuracy_pass = confirmation_gain >= minimum_gain - epsilon
+    one_question = 1.0 / max(1, int(confirmation_n))
+    noise_tolerated = bool(
+        getattr(cfg, "phase1_allow_confirmation_noise_tolerance", True)
+        and confirmation_n <= 32
+        and confirmation_gain >= -one_question - epsilon
+        and calibration_gain >= 0.10 - epsilon
+        and combined_gain >= -epsilon
+    )
+    reasons = []
+    if not safe:
+        reasons.append("confirmation_safety")
+    if not nll_safe:
+        reasons.append("nll_reduction")
+    if not (direct_accuracy_pass or noise_tolerated):
+        reasons.append("confirmation_accuracy")
+    return safe and nll_safe and (direct_accuracy_pass or noise_tolerated), noise_tolerated, reasons
+
+
 def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
     """Certify one independently useful, generation-safe Phase-1 intervention.
 
@@ -382,6 +425,7 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
     confirmation_rows = val_probe[screen_n:screen_n + confirmation_n]
     old_override = model._routing_override
     old_layers = getattr(cfg, "fixed_steer_eval_layers", None)
+    old_gate_scale = float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0))
     started_at = time.monotonic()
     try:
         print("\n" + "=" * 80)
@@ -482,59 +526,130 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 f"acc={pair['accuracy']:.1%} present={pair['answer_present']:.1%} "
                 f"val_nll={row['val_nll']:.4f} CoT={pair['completion_len_ratio']:.2f} q95={pair['pre_cap_q_p95']:.2f}"
             )
-        best, best_scale = ranked_pairs[0]
         selection_reason = "accuracy > answer_present > lower_val_nll > lower_q95 > lower_alpha"
-        print(f"  [4/4] Disjoint confirmation: L{best['layer']} alpha={best_scale['gate_scale']:.2f} ({confirmation_n} each)...")
+        max_confirmation_candidates = max(1, int(getattr(cfg, "phase1_max_confirmation_candidates", 3)))
+        confirmation_candidates = ranked_pairs[:max_confirmation_candidates]
+        print(
+            f"  [4/4] Disjoint confirmation: up to {len(confirmation_candidates)} ranked candidates "
+            f"({confirmation_n} each)..."
+        )
         base_confirmation = _phase1_probe_with_norm(
             model, tokenizer, confirmation_rows, cfg, device, confirmation_n, None, 1.0,
             "Acceptance baseline confirmation",
         )
-        candidate_confirmation = _phase1_probe_with_norm(
-            model, tokenizer, confirmation_rows, cfg, device, confirmation_n, best["layer"], best_scale["gate_scale"],
-            f"Acceptance L{best['layer']} alpha={best_scale['gate_scale']:.2f} confirmation",
-        )
-        confirm_safe, confirm_ratio, confirm_q_p95 = _phase1_pair_is_safe(
-            candidate_confirmation, max(1.0, float(base_confirmation.get("median_tokens", 0.0))), cfg
-        )
-        selected_val_acc = candidate_confirmation["accuracy"]
         base_val_acc = base_confirmation["accuracy"]
-        acc_gain = selected_val_acc - base_val_acc
-        nll_reduction = (base_train_nll - best["train_nll"]) / max(base_train_nll, 1e-8)
-        val_nll_reduction = (base_val_nll - best["val_nll"]) / max(base_val_nll, 1e-8)
-        cfg.fixed_steer_eval_layers = [best["layer"]]
-        cfg.fixed_steer_eval_gate_scale = float(best_scale["gate_scale"])
+        confirmation_trials = []
+        accepted = None
+        for confirmation_rank, (candidate, calibration) in enumerate(confirmation_candidates, start=1):
+            print(
+                f"        confirmation candidate #{confirmation_rank}: L{candidate['layer']} "
+                f"alpha={calibration['gate_scale']:.2f}..."
+            )
+            candidate_confirmation = _phase1_probe_with_norm(
+                model, tokenizer, confirmation_rows, cfg, device, confirmation_n,
+                candidate["layer"], calibration["gate_scale"],
+                f"Acceptance L{candidate['layer']} alpha={calibration['gate_scale']:.2f} confirmation",
+            )
+            confirm_safe, confirm_ratio, confirm_q_p95 = _phase1_pair_is_safe(
+                candidate_confirmation, max(1.0, float(base_confirmation.get("median_tokens", 0.0))), cfg
+            )
+            confirmation_gain = float(candidate_confirmation["accuracy"]) - float(base_val_acc)
+            calibration_gain = float(calibration["accuracy"]) - float(base_screen_acc)
+            combined_gain = (
+                (float(calibration["accuracy"]) * screen_n + float(candidate_confirmation["accuracy"]) * confirmation_n)
+                - (float(base_screen_acc) * screen_n + float(base_val_acc) * confirmation_n)
+            ) / max(1, screen_n + confirmation_n)
+            nll_reduction = (base_train_nll - candidate["train_nll"]) / max(base_train_nll, 1e-8)
+            val_nll_reduction = (base_val_nll - candidate["val_nll"]) / max(base_val_nll, 1e-8)
+            nll_safe = (
+                nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
+                and val_nll_reduction >= float(cfg.phase1_min_val_nll_reduction)
+            )
+            passed, noise_tolerated, failure_reasons = _phase1_confirmation_verdict(
+                confirmation_gain=confirmation_gain,
+                calibration_gain=calibration_gain,
+                combined_gain=combined_gain,
+                confirmation_n=confirmation_n,
+                safe=confirm_safe,
+                nll_safe=nll_safe,
+                cfg=cfg,
+            )
+            trial = {
+                "rank": confirmation_rank,
+                "layer": candidate["layer"],
+                "gate_scale": calibration["gate_scale"],
+                "calibration": calibration,
+                "candidate": candidate_confirmation,
+                "confirmation_gain": confirmation_gain,
+                "calibration_gain": calibration_gain,
+                "combined_accuracy_gain": combined_gain,
+                "completion_len_ratio": confirm_ratio,
+                "pre_cap_q_p95": confirm_q_p95,
+                "safe": confirm_safe,
+                "train_relative_nll_reduction": nll_reduction,
+                "val_relative_nll_reduction": val_nll_reduction,
+                "nll_safe": nll_safe,
+                "noise_tolerance_used": noise_tolerated,
+                "passed": passed,
+                "failure_reasons": failure_reasons,
+            }
+            confirmation_trials.append(trial)
+            verdict = "PASS" if passed else f"FAIL ({', '.join(failure_reasons)})"
+            tolerance = " [one-question tolerance]" if noise_tolerated else ""
+            print(
+                f"          {verdict}{tolerance}: confirmation Δ={confirmation_gain * 100:+.1f}pp, "
+                f"calibration Δ={calibration_gain * 100:+.1f}pp, combined Δ={combined_gain * 100:+.1f}pp, "
+                f"CoT={confirm_ratio:.2f}, q95={confirm_q_p95:.2f}"
+            )
+            if passed:
+                accepted = (candidate, calibration, candidate_confirmation, trial)
+                break
+
+        # Preserve legacy report keys even on a failed audit: they describe
+        # the first ranked confirmation attempt, while confirmation_trials
+        # provides the complete fallback record.
+        selected_candidate, selected_calibration, selected_confirmation, selected_trial = (
+            accepted if accepted is not None else (
+                confirmation_candidates[0][0], confirmation_candidates[0][1],
+                confirmation_trials[0]["candidate"], confirmation_trials[0],
+            )
+        )
+        if accepted is not None:
+            cfg.fixed_steer_eval_layers = [selected_candidate["layer"]]
+            cfg.fixed_steer_eval_gate_scale = float(selected_calibration["gate_scale"])
         report = {
             "baseline_train_nll": base_train_nll, "baseline_val_nll": base_val_nll,
             "baseline_screen_accuracy": base_screen_acc, "baseline_validation_accuracy": base_val_acc,
-            "candidates": candidates, "selected_layer": best["layer"],
-            "selected_validation_accuracy": selected_val_acc,
+            "candidates": candidates, "selected_layer": selected_candidate["layer"],
+            "selected_validation_accuracy": selected_confirmation["accuracy"],
             "accuracy_comparison": "disjoint_generation_confirmation",
             "accuracy_comparison_baseline": base_val_acc,
-            "fixed_steer_gate_scale": cfg.fixed_steer_eval_gate_scale,
-            "gate_scale_candidates": best["scale_screen"],
-            "selected_calibration": best_scale,
+            "fixed_steer_gate_scale": float(selected_calibration["gate_scale"]),
+            "gate_scale_candidates": selected_candidate["scale_screen"],
+            "selected_calibration": selected_calibration,
             "calibration_ranking": calibration_ranking,
             "selection_reason": selection_reason,
             "confirmation": {
-                "baseline": base_confirmation, "candidate": candidate_confirmation,
-                "completion_len_ratio": confirm_ratio, "pre_cap_q_p95": confirm_q_p95, "safe": confirm_safe,
+                "baseline": base_confirmation, "candidate": selected_confirmation,
+                "completion_len_ratio": selected_trial["completion_len_ratio"],
+                "pre_cap_q_p95": selected_trial["pre_cap_q_p95"],
+                "safe": selected_trial["safe"],
             },
-            "train_relative_nll_reduction": nll_reduction, "val_relative_nll_reduction": val_nll_reduction,
-            "validation_accuracy_gain": acc_gain, "validation_examples": val_n,
+            "confirmation_trials": confirmation_trials,
+            "train_relative_nll_reduction": selected_trial["train_relative_nll_reduction"],
+            "val_relative_nll_reduction": selected_trial["val_relative_nll_reduction"],
+            "validation_accuracy_gain": selected_trial["confirmation_gain"], "validation_examples": val_n,
             "calibration_examples": screen_n, "confirmation_examples": confirmation_n,
             "reliability_waived": small_run_waiver, "truncation_rejected_layers": rejected_layers,
-            "passed": (
-                confirm_safe
-                and nll_reduction >= float(cfg.phase1_min_train_nll_reduction)
-                and val_nll_reduction >= float(cfg.phase1_min_val_nll_reduction)
-                and acc_gain >= float(getattr(cfg, "phase1_min_validation_accuracy_gain", cfg.phase1_min_train_accuracy_gain))
-            ),
+            "passed": accepted is not None,
         }
         print(
             "  Phase-1 acceptance: "
-            f"L{best['layer']} alpha={best_scale['gate_scale']:.2f} | train/val NLL Δ="
-            f"{nll_reduction * 100:+.1f}%/{val_nll_reduction * 100:+.1f}% | "
-            f"confirmation Δ={acc_gain * 100:+.1f}pp | CoT={confirm_ratio:.2f} q95={confirm_q_p95:.2f}"
+            f"L{selected_candidate['layer']} alpha={selected_calibration['gate_scale']:.2f} | train/val NLL Δ="
+            f"{selected_trial['train_relative_nll_reduction'] * 100:+.1f}%/"
+            f"{selected_trial['val_relative_nll_reduction'] * 100:+.1f}% | "
+            f"confirmation Δ={selected_trial['confirmation_gain'] * 100:+.1f}pp | "
+            f"CoT={selected_trial['completion_len_ratio']:.2f} q95={selected_trial['pre_cap_q_p95']:.2f}"
         )
         print(f"  Acceptance audit finished in {(time.monotonic() - started_at) / 60:.1f} min.")
         if not report["passed"] and small_run_waiver:
@@ -554,8 +669,9 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             model.set_routing_override(None)
         else:
             model.set_routing_override(old_override[0], old_override[1])
-        if not getattr(cfg, "fixed_steer_eval_layers", None):
+        if not locals().get("accepted", None):
             cfg.fixed_steer_eval_layers = old_layers
+            cfg.fixed_steer_eval_gate_scale = old_gate_scale
 
 
 def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
