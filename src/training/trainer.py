@@ -1212,19 +1212,48 @@ def train_phase1b_coadaptation(
     if epochs <= 0:
         return {"status": "SKIPPED", "candidate_layers": [], "steps": 0}
     ranking = acceptance_report.get("calibration_ranking", [])
+    # A layer that reached disjoint confirmation but violated safety or failed
+    # the complete confirmation verdict must never re-enter through its earlier
+    # calibration result.  Calibration selects candidates; confirmation is the
+    # final safety contract for any candidate it evaluates.
+    failed_confirmation_layers = {
+        int(layer)
+        for trial in acceptance_report.get("confirmation_trials", [])
+        for layer in [trial.get("layer")]
+        if layer is not None and (
+            not trial.get("safe", True) or not trial.get("passed", True)
+        )
+    }
+    if failed_confirmation_layers:
+        print(
+            "  [Phase 1B] Excluding confirmation-failed layers: "
+            f"{sorted(failed_confirmation_layers)}"
+        )
     layers = []
     for row in ranking:
         layer = int(row.get("layer", -1))
         # calibration_ranking entries are strictly filtered from eligible safe pairs
-        is_safe = row.get("safe", True)
-        if is_safe and layer in model.target_layers and layer not in layers:
+        # Do not trust a legacy ranking that does not explicitly attest safety;
+        # its candidate-scale fallback below remains available for recovery.
+        is_safe = row.get("safe", False)
+        if (
+            is_safe
+            and layer not in failed_confirmation_layers
+            and layer in model.target_layers
+            and layer not in layers
+        ):
             layers.append(layer)
         if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
             break
     if len(layers) < 2:
         for candidate in acceptance_report.get("candidates", []):
             layer = int(candidate.get("layer", -1))
-            if any(p.get("safe", False) for p in candidate.get("scale_screen", [])) and layer in model.target_layers and layer not in layers:
+            if (
+                layer not in failed_confirmation_layers
+                and any(p.get("safe", False) for p in candidate.get("scale_screen", []))
+                and layer in model.target_layers
+                and layer not in layers
+            ):
                 layers.append(layer)
             if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
                 break
@@ -1990,7 +2019,13 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     phase1_report_path = getattr(cfg, "phase1_report_save_path", os.path.join(cfg.checkpoint_dir, "phase1_report.json"))
     loaded_existing_phase1 = False
 
-    if resume_phase1 and os.path.exists(cfg.lora_save_path):
+    if resume_phase1 and not os.path.exists(cfg.lora_save_path):
+        raise FileNotFoundError(
+            "CFG.resume_phase1 is True but checkpoint was not found at "
+            f"{cfg.lora_save_path}. Refusing silent full retraining."
+        )
+
+    if resume_phase1:
         print(f"\n  [Phase 1 Resume] Loading existing Phase 1 SteerNet weights from {cfg.lora_save_path}...")
         load_ars_checkpoint_strict(model, cfg.lora_save_path, device=device)
         best_val_p1 = 0.0
@@ -2008,6 +2043,13 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
             logs["phase1_acceptance"] = phase1_steernet_acceptance(
                 model, tokenizer, steer_data, eval_sel, cfg, device
             )
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(phase1_report_path)), exist_ok=True)
+                with open(phase1_report_path, "w", encoding="utf-8") as f:
+                    json.dump(logs["phase1_acceptance"], f, indent=2, default=str)
+                print(f"  [Phase 1 Resume] Cached re-evaluated acceptance report at {phase1_report_path}.")
+            except Exception as e:
+                print(f"  ⚠️ Could not cache re-evaluated Phase 1 acceptance report: {e}")
             loaded_existing_phase1 = True
         logs.update(p1_logs)
 

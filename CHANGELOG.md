@@ -10,11 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.13.1] - 2026-10-20
 
 ### 🐛 Fixed
-- **Phase 1B candidate handoff (src/training/trainer.py):** Fixed schema mismatch where calibration_ranking dictionaries omitted the 'safe' flag, causing 	rain_phase1b_coadaptation to evaluate 
-ow.get('safe', False) as False for all rows and crash with RuntimeError: Phase 1B requires at least two independently safe candidate layers. Added explicit 'safe' retention in calibration_ranking, safe default by construction, and fallback to candidate scale screens.
-- **Phase-1 resume resilience (src/training/trainer.py, src/configs/config.py):** Added 
-esume_phase1 flag and automated caching of phase1_report.json to enable resuming training directly at Phase 1B from existing Phase-1 SteerNet checkpoints.
-- **Regression tests (	ests/test_modules.py):** Added test coverage ensuring Phase 1B correctly ingests multi-layer calibration rankings and candidate fallbacks.
+- **Phase 1B candidate handoff (src/training/trainer.py):** Fixed schema mismatch where calibration_ranking dictionaries omitted the `safe` flag, causing `train_phase1b_coadaptation` to evaluate `row.get('safe', False)` as false for all rows and crash with `RuntimeError: Phase 1B requires at least two independently safe candidate layers`. Added explicit `safe` retention in calibration_ranking, safe candidate-scale fallback, and strict exclusion of any layer that failed disjoint confirmation.
+- **Phase-1 resume resilience (src/training/trainer.py, src/configs/config.py):** Added `resume_phase1` flag and automated caching of `phase1_report.json` to enable resuming training directly at Phase 1B from existing Phase-1 SteerNet checkpoints. Resume now refuses silent full retraining if its checkpoint is absent and re-caches a report produced by fallback re-evaluation.
+- **Regression tests (tests/test_modules.py):** Added test coverage ensuring Phase 1B correctly ingests multi-layer calibration rankings and candidate fallbacks.
 
 ---
 
