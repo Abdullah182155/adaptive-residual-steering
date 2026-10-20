@@ -359,11 +359,15 @@ class Phi2WithRSC(nn.Module):
         )
 
     def mask_routing_logits(self, logits: torch.Tensor) -> torch.Tensor:
-        """Mask ineligible layer logits for learned routing and RLOO probes."""
+        """Mask ineligible logits with a finite sentinel for stable policy math."""
         eligible = self.routing_eligibility_mask(logits.device)
         if not eligible.any():
             raise RuntimeError("learned routing has no eligible Phase-1B layers")
-        return logits.masked_fill(~eligible.unsqueeze(0), float("-inf"))
+        # ``-inf`` reaches log-softmax/entropy/preference terms and can turn
+        # an otherwise zero-probability product into NaN.  The legal action
+        # space is bounded separately by K_max, so a finite sentinel is both
+        # semantically equivalent for routing and numerically safe.
+        return logits.masked_fill(~eligible.unsqueeze(0), -1.0e4)
 
     def mask_routing_k_logits(self, k_logits: torch.Tensor) -> torch.Tensor:
         """Disallow K values that cannot be realised by the eligible pool."""
@@ -374,7 +378,7 @@ class Phi2WithRSC(nn.Module):
             legal = torch.arange(k_logits.shape[-1], device=k_logits.device) <= max_k
         else:
             legal = torch.arange(1, k_logits.shape[-1] + 1, device=k_logits.device) <= max_k
-        return k_logits.masked_fill(~legal.unsqueeze(0), float("-inf"))
+        return k_logits.masked_fill(~legal.unsqueeze(0), -1.0e4)
 
     def set_routing_override(self, mode=None, layers=None):
         if mode is None:
@@ -643,6 +647,8 @@ class Phi2WithRSC(nn.Module):
         self.router.seen_forwards.zero_()
         self.routing_k_hist.zero_()
         self.routing_forwards.zero_()
+        self._prompt_level_selected_count = [0] * len(self.target_layers)
+        self._prompt_level_total = 0
         self._steering_telemetry = {}
         for gate in self.gates.values():
             gate.reset_diagnostics()
@@ -668,7 +674,7 @@ class Phi2WithRSC(nn.Module):
         return {k: int(count.item()) / total for k, count in enumerate(self.routing_k_hist)}
 
     def intervention_diagnostics(self):
-        """Summarize realized K, layer usage, and token-gate diversity."""
+        """Summarize batch-union K/layer usage and token-gate diversity."""
         k_dist = self.routing_k_distribution()
         all_layer_rates = [row["selection_rate_ema"] for row in self.routing_diagnostics().values()]
         eligible = self.routing_eligibility_mask(self.device).tolist()
@@ -682,6 +688,29 @@ class Phi2WithRSC(nn.Module):
             entropy = -sum(p * float(torch.log(torch.tensor(p)).item()) for p in probs)
             return entropy / float(torch.log(torch.tensor(float(support))).item())
         gate_metrics = {int(layer): gate.get_saturation_metrics() for layer, gate in self.gates.items()}
+        routing = self.routing_diagnostics()
+        active_union = [
+            layer for layer, allowed in zip(self.target_layers, eligible)
+            if allowed and routing[int(layer)]["selected_forwards"] > 0
+        ]
+        ordered = list(self.target_layers)
+        def depth_band(layer: int) -> str:
+            # Match the Phase-1B physical-depth contract.  A safe pool can
+            # omit neighbours, but L15 must remain a middle layer rather than
+            # becoming "late" merely because L13 was excluded.
+            if ordered and min(ordered) <= 13 and max(ordered) >= 20:
+                if layer <= 13:
+                    return "early"
+                if layer <= 18:
+                    return "middle"
+                return "late"
+            position = ordered.index(layer)
+            if position < max(1, len(ordered) // 3):
+                return "early"
+            if position < max(2, (2 * len(ordered)) // 3):
+                return "middle"
+            return "late"
+        active_bands = sorted({depth_band(layer) for layer in active_union})
         return {
             "realized_k_distribution": k_dist,
             "realized_k_support": sum(p > 0.0 for p in k_dist.values()),
@@ -689,8 +718,11 @@ class Phi2WithRSC(nn.Module):
             "eligible_routing_layers": [
                 layer for layer, allowed in zip(self.target_layers, eligible) if allowed
             ],
+            "active_layer_union": active_union,
+            "active_depth_bands": active_bands,
+            "active_depth_band_count": len(active_bands),
             "layer_selection_entropy": round(normalized_entropy(layer_probs, len(layer_rates)), 4),
-            "active_layer_count": sum(rate > 0.02 for rate in layer_rates),
+            "active_layer_count": len(active_union),
             "gate": gate_metrics,
             "steering": self.steering_diagnostics(),
         }
@@ -770,7 +802,13 @@ class Phi2WithRSC(nn.Module):
         return self.router.get_layer_synergy_matrix()
 
     def get_cooperation_analysis(self) -> dict:
-        return self.router.get_cooperation_analysis()
+        """Report cooperation only among the currently legal router pool."""
+        eligible = [
+            layer for layer, allowed in zip(
+                self.target_layers, self.routing_eligibility_mask(self.device).tolist(),
+            ) if allowed
+        ]
+        return self.router.get_cooperation_analysis(eligible_layers=eligible)
 
     def remove_hooks(self):
         for h in self._hooks:

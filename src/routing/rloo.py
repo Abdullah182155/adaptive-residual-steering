@@ -218,6 +218,10 @@ def counterfactual_k_preference_loss(
     steered rewards already include their proportional route tariff, so no
     additional baseline margin or aggregate-logit hinge is applied here.
     """
+    if not torch.isfinite(k_logits).all():
+        raise FloatingPointError("non-finite K logits in counterfactual preference loss")
+    if not torch.isfinite(reward_0).all() or not torch.isfinite(action_rewards).all():
+        raise FloatingPointError("non-finite counterfactual reward in K preference loss")
     B, n_actions = k_logits.shape
     rewards_sum = torch.zeros(B, n_actions, device=k_logits.device, dtype=k_logits.dtype)
     counts = torch.zeros_like(rewards_sum)
@@ -230,12 +234,39 @@ def counterfactual_k_preference_loss(
     mean_reward = rewards_sum / counts.clamp_min(1)
     target_scores = (mean_reward / max(float(temperature), 1e-4)).masked_fill(~observed, float("-inf"))
     target = F.softmax(target_scores, dim=-1)
+    if not torch.isfinite(target).all():
+        raise FloatingPointError("non-finite K preference target")
     # Legal-action masking may put ``-inf`` in an unavailable K logit.  A
     # zero target probability multiplied by that value is mathematically zero
     # but numerically NaN, so form only the observed cross-entropy terms.
     log_probs = F.log_softmax(k_logits, dim=-1)
+    if not torch.isfinite(log_probs).all():
+        raise FloatingPointError("non-finite K preference log probabilities")
     terms = torch.where(target > 0, target * log_probs, torch.zeros_like(log_probs))
     return -terms.sum(dim=-1).mean()
+
+
+def capped_route_tariff(
+    per_layer_cost: torch.Tensor,
+    k_actions: torch.Tensor,
+    raw_delta: torch.Tensor,
+    tariff_scale: float,
+    max_positive_gain_fraction: float,
+) -> torch.Tensor:
+    """Price route size without reversing a measured positive utility.
+
+    The first bootstrap epoch linearly ramps ``tariff_scale`` from zero.  For
+    a route that already improves on K=0, its total tariff is bounded by a
+    configured fraction of that measured improvement.  This keeps compute
+    pressure proportional while preventing a fixed K tariff from making a
+    genuinely useful K=2 route look worse than the baseline.
+    """
+    if not torch.isfinite(per_layer_cost).all() or not torch.isfinite(raw_delta).all():
+        raise FloatingPointError("non-finite route tariff inputs")
+    scale = max(0.0, min(1.0, float(tariff_scale)))
+    fraction = max(0.0, min(1.0, float(max_positive_gain_fraction)))
+    base_tariff = per_layer_cost.unsqueeze(1) * k_actions.to(per_layer_cost.dtype) * scale
+    return torch.minimum(base_tariff, raw_delta.clamp_min(0.0) * fraction)
 
 def compute_router_rloo_loss(
     model,
@@ -246,6 +277,7 @@ def compute_router_rloo_loss(
     prompt_mask: torch.Tensor = None,
     shield_mask: torch.Tensor = None,
     calc_mask: Optional[torch.Tensor] = None,
+    tariff_scale: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """RLOO subset selection loss for training cooperative router policy with leave-one-out advantage."""
     if prompt_mask is None:
@@ -297,6 +329,12 @@ def compute_router_rloo_loss(
         k_logits_policy = k_logits_fresh
         eligible_count = u_fresh.shape[-1]
     synergy = getattr(model.router, "_last_synergy_matrix", None)
+    # Do this before Plackett--Luce sampling: a NaN synergy bonus otherwise
+    # poisons categorical logits before the later pairwise diagnostic can
+    # observe it.  Bootstrap treats this as an explicit invalid-numerics
+    # event and returns to the certified fixed-SteerNet fallback.
+    if synergy is not None and not torch.isfinite(synergy).all():
+        raise FloatingPointError("non-finite router synergy matrix before subset sampling")
     K_max = min(model.cfg.max_active_layers, eligible_count)
     if K_max < 1:
         raise RuntimeError("RLOO requires at least one eligible routing layer")
@@ -393,18 +431,21 @@ def compute_router_rloo_loss(
             module.train(was_training)
 
     reward_0 = reward_0.detach()
-    # A fixed K tariff is scale-blind: with answer NLL around one nat, the
-    # former 0.025 cost was too small to ever offset a teacher-forced gain and
-    # made K=4 the default policy.  Price each extra residual against the
-    # unsteered difficulty of the *same* example.  K=0 is therefore a real
-    # competing action whenever the marginal likelihood gain is insufficient.
+    # Price compute without reversing a measured positive utility.  The
+    # tariff is linearly warmed by the bootstrap caller and capped to a
+    # fraction of a route's raw gain over K=0.
     absolute_cost = float(getattr(cfg, "lambda_cost", 0.005))
     relative_cost = float(getattr(cfg, "router_relative_k_cost", 0.0))
     per_layer_cost = torch.maximum(
         torch.full_like(nll_0, absolute_cost),
         nll_0.detach() * relative_cost,
     )
-    action_rewards = (arm_rewards - per_layer_cost.unsqueeze(1) * k_actions.float()).detach()
+    raw_delta = arm_rewards - reward_0.unsqueeze(1)
+    max_fraction = float(getattr(cfg, "router_tariff_max_positive_gain_fraction", 0.50))
+    tariff = capped_route_tariff(
+        per_layer_cost, k_actions, raw_delta, tariff_scale, max_fraction,
+    )
+    action_rewards = (arm_rewards - tariff).detach()
 
     # Anchor-grounded leave-one-out advantage for each sampled subset.  K
     # itself is evaluated exhaustively and receives direct action-value
@@ -426,6 +467,8 @@ def compute_router_rloo_loss(
     mean_pair_interaction = torch.zeros((), device=ids.device)
     pair_utility = {}
     if synergy is not None:
+        if not torch.isfinite(synergy).all():
+            raise FloatingPointError("non-finite router synergy matrix")
         # K=2 is the first non-trivial pair route and therefore measures a
         # clean second-order interaction instead of an arbitrary pair inside
         # a much larger selected set.
@@ -455,11 +498,16 @@ def compute_router_rloo_loss(
                 row = pair_utility.setdefault(key, {"observations": 0, "raw_reward_sum": 0.0, "net_reward_sum": 0.0, "interaction_sum": 0.0})
                 row["observations"] += 1
                 row["raw_reward_sum"] += float(rew_pair[b].item())
-                row["net_reward_sum"] += float((rew_pair[b] - 2.0 * per_layer_cost[b]).item())
+                row["net_reward_sum"] += float((rew_pair[b] - tariff[b, 1]).item())
                 row["interaction_sum"] += float(interaction[b].item())
             pair_syn = synergy[torch.arange(ids.shape[0], device=ids.device), first, second]
             target_scale = max(float(getattr(cfg, "router_synergy_target_scale", 0.10)), 1e-4)
             interaction_target = torch.tanh(interaction / target_scale)
+            if not (
+                torch.isfinite(pair_syn[valid_pair]).all()
+                and torch.isfinite(interaction_target[valid_pair]).all()
+            ):
+                raise FloatingPointError("non-finite pairwise synergy interaction")
             pairwise_interaction_loss = F.smooth_l1_loss(
                 pair_syn[valid_pair], interaction_target[valid_pair], beta=0.25,
             )
@@ -538,7 +586,8 @@ def compute_router_rloo_loss(
             "raw_reward": float(arm_rewards[:, arm].mean().item()),
             "cost_adjusted_reward": float(action_rewards[:, arm].mean().item()),
             "nll": float(arm_nll[:, arm].mean().item()),
-            "cost": float((per_layer_cost * float(k_value)).mean().item()),
+            "cost": float(tariff[:, arm].mean().item()),
+            "raw_delta_vs_k0": float(raw_delta[:, arm].mean().item()),
         }
         selected = subset_masks[arm]
         for pos, layer in enumerate(model.target_layers):
@@ -566,6 +615,8 @@ def compute_router_rloo_loss(
         "synergy_prior_loss": float(synergy_prior_loss.detach().item()),
         "k0_probability": float(F.softmax(k_logits_policy.detach(), dim=-1)[:, 0].mean().item()),
         "mean_per_layer_cost": float(per_layer_cost.mean().item()),
+        "tariff_scale": float(tariff_scale),
+        "mean_tariff": float(tariff.mean().item()),
         "argmax_k_distribution": {
             int(k): float((k_logits_policy.detach().argmax(dim=-1) == k).float().mean().item())
             for k in range(k_logits_policy.shape[-1])

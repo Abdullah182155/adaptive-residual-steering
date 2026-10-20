@@ -48,10 +48,12 @@ class RSCConfig:
     steer_norm_q_hi: float = 0.50           # Keep Phase-1 residuals in the linear operating regime
     steer_norm_huber_delta: float = 0.10    # Transition delta for smooth Huber norm penalty
     phase1_max_eval_p95_norm_ratio: float = 1.0  # Legacy telemetry threshold
-    # Raw q is measured before the gate.  Permit modest empirical tail
-    # variation when the selected gate still keeps the realized displacement
-    # comfortably bounded, while rejecting genuinely runaway pre-cap norms.
-    phase1_max_generation_p95_norm_ratio: float = 1.25
+    # Raw q is measured before the gate.  It remains a runaway guard, while
+    # the effective (gate-scaled) q below is the actual displacement safety
+    # contract.  This permits early/middle layers to use a conservative alpha
+    # instead of excluding them solely for harmless pre-gate tail variation.
+    phase1_max_generation_p95_norm_ratio: float = 1.50
+    phase1_max_effective_generation_p95_norm_ratio: float = 1.00
     # Teacher forcing can reduce the loss of boilerplate reasoning tokens
     # while making the generated final answer worse.
     answer_tail_tokens: int = 8
@@ -132,7 +134,9 @@ class RSCConfig:
     # Select residual intensity on validation free generation after selecting
     # a candidate layer.  This is a bounded calibration of the model's own
     # learned direction, not a test-set threshold or a hidden override.
-    phase1_gate_scale_grid: Tuple[float, ...] = (0.2, 0.4, 0.6, 0.8, 1.0)
+    # Fine lower scales are essential for early and middle residuals; late
+    # layers may still use larger calibrated interventions when safe.
+    phase1_gate_scale_grid: Tuple[float, ...] = (0.25, 0.35, 0.50, 0.70)
     phase1_min_train_nll_reduction: float = 0.05
     phase1_min_val_nll_reduction: float = 0.05
     # Do not promote an adapter merely because it does not regress on a tiny
@@ -246,6 +250,9 @@ class RSCConfig:
     router_min_eval_k_ge2_rate: float = 0.02
     router_min_eval_k_entropy: float = 0.20
     router_min_eval_active_layers: int = 2
+    # Distinct depth bands in the *union across the deterministic preflight
+    # batch*, not a requirement that every prompt selects every band.
+    router_min_eval_active_depth_bands: int = 2
     router_min_eval_layer_entropy: float = 0.25
     gate_min_eval_sequence_std: float = 0.015
     gate_max_eval_high_saturation_pct: float = 35.0
@@ -265,6 +272,11 @@ class RSCConfig:
     # Cost > entropy bonus => K=1 is always the mathematically optimal greedy choice.
     # With 0.03: cost = 0.033 nat, entropy bonus = 0.10*1.609 = 0.161 nat => router CAN explore.
     router_relative_k_cost: float = 0.03
+    # Bootstrap starts with an unbiased utility estimate and linearly ramps
+    # this tariff across epoch one.  Cap the tariff to a fraction of observed
+    # positive gain so pricing cannot reverse a route that beats K=0.
+    router_tariff_warmup_epochs: int = 1
+    router_tariff_max_positive_gain_fraction: float = 0.50
     # RC-2 fix: beta_entropy_k 0.03->0.10, beta_entropy_subset 0.02->0.05
     # The entropy bonus must be large enough to overcome k_cost under genuine reward noise.
     beta_entropy_k: float = 0.10
@@ -331,6 +343,9 @@ class RSCConfig:
     # unified adaptive stage then replaces the former 2B->2C->2D sequence.
     phase1b_coadapt_epochs: int = 1
     phase1b_candidate_layers: int = 4
+    # Require a scientifically meaningful co-adaptation pool before routing.
+    phase1b_min_candidate_layers: int = 3
+    phase1b_min_depth_bands: int = 3
     phase1b_lr: float = 5e-5
     phase1b_joint_nll_weight: float = 1.0
     unified_adaptive_phase: bool = True

@@ -18,6 +18,7 @@ from src.routing.rloo import (
     policy_entropy_bonus,
     mutual_information_diversity_loss,
     counterfactual_k_preference_loss,
+    capped_route_tariff,
     per_example_answer_nll,
 )
 from src.training import (
@@ -364,17 +365,17 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(len(result["safe_pairs"]), 1)
         self.assertTrue(model._router_warmup)
 
-    def test_phase1_pair_allows_bounded_q95_tail_and_rejects_runaway(self):
-        """The 1.25 raw-q ceiling allows bounded tails but blocks saturation."""
+    def test_phase1_pair_uses_effective_envelope_and_rejects_runaway(self):
+        """Low-alpha early routes may pass, but raw runaway residuals cannot."""
         cfg = RSCConfig()
         safe, ratio, q95 = _phase1_pair_is_safe(
-            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.16}}, 100.0, cfg
+            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.16}}, 100.0, cfg, gate_scale=0.70,
         )
         self.assertTrue(safe)
         self.assertEqual(ratio, 1.0)
         self.assertEqual(q95, 1.16)
         runaway, _, _ = _phase1_pair_is_safe(
-            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.26}}, 100.0, cfg
+            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.51}}, 100.0, cfg, gate_scale=0.25,
         )
         self.assertFalse(runaway)
 
@@ -1679,16 +1680,147 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
         wrapper.set_eligible_routing_layers(eligible)
         raw = torch.zeros(1, len(wrapper.target_layers))
         masked = wrapper.mask_routing_logits(raw)
-        self.assertTrue(torch.isneginf(masked[0, :-2]).all())
+        self.assertTrue((masked[0, :-2] < -1e3).all())
         self.assertTrue(torch.isfinite(masked[0, -2:]).all())
         k_logits = torch.zeros(1, wrapper.cfg.max_active_layers + 1)
         masked_k = wrapper.mask_routing_k_logits(k_logits)
-        self.assertTrue(torch.isneginf(masked_k[0, 3:]).all())
+        self.assertTrue((masked_k[0, 3:] < -1e3).all())
 
         # Explicit measurements retain full catalog access by design.
         rejected_layer = wrapper.target_layers[0]
         wrapper.set_routing_override("only", [rejected_layer])
         self.assertEqual(wrapper._routing_override[1], {rejected_layer})
+
+    def test_v31_low_scale_grid_covers_early_layer_calibration(self):
+        """The default grid must expose conservative early/middle amplitudes."""
+        grid = RSCConfig().phase1_gate_scale_grid
+        self.assertEqual(grid, (0.25, 0.35, 0.50, 0.70))
+
+    def test_v31_effective_norm_contract_accepts_safe_low_scale(self):
+        """Raw tails are acceptable only when alpha-scaled displacement is safe."""
+        cfg = RSCConfig(
+            phase1_max_generation_p95_norm_ratio=1.50,
+            phase1_max_effective_generation_p95_norm_ratio=1.00,
+        )
+        result = {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.40}}
+        self.assertTrue(_phase1_pair_is_safe(result, 100.0, cfg, gate_scale=0.70)[0])
+        self.assertFalse(_phase1_pair_is_safe(result, 100.0, cfg, gate_scale=0.80)[0])
+
+    def test_v31_tariff_zero_at_bootstrap_start(self):
+        """The first bootstrap update has no abrupt K-cost policy shock."""
+        tariff = capped_route_tariff(
+            torch.tensor([0.04]), torch.tensor([[1, 2]]),
+            torch.tensor([[0.10, 0.20]]), tariff_scale=0.0,
+            max_positive_gain_fraction=0.50,
+        )
+        self.assertTrue(torch.equal(tariff, torch.zeros_like(tariff)))
+
+    def test_v31_tariff_cannot_reverse_positive_route_gain(self):
+        """A K=2 route that beats K=0 keeps a strictly positive net gain."""
+        raw_delta = torch.tensor([[0.08, 0.10]])
+        tariff = capped_route_tariff(
+            torch.tensor([0.10]), torch.tensor([[1, 2]]), raw_delta,
+            tariff_scale=1.0, max_positive_gain_fraction=0.50,
+        )
+        self.assertTrue(torch.all(raw_delta - tariff > 0.0))
+        self.assertAlmostEqual(float(tariff[0, 1]), 0.05, places=6)
+
+    def test_v31_finite_preference_with_masked_k_logits(self):
+        """Finite sentinels keep K distillation differentiable under eligibility masks."""
+        logits = torch.tensor([[0.2, 0.1, -1.0e4, -1.0e4]], requires_grad=True)
+        loss = counterfactual_k_preference_loss(
+            logits, torch.tensor([[1, 2]]), torch.tensor([0.2]),
+            torch.tensor([[0.3, 0.1]]), temperature=0.10,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_v31_cooperation_report_omits_nonfinite_masked_pairs(self):
+        """Masked/invalid pairs cannot poison synergy telemetry with NaN."""
+        router = JointLayerRouter([11, 15, 22, 24], hidden_dim=8, n_layers=32, max_active_layers=4)
+        router._last_synergy_matrix = torch.tensor([[
+            [0.0, float("nan"), 0.2, 0.1],
+            [float("nan"), 0.0, -0.1, 0.3],
+            [0.2, -0.1, 0.0, 0.4],
+            [0.1, 0.3, 0.4, 0.0],
+        ]])
+        report = router.get_cooperation_analysis(eligible_layers=[11, 22, 24])
+        self.assertTrue(all(torch.isfinite(torch.tensor(pair[2])) for pair in report["top_synergy_pairs"]))
+        self.assertTrue(torch.isfinite(torch.tensor(report["mean_synergy"])))
+
+    def test_v31_cross_band_pool_prioritises_early_middle_late(self):
+        """Phase 1B retains distinct physical depth bands before extra ranks."""
+        from src.training.trainer import select_phase1b_candidate_layers
+
+        class PoolModel:
+            target_layers = [11, 13, 15, 18, 22, 24]
+
+        report = {
+            "calibration_ranking": [
+                {"layer": 24, "gate_scale": 0.70, "safe": True},
+                {"layer": 11, "gate_scale": 0.35, "safe": True},
+                {"layer": 15, "gate_scale": 0.50, "safe": True},
+                {"layer": 22, "gate_scale": 0.70, "safe": True},
+            ]
+        }
+        layers, _, pool = select_phase1b_candidate_layers(
+            PoolModel(), report, RSCConfig(phase1b_candidate_layers=4),
+        )
+        self.assertEqual(layers[:3], [11, 15, 24])
+        self.assertEqual(pool["depth_bands"], ["early", "middle", "late"])
+
+    def test_v31_preflight_requires_batch_union_depth_bands(self):
+        """Two layers in one band do not satisfy the deterministic preflight contract."""
+        from src.training.trainer import audit_router_policy_health
+
+        class FakeRouterModel:
+            _routing_override = None
+            _router_inference_mode = "argmax"
+            def reset_routing_diagnostics(self): pass
+            def eval(self): return self
+            def set_router_inference_mode(self, mode): self._router_inference_mode = mode
+            def set_routing_override(self, mode=None, layers=None): self._routing_override = None if mode is None else (mode, layers)
+            def set_prompt_shield_mask(self, mask): pass
+            def set_router_context_mask(self, mask): pass
+            def __call__(self, **kwargs): return None
+            def intervention_diagnostics(self):
+                return {
+                    "realized_k_distribution": {0: 0.1, 1: 0.7, 2: 0.2},
+                    "realized_k_support": 3, "realized_k_entropy": 0.5,
+                    "active_layer_count": 2, "active_depth_band_count": 1,
+                    "layer_selection_entropy": 0.5, "gate": {}, "steering": {},
+                }
+
+        row = {"input_ids": torch.ones(4, dtype=torch.long), "attention_mask": torch.ones(4, dtype=torch.long), "labels": torch.tensor([-100, -100, 1, 2])}
+        cfg = RSCConfig(allow_inconclusive_small_runs=False, router_preflight_examples=2, continue_on_diagnostic_failure=True)
+        result = audit_router_policy_health(FakeRouterModel(), [row, row], cfg, torch.device("cpu"))
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("depth bands" in failure for failure in result["failures"]))
+
+    def test_v31_router_rejection_preserves_certified_fixed_steernet(self):
+        """An adaptive rejection must retain the confirmed fixed control."""
+        from src.training.trainer import _fallback_to_certified_fixed_steernet
+
+        class FallbackModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.eligible = "unset"
+                self.override = None
+                self.gate = None
+            def set_eligible_routing_layers(self, layers): self.eligible = layers
+            def set_router_warmup(self, value): self.warmup = value
+            def set_routing_override(self, mode, layers=None): self.override = (mode, layers)
+            def set_gate_freeze(self, frozen, scale): self.gate = (frozen, scale)
+
+        model = FallbackModel()
+        cfg = RSCConfig(fixed_steer_eval_layers=[24], fixed_steer_eval_gate_scale=0.70)
+        logs = {}
+        with patch("src.training.trainer.save_ars_checkpoint"):
+            _fallback_to_certified_fixed_steernet(model, cfg, logs, {}, "preflight rejected")
+        self.assertEqual(logs["adaptive_phases_status"], "FALLBACK_TO_CERTIFIED_FIXED_STEERNET")
+        self.assertEqual(model.override, ("only", [24]))
+        self.assertEqual(model.gate, (True, 0.70))
 
     def test_phase1_report_cache_requires_matching_checkpoint_provenance(self):
         """Resume must reject a cache copied from a different checkpoint."""
@@ -1844,8 +1976,8 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
         }
         res = train_phase1b_coadaptation(model, [row], report, cfg, torch.device("cpu"))
         self.assertEqual(res["status"], "COMPLETE")
-        self.assertEqual(res["candidate_layers"], [22, 11, 15])
-        self.assertEqual(res["pair_count"], 3)  # (22, 11), (22, 15), (11, 15)
+        self.assertEqual(res["candidate_layers"], [11, 15, 22])
+        self.assertEqual(res["pair_count"], 2)  # long-range (22, 11), (22, 15)
         self.assertEqual(res["schedule_k1_steps"], res["schedule_k2_steps"])
         self.assertEqual(res["candidate_gate_scales"], {22: 0.60, 11: 0.80, 15: 0.60})
 
@@ -1880,7 +2012,7 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
                 return type("Out", (), {"logits": logits})()
 
         model = DummyWrapper()
-        cfg = RSCConfig(phase1b_coadapt_epochs=1, phase1b_candidate_layers=2)
+        cfg = RSCConfig(phase1b_coadapt_epochs=1, phase1b_candidate_layers=2, phase1b_min_candidate_layers=2, phase1b_min_depth_bands=2)
         row = {
             "input_ids": torch.ones(4, dtype=torch.long),
             "attention_mask": torch.ones(4, dtype=torch.long),
@@ -1932,7 +2064,7 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
                 return type("Out", (), {"logits": logits})()
 
         model = DummyWrapper()
-        cfg = RSCConfig(phase1b_coadapt_epochs=1, phase1b_candidate_layers=3)
+        cfg = RSCConfig(phase1b_coadapt_epochs=1, phase1b_candidate_layers=3, phase1b_min_candidate_layers=2, phase1b_min_depth_bands=2)
         row = {
             "input_ids": torch.ones(4, dtype=torch.long),
             "attention_mask": torch.ones(4, dtype=torch.long),

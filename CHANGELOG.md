@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.13.3] - 2026-10-21
+
+### 🚀 Engine v3.1: Diverse Cooperative Routing & Fixed-SteerNet Continuity
+- **Cross-band co-adaptation (`src/training/trainer.py`):** Phase 1B now constructs its safe pool across physical early (L11--13), middle (L15--18), and late (L20--24) depth bands before filling additional ranks. Its K=2 curriculum and bootstrap compatibility correction prioritize long-range early/middle-to-late pairs rather than adjacent residuals.
+- **Generation-safe calibration (`src/configs/config.py`, `src/training/trainer.py`, `notebooks/kaggle_ars_runner.ipynb`):** Added fine lower-scale calibration at `alpha={0.25, 0.35, 0.50, 0.70}` and separates raw pre-cap runaway protection (`q95 <= 1.50`) from the strict effective displacement contract (`alpha * q95 <= 1.00`).
+- **Utility-preserving K pricing (`src/routing/rloo.py`):** K tariffs now warm linearly from zero over bootstrap epoch one and are capped to a fraction of a route's measured positive gain over K=0. Raw, cost-adjusted, and pair utilities remain explicit in telemetry.
+- **Numerical fail-closed router bootstrap (`src/models/wrapper.py`, `src/routing/rloo.py`, `src/routing/router.py`, `src/training/trainer.py`):** Eligibility masks use finite sentinels; non-finite logits, rewards, synergies, losses, gradients, and parameters halt bootstrap as a named invalid-numerics state rather than producing a misleading zero loss.
+- **Scientific preflight and graceful fallback (`src/training/trainer.py`):** Router preflight evaluates the union of deterministic selections across its batch and requires both K>=2 support and at least two participating depth bands. If the diversity contract fails, `train_rsc` restores the certified fixed SteerNet, saves it as `certified-fixed-steernet-fallback`, and records `FALLBACK_TO_CERTIFIED_FIXED_STEERNET` for full benchmarking instead of discarding valid Phase-1 results. Provenance-verified Phase-1 resume now also rehydrates its certified `(layer, alpha)` route from the cache.
+- **Regression coverage (`tests/test_modules.py`):** Added CPU coverage for low-scale/effective-norm safety, tariff warm-up and gain preservation, finite masked K distillation, NaN-free synergy reporting, cross-band pool selection, and the batch-union depth-band preflight contract.
+
+---
+
 ## [1.13.2] - 2026-10-20
 
 ### 🛡️ Phase-1B Routing Contract & Fail-Closed Recovery

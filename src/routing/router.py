@@ -251,8 +251,8 @@ class JointLayerRouter(nn.Module):
         tokens = self.identity_embed.weight.unsqueeze(0)
         return self._compute_synergy(tokens).detach()
 
-    def get_cooperation_analysis(self) -> dict:
-        """Extracts top cooperative (synergistic) and conflicting (antagonistic) layer pairs."""
+    def get_cooperation_analysis(self, eligible_layers: Optional[List[int]] = None) -> dict:
+        """Extract finite cooperative pairs, optionally restricted to a legal pool."""
         syn_mat = self.get_layer_synergy_matrix()
         if syn_mat is None:
             return {"top_synergy_pairs": [], "top_antagonistic_pairs": [], "mean_synergy": 0.0}
@@ -260,14 +260,20 @@ class JointLayerRouter(nn.Module):
         mat_cpu = mat.detach().cpu().numpy()
         N = len(self.target_layers)
         pairs = []
+        allowed = set(self.target_layers if eligible_layers is None else eligible_layers)
         for i in range(N):
             for j in range(i + 1, N):
+                if self.target_layers[i] not in allowed or self.target_layers[j] not in allowed:
+                    continue
                 val = float(mat_cpu[i, j])
+                if not np.isfinite(val):
+                    continue
                 pairs.append((self.target_layers[i], self.target_layers[j], val))
         pairs_sorted = sorted(pairs, key=lambda x: x[2], reverse=True)
+        finite_values = [item[2] for item in pairs]
         return {
             "top_synergy_pairs": pairs_sorted[:3],
             "top_antagonistic_pairs": list(reversed(pairs_sorted[-3:])),
-            "mean_synergy": float(mat_cpu[~np.eye(N, dtype=bool)].mean()) if N > 1 else 0.0,
+            "mean_synergy": float(np.mean(finite_values)) if finite_values else 0.0,
         }
 

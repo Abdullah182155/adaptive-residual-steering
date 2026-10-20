@@ -427,14 +427,18 @@ def _phase1_probe_with_norm(
     return probe
 
 
-def _phase1_pair_is_safe(result: Dict[str, Any], base_median_tokens: float, cfg: RSCConfig) -> Tuple[bool, float, float]:
-    """Return whether a generation pair preserves CoT length and raw norm safety."""
+def _phase1_pair_is_safe(
+    result: Dict[str, Any], base_median_tokens: float, cfg: RSCConfig, gate_scale: float = 1.0,
+) -> Tuple[bool, float, float]:
+    """Return whether a generation pair preserves CoT and raw/effective norm safety."""
     completion_ratio = float(result.get("median_tokens", 0.0)) / max(1.0, base_median_tokens)
     norm = result.get("pre_cap_norm", {})
     q_p95 = float(norm.get("p95", norm.get("mean", 0.0)))
+    effective_q_p95 = float(gate_scale) * q_p95
     safe = (
         completion_ratio >= float(getattr(cfg, "phase1_min_completion_len_ratio", 0.85))
         and q_p95 <= float(getattr(cfg, "phase1_max_generation_p95_norm_ratio", 1.0))
+        and effective_q_p95 <= float(getattr(cfg, "phase1_max_effective_generation_p95_norm_ratio", 1.0))
     )
     return safe, completion_ratio, q_p95
 
@@ -574,12 +578,15 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                     model, tokenizer, calibration_rows, cfg, device, screen_n, row["layer"], scale,
                     f"Acceptance L{row['layer']} alpha={scale:.2f}",
                 )
-                safe, completion_ratio, q_p95 = _phase1_pair_is_safe(screen, base_median_tokens, cfg)
+                safe, completion_ratio, q_p95 = _phase1_pair_is_safe(
+                    screen, base_median_tokens, cfg, gate_scale=scale,
+                )
                 pair = {
                     "layer": row["layer"], "gate_scale": scale,
                     "accuracy": screen["accuracy"], "answer_present": screen["answer_present"],
                     "median_tokens": screen.get("median_tokens", 0.0),
                     "completion_len_ratio": completion_ratio, "pre_cap_q_p95": q_p95,
+                    "effective_pre_cap_q_p95": scale * q_p95,
                     "pre_cap_norm": screen.get("pre_cap_norm", {}), "safe": safe,
                 }
                 row["scale_screen"].append(pair)
@@ -588,7 +595,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 status = "" if safe else " ⚠️ REJECTED"
                 print(
                     f"        L{row['layer']} alpha={scale:.2f}: acc={pair['accuracy']:.1%} "
-                    f"tokens={pair['median_tokens']:.0f} (ratio {completion_ratio:.2f}) q95={q_p95:.2f}{status}"
+                    f"tokens={pair['median_tokens']:.0f} (ratio {completion_ratio:.2f}) "
+                    f"q95={q_p95:.2f} effective_q95={pair['effective_pre_cap_q_p95']:.2f}{status}"
                 )
 
         rejected_layers = [row["layer"] for row in candidates if not any(p["safe"] for p in row["scale_screen"])]
@@ -650,7 +658,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 f"Acceptance L{candidate['layer']} alpha={calibration['gate_scale']:.2f} confirmation",
             )
             confirm_safe, confirm_ratio, confirm_q_p95 = _phase1_pair_is_safe(
-                candidate_confirmation, max(1.0, float(base_confirmation.get("median_tokens", 0.0))), cfg
+                candidate_confirmation, max(1.0, float(base_confirmation.get("median_tokens", 0.0))), cfg,
+                gate_scale=calibration["gate_scale"],
             )
             confirmation_gain = float(candidate_confirmation["accuracy"]) - float(base_val_acc)
             calibration_gain = float(calibration["accuracy"]) - float(base_screen_acc)
@@ -684,6 +693,7 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 "combined_accuracy_gain": combined_gain,
                 "completion_len_ratio": confirm_ratio,
                 "pre_cap_q_p95": confirm_q_p95,
+                "effective_pre_cap_q_p95": float(calibration["gate_scale"]) * confirm_q_p95,
                 "safe": confirm_safe,
                 "train_relative_nll_reduction": nll_reduction,
                 "val_relative_nll_reduction": val_nll_reduction,
@@ -816,8 +826,16 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
             failures.append(f"K support={report['realized_k_support']} < {cfg.router_min_eval_k_support}")
         if report["realized_k_entropy"] < float(cfg.router_min_eval_k_entropy):
             failures.append(f"K entropy={report['realized_k_entropy']:.3f} < {cfg.router_min_eval_k_entropy}")
+        # Active means the union of deterministic selections across the whole
+        # preflight batch, not an impossible requirement that every prompt
+        # activate every certified layer.
         if report["active_layer_count"] < int(cfg.router_min_eval_active_layers):
             failures.append(f"active layers={report['active_layer_count']} < {cfg.router_min_eval_active_layers}")
+        min_bands = int(getattr(cfg, "router_min_eval_active_depth_bands", 2))
+        if report.get("active_depth_band_count", 0) < min_bands:
+            failures.append(
+                f"active depth bands={report.get('active_depth_band_count', 0)} < {min_bands}"
+            )
         if report["layer_selection_entropy"] < float(cfg.router_min_eval_layer_entropy):
             failures.append(f"layer entropy={report['layer_selection_entropy']:.3f} < {cfg.router_min_eval_layer_entropy}")
         active_gates = [row for row in report["gate"].values() if row["intervened_tokens"] > 0]
@@ -904,6 +922,14 @@ def audit_router_policy_health(model, eval_data, cfg: RSCConfig, device: torch.d
             failures.append(f"K entropy={report['realized_k_entropy']:.3f} < {cfg.router_min_eval_k_entropy}")
         if report["active_layer_count"] < int(cfg.router_min_eval_active_layers):
             failures.append(f"active layers={report['active_layer_count']} < {cfg.router_min_eval_active_layers}")
+        # This is intentionally a batch-union property.  A useful policy may
+        # select an early+late route on only some prompts; requiring every
+        # prompt to use every layer would reject that valid specialization.
+        min_bands = int(getattr(cfg, "router_min_eval_active_depth_bands", 2))
+        if report.get("active_depth_band_count", 0) < min_bands:
+            failures.append(
+                f"active depth bands={report.get('active_depth_band_count', 0)} < {min_bands}"
+            )
         if report["layer_selection_entropy"] < float(cfg.router_min_eval_layer_entropy):
             failures.append(f"layer entropy={report['layer_selection_entropy']:.3f} < {cfg.router_min_eval_layer_entropy}")
         report.update({
@@ -1019,12 +1045,14 @@ def _phase1_epoch_generation_screen(model, tokenizer, eval_data, cfg: RSCConfig,
                     model, tokenizer, rows, cfg, device, n_samples, layer, scale,
                     f"Phase1 epoch L{layer} alpha={scale:.2f}",
                 )
-                safe, completion_ratio, q_p95 = _phase1_pair_is_safe(probe, base_median_tokens, cfg)
+                safe, completion_ratio, q_p95 = _phase1_pair_is_safe(
+                    probe, base_median_tokens, cfg, gate_scale=scale,
+                )
                 if safe:
                     safe_pairs.append({
                         "layer": int(layer), "gate_scale": scale, "accuracy": probe["accuracy"],
                         "answer_present": probe["answer_present"], "completion_len_ratio": completion_ratio,
-                        "pre_cap_q_p95": q_p95,
+                        "pre_cap_q_p95": q_p95, "effective_pre_cap_q_p95": scale * q_p95,
                     })
         # A checkpoint cannot win merely by avoiding CoT/norm failures: its
         # best safe route must also not underperform the matched baseline.
@@ -1279,6 +1307,121 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
     return best_state_p1, best_val_p1, logs
 
 
+def _phase1_depth_band(layer: int, candidate_layers: List[int]) -> str:
+    """Map catalog depth to a stable early/middle/late co-adaptation band."""
+    # Use the *catalogue's physical depth*, not a position within the safe
+    # subset.  Otherwise omitting L13 from a safe pool re-labels L15 as a
+    # late layer and makes a nominally cross-band L15+L22 pair look adjacent.
+    # The fallback keeps this helper useful for non-standard, very small
+    # catalogues used by CPU tests.
+    ordered = sorted(int(value) for value in candidate_layers)
+    # Phi-2's canonical ARS catalogue is deliberately non-uniform across
+    # representational roles: L11--13 are early, L15--18 are middle, and
+    # L20--24 are late.  Preserve those role boundaries even when a safe
+    # subset omits a neighbouring layer.
+    if ordered and min(ordered) <= 13 and max(ordered) >= 20:
+        if int(layer) <= 13:
+            return "early"
+        if int(layer) <= 18:
+            return "middle"
+        return "late"
+    if len(ordered) >= 3:
+        position = ordered.index(int(layer))
+        if position < max(1, len(ordered) // 3):
+            return "early"
+        if position < max(2, (2 * len(ordered)) // 3):
+            return "middle"
+        return "late"
+    if int(layer) == ordered[0]:
+        return "early"
+    if len(ordered) == 2 and int(layer) == ordered[1]:
+        return "middle"
+    return "late"
+
+
+def _is_long_range_coadaptation_pair(
+    first: int, second: int, candidate_layers: List[int],
+) -> bool:
+    """Return whether a pair joins a late layer to an earlier reasoning band."""
+    bands = {
+        _phase1_depth_band(int(first), candidate_layers),
+        _phase1_depth_band(int(second), candidate_layers),
+    }
+    # L11+L24 and L15+L24 are the intended curriculum examples.  L11+L15
+    # remains a legitimate ablation, but it is not a long-range pair and must
+    # not consume the scarce K=2 co-adaptation budget by default.
+    return "late" in bands and len(bands) == 2
+
+
+def select_phase1b_candidate_layers(
+    model, acceptance_report: Dict[str, Any], cfg: RSCConfig,
+) -> Tuple[List[int], Dict[int, float], Dict[str, Any]]:
+    """Build a safe, depth-diverse Phase-1B pool from calibration evidence.
+
+    Confirmation failures are absolute exclusions.  Among remaining safe
+    calibration routes, take the highest-ranked distinct layer from each depth
+    band before filling spare capacity by rank.  This creates opportunities
+    for long-range early/late cooperation without allowing unsafe adapters
+    back into the learned router.
+    """
+    ranking = acceptance_report.get("calibration_ranking", [])
+    failed_confirmation_layers = {
+        int(layer)
+        for trial in acceptance_report.get("confirmation_trials", [])
+        for layer in [trial.get("layer")]
+        if layer is not None and (
+            not trial.get("safe", True) or not trial.get("passed", True)
+        )
+    }
+    candidate_rows: List[Dict[str, Any]] = []
+    seen = set()
+    for row in ranking:
+        layer = int(row.get("layer", -1))
+        if (
+            row.get("safe", False)
+            and layer in model.target_layers
+            and layer not in failed_confirmation_layers
+            and layer not in seen
+        ):
+            candidate_rows.append(dict(row))
+            seen.add(layer)
+    # A legacy/malformed ranking should not discard independently recorded
+    # safe screens, but these fallback rows rank after the explicit ranking.
+    for candidate in acceptance_report.get("candidates", []):
+        layer = int(candidate.get("layer", -1))
+        if layer in seen or layer in failed_confirmation_layers or layer not in model.target_layers:
+            continue
+        safe_scales = [entry for entry in candidate.get("scale_screen", []) if entry.get("safe", False)]
+        if safe_scales:
+            best = min(safe_scales, key=lambda entry: float(entry.get("gate_scale", 1.0)))
+            candidate_rows.append({"layer": layer, "gate_scale": best.get("gate_scale", 1.0), "safe": True})
+            seen.add(layer)
+
+    limit = int(getattr(cfg, "phase1b_candidate_layers", 4))
+    chosen: List[int] = []
+    scales: Dict[int, float] = {}
+    covered_bands = []
+    for band in ("early", "middle", "late"):
+        row = next((item for item in candidate_rows if _phase1_depth_band(int(item["layer"]), model.target_layers) == band), None)
+        if row is not None and len(chosen) < limit:
+            layer = int(row["layer"])
+            chosen.append(layer)
+            scales[layer] = float(row.get("gate_scale", 1.0))
+            covered_bands.append(band)
+    for row in candidate_rows:
+        if len(chosen) >= limit:
+            break
+        layer = int(row["layer"])
+        if layer not in chosen:
+            chosen.append(layer)
+            scales[layer] = float(row.get("gate_scale", 1.0))
+    return chosen, scales, {
+        "failed_confirmation_layers": sorted(failed_confirmation_layers),
+        "depth_bands": covered_bands,
+        "ranked_safe_layers": [int(item["layer"]) for item in candidate_rows],
+    }
+
+
 def train_phase1b_coadaptation(
     model, train_data, acceptance_report: Dict[str, Any], cfg: RSCConfig, device: torch.device,
 ) -> Dict[str, Any]:
@@ -1292,62 +1435,32 @@ def train_phase1b_coadaptation(
     epochs = int(getattr(cfg, "phase1b_coadapt_epochs", 0))
     if epochs <= 0:
         return {"status": "SKIPPED", "candidate_layers": [], "steps": 0}
-    ranking = acceptance_report.get("calibration_ranking", [])
-    # A layer that reached disjoint confirmation but violated safety or failed
-    # the complete confirmation verdict must never re-enter through its earlier
-    # calibration result.  Calibration selects candidates; confirmation is the
-    # final safety contract for any candidate it evaluates.
-    failed_confirmation_layers = {
-        int(layer)
-        for trial in acceptance_report.get("confirmation_trials", [])
-        for layer in [trial.get("layer")]
-        if layer is not None and (
-            not trial.get("safe", True) or not trial.get("passed", True)
-        )
-    }
-    if failed_confirmation_layers:
+    layers, layer_scales, pool_report = select_phase1b_candidate_layers(model, acceptance_report, cfg)
+    if pool_report["failed_confirmation_layers"]:
         print(
             "  [Phase 1B] Excluding confirmation-failed layers: "
-            f"{sorted(failed_confirmation_layers)}"
+            f"{pool_report['failed_confirmation_layers']}"
         )
-    layers = []
-    layer_scales: Dict[int, float] = {}
-    for row in ranking:
-        layer = int(row.get("layer", -1))
-        # calibration_ranking entries are strictly filtered from eligible safe pairs
-        # Do not trust a legacy ranking that does not explicitly attest safety;
-        # its candidate-scale fallback below remains available for recovery.
-        is_safe = row.get("safe", False)
-        if (
-            is_safe
-            and layer not in failed_confirmation_layers
-            and layer in model.target_layers
-            and layer not in layers
-        ):
-            layers.append(layer)
-            layer_scales[layer] = float(row.get("gate_scale", 1.0))
-        if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
-            break
-    if len(layers) < 2:
-        for candidate in acceptance_report.get("candidates", []):
-            layer = int(candidate.get("layer", -1))
-            if (
-                layer not in failed_confirmation_layers
-                and any(p.get("safe", False) for p in candidate.get("scale_screen", []))
-                and layer in model.target_layers
-                and layer not in layers
-            ):
-                layers.append(layer)
-                safe_scales = [float(p.get("gate_scale", 1.0)) for p in candidate.get("scale_screen", []) if p.get("safe", False)]
-                layer_scales[layer] = min(safe_scales) if safe_scales else 1.0
-            if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
-                break
-    if len(layers) < 2:
-        if getattr(cfg, "continue_on_diagnostic_failure", False):
-            print(f"  ⚠️ Phase 1B: Fewer than 2 safe candidate layers found ({layers}); skipping co-adaptation.")
-            return {"status": "SKIPPED_INSUFFICIENT_LAYERS", "candidate_layers": layers, "steps": 0}
-        raise RuntimeError(f"Phase 1B requires at least two independently safe candidate layers (found {layers})")
-    pairs = [(layers[i], layers[j]) for i in range(len(layers)) for j in range(i + 1, len(layers))]
+    min_layers = int(getattr(cfg, "phase1b_min_candidate_layers", 3))
+    min_bands = int(getattr(cfg, "phase1b_min_depth_bands", 3))
+    if len(layers) < min_layers or len(pool_report["depth_bands"]) < min_bands:
+        print(
+            "  ⚠️ Phase 1B: insufficient safe depth-diverse pool; "
+            f"layers={layers}, bands={pool_report['depth_bands']}"
+        )
+        return {
+            "status": "SKIPPED_INSUFFICIENT_DIVERSE_LAYERS", "candidate_layers": layers,
+            "candidate_gate_scales": layer_scales, "steps": 0, **pool_report,
+        }
+    # Long-range pairs are the cooperative hypothesis: early/middle trajectory
+    # steering plus late answer extraction.  Adjacent routes remain available
+    # only if no cross-band choice exists.
+    pairs = [
+        (layers[i], layers[j]) for i in range(len(layers)) for j in range(i + 1, len(layers))
+        if _is_long_range_coadaptation_pair(layers[i], layers[j], model.target_layers)
+    ]
+    if not pairs:
+        pairs = [(layers[i], layers[j]) for i in range(len(layers)) for j in range(i + 1, len(layers))]
     # Repeat the smaller route family and interleave it with the other so
     # every epoch has exactly equal K=1 and K=2 exposure independent of the
     # number of certified layers.  The old concatenation was 40/60 for four
@@ -1426,7 +1539,7 @@ def train_phase1b_coadaptation(
         "candidate_gate_scales": layer_scales,
         "schedule_k1_steps": len(schedule) // 2,
         "schedule_k2_steps": len(schedule) // 2,
-        "steps": steps, "mean_norm_loss": norm_total / max(1, steps),
+        "steps": steps, "mean_norm_loss": norm_total / max(1, steps), **pool_report,
     }
 
 
@@ -1514,6 +1627,11 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
         "attempts": 0,
         "successful_steps": 0,
         "nonzero_gradient_steps": 0,
+        "attempted_rloo_steps": 0,
+        "finite_rloo_steps": 0,
+        "nonfinite_loss_steps": 0,
+        "nonfinite_gradient_steps": 0,
+        "status": "RUNNING",
     }
     # Keep a live dictionary on the model so a raised correction failure still
     # leaves forensic evidence for the caller or an interactive notebook.
@@ -1525,6 +1643,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
         running_joint_nll, n_joint_steps = 0.0, 0
         joint_attempts_epoch, joint_grad_steps_epoch = 0, 0
         counterfactual_k_actions = None
+        bootstrap_invalid = False
         rloo_batch_size = max(2, int(getattr(cfg, "router_rloo_batch_size", 8)))
         pbar = tqdm(
             range(0, len(subset_idx), rloo_batch_size),
@@ -1550,14 +1669,39 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             )
 
             # --- Step 1: RLOO router loss (router params + SteerNet compat gradient) ---
-            loss, rloo_diag = compute_router_rloo_loss(
-                model, ids, mask, lbls, cfg, prompt_mask=prompt_mask, shield_mask=shield, calc_mask=calc_mask
-            )
+            compatibility_telemetry["attempted_rloo_steps"] += 1
+            warmup_epochs = max(1, int(getattr(cfg, "router_tariff_warmup_epochs", 1)))
+            epoch_progress = float(epoch) + float(start) / max(1, len(subset_idx))
+            tariff_scale = min(1.0, epoch_progress / float(warmup_epochs))
+            try:
+                loss, rloo_diag = compute_router_rloo_loss(
+                    model, ids, mask, lbls, cfg, prompt_mask=prompt_mask,
+                    shield_mask=shield, calc_mask=calc_mask, tariff_scale=tariff_scale,
+                )
+            except FloatingPointError as exc:
+                compatibility_telemetry["nonfinite_loss_steps"] += 1
+                compatibility_telemetry["status"] = f"INVALID_NUMERICS: {exc}"
+                bootstrap_invalid = True
+                print(f"  ⚠️ Router bootstrap stopped: {compatibility_telemetry['status']}")
+                break
             if not torch.isfinite(loss):
-                continue
+                compatibility_telemetry["nonfinite_loss_steps"] += 1
+                compatibility_telemetry["status"] = "INVALID_NUMERICS: non-finite RLOO loss"
+                bootstrap_invalid = True
+                print(f"  ⚠️ Router bootstrap stopped: {compatibility_telemetry['status']}")
+                break
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+            if not all(
+                p.grad is None or torch.isfinite(p.grad).all()
+                for p in router_params
+            ):
+                compatibility_telemetry["nonfinite_gradient_steps"] += 1
+                compatibility_telemetry["status"] = "INVALID_NUMERICS: non-finite router gradient"
+                bootstrap_invalid = True
+                print(f"  ⚠️ Router bootstrap stopped: {compatibility_telemetry['status']}")
+                break
             torch.nn.utils.clip_grad_norm_(router_params, cfg.clip_grad)
             # Note: steer_params grad clipping happens AFTER joint-NLL correction below
 
@@ -1571,15 +1715,25 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                 compatibility_telemetry["attempts"] += 1
                 coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
                 top_pairs = coop.get("top_synergy_pairs", [])
-                # Use best positive-synergy pair; fall back to first two candidate layers
+                # Prefer a distant cross-band pair: the curriculum hypothesis is
+                # early/middle trajectory steering plus late answer extraction,
+                # not redundant adjacent residuals.
+                cross_band_pairs = [
+                    pair for pair in top_pairs
+                    if len(pair) >= 3
+                    and int(pair[0]) in eligible_layers and int(pair[1]) in eligible_layers
+                    and _is_long_range_coadaptation_pair(
+                        int(pair[0]), int(pair[1]), model.target_layers,
+                    )
+                ]
+                # Use best positive cross-band synergy; fall back to the
+                # maximally distant eligible pair before any adjacent pair.
                 if (
-                    top_pairs and len(top_pairs[0]) >= 3 and top_pairs[0][2] > 0
-                    and int(top_pairs[0][0]) in eligible_layers
-                    and int(top_pairs[0][1]) in eligible_layers
+                    cross_band_pairs and cross_band_pairs[0][2] > 0
                 ):
-                    layer_i, layer_j = int(top_pairs[0][0]), int(top_pairs[0][1])
+                    layer_i, layer_j = int(cross_band_pairs[0][0]), int(cross_band_pairs[0][1])
                 else:
-                    layer_i, layer_j = eligible_layers[0], eligible_layers[1]
+                    layer_i, layer_j = min(eligible_layers), max(eligible_layers)
 
                 n_cands = len(model.target_layers)
                 # Single example: avoids holding B×T×V graph in memory alongside RLOO activations
@@ -1637,9 +1791,16 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             if steer_params:
                 torch.nn.utils.clip_grad_norm_(steer_params, cfg.clip_grad)
             optimizer.step()
+            if not all(torch.isfinite(p).all() for p in router_params):
+                compatibility_telemetry["nonfinite_gradient_steps"] += 1
+                compatibility_telemetry["status"] = "INVALID_NUMERICS: non-finite router parameter"
+                bootstrap_invalid = True
+                print(f"  ⚠️ Router bootstrap stopped: {compatibility_telemetry['status']}")
+                break
 
             running += loss.item()
             n_steps += 1
+            compatibility_telemetry["finite_rloo_steps"] += 1
             postfix_dict = {"loss": f"{loss.item():.4f}"}
             if rloo_diag:
                 postfix_dict["mean_Kcf"] = f"{rloo_diag.get('mean_k_sampled', 0.0):.2f}"
@@ -1648,7 +1809,7 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
                 counterfactual_k_actions = rloo_diag.get("counterfactual_k_actions", counterfactual_k_actions)
             pbar.set_postfix(**postfix_dict)
 
-        avg_loss = running / max(1, n_steps)
+        avg_loss = running / n_steps if n_steps else float("nan")
         avg_joint = running_joint_nll / max(1, n_joint_steps) if n_joint_steps > 0 else float("nan")
         k_cf_str = (
             " | K counterfactuals={0," + ",".join(str(k) for k in counterfactual_k_actions) + "}"
@@ -1662,7 +1823,8 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
         k_pref_str = (
             f" | Kpref={rloo_diag.get('k_preference_loss', 0.0):.3f} "
             f"p(K0)={rloo_diag.get('k0_probability', 0.0):.2f} "
-            f"Kcost={rloo_diag.get('mean_per_layer_cost', 0.0):.3f}"
+            f"Ktariff={rloo_diag.get('mean_tariff', 0.0):.3f}"
+            f"@{rloo_diag.get('tariff_scale', 0.0):.2f}"
             if rloo_diag else ""
         )
         k_argmax_str = (
@@ -1694,6 +1856,8 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             f" | active layers={active_cnt}/{len(diag)}"
             f"{syn_str}{joint_str}{utility_str}{k_cf_str}"
         )
+        if bootstrap_invalid:
+            break
         if avg_loss < best_loss - 1e-4:
             best_loss, patience_ctr = avg_loss, 0
             # Save both router AND steer_nets so best joint checkpoint can be restored
@@ -1706,15 +1870,28 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
         if patience_ctr >= cfg.router_bootstrap_patience:
             break
 
+    if compatibility_telemetry["status"] == "RUNNING":
+        compatibility_telemetry["status"] = "COMPLETE"
+    if compatibility_telemetry["status"] != "COMPLETE":
+        if steer_snapshot:
+            model.load_state_dict(steer_snapshot, strict=False)
+        for sn in model.steer_nets.values():
+            for p in sn.parameters():
+                p.requires_grad = False
+        model.set_routing_override(None)
+        print("  ⚠️ Router bootstrap is invalid; restored certified Phase-1 SteerNet state for fixed fallback.")
+        return None, float("inf"), steer_snapshot
+
     if compatibility_required and (
         compatibility_telemetry["attempts"] == 0
         or compatibility_telemetry["successful_steps"] == 0
         or compatibility_telemetry["nonzero_gradient_steps"] == 0
     ):
-        raise RuntimeError(
-            "Router bootstrap completed without a valid K=2 SteerNet compatibility correction: "
-            f"{compatibility_telemetry}"
-        )
+        compatibility_telemetry["status"] = "INVALID_NO_K2_COMPATIBILITY_GRADIENT"
+        if steer_snapshot:
+            model.load_state_dict(steer_snapshot, strict=False)
+        print(f"  ⚠️ Router bootstrap invalid: {compatibility_telemetry}")
+        return None, float("inf"), steer_snapshot
 
     if best_state:
         model.load_state_dict(best_state, strict=False)
@@ -2082,6 +2259,39 @@ def _purge_ckpt(path: str) -> None:
             os.remove(p)
 
 
+def _fallback_to_certified_fixed_steernet(
+    model, cfg: RSCConfig, logs: Dict[str, Any], steer_snapshot: Dict[str, torch.Tensor], reason: str,
+) -> None:
+    """Restore the certified Phase-1 route when adaptive routing is rejected.
+
+    A failed router is not evidence that the independently confirmed SteerNet
+    is ineffective.  Preserve that control for the notebook's full benchmark
+    instead of terminating a costly Kaggle run without its fixed-route result.
+    """
+    if steer_snapshot:
+        model.load_state_dict(steer_snapshot, strict=False)
+    fixed_layers = list(getattr(cfg, "fixed_steer_eval_layers", None) or [])
+    if len(fixed_layers) != 1:
+        raise RuntimeError(
+            "Cannot activate certified fixed-SteerNet fallback without exactly one Phase-1 confirmed layer."
+        )
+    model.set_eligible_routing_layers(None)
+    model.set_router_warmup(False)
+    model.set_routing_override("only", fixed_layers)
+    model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+    save_ars_checkpoint(model, cfg.phase2_save_path, phase="certified-fixed-steernet-fallback", cfg=cfg)
+    logs["adaptive_phases_status"] = "FALLBACK_TO_CERTIFIED_FIXED_STEERNET"
+    logs["fixed_steernet_fallback"] = {
+        "layer": fixed_layers[0],
+        "gate_scale": float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)),
+        "reason": reason,
+    }
+    print(
+        "  ↩️  FALLBACK_TO_CERTIFIED_FIXED_STEERNET: "
+        f"L{fixed_layers[0]} alpha={cfg.fixed_steer_eval_gate_scale:.2f}; {reason}"
+    )
+
+
 def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device):
     """Complete multi-phase staged training pipeline:
     Phase 1: Pure SteerNet (Warmup Rotation, Gates=1.0)
@@ -2185,6 +2395,20 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
             )
         except Exception as e:
             raise RuntimeError(f"Could not save Phase 1 acceptance cache: {e}") from e
+    # A provenance-verified resume restores adapter tensors, but the fixed
+    # route is experiment metadata rather than a model parameter.  Rehydrate
+    # it from the acceptance report so a later router rejection can always
+    # fall back to the same independently confirmed `(layer, alpha)` control.
+    resumed_report = logs["phase1_acceptance"]
+    if resumed_report.get("passed", False):
+        selected_layer = resumed_report.get("selected_layer")
+        selected_scale = resumed_report.get("fixed_steer_gate_scale")
+        if selected_layer is None or selected_scale is None:
+            raise RuntimeError(
+                "A passing Phase-1 acceptance report is missing its certified fixed-SteerNet route."
+            )
+        cfg.fixed_steer_eval_layers = [int(selected_layer)]
+        cfg.fixed_steer_eval_gate_scale = float(selected_scale)
     p1_pre_cap = collect_pre_cap_ratio(model)
     if p1_pre_cap:
         print(f"  [telemetry] Phase 1 SteerNet pre-cap norm ratios (delta_norm / cap): {p1_pre_cap}")
@@ -2239,11 +2463,19 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         model, router_data, phase1_report, cfg, device,
     )
     phase1b_layers = logs["phase1b_coadaptation"].get("candidate_layers", [])
-    if len(phase1b_layers) < 2:
-        raise RuntimeError(
-            "Phase 1B completed without at least two eligible routing layers; "
-            f"got {phase1b_layers}"
+    min_pool = int(getattr(cfg, "phase1b_min_candidate_layers", 3))
+    if len(phase1b_layers) < min_pool or logs["phase1b_coadaptation"].get("status") != "COMPLETE":
+        _fallback_to_certified_fixed_steernet(
+            model, cfg, logs, phase1_safe_snapshot,
+            "Phase 1B did not establish the required safe, depth-diverse co-adaptation pool.",
         )
+        logs["router_bootstrap_loss"] = None
+        logs["router_bootstrap_preflight"] = None
+        logs["ars_intervention_audit"] = {
+            "status": "NOT_RUN_INSUFFICIENT_DIVERSE_POOL", "passed": False,
+            "failures": ["Phase 1B safe co-adaptation pool was insufficient"],
+        }
+        return logs, best_val_p1, best_val_p1
     if hasattr(model, "set_eligible_routing_layers"):
         model.set_eligible_routing_layers(phase1b_layers)
         logs["eligible_routing_layers"] = list(phase1b_layers)
@@ -2270,13 +2502,13 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print("ROUTER DEPLOYMENT GATE: ADAPTIVE PHASES SKIPPED")
         print("         Deployment argmax collapsed; Gate/Phase 2 cannot make this a valid ARS policy.")
         print("         Retaining Phase-1 and Router diagnostics; no Full-ARS checkpoint claim is produced.")
-        # Restore the independently accepted Phase-1 state; neither failed
-        # co-adaptation nor a collapsed router may overwrite that artifact.
-        if phase1_safe_snapshot:
-            model.load_state_dict(phase1_safe_snapshot, strict=False)
-            print("         ↩️  Accepted Phase-1 SteerNet weights restored after failed Phase-1B/router preflight.")
+        # Preserve the independently accepted Phase-1 route for the full
+        # benchmark; adaptive failure cannot erase fixed-SteerNet evidence.
+        _fallback_to_certified_fixed_steernet(
+            model, cfg, logs, phase1_safe_snapshot,
+            "Router bootstrap or deterministic multi-layer preflight was rejected.",
+        )
         print("=" * 80)
-        logs["adaptive_phases_status"] = "SKIPPED_COLLAPSED_ROUTER"
         logs["ars_intervention_audit"] = {
             "status": "NOT_RUN_COLLAPSED_ROUTER",
             "passed": False,
