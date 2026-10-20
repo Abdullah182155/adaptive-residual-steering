@@ -1180,13 +1180,13 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
 
     if hasattr(model, "pre_cap_norm_diagnostics"):
         ratios = model.pre_cap_norm_diagnostics()
-        print(f"  Phase 1 SteerNet pre-cap norm ratios: {ratios}")
+        print(f"  Phase 1 SteerNet last-batch mean pre-cap norm ratios: {ratios}")
         max_ratio = max(ratios.values()) if ratios else 0.0
         thresh = float(getattr(cfg, "phase1_max_eval_p95_norm_ratio", 1.0))
         if max_ratio > thresh:
-            print(f"  ⚠️ SteerNet saturation notice: max pre-cap ratio = {max_ratio:.2f} > {thresh:.2f}")
+            print(f"  ℹ️ SteerNet last-batch ratio notice: max ratio = {max_ratio:.2f} > {thresh:.2f} (acceptance audit evaluates exact p95)")
         else:
-            print(f"  ✅ SteerNet norm control healthy: max pre-cap ratio = {max_ratio:.2f} <= {thresh:.2f}")
+            print(f"  ✅ SteerNet norm control healthy: max ratio = {max_ratio:.2f} <= {thresh:.2f}")
 
     model.set_router_warmup(False)
     model.reset_routing_diagnostics()
