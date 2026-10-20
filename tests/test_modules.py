@@ -1736,6 +1736,104 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
             self.assertEqual(modes["0"], "ars")
             self.assertEqual(modes["2"], "baseline")
 
+    def test_phase1b_coadaptation_extracts_safe_layers_from_calibration_ranking(self):
+        """Phase 1B must extract safe candidate layers from calibration_ranking."""
+        from src.training.trainer import train_phase1b_coadaptation
+        from src.configs.config import RSCConfig
+
+        class DummySteerNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(4, 4)
+            def forward(self, h, active_k=None):
+                return h
+
+        class DummyWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.target_layers = [11, 13, 15, 22]
+                self.steer_nets = nn.ModuleDict({str(l): DummySteerNet() for l in self.target_layers})
+                self.router = nn.Linear(4, len(self.target_layers))
+                self.base_model = nn.Identity()
+            def set_gate_freeze(self, *args, **kwargs): pass
+            def set_router_warmup(self, *args, **kwargs): pass
+            def set_routing_override(self, *args, **kwargs): pass
+            def set_prompt_shield_mask(self, *args, **kwargs): pass
+            def set_router_context_mask(self, *args, **kwargs): pass
+            def compute_active_steer_norm_loss(self, **kwargs):
+                return torch.zeros((), requires_grad=True), {}
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                logits = torch.randn(1, 4, 32, requires_grad=True)
+                return type("Out", (), {"logits": logits})()
+
+        model = DummyWrapper()
+        cfg = RSCConfig(phase1b_coadapt_epochs=1, phase1b_candidate_layers=3)
+        row = {
+            "input_ids": torch.ones(4, dtype=torch.long),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "labels": torch.tensor([1, 2, 3, 4]),
+        }
+        report = {
+            "calibration_ranking": [
+                {"rank": 1, "layer": 22, "gate_scale": 0.60, "safe": True},
+                {"rank": 2, "layer": 11, "gate_scale": 0.80, "safe": True},
+                {"rank": 3, "layer": 15, "gate_scale": 0.60, "safe": True},
+            ],
+            "candidates": [],
+        }
+        res = train_phase1b_coadaptation(model, [row], report, cfg, torch.device("cpu"))
+        self.assertEqual(res["status"], "COMPLETE")
+        self.assertEqual(res["candidate_layers"], [22, 11, 15])
+        self.assertEqual(res["pair_count"], 3)  # (22, 11), (22, 15), (11, 15)
+
+    def test_phase1b_coadaptation_falls_back_to_candidates_if_ranking_missing(self):
+        """Phase 1B must fall back to candidate scale_screen when ranking is empty."""
+        from src.training.trainer import train_phase1b_coadaptation
+        from src.configs.config import RSCConfig
+
+        class DummySteerNet(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc = nn.Linear(4, 4)
+            def forward(self, h, active_k=None):
+                return h
+
+        class DummyWrapper(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.target_layers = [11, 13, 15, 22]
+                self.steer_nets = nn.ModuleDict({str(l): DummySteerNet() for l in self.target_layers})
+                self.router = nn.Linear(4, len(self.target_layers))
+                self.base_model = nn.Identity()
+            def set_gate_freeze(self, *args, **kwargs): pass
+            def set_router_warmup(self, *args, **kwargs): pass
+            def set_routing_override(self, *args, **kwargs): pass
+            def set_prompt_shield_mask(self, *args, **kwargs): pass
+            def set_router_context_mask(self, *args, **kwargs): pass
+            def compute_active_steer_norm_loss(self, **kwargs):
+                return torch.zeros((), requires_grad=True), {}
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                logits = torch.randn(1, 4, 32, requires_grad=True)
+                return type("Out", (), {"logits": logits})()
+
+        model = DummyWrapper()
+        cfg = RSCConfig(phase1b_coadapt_epochs=1, phase1b_candidate_layers=2)
+        row = {
+            "input_ids": torch.ones(4, dtype=torch.long),
+            "attention_mask": torch.ones(4, dtype=torch.long),
+            "labels": torch.tensor([1, 2, 3, 4]),
+        }
+        report = {
+            "calibration_ranking": [],
+            "candidates": [
+                {"layer": 11, "scale_screen": [{"safe": True, "gate_scale": 0.8}]},
+                {"layer": 15, "scale_screen": [{"safe": True, "gate_scale": 0.6}]},
+            ],
+        }
+        res = train_phase1b_coadaptation(model, [row], report, cfg, torch.device("cpu"))
+        self.assertEqual(res["status"], "COMPLETE")
+        self.assertEqual(res["candidate_layers"], [11, 15])
+
 
 
 

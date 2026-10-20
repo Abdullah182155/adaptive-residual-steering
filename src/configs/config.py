@@ -209,6 +209,8 @@ class RSCConfig:
     lora_save_path: str = "./checkpoints/steer_phase1_adaptive_v11.pt"
     phase2_save_path: str = "./checkpoints/rsc_phase2_catalog_v14.pt"
     checkpoint_dir: str = "./checkpoints"
+    phase1_report_save_path: str = "./checkpoints/phase1_report.json"
+    resume_phase1: bool = False
 
     # Router bootstrap settings
     router_bootstrap_epochs: int = 3

@@ -535,6 +535,7 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 "accuracy": pair["accuracy"], "answer_present": pair["answer_present"],
                 "val_nll": row["val_nll"], "completion_len_ratio": pair["completion_len_ratio"],
                 "pre_cap_q_p95": pair["pre_cap_q_p95"],
+                "safe": pair.get("safe", True),
                 "selection_key": list(_phase1_calibration_rank_key((row, pair))),
             }
             calibration_ranking.append(ranked)
@@ -1214,12 +1215,24 @@ def train_phase1b_coadaptation(
     layers = []
     for row in ranking:
         layer = int(row.get("layer", -1))
-        if row.get("safe", False) and layer in model.target_layers and layer not in layers:
+        # calibration_ranking entries are strictly filtered from eligible safe pairs
+        is_safe = row.get("safe", True)
+        if is_safe and layer in model.target_layers and layer not in layers:
             layers.append(layer)
         if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
             break
     if len(layers) < 2:
-        raise RuntimeError("Phase 1B requires at least two independently safe candidate layers")
+        for candidate in acceptance_report.get("candidates", []):
+            layer = int(candidate.get("layer", -1))
+            if any(p.get("safe", False) for p in candidate.get("scale_screen", [])) and layer in model.target_layers and layer not in layers:
+                layers.append(layer)
+            if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
+                break
+    if len(layers) < 2:
+        if getattr(cfg, "continue_on_diagnostic_failure", False):
+            print(f"  ⚠️ Phase 1B: Fewer than 2 safe candidate layers found ({layers}); skipping co-adaptation.")
+            return {"status": "SKIPPED_INSUFFICIENT_LAYERS", "candidate_layers": layers, "steps": 0}
+        raise RuntimeError(f"Phase 1B requires at least two independently safe candidate layers (found {layers})")
     pairs = [(layers[i], layers[j]) for i in range(len(layers)) for j in range(i + 1, len(layers))]
     schedule = [(layer,) for layer in layers] + pairs
     params = [p for sn in model.steer_nets.values() for p in sn.parameters()]
@@ -1973,13 +1986,45 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     print(f"  [eval split] eval_data split: {len(eval_sel)} for selection/audits, {len(confirm_rows)} reserved for deployment confirmation.")
 
     # PHASE 1: Pure SteerNet (uses steer_data, eval_sel)
-    best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(
-        model, steer_data, eval_sel, cfg, device, tokenizer=tokenizer
-    )
-    logs.update(p1_logs)
-    logs["phase1_acceptance"] = phase1_steernet_acceptance(
-        model, tokenizer, steer_data, eval_sel, cfg, device
-    )
+    resume_phase1 = bool(getattr(cfg, "resume_phase1", False))
+    phase1_report_path = getattr(cfg, "phase1_report_save_path", os.path.join(cfg.checkpoint_dir, "phase1_report.json"))
+    loaded_existing_phase1 = False
+
+    if resume_phase1 and os.path.exists(cfg.lora_save_path):
+        print(f"\n  [Phase 1 Resume] Loading existing Phase 1 SteerNet weights from {cfg.lora_save_path}...")
+        load_ars_checkpoint_strict(model, cfg.lora_save_path, device=device)
+        best_val_p1 = 0.0
+        p1_logs = {"p1_train": [], "p1_val": []}
+        if os.path.exists(phase1_report_path):
+            try:
+                with open(phase1_report_path, "r", encoding="utf-8") as f:
+                    logs["phase1_acceptance"] = json.load(f)
+                print(f"  [Phase 1 Resume] Loaded cached Phase 1 acceptance report from {phase1_report_path}.")
+                loaded_existing_phase1 = True
+            except Exception as e:
+                print(f"  ⚠️ [Phase 1 Resume] Failed loading report from {phase1_report_path}: {e}")
+        if not loaded_existing_phase1:
+            print("  [Phase 1 Resume] Re-evaluating acceptance audit on loaded weights...")
+            logs["phase1_acceptance"] = phase1_steernet_acceptance(
+                model, tokenizer, steer_data, eval_sel, cfg, device
+            )
+            loaded_existing_phase1 = True
+        logs.update(p1_logs)
+
+    if not loaded_existing_phase1:
+        best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(
+            model, steer_data, eval_sel, cfg, device, tokenizer=tokenizer
+        )
+        logs.update(p1_logs)
+        logs["phase1_acceptance"] = phase1_steernet_acceptance(
+            model, tokenizer, steer_data, eval_sel, cfg, device
+        )
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(phase1_report_path)), exist_ok=True)
+            with open(phase1_report_path, "w", encoding="utf-8") as f:
+                json.dump(logs["phase1_acceptance"], f, indent=2, default=str)
+        except Exception as e:
+            print(f"  ⚠️ Could not save Phase 1 acceptance cache: {e}")
     p1_pre_cap = collect_pre_cap_ratio(model)
     if p1_pre_cap:
         print(f"  [telemetry] Phase 1 SteerNet pre-cap norm ratios (delta_norm / cap): {p1_pre_cap}")
