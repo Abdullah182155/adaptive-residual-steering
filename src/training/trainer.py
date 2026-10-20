@@ -1,7 +1,10 @@
 import gc
+import hashlib
+import json
 import os
 import random
 import time
+from dataclasses import asdict, is_dataclass
 import torch
 from tqdm import tqdm
 from typing import List, Dict, Any, Tuple, Optional
@@ -25,7 +28,75 @@ from src.training.losses import (
     log_gpu_memory,
 )
 from src.training.contrastive import compute_contrastive_gate_loss
-from src.experiments.checkpointing import save_ars_checkpoint, load_ars_checkpoint_strict
+from src.experiments.checkpointing import (
+    load_ars_checkpoint_strict,
+    load_checkpoint_manifest,
+    save_ars_checkpoint,
+)
+
+
+def _phase1_runtime_config_sha256(cfg: RSCConfig) -> str:
+    """Fingerprint Phase-1-relevant runtime choices, excluding resume plumbing."""
+    raw = asdict(cfg) if is_dataclass(cfg) else dict(vars(cfg))
+    ignored = {
+        "resume_phase1", "phase1_report_save_path", "checkpoint_dir",
+        "lora_save_path", "phase2_save_path", "router_bootstrap_save_path",
+        "steer_finetune_save_path", "gate_only_save_path",
+    }
+    selected = {key: value for key, value in raw.items() if key not in ignored}
+    payload = json.dumps(selected, sort_keys=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _phase1_report_provenance(checkpoint_path: str, cfg: Optional[RSCConfig] = None) -> Dict[str, str]:
+    """Bind a cached acceptance report to the exact Phase-1 checkpoint.
+
+    A report selected under different weights, source revision, or architecture
+    must never be trusted during resume.  The checkpoint manifest already
+    records an exact ARS state hash and configuration, so reuse it instead of
+    inventing a second, weaker identity scheme.
+    """
+    manifest = load_checkpoint_manifest(checkpoint_path)
+    if not manifest or not manifest.get("state_sha256"):
+        raise RuntimeError(
+            f"Phase-1 resume requires a manifest with state_sha256: {checkpoint_path}"
+        )
+    config_json = json.dumps(manifest.get("config", {}), sort_keys=True, default=str)
+    provenance = {
+        "checkpoint_path": os.path.abspath(checkpoint_path),
+        "checkpoint_state_sha256": str(manifest["state_sha256"]),
+        "checkpoint_git_commit": str(manifest.get("git_commit", "unknown")),
+        "checkpoint_config_sha256": hashlib.sha256(config_json.encode("utf-8")).hexdigest(),
+    }
+    if cfg is not None:
+        provenance["runtime_config_sha256"] = _phase1_runtime_config_sha256(cfg)
+    return provenance
+
+
+def _cache_phase1_report(
+    report: Dict[str, Any], report_path: str, checkpoint_path: str, cfg: Optional[RSCConfig] = None,
+) -> Dict[str, Any]:
+    """Atomically persist a Phase-1 report with checkpoint provenance."""
+    payload = dict(report)
+    payload["cache_provenance"] = _phase1_report_provenance(checkpoint_path, cfg)
+    directory = os.path.dirname(os.path.abspath(report_path))
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = report_path + ".tmp"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, default=str)
+    os.replace(temporary_path, report_path)
+    return payload
+
+
+def _phase1_report_matches_checkpoint(
+    report: Dict[str, Any], checkpoint_path: str, cfg: Optional[RSCConfig] = None,
+) -> bool:
+    """Return whether a cached report was generated from the loaded weights."""
+    cached = report.get("cache_provenance")
+    if not isinstance(cached, dict):
+        return False
+    expected = _phase1_report_provenance(checkpoint_path, cfg)
+    return all(cached.get(key) == value for key, value in expected.items())
 
 
 def _set_batch_context(model, mask: torch.Tensor, labels: torch.Tensor, shield_mask: Optional[torch.Tensor] = None):
@@ -401,14 +472,18 @@ def _phase1_confirmation_verdict(
     # Accuracy is calculated as floating-point ratios; retain the intended
     # exact binomial boundary (for example 12/20 - 13/20 == -1/20).
     epsilon = 1e-12
-    direct_accuracy_pass = confirmation_gain >= minimum_gain - epsilon
+    combined_nonregressing = combined_gain >= -epsilon
+    direct_accuracy_pass = confirmation_gain >= minimum_gain - epsilon and (
+        not bool(getattr(cfg, "phase1_require_nonnegative_combined_gain", True))
+        or combined_nonregressing
+    )
     one_question = 1.0 / max(1, int(confirmation_n))
     noise_tolerated = bool(
         getattr(cfg, "phase1_allow_confirmation_noise_tolerance", True)
         and confirmation_n <= 32
         and confirmation_gain >= -one_question - epsilon
         and calibration_gain >= 0.10 - epsilon
-        and combined_gain >= -epsilon
+        and combined_nonregressing
     )
     reasons = []
     if not safe:
@@ -520,9 +595,15 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
         if not eligible_pairs:
             warning = "  ⚠️ Phase-1 acceptance FAILED: no (layer, alpha) pair met CoT and norm safety constraints."
             print(warning)
-            if not getattr(cfg, "continue_on_diagnostic_failure", True):
-                raise RuntimeError(warning)
-            return {"candidates": candidates, "passed": False, "status": "FAIL_NO_SAFE_PAIR", "truncation_rejected_layers": rejected_layers}
+            # ``train_rsc`` owns the fail-closed transition so it can persist
+            # this diagnostic report before it stops downstream phases.
+            return {
+                "candidates": candidates,
+                "passed": False,
+                "status": "FAIL_NO_SAFE_PAIR",
+                "truncation_rejected_layers": rejected_layers,
+                "confirmation_trials": [],
+            }
 
         # Accuracy drives calibration selection; answer presence, NLL, raw-q
         # and lower intensity are deterministic secondary tie-breakers.
@@ -676,8 +757,6 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             report["status"] = "FAIL"
             warning = "  ⚠️ Phase-1 SteerNet acceptance FAILED; failing closed before routing."
             print(warning)
-            if not getattr(cfg, "continue_on_diagnostic_failure", True):
-                raise RuntimeError(warning)
         else:
             report["status"] = "PASS"
         return report
@@ -841,8 +920,10 @@ def audit_router_policy_health(model, eval_data, cfg: RSCConfig, device: torch.d
                 + "; ".join(failures)
             )
             print(warning)
-            if getattr(cfg, "router_fail_fast_on_collapse", False) and not getattr(cfg, "continue_on_diagnostic_failure", True):
-                raise RuntimeError(warning)
+            # The top-level curriculum owns termination/rollback.  Raising
+            # here used to bypass report persistence and restore logic in
+            # ``train_rsc``, leaving an interrupted Kaggle session with no
+            # clean diagnostic artifact.
         return report
     finally:
         model.set_router_inference_mode(previous_mode)
@@ -1230,6 +1311,7 @@ def train_phase1b_coadaptation(
             f"{sorted(failed_confirmation_layers)}"
         )
     layers = []
+    layer_scales: Dict[int, float] = {}
     for row in ranking:
         layer = int(row.get("layer", -1))
         # calibration_ranking entries are strictly filtered from eligible safe pairs
@@ -1243,6 +1325,7 @@ def train_phase1b_coadaptation(
             and layer not in layers
         ):
             layers.append(layer)
+            layer_scales[layer] = float(row.get("gate_scale", 1.0))
         if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
             break
     if len(layers) < 2:
@@ -1255,6 +1338,8 @@ def train_phase1b_coadaptation(
                 and layer not in layers
             ):
                 layers.append(layer)
+                safe_scales = [float(p.get("gate_scale", 1.0)) for p in candidate.get("scale_screen", []) if p.get("safe", False)]
+                layer_scales[layer] = min(safe_scales) if safe_scales else 1.0
             if len(layers) >= int(getattr(cfg, "phase1b_candidate_layers", 4)):
                 break
     if len(layers) < 2:
@@ -1263,7 +1348,15 @@ def train_phase1b_coadaptation(
             return {"status": "SKIPPED_INSUFFICIENT_LAYERS", "candidate_layers": layers, "steps": 0}
         raise RuntimeError(f"Phase 1B requires at least two independently safe candidate layers (found {layers})")
     pairs = [(layers[i], layers[j]) for i in range(len(layers)) for j in range(i + 1, len(layers))]
-    schedule = [(layer,) for layer in layers] + pairs
+    # Repeat the smaller route family and interleave it with the other so
+    # every epoch has exactly equal K=1 and K=2 exposure independent of the
+    # number of certified layers.  The old concatenation was 40/60 for four
+    # layers and 67/33 for two layers, despite claiming to be balanced.
+    singletons = [(layer,) for layer in layers]
+    schedule = []
+    for index in range(max(len(singletons), len(pairs))):
+        schedule.append(singletons[index % len(singletons)])
+        schedule.append(pairs[index % len(pairs)])
     params = [p for sn in model.steer_nets.values() for p in sn.parameters()]
     for p in params:
         p.requires_grad = True
@@ -1273,9 +1366,12 @@ def train_phase1b_coadaptation(
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     steps, norm_total = 0, 0.0
     model.base_model.eval()
-    model.set_gate_freeze(True, 1.0)
+    model.set_gate_freeze(True, layer_scales)
     model.set_router_warmup(False)
-    print(f"\nPHASE 1B: Balanced K=1/K=2 Co-adaptation | layers={layers} pairs={len(pairs)}")
+    print(
+        f"\nPHASE 1B: Balanced K=1/K=2 Co-adaptation | layers={layers} "
+        f"pairs={len(pairs)} scales={layer_scales}"
+    )
     try:
         for epoch in range(epochs):
             order = list(range(len(train_data)))
@@ -1327,6 +1423,9 @@ def train_phase1b_coadaptation(
             p.requires_grad = False
     return {
         "status": "COMPLETE", "candidate_layers": layers, "pair_count": len(pairs),
+        "candidate_gate_scales": layer_scales,
+        "schedule_k1_steps": len(schedule) // 2,
+        "schedule_k2_steps": len(schedule) // 2,
         "steps": steps, "mean_norm_loss": norm_total / max(1, steps),
     }
 
@@ -1402,7 +1501,14 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
     print(f"           steer_compat_lr={compat_lr:.2e}  joint_nll_weight={lambda_joint}")
     print("=" * 80)
 
-    compatibility_required = lambda_joint > 0.0 and bool(steer_params) and len(model.target_layers) >= 2
+    eligible_layers = [
+        layer for layer, allowed in zip(
+            model.target_layers,
+            model.routing_eligibility_mask(device).tolist()
+            if hasattr(model, "routing_eligibility_mask") else [True] * len(model.target_layers),
+        ) if allowed
+    ]
+    compatibility_required = lambda_joint > 0.0 and bool(steer_params) and len(eligible_layers) >= 2
     compatibility_telemetry = {
         "required": compatibility_required,
         "attempts": 0,
@@ -1460,16 +1566,20 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             # We pick the top-synergy pair so the correction reinforces actual cooperation.
             # OOM FIX: run on a single example (ids[:1]) instead of the full batch.
             # Full-batch logits.float() = [B,T,V] fp32 → ~800 MB at B=8; single = ~100 MB.
-            if lambda_joint > 0.0 and steer_params and len(model.target_layers) >= 2:
+            if lambda_joint > 0.0 and steer_params and len(eligible_layers) >= 2:
                 joint_attempts_epoch += 1
                 compatibility_telemetry["attempts"] += 1
                 coop = model.get_cooperation_analysis() if hasattr(model, "get_cooperation_analysis") else {}
                 top_pairs = coop.get("top_synergy_pairs", [])
                 # Use best positive-synergy pair; fall back to first two candidate layers
-                if top_pairs and len(top_pairs[0]) >= 3 and top_pairs[0][2] > 0:
+                if (
+                    top_pairs and len(top_pairs[0]) >= 3 and top_pairs[0][2] > 0
+                    and int(top_pairs[0][0]) in eligible_layers
+                    and int(top_pairs[0][1]) in eligible_layers
+                ):
                     layer_i, layer_j = int(top_pairs[0][0]), int(top_pairs[0][1])
                 else:
-                    layer_i, layer_j = model.target_layers[0], model.target_layers[1]
+                    layer_i, layer_j = eligible_layers[0], eligible_layers[1]
 
                 n_cands = len(model.target_layers)
                 # Single example: avoids holding B×T×V graph in memory alongside RLOO activations
@@ -1985,6 +2095,11 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         return train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg, device)
 
     logs = {}
+    # A notebook may invoke ``train_rsc`` more than once on the same wrapper.
+    # Phase 1 must begin against the full catalog; its newly certified Phase
+    # 1B pool is installed later before router bootstrap.
+    if hasattr(model, "set_eligible_routing_layers"):
+        model.set_eligible_routing_layers(None)
 
     # ISSUE-15: purge stale checkpoint files from previous runs before writing new ones
     for _ckpt_path in (
@@ -2033,23 +2148,26 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         if os.path.exists(phase1_report_path):
             try:
                 with open(phase1_report_path, "r", encoding="utf-8") as f:
-                    logs["phase1_acceptance"] = json.load(f)
-                print(f"  [Phase 1 Resume] Loaded cached Phase 1 acceptance report from {phase1_report_path}.")
+                    cached_report = json.load(f)
+                if not _phase1_report_matches_checkpoint(cached_report, cfg.lora_save_path, cfg):
+                    raise RuntimeError("cache provenance does not match the loaded Phase-1 checkpoint")
+                logs["phase1_acceptance"] = cached_report
+                print(f"  [Phase 1 Resume] Loaded provenance-verified Phase 1 acceptance report from {phase1_report_path}.")
                 loaded_existing_phase1 = True
             except Exception as e:
-                print(f"  ⚠️ [Phase 1 Resume] Failed loading report from {phase1_report_path}: {e}")
+                print(f"  ⚠️ [Phase 1 Resume] Ignoring stale/corrupt report from {phase1_report_path}: {e}")
         if not loaded_existing_phase1:
             print("  [Phase 1 Resume] Re-evaluating acceptance audit on loaded weights...")
             logs["phase1_acceptance"] = phase1_steernet_acceptance(
                 model, tokenizer, steer_data, eval_sel, cfg, device
             )
             try:
-                os.makedirs(os.path.dirname(os.path.abspath(phase1_report_path)), exist_ok=True)
-                with open(phase1_report_path, "w", encoding="utf-8") as f:
-                    json.dump(logs["phase1_acceptance"], f, indent=2, default=str)
+                logs["phase1_acceptance"] = _cache_phase1_report(
+                    logs["phase1_acceptance"], phase1_report_path, cfg.lora_save_path, cfg
+                )
                 print(f"  [Phase 1 Resume] Cached re-evaluated acceptance report at {phase1_report_path}.")
             except Exception as e:
-                print(f"  ⚠️ Could not cache re-evaluated Phase 1 acceptance report: {e}")
+                raise RuntimeError(f"Could not cache re-evaluated Phase 1 acceptance report: {e}") from e
             loaded_existing_phase1 = True
         logs.update(p1_logs)
 
@@ -2062,11 +2180,11 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
             model, tokenizer, steer_data, eval_sel, cfg, device
         )
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(phase1_report_path)), exist_ok=True)
-            with open(phase1_report_path, "w", encoding="utf-8") as f:
-                json.dump(logs["phase1_acceptance"], f, indent=2, default=str)
+            logs["phase1_acceptance"] = _cache_phase1_report(
+                logs["phase1_acceptance"], phase1_report_path, cfg.lora_save_path, cfg
+            )
         except Exception as e:
-            print(f"  ⚠️ Could not save Phase 1 acceptance cache: {e}")
+            raise RuntimeError(f"Could not save Phase 1 acceptance cache: {e}") from e
     p1_pre_cap = collect_pre_cap_ratio(model)
     if p1_pre_cap:
         print(f"  [telemetry] Phase 1 SteerNet pre-cap norm ratios (delta_norm / cap): {p1_pre_cap}")
@@ -2120,6 +2238,16 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     logs["phase1b_coadaptation"] = train_phase1b_coadaptation(
         model, router_data, phase1_report, cfg, device,
     )
+    phase1b_layers = logs["phase1b_coadaptation"].get("candidate_layers", [])
+    if len(phase1b_layers) < 2:
+        raise RuntimeError(
+            "Phase 1B completed without at least two eligible routing layers; "
+            f"got {phase1b_layers}"
+        )
+    if hasattr(model, "set_eligible_routing_layers"):
+        model.set_eligible_routing_layers(phase1b_layers)
+        logs["eligible_routing_layers"] = list(phase1b_layers)
+        print(f"  [routing contract] learned router restricted to Phase-1B layers: {phase1b_layers}")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -2142,10 +2270,11 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print("ROUTER DEPLOYMENT GATE: ADAPTIVE PHASES SKIPPED")
         print("         Deployment argmax collapsed; Gate/Phase 2 cannot make this a valid ARS policy.")
         print("         Retaining Phase-1 and Router diagnostics; no Full-ARS checkpoint claim is produced.")
-        # RC-5: restore Phase-1 SteerNet state so bootstrap didn't corrupt the best known checkpoint
+        # Restore the independently accepted Phase-1 state; neither failed
+        # co-adaptation nor a collapsed router may overwrite that artifact.
         if phase1_safe_snapshot:
             model.load_state_dict(phase1_safe_snapshot, strict=False)
-            print("         ↩️  Original Phase-1 SteerNet weights restored (co-adaptation/bootstrap did not improve preflight).")
+            print("         ↩️  Accepted Phase-1 SteerNet weights restored after failed Phase-1B/router preflight.")
         print("=" * 80)
         logs["adaptive_phases_status"] = "SKIPPED_COLLAPSED_ROUTER"
         logs["ars_intervention_audit"] = {

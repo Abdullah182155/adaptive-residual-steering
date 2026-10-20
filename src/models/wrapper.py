@@ -56,6 +56,11 @@ class Phi2WithRSC(nn.Module):
         self._prompt_level_selected_count = [0] * len(self.target_layers)
         self._prompt_level_total = 0
         self._routing_override = None
+        # Set after Phase 1B.  A router may only learn/deploy routes composed
+        # of layers that survived the Phase-1 safety contract and received
+        # co-adaptation updates.  ``None`` preserves the complete catalog for
+        # Phase-1 audits and fixed experimental controls.
+        self._eligible_routing_layers: Optional[Set[int]] = None
         if not getattr(cfg, "use_router", True) or getattr(cfg, "fixed_layers", None) is not None:
             fl = cfg.fixed_layers or list(self.target_layers)
             self.set_routing_override("only", fl)
@@ -292,10 +297,14 @@ class Phi2WithRSC(nn.Module):
         """Enable or disable prompt shielding."""
         self.prompt_shielding = enabled
 
-    def set_gate_freeze(self, freeze: bool, value: float = 1.0):
-        for gate in self.gates.values():
+    def set_gate_freeze(self, freeze: bool, value: float | Dict[int, float] = 1.0):
+        """Freeze gates globally or at calibrated per-layer intensities."""
+        values = value if isinstance(value, dict) else None
+        for layer, gate in self.gates.items():
             gate._freeze_gate = freeze
-            gate._freeze_gate_value = value
+            gate._freeze_gate_value = float(
+                values.get(int(layer), 1.0) if values is not None else value
+            )
 
     def set_router_warmup(self, enabled: bool):
         self._router_warmup = enabled
@@ -310,6 +319,62 @@ class Phi2WithRSC(nn.Module):
 
     def set_router_context_mask(self, context_mask=None):
         self._router_context_mask_pending = context_mask
+
+    def set_eligible_routing_layers(self, layers: Optional[List[int]] = None):
+        """Restrict learned routing to a certified Phase-1B layer pool.
+
+        Explicit routing overrides remain available for controlled audits, but
+        ordinary router inference and RLOO sampling are masked to this pool.
+        This prevents a confirmation-failed or never-co-adapted SteerNet from
+        silently re-entering downstream adaptive phases.
+        """
+        if layers is None:
+            self._eligible_routing_layers = None
+        else:
+            selected = {int(layer) for layer in layers}
+            unknown = selected - set(self.target_layers)
+            if unknown:
+                raise ValueError(f"eligible routing layers contain non-candidates: {sorted(unknown)}")
+            if not selected:
+                raise ValueError("eligible routing layers must not be empty")
+            self._eligible_routing_layers = selected
+        # Cached decode routes were constructed under the preceding contract.
+        self._cached_decode_routes = None
+        self._cached_decode_k = None
+        self._cached_decode_probs = None
+        self._cached_decode_logits = None
+        self._cached_decode_margins = None
+        self._cached_decode_active_k = None
+        self._cached_decode_allocation = None
+
+    def routing_eligibility_mask(self, device: Optional[torch.device] = None) -> torch.Tensor:
+        """Return the learned-routing eligibility mask in catalog order."""
+        target_device = device or self.device
+        if self._eligible_routing_layers is None:
+            return torch.ones(len(self.target_layers), dtype=torch.bool, device=target_device)
+        return torch.tensor(
+            [layer in self._eligible_routing_layers for layer in self.target_layers],
+            dtype=torch.bool,
+            device=target_device,
+        )
+
+    def mask_routing_logits(self, logits: torch.Tensor) -> torch.Tensor:
+        """Mask ineligible layer logits for learned routing and RLOO probes."""
+        eligible = self.routing_eligibility_mask(logits.device)
+        if not eligible.any():
+            raise RuntimeError("learned routing has no eligible Phase-1B layers")
+        return logits.masked_fill(~eligible.unsqueeze(0), float("-inf"))
+
+    def mask_routing_k_logits(self, k_logits: torch.Tensor) -> torch.Tensor:
+        """Disallow K values that cannot be realised by the eligible pool."""
+        max_k = min(self.cfg.max_active_layers, int(self.routing_eligibility_mask(k_logits.device).sum().item()))
+        # Modern routers expose K=0..Kmax.  Retain the legacy fallback for a
+        # K=1..Kmax head so older checkpoints can still be inspected.
+        if k_logits.shape[-1] > self.cfg.max_active_layers:
+            legal = torch.arange(k_logits.shape[-1], device=k_logits.device) <= max_k
+        else:
+            legal = torch.arange(1, k_logits.shape[-1] + 1, device=k_logits.device) <= max_k
+        return k_logits.masked_fill(~legal.unsqueeze(0), float("-inf"))
 
     def set_routing_override(self, mode=None, layers=None):
         if mode is None:
@@ -388,14 +453,23 @@ class Phi2WithRSC(nn.Module):
 
         router_mask = self._router_mask_for(h, mask)
         u, k_logits = self.router(h, router_mask)
-        self._router_logits = u
-        self._router_margins = u
-        self._router_probabilities = F.softmax(u, dim=-1)
+        learned_logits = self.mask_routing_logits(u)
+        learned_k_logits = self.mask_routing_k_logits(k_logits)
+        # A prescribed audit route may intentionally inspect any catalog
+        # member.  Eligibility constrains learned routing, never an explicit
+        # experimental control.
+        trace_logits = learned_logits if self._routing_override is None else u
+        self._router_logits = trace_logits
+        self._router_margins = trace_logits
+        self._router_probabilities = F.softmax(trace_logits, dim=-1)
         if self._routing_override is None:
             self.router.seen_forwards += h.shape[0]
 
         n_candidates = len(self.target_layers)
-        K_max = self.cfg.max_active_layers
+        eligible_mask = self.routing_eligibility_mask(h.device)
+        eligible_layers = [layer for layer, allowed in zip(self.target_layers, eligible_mask.tolist()) if allowed]
+        n_eligible = len(eligible_layers)
+        K_max = min(self.cfg.max_active_layers, n_eligible)
 
         # An explicit route is an audit/benchmark contract.  It must win over
         # background warmup coverage so a requested baseline remains truly
@@ -404,14 +478,14 @@ class Phi2WithRSC(nn.Module):
             warmup_max_k = int(getattr(self.cfg, "router_warmup_max_k", 4))
             if getattr(self.cfg, "router_warmup_random_subsets", True):
                 import random as _random
-                k_max = min(K_max, warmup_max_k, n_candidates)
+                k_max = min(K_max, warmup_max_k, n_eligible)
                 width = _random.randint(1, max(1, k_max))
-                forced_indices = set(_random.sample(self.target_layers, width))
+                forced_indices = set(_random.sample(eligible_layers, width))
             else:
                 width = 1 + (self._warmup_cursor % max(1, min(K_max, warmup_max_k)))
-                stride = max(1, n_candidates // width)
+                stride = max(1, n_eligible // width)
                 pos = self._warmup_width_visits[width - 1]
-                forced_indices = {self.target_layers[(pos + j * stride) % n_candidates] for j in range(width)}
+                forced_indices = {eligible_layers[(pos + j * stride) % n_eligible] for j in range(width)}
                 self._warmup_width_visits[width - 1] += 1
             selected_matrix = torch.tensor(
                 [idx in forced_indices for idx in self.target_layers], device=h.device, dtype=torch.bool
@@ -422,28 +496,28 @@ class Phi2WithRSC(nn.Module):
             synergy = getattr(self.router, "_last_synergy_matrix", None)
             if self.training and self._router_exploration:
                 with torch.no_grad():
-                    k_real, _ = sample_k(k_logits)
-                    selected_matrix, _ = sample_subset_plackett_luce(u, k_real, synergy_matrix=synergy)
+                    k_real, _ = sample_k(learned_k_logits, k_max=K_max)
+                    selected_matrix, _ = sample_subset_plackett_luce(learned_logits, k_real, synergy_matrix=synergy)
                 self._desired_k = k_real
             else:
                 if self._router_inference_mode == "sample":
                     with torch.no_grad():
-                        k_real, _ = sample_k(k_logits, k_max=K_max)
-                        selected_matrix, _ = sample_subset_plackett_luce(u, k_real, synergy_matrix=synergy)
+                        k_real, _ = sample_k(learned_k_logits, k_max=K_max)
+                        selected_matrix, _ = sample_subset_plackett_luce(learned_logits, k_real, synergy_matrix=synergy)
                     k_real = k_real.clamp(min=0, max=K_max)
                 else:
                     # Deterministic evaluation: select the learned K (including
                     # K=0) and greedily construct the cooperative subset.
                     with torch.no_grad():
-                        k_idx = k_logits.float().argmax(dim=-1)
-                        if k_logits.shape[-1] > K_max:
+                        k_idx = learned_k_logits.float().argmax(dim=-1)
+                        if learned_k_logits.shape[-1] > self.cfg.max_active_layers:
                             k_real = k_idx.clamp(min=0, max=K_max)
                         else:
                             k_real = (k_idx + 1).clamp(min=1, max=K_max)
                     selected_matrix = torch.zeros(h.shape[0], n_candidates, dtype=torch.bool, device=h.device)
                     for b in range(h.shape[0]):
                         kb = int(k_real[b].item())
-                        cur_u = u[b].clone()
+                        cur_u = learned_logits[b].clone()
                         sel_idx = []
                         for _ in range(min(kb, n_candidates)):
                             for prev in sel_idx:
@@ -454,7 +528,7 @@ class Phi2WithRSC(nn.Module):
                                 cur_u = cur_u + 0.5 * synergy[b, best]
                         selected_matrix[b, sel_idx] = True
                 self._desired_k = k_real
-            self.router.observe(u, selected_matrix)
+            self.router.observe(u, selected_matrix, eligible_mask=eligible_mask)
             any_selected_this_fwd = selected_matrix.any(dim=0)
             for i in range(n_candidates):
                 if bool(any_selected_this_fwd[i]):
@@ -596,7 +670,9 @@ class Phi2WithRSC(nn.Module):
     def intervention_diagnostics(self):
         """Summarize realized K, layer usage, and token-gate diversity."""
         k_dist = self.routing_k_distribution()
-        layer_rates = [row["selection_rate_ema"] for row in self.routing_diagnostics().values()]
+        all_layer_rates = [row["selection_rate_ema"] for row in self.routing_diagnostics().values()]
+        eligible = self.routing_eligibility_mask(self.device).tolist()
+        layer_rates = [rate for rate, allowed in zip(all_layer_rates, eligible) if allowed]
         layer_total = sum(layer_rates)
         layer_probs = [rate / layer_total for rate in layer_rates if rate > 0.0]
         k_probs = [p for p in k_dist.values() if p > 0.0]
@@ -610,7 +686,10 @@ class Phi2WithRSC(nn.Module):
             "realized_k_distribution": k_dist,
             "realized_k_support": sum(p > 0.0 for p in k_dist.values()),
             "realized_k_entropy": round(normalized_entropy(k_probs, len(k_dist)), 4),
-            "layer_selection_entropy": round(normalized_entropy(layer_probs, len(self.target_layers)), 4),
+            "eligible_routing_layers": [
+                layer for layer, allowed in zip(self.target_layers, eligible) if allowed
+            ],
+            "layer_selection_entropy": round(normalized_entropy(layer_probs, len(layer_rates)), 4),
             "active_layer_count": sum(rate > 0.02 for rate in layer_rates),
             "gate": gate_metrics,
             "steering": self.steering_diagnostics(),

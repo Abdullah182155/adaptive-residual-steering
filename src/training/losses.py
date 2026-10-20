@@ -155,10 +155,17 @@ def compute_l1_gate(model) -> torch.Tensor:
     return total / max(1, count)
 
 def compute_gate_budget_loss(model, target_sparsity: float = 0.20) -> torch.Tensor:
-    """Quadratic budget penalty pulling mean gate activation towards target_sparsity (Engine v2)."""
+    """Penalize total route-level intervention mass, not each selected layer.
+
+    Factorized routing makes ``_alpha_for_aux`` the effective per-layer gate
+    mass.  Budgeting each layer independently accidentally allows a K=2 route
+    to spend roughly twice the configured intervention budget.  Summing active
+    gates tokenwise gives K=1 and K>1 routes one comparable budget while still
+    letting the allocation mechanism time-share it across layers.
+    """
     device = next(iter(p for g in model.gates.values() for p in g.parameters()), torch.tensor(0.0)).device
-    total = torch.tensor(0.0, device=device)
-    count = 0
+    rows = []
+    masks = []
     for gate in model.gates.values():
         alpha = gate._alpha_for_aux
         if alpha is None:
@@ -166,13 +173,19 @@ def compute_gate_budget_loss(model, target_sparsity: float = 0.20) -> torch.Tens
         a = alpha.float().squeeze(-1)
         vm = gate._valid_mask
         if vm is not None and vm.shape == a.shape:
-            denom = vm.sum().clamp(min=1)
-            mean_a = (a * vm.float()).sum() / denom
+            valid = vm.bool()
         else:
-            mean_a = a.mean()
-        total = total + (mean_a - float(target_sparsity)).pow(2)
-        count += 1
-    return total / max(1, count)
+            valid = torch.ones_like(a, dtype=torch.bool)
+        if rows and a.shape != rows[0].shape:
+            raise ValueError("active gate tensors must share batch/token dimensions")
+        rows.append(a * valid.float())
+        masks.append(valid)
+    if not rows:
+        return torch.zeros((), device=device)
+    route_mass = torch.stack(rows, dim=0).sum(dim=0)
+    route_valid = torch.stack(masks, dim=0).any(dim=0)
+    mean_mass = route_mass[route_valid].mean() if route_valid.any() else torch.zeros((), device=device)
+    return (mean_mass - float(target_sparsity)).pow(2)
 
 def compute_gate_diversity_loss(model, floor: float = 0.05) -> torch.Tensor:
     """Penalize low per-sequence gate variance, excluding single max token."""

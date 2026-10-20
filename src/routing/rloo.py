@@ -162,7 +162,7 @@ def policy_entropy_bonus(logits: torch.Tensor, k_logits: torch.Tensor, k_max: in
     """Compute decoupled entropy for K distribution and Plackett-Luce sequential subset policy."""
     log_p_k = F.log_softmax(k_logits, dim=-1)
     p_k = log_p_k.exp()
-    h_k = -(p_k * log_p_k).sum(dim=-1).mean()
+    h_k = -torch.where(p_k > 0, p_k * log_p_k, torch.zeros_like(log_p_k)).sum(dim=-1).mean()
 
     B, N = logits.shape
     remaining = torch.ones(B, N, dtype=torch.bool, device=logits.device)
@@ -230,7 +230,12 @@ def counterfactual_k_preference_loss(
     mean_reward = rewards_sum / counts.clamp_min(1)
     target_scores = (mean_reward / max(float(temperature), 1e-4)).masked_fill(~observed, float("-inf"))
     target = F.softmax(target_scores, dim=-1)
-    return -(target * F.log_softmax(k_logits, dim=-1)).sum(dim=-1).mean()
+    # Legal-action masking may put ``-inf`` in an unavailable K logit.  A
+    # zero target probability multiplied by that value is mathematically zero
+    # but numerically NaN, so form only the observed cross-entropy terms.
+    log_probs = F.log_softmax(k_logits, dim=-1)
+    terms = torch.where(target > 0, target * log_probs, torch.zeros_like(log_probs))
+    return -terms.sum(dim=-1).mean()
 
 def compute_router_rloo_loss(
     model,
@@ -276,8 +281,25 @@ def compute_router_rloo_loss(
             model.set_routing_override(old_override[0], old_override[1])
 
     u_fresh, k_logits_fresh = model.router.recompute_from_cache()
+    # Phase 1B certifies a finite layer pool.  Counterfactual training must
+    # use that exact pool; otherwise RLOO can reward layers that never passed
+    # acceptance or pair co-adaptation and deployment no longer matches the
+    # curriculum.  Lightweight test doubles may not expose the helper.
+    if hasattr(model, "mask_routing_logits"):
+        u_policy = model.mask_routing_logits(u_fresh)
+        k_logits_policy = model.mask_routing_k_logits(k_logits_fresh)
+        if hasattr(model, "routing_eligibility_mask"):
+            eligible_count = int(model.routing_eligibility_mask(ids.device).sum().item())
+        else:
+            eligible_count = u_fresh.shape[-1]
+    else:
+        u_policy = u_fresh
+        k_logits_policy = k_logits_fresh
+        eligible_count = u_fresh.shape[-1]
     synergy = getattr(model.router, "_last_synergy_matrix", None)
-    K_max = model.cfg.max_active_layers
+    K_max = min(model.cfg.max_active_layers, eligible_count)
+    if K_max < 1:
+        raise RuntimeError("RLOO requires at least one eligible routing layer")
 
     # K is a tiny discrete action space (0..4), so it is both cheaper in
     # variance and more scientifically defensible to score every non-zero K
@@ -290,7 +312,7 @@ def compute_router_rloo_loss(
     subset_logprobs = []
     for arm in range(K_max):
         route_mask, route_logprob = sample_subset_plackett_luce(
-            u_fresh, k_actions[:, arm], synergy_matrix=synergy
+            u_policy, k_actions[:, arm], synergy_matrix=synergy
         )
         subset_masks.append(route_mask)
         subset_logprobs.append(route_logprob)
@@ -450,10 +472,10 @@ def compute_router_rloo_loss(
         row["cost_adjusted_reward"] = row.pop("net_reward_sum") / n_obs
         row["interaction"] = row.pop("interaction_sum") / n_obs
 
-    h_k, h_subset = policy_entropy_bonus(u_fresh, k_logits_fresh, K_max)
+    h_k, h_subset = policy_entropy_bonus(u_policy, k_logits_policy, K_max)
     diversity_temp = float(getattr(cfg, "router_diversity_temperature", 1.0))
     k_mi_loss, layer_mi_loss = mutual_information_diversity_loss(
-        k_logits_fresh, u_fresh, temperature=diversity_temp,
+        k_logits_policy, u_policy, temperature=diversity_temp,
     )
 
     beta_k = getattr(cfg, "beta_entropy_k", 0.15)
@@ -472,7 +494,7 @@ def compute_router_rloo_loss(
     lambda_k_mi = float(getattr(cfg, "lambda_router_k_mi", 0.10))
     lambda_layer_mi = float(getattr(cfg, "lambda_router_layer_mi", 0.10))
     k_preference_loss = counterfactual_k_preference_loss(
-        k_logits_fresh, k_actions, reward_0, action_rewards,
+        k_logits_policy, k_actions, reward_0, action_rewards,
         temperature=float(getattr(cfg, "router_k_preference_temperature", 0.10)),
     )
     lambda_k_preference = float(getattr(cfg, "lambda_router_k_preference", 0.25))
@@ -542,11 +564,11 @@ def compute_router_rloo_loss(
         "layer_mi_loss": float(layer_mi_loss.detach().item()),
         "k_preference_loss": float(k_preference_loss.detach().item()),
         "synergy_prior_loss": float(synergy_prior_loss.detach().item()),
-        "k0_probability": float(F.softmax(k_logits_fresh.detach(), dim=-1)[:, 0].mean().item()),
+        "k0_probability": float(F.softmax(k_logits_policy.detach(), dim=-1)[:, 0].mean().item()),
         "mean_per_layer_cost": float(per_layer_cost.mean().item()),
         "argmax_k_distribution": {
-            int(k): float((k_logits_fresh.detach().argmax(dim=-1) == k).float().mean().item())
-            for k in range(k_logits_fresh.shape[-1])
+            int(k): float((k_logits_policy.detach().argmax(dim=-1) == k).float().mean().item())
+            for k in range(k_logits_policy.shape[-1])
         },
         "counterfactual_k_actions": list(range(1, K_max + 1)),
         "counterfactual_utility_by_k": k_utility,

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.13.2] - 2026-10-20
+
+### 🛡️ Phase-1B Routing Contract & Fail-Closed Recovery
+- **Certified routing pool (`src/models/wrapper.py`, `src/routing/rloo.py`, `src/training/trainer.py`):** The learned router, its K head, RLOO counterfactual subset sampler, and bootstrap K=2 correction are now masked to the safe layers produced by Phase 1B. Explicit audit overrides remain available, but confirmation-failed or never-co-adapted layers cannot silently re-enter adaptive routing.
+- **Balanced calibrated co-adaptation (`src/training/trainer.py`):** Phase 1B now alternates an exactly balanced K=1/K=2 schedule regardless of pool size and freezes each safe layer at its validated Phase-1 gate scale rather than reverting to a mismatched global intensity.
+- **Robust Phase-1 recovery (`src/training/trainer.py`):** Acceptance reports are atomically cached with the strict checkpoint manifest state hash, commit, and configuration fingerprint. Stale/corrupt reports trigger re-evaluation; cache persistence failures are fatal rather than silently disabling resume. Phase-1 and router failures now return structured diagnostics through `train_rsc`, allowing evidence persistence and rollback before downstream phases are skipped.
+- **Route-level gate budget (`src/training/losses.py`):** Gate-budget regularization now constrains total effective intervention mass per token across selected layers, preventing K=2 routes from receiving twice the intended budget merely because two gates are active.
+- **Scientific promotion guard (`src/configs/config.py`, `src/training/trainer.py`):** Direct Phase-1 confirmation promotion now also requires non-regressing pooled calibration-plus-confirmation accuracy by default; the existing one-question tolerance remains bounded by the same pooled criterion.
+
+---
+
 ## [1.13.1] - 2026-10-20
 
 ### 🐛 Fixed

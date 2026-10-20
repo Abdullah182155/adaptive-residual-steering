@@ -110,6 +110,10 @@ class RSCConfig:
     # the pooled calibration-plus-confirmation accuracy does not regress.
     # CoT, raw-norm, and NLL safety gates remain strict in all cases.
     phase1_allow_confirmation_noise_tolerance: bool = True
+    # A selected calibration winner must not be promoted solely because a
+    # small confirmation split happened to be positive.  Require its pooled,
+    # disjoint calibration-plus-confirmation result to be non-regressing.
+    phase1_require_nonnegative_combined_gain: bool = True
     # During training, screen every epoch on a smaller fixed partition and
     # conservative scales only.  Full five-scale calibration happens once.
     phase1_epoch_generation_screen_examples: int = 6
@@ -231,6 +235,9 @@ class RSCConfig:
     bootstrap_joint_nll_weight: float = 0.3          # weight of K=2 joint-NLL correction
     router_rloo_batch_size: int = 8  # enables batch-level policy diversity, unlike a B=1 RLOO probe
     router_preflight_examples: int = 128
+    # Retained for backward-compatible notebook configurations.  Router
+    # preflight always reports its verdict; train_rsc owns the clean
+    # fail-closed return before expensive adaptive phases begin.
     router_fail_fast_on_collapse: bool = True
     intervention_audit_examples: int = 128
     router_min_eval_k_support: int = 2

@@ -212,15 +212,34 @@ class JointLayerRouter(nn.Module):
         per_candidate_semantic = self._semantic_from_pooled(self._last_pooled)
         return self._score_from_base(self._last_scalars, per_candidate_semantic, return_synergy=return_synergy)
 
-    def observe(self, u: torch.Tensor, selected_matrix: torch.Tensor):
+    def observe(
+        self,
+        u: torch.Tensor,
+        selected_matrix: torch.Tensor,
+        eligible_mask: Optional[torch.Tensor] = None,
+    ):
+        """Update diagnostics without treating masked candidates as -inf data."""
         if not self.training:
             return
-        self.logit_ema.mul_(0.98).add_(0.02 * u.detach().mean(dim=0))
-        self.logit_sq_ema.mul_(0.98).add_(0.02 * u.detach().pow(2).mean(dim=0))
+        if eligible_mask is None:
+            eligible_mask = torch.ones(u.shape[-1], dtype=torch.bool, device=u.device)
+        eligible_mask = eligible_mask.to(device=u.device, dtype=torch.bool)
+        if eligible_mask.shape != (u.shape[-1],):
+            raise ValueError("eligible_mask must have shape (n_candidates,)")
+        mean_u = u.detach().mean(dim=0)
+        mean_u_sq = u.detach().pow(2).mean(dim=0)
+        self.logit_ema[eligible_mask] = (
+            self.logit_ema[eligible_mask] * 0.98 + 0.02 * mean_u[eligible_mask]
+        )
+        self.logit_sq_ema[eligible_mask] = (
+            self.logit_sq_ema[eligible_mask] * 0.98 + 0.02 * mean_u_sq[eligible_mask]
+        )
         realized = selected_matrix.detach().float().mean(dim=0)
         # BUG-I1 fix: selection_rate_ema was never updated — always stayed at init value 0.5.
         # Now properly tracks empirical per-layer selection rate via EMA.
-        self.selection_rate_ema.mul_(0.98).add_(0.02 * realized)
+        self.selection_rate_ema[eligible_mask] = (
+            self.selection_rate_ema[eligible_mask] * 0.98 + 0.02 * realized[eligible_mask]
+        )
         k_realized = selected_matrix.detach().sum(dim=-1).clamp(min=0, max=self.max_active_layers)
         k_onehot = F.one_hot(k_realized.long(), num_classes=self.max_active_layers + 1).float().mean(dim=0)
         self.k_dist_ema.mul_(0.98).add_(0.02 * k_onehot)

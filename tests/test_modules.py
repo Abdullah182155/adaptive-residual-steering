@@ -1415,7 +1415,7 @@ class TestEngineV2OutcomeSupervision(unittest.TestCase):
         self.assertLess(nll_calc.item(), 0.05)
 
     def test_compute_gate_budget_loss(self):
-        """Budget loss pulls mean alpha towards target_sparsity (e.g. 0.20)."""
+        """Budget loss pulls total route mass towards target_sparsity (e.g. 0.20)."""
         from src.training.losses import compute_gate_budget_loss
 
         class DummyGate(nn.Module):
@@ -1439,6 +1439,13 @@ class TestEngineV2OutcomeSupervision(unittest.TestCase):
         m_sat = DummyModel(1.0)
         loss_sat = compute_gate_budget_loss(m_sat, target_sparsity=0.20)
         self.assertAlmostEqual(loss_sat.item(), 0.64, places=4)
+
+        # Two selected layers splitting the same route budget must still be
+        # ideal at total mass 0.20, rather than being penalized per layer.
+        m_split = DummyModel(0.10)
+        m_split.gates["13"] = DummyGate(0.10)
+        loss_split = compute_gate_budget_loss(m_split, target_sparsity=0.20)
+        self.assertAlmostEqual(loss_split.item(), 0.0, places=4)
 
     def test_trim_batch_with_calc_mask(self):
         """_trim_batch trims both standard tensors and calc_mask to the same sequence length."""
@@ -1648,6 +1655,60 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
         self.assertEqual(float(allocation[0, 2]), 0.0)
         self.assertTrue(torch.equal(allocation[1], torch.zeros(3)))
 
+    def test_phase1b_eligibility_masks_learned_routes_but_not_audit_overrides(self):
+        """Rejected/non-coadapted layers cannot re-enter learned routing."""
+        class DummyLayer(nn.Module):
+            def forward(self, h, *args, **kwargs):
+                return h
+
+        class DummyModel(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = type("Config", (), {"num_hidden_layers": 10, "hidden_size": 16})()
+                self.embed = nn.Embedding(32, 16)
+                self.model = type("Model", (), {"layers": nn.ModuleList([DummyLayer() for _ in range(10)])})()
+
+            def forward(self, input_ids=None, attention_mask=None, **kwargs):
+                h = self.embed(input_ids)
+                for layer in self.model.layers:
+                    h = layer(h)
+                return type("Output", (), {"logits": h})()
+
+        wrapper = Phi2WithRSC(DummyModel(), RSCConfig(), device=torch.device("cpu"))
+        eligible = wrapper.target_layers[-2:]
+        wrapper.set_eligible_routing_layers(eligible)
+        raw = torch.zeros(1, len(wrapper.target_layers))
+        masked = wrapper.mask_routing_logits(raw)
+        self.assertTrue(torch.isneginf(masked[0, :-2]).all())
+        self.assertTrue(torch.isfinite(masked[0, -2:]).all())
+        k_logits = torch.zeros(1, wrapper.cfg.max_active_layers + 1)
+        masked_k = wrapper.mask_routing_k_logits(k_logits)
+        self.assertTrue(torch.isneginf(masked_k[0, 3:]).all())
+
+        # Explicit measurements retain full catalog access by design.
+        rejected_layer = wrapper.target_layers[0]
+        wrapper.set_routing_override("only", [rejected_layer])
+        self.assertEqual(wrapper._routing_override[1], {rejected_layer})
+
+    def test_phase1_report_cache_requires_matching_checkpoint_provenance(self):
+        """Resume must reject a cache copied from a different checkpoint."""
+        import json
+        import tempfile
+        from src.training.trainer import _cache_phase1_report, _phase1_report_matches_checkpoint
+
+        with tempfile.TemporaryDirectory() as directory:
+            checkpoint = os.path.join(directory, "phase1.pt")
+            manifest = checkpoint + ".manifest.json"
+            with open(manifest, "w", encoding="utf-8") as handle:
+                json.dump({"state_sha256": "state-a", "git_commit": "abc", "config": {"rank": 16}}, handle)
+            report_path = os.path.join(directory, "phase1_report.json")
+            cached = _cache_phase1_report({"passed": True}, report_path, checkpoint)
+            self.assertTrue(_phase1_report_matches_checkpoint(cached, checkpoint))
+
+            with open(manifest, "w", encoding="utf-8") as handle:
+                json.dump({"state_sha256": "state-b", "git_commit": "abc", "config": {"rank": 16}}, handle)
+            self.assertFalse(_phase1_report_matches_checkpoint(cached, checkpoint))
+
     def test_none_override_trace_reports_realized_k_zero(self):
         """A baseline control must not be mislabeled as a K=1 route."""
         class DummyLayer(nn.Module):
@@ -1785,6 +1846,8 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
         self.assertEqual(res["status"], "COMPLETE")
         self.assertEqual(res["candidate_layers"], [22, 11, 15])
         self.assertEqual(res["pair_count"], 3)  # (22, 11), (22, 15), (11, 15)
+        self.assertEqual(res["schedule_k1_steps"], res["schedule_k2_steps"])
+        self.assertEqual(res["candidate_gate_scales"], {22: 0.60, 11: 0.80, 15: 0.60})
 
     def test_phase1b_coadaptation_falls_back_to_candidates_if_ranking_missing(self):
         """Phase 1B must fall back to candidate scale_screen when ranking is empty."""
