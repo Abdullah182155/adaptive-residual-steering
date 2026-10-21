@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.13.6] - 2026-10-21
+
+### 🧪 Run `exp_20261021_113159_ars_phi2_kaggle_engine_v3_2_memory_halt`: Engine v3.2 Cooperative-Routing Milestone
+- **Experiment preservation:** Registered the complete Kaggle run in `experiments/registry.json` with terminal status `CUDA_MEMORY_LIMIT_HALT_IN_PHASE_2`. Its structured record and verbatim 57,387-byte Kaggle output are retained under `experiments/runs/exp_20261021_113159_ars_phi2_kaggle_engine_v3_2_memory_halt/`; the output SHA-256 is `917f41bd882ab1875bc30706524f8c6d600ddb4694acc4ddbaa2be5e2c54160d`.
+- **Phase-1 breakthrough:** L20 at `alpha=0.50` passed disjoint confirmation at `62.5%` versus `53.1%` baseline (`+9.4pp`), with CoT retention `1.07`, effective post-cap displacement q95 `0.42`, and train/validation NLL reductions of `15.2%/16.7%`.
+- **Cooperative routing established:** Phase 1B formed the intended early+late pair `[L13, L20]`. Phase 1.5 completed without NaNs or frozen gradients; deterministic preflight passed with `K>=2` on `28.9%` of prompts and both depth bands active.
+- **Phase-2 signal preserved:** Unified adaptation Epoch 1 saved a checkpoint at validation loss `1.0440` and generation accuracy `60.0%`, with realized routing `K=0: 3%`, `K=1: 21%`, `K=2: 76%` and low gate high-saturation (`0.9%`).
+- **Operational halt, not CUDA OOM:** At the first Phase-2 watchdog check (global step 50), peak allocated memory was `8,095 MiB`, but PyTorch's cached peak reservation was `13,602 MiB`, exceeding the fixed `12,288 MiB` reserved-memory limit. The run stopped before final benchmarking. This is the Engine v3.3 memory-watchdog and resumability priority; no final benchmark claim is made for this interrupted run.
+
+---
+
 ## [1.13.5] - 2026-10-21
 
 ### 🚀 Engine v3.2: Physical Displacement Safety & Reproducible Screening
