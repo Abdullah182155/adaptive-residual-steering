@@ -29,6 +29,8 @@ from src.training.losses import (
 )
 from src.training.contrastive import compute_contrastive_gate_loss
 from src.experiments.checkpointing import (
+    ARS_PREFIXES,
+    ars_state_dict,
     load_ars_checkpoint_strict,
     load_checkpoint_manifest,
     save_ars_checkpoint,
@@ -40,9 +42,9 @@ def _phase1_runtime_config_sha256(cfg: RSCConfig) -> str:
     """Fingerprint Phase-1-relevant runtime choices, excluding resume plumbing."""
     raw = asdict(cfg) if is_dataclass(cfg) else dict(vars(cfg))
     ignored = {
-        "resume_phase1", "phase1_report_save_path", "checkpoint_dir",
+        "resume_phase1", "resume_phase2", "phase1_report_save_path", "checkpoint_dir",
         "lora_save_path", "phase2_save_path", "router_bootstrap_save_path",
-        "steer_finetune_save_path", "gate_only_save_path",
+        "steer_finetune_save_path", "gate_only_save_path", "phase2_training_state_path",
     }
     selected = {key: value for key, value in raw.items() if key not in ignored}
     payload = json.dumps(selected, sort_keys=True, default=str)
@@ -129,20 +131,224 @@ def _optimizer_has_gradients(parameters) -> bool:
     return any(parameter.grad is not None for parameter in parameters)
 
 
-def enforce_gpu_memory_budget(label: str, cfg: RSCConfig) -> None:
-    """Fail before a T4 allocator peak becomes an unrecoverable OOM."""
+def _cuda_memory_snapshot() -> Dict[str, float]:
+    """Return allocator and device-memory measurements in MiB.
+
+    ``reserved`` is intentionally exposed as a cache-pressure signal; it is
+    not equivalent to live tensor allocation and must not by itself kill a
+    long-running Kaggle experiment.
+    """
     if not torch.cuda.is_available():
-        return
-    limit_mb = int(getattr(cfg, "cuda_reserved_memory_limit_mb", 0))
-    if limit_mb <= 0:
-        return
-    current_mb = torch.cuda.memory_reserved() / (1024 ** 2)
-    peak_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
-    if max(current_mb, peak_mb) > limit_mb:
-        raise RuntimeError(
-            f"CUDA reserved-memory budget exceeded at {label}: current={current_mb:.0f}MB "
-            f"peak={peak_mb:.0f}MB limit={limit_mb}MB"
+        return {"available": False}
+    free_bytes, total_bytes = torch.cuda.mem_get_info()
+    mib = float(1024 ** 2)
+    return {
+        "available": True,
+        "allocated_mb": float(torch.cuda.memory_allocated() / mib),
+        "peak_allocated_mb": float(torch.cuda.max_memory_allocated() / mib),
+        "reserved_mb": float(torch.cuda.memory_reserved() / mib),
+        "peak_reserved_mb": float(torch.cuda.max_memory_reserved() / mib),
+        "free_mb": float(free_bytes / mib),
+        "total_mb": float(total_bytes / mib),
+    }
+
+
+def enforce_gpu_memory_budget(label: str, cfg: RSCConfig) -> Dict[str, Any]:
+    """Reclaim cached CUDA blocks before requesting a controlled staged stop.
+
+    The active-allocation limit is the primary safety contract.  A high
+    reservation triggers ``gc.collect`` plus ``empty_cache`` first because
+    PyTorch deliberately retains reusable allocator blocks.  Callers save a
+    resumable state checkpoint when the returned action is ``"emergency"``;
+    this helper never raises a raw CUDA-memory RuntimeError.
+    """
+    before = _cuda_memory_snapshot()
+    if not before.get("available", False):
+        return {"action": "disabled", "before": before, "after": before}
+
+    active_limit = max(0, int(getattr(cfg, "cuda_active_memory_limit_mb", 0)))
+    reserved_limit = max(0, int(getattr(cfg, "cuda_reserved_memory_limit_mb", 0)))
+    min_free = max(0, int(getattr(cfg, "cuda_memory_min_free_mb", 0)))
+    cache_pressure = (
+        (reserved_limit > 0 and max(before["reserved_mb"], before["peak_reserved_mb"]) > reserved_limit)
+        or (min_free > 0 and before["free_mb"] < min_free)
+    )
+
+    after = before
+    reclaimed = False
+    if cache_pressure:
+        gc.collect()
+        torch.cuda.empty_cache()
+        after = _cuda_memory_snapshot()
+        reclaimed = True
+        print(
+            f"    [mem] {label}: cache pressure reclaimed "
+            f"reserved={before['reserved_mb']:.0f}->{after['reserved_mb']:.0f}MB "
+            f"free={before['free_mb']:.0f}->{after['free_mb']:.0f}MB"
         )
+
+    active_peak = max(after["allocated_mb"], after["peak_allocated_mb"])
+    insufficient_free = min_free > 0 and after["free_mb"] < min_free
+    if (active_limit > 0 and active_peak > active_limit) or insufficient_free:
+        reason = (
+            f"active peak {active_peak:.0f}MB exceeds {active_limit}MB"
+            if active_limit > 0 and active_peak > active_limit
+            else f"free device memory {after['free_mb']:.0f}MB is below {min_free}MB"
+        )
+        print(f"    ⚠️ [mem] {label}: controlled emergency requested ({reason}).")
+        torch.cuda.reset_peak_memory_stats()
+        return {"action": "emergency", "reason": reason, "before": before, "after": after}
+    if reclaimed:
+        torch.cuda.reset_peak_memory_stats()
+        return {"action": "reclaimed", "before": before, "after": after}
+    torch.cuda.reset_peak_memory_stats()
+    return {"action": "ok", "before": before, "after": after}
+
+
+def _to_cpu_tree(value: Any) -> Any:
+    """Copy tensors recursively to CPU for a portable training-state file."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().clone()
+    if isinstance(value, dict):
+        return {key: _to_cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_to_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_to_cpu_tree(item) for item in value)
+    return value
+
+
+def _phase2_runtime_state(model) -> Dict[str, Any]:
+    """Capture non-tensor routing state required to continue Phase 2 exactly."""
+    eligible = None
+    if hasattr(model, "routing_eligibility_mask") and hasattr(model, "target_layers"):
+        device = getattr(model, "device", next(model.parameters()).device)
+        mask = model.routing_eligibility_mask(device).detach().cpu().tolist()
+        eligible = [int(layer) for layer, allowed in zip(model.target_layers, mask) if allowed]
+    return {
+        "eligible_layers": eligible,
+        "router_warmup": bool(getattr(model, "_router_warmup", False)),
+        "router_exploration": bool(getattr(model, "_router_exploration", False)),
+        "router_inference_mode": getattr(model, "_router_inference_mode", "argmax"),
+    }
+
+
+def _restore_phase2_runtime_state(model, state: Dict[str, Any]) -> None:
+    """Restore routing controls after a validated Phase-2 state load."""
+    eligible = state.get("eligible_layers")
+    if eligible is not None and hasattr(model, "set_eligible_routing_layers"):
+        model.set_eligible_routing_layers([int(layer) for layer in eligible])
+    if hasattr(model, "set_router_warmup"):
+        model.set_router_warmup(bool(state.get("router_warmup", False)))
+    if hasattr(model, "set_router_exploration"):
+        model.set_router_exploration(bool(state.get("router_exploration", False)))
+    if hasattr(model, "set_router_inference_mode"):
+        model.set_router_inference_mode(state.get("router_inference_mode", "argmax"))
+
+
+def _capture_rng_state() -> Dict[str, Any]:
+    """Capture all stochastic sources used by staged training."""
+    state = {"python": random.getstate(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_rng_state(state: Dict[str, Any]) -> None:
+    """Restore a checkpointed stochastic state before resuming a stage."""
+    random.setstate(state["python"])
+    torch.set_rng_state(state["torch"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
+
+
+def save_phase2_training_state(
+    path: str,
+    *,
+    model,
+    optimizer: torch.optim.Optimizer,
+    scaler,
+    lr_reducer: LRReducer,
+    stage_name: str,
+    epochs: int,
+    epoch: int,
+    next_batch_start: int,
+    indices: List[int],
+    global_step: int,
+    best_acc: float,
+    best_val: float,
+    patience_ctr: int,
+    baseline_ema: List[float],
+    effective_rloo_batch_size: int,
+    train_steer: bool,
+    train_gate: bool,
+    train_router: bool,
+    save_path: str,
+) -> Dict[str, Any]:
+    """Atomically persist complete Phase-2 state for exact restart after pressure.
+
+    This intentionally supplements, rather than replaces, the portable
+    tensor-only ARS checkpoint consumed by evaluation notebooks.
+    """
+    destination = os.path.abspath(path)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    payload = {
+        "format": "ars-phase2-training-state-v1",
+        "ars_state": ars_state_dict(model),
+        "optimizer": _to_cpu_tree(optimizer.state_dict()),
+        "scaler": _to_cpu_tree(scaler.state_dict()),
+        "lr_reducer": lr_reducer.state_dict(),
+        "rng": _to_cpu_tree(_capture_rng_state()),
+        "runtime": _phase2_runtime_state(model),
+        "progress": {
+            "stage_name": stage_name,
+            "epochs": int(epochs),
+            "epoch": int(epoch),
+            "next_batch_start": int(next_batch_start),
+            "indices": list(indices),
+            "global_step": int(global_step),
+            "best_acc": float(best_acc),
+            "best_val": float(best_val),
+            "patience_ctr": int(patience_ctr),
+            "baseline_ema": list(baseline_ema),
+            "effective_rloo_batch_size": int(effective_rloo_batch_size),
+            "train_steer": bool(train_steer),
+            "train_gate": bool(train_gate),
+            "train_router": bool(train_router),
+            "save_path": str(save_path),
+        },
+    }
+    temporary = destination + ".tmp"
+    torch.save(payload, temporary)
+    os.replace(temporary, destination)
+    return {"path": destination, "format": payload["format"], "global_step": global_step}
+
+
+def load_phase2_training_state(path: str, model, device: torch.device) -> Dict[str, Any]:
+    """Load and validate a complete Phase-2 state before any resumed update."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CFG.resume_phase2 is True but state was not found at {path}.")
+    payload = torch.load(path, map_location="cpu")
+    if not isinstance(payload, dict) or payload.get("format") != "ars-phase2-training-state-v1":
+        raise RuntimeError(f"Invalid Phase-2 training state: {path}")
+    required = {"ars_state", "optimizer", "scaler", "lr_reducer", "rng", "runtime", "progress"}
+    missing = sorted(required - set(payload))
+    if missing:
+        raise RuntimeError(f"Phase-2 training state is incomplete: missing {missing}")
+    saved = payload["ars_state"]
+    expected = {name: value for name, value in model.state_dict().items() if name.startswith(ARS_PREFIXES)}
+    unexpected = sorted(set(saved) - set(expected))
+    mismatched = sorted(name for name in set(saved) & set(expected) if tuple(saved[name].shape) != tuple(expected[name].shape))
+    if unexpected or mismatched or set(saved) != set(expected):
+        raise RuntimeError(
+            "Phase-2 training state is incompatible with this ARS wrapper: "
+            f"unexpected={unexpected}, mismatched={mismatched}, missing={sorted(set(expected) - set(saved))}"
+        )
+    result = model.load_state_dict(saved, strict=False)
+    if result.unexpected_keys:
+        raise RuntimeError(f"Phase-2 state produced unexpected model keys: {result.unexpected_keys}")
+    _restore_phase2_runtime_state(model, payload["runtime"])
+    return payload
 
 
 def _answer_aware_loss(
@@ -2046,8 +2252,15 @@ def run_staged_phase(
     train_steer: bool, train_gate: bool, train_router: bool,
     global_step: int = 0, baseline_ema: Optional[List[float]] = None, patience: int = 3,
     init_best_acc: float = 0.0, init_best_val: float = float("inf"),
+    resume_state: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, float, float]:
-    """Shared Phase 2 epoch loop for SteerNet fine-tune, Gate-only, Joint fine-tune, and Gate re-tune."""
+    """Run a Phase-2 stage, optionally resuming its optimizer-exact state.
+
+    Memory pressure never raises a raw allocator exception from this loop.  It
+    first reclaims cache, reduces the next RLOO probe if needed, and writes a
+    complete training-state checkpoint before returning control to the caller
+    on genuine active-memory exhaustion.
+    """
     if baseline_ema is None:
         baseline_ema = [0.0]
     print("\n" + "=" * 80)
@@ -2076,8 +2289,48 @@ def run_staged_phase(
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
     best_acc, best_val, best_state, patience_ctr = init_best_acc, init_best_val, None, 0
+    start_epoch = 0
+    resume_batch_start = 0
+    resume_indices = None
+    effective_rloo_batch_size = max(2, int(getattr(cfg, "router_rloo_batch_size", 8)))
+    if resume_state is not None:
+        progress = resume_state.get("progress", {})
+        if progress.get("stage_name") != stage_name:
+            raise RuntimeError(
+                f"Phase-2 state stage mismatch: expected {stage_name!r}, "
+                f"got {progress.get('stage_name')!r}."
+            )
+        expected_flags = (bool(train_steer), bool(train_gate), bool(train_router))
+        saved_flags = tuple(bool(progress.get(key, False)) for key in ("train_steer", "train_gate", "train_router"))
+        if saved_flags != expected_flags:
+            raise RuntimeError("Phase-2 state trainable-component contract does not match the requested stage.")
+        optimizer.load_state_dict(resume_state["optimizer"])
+        scaler.load_state_dict(resume_state["scaler"])
+        lr_reducer.load_state_dict(resume_state["lr_reducer"])
+        _restore_rng_state(resume_state["rng"])
+        start_epoch = int(progress["epoch"])
+        resume_batch_start = int(progress["next_batch_start"])
+        resume_indices = list(progress.get("indices", []))
+        global_step = int(progress["global_step"])
+        best_acc = float(progress["best_acc"])
+        best_val = float(progress["best_val"])
+        patience_ctr = int(progress["patience_ctr"])
+        baseline_ema[:] = list(progress.get("baseline_ema", baseline_ema))
+        effective_rloo_batch_size = max(2, int(progress.get("effective_rloo_batch_size", effective_rloo_batch_size)))
+        print(
+            f"  ↪️  Resuming {stage_name} at epoch {start_epoch + 1}, batch offset {resume_batch_start}, "
+            f"global_step={global_step}, RLOO batch={effective_rloo_batch_size}."
+        )
 
-    for epoch in range(epochs):
+    # A previous controlled memory pause may leave this diagnostic on a
+    # long-lived notebook wrapper.  It describes the old invocation only;
+    # clearing it here prevents a successful resumed stage from being
+    # misreported as paused.
+    if hasattr(model, "_phase2_memory_emergency"):
+        delattr(model, "_phase2_memory_emergency")
+
+    stop_for_memory = False
+    for epoch in range(start_epoch, epochs):
         model.train()
         # The frozen backbone must remain in inference mode.  Leaving it in
         # ``train`` here makes a frozen model's dropout part of the target the
@@ -2095,15 +2348,23 @@ def run_staged_phase(
         # detached h/delta, so this does not unfreeze or backpropagate into the
         # SteerNet; it only lets task error calibrate alpha.
         model._joint_grad_mode = bool(train_gate)
-        indices = list(range(len(train_data)))
-        random.shuffle(indices)
+        if epoch == start_epoch and resume_indices:
+            indices = resume_indices
+            batch_start_offset = resume_batch_start
+        else:
+            indices = list(range(len(train_data)))
+            random.shuffle(indices)
+            batch_start_offset = 0
         epoch_task, n_opt_steps, accum_count = 0.0, 0, 0
         no_gradient_windows = 0
 
         epoch_gate_l1, epoch_gate_div, epoch_gate_antisat, epoch_gate_contrast, n_gate_aux_steps = 0.0, 0.0, 0.0, 0.0, 0
         epoch_policy_loss, epoch_mean_k, n_router_rloo_steps = 0.0, 0.0, 0
         optimizer.zero_grad(set_to_none=True)
-        pbar = tqdm(range(0, len(indices), cfg.batch_size), desc=f"{stage_name.split(':')[0]} {epoch + 1}/{epochs}")
+        pbar = tqdm(
+            range(batch_start_offset, len(indices), cfg.batch_size),
+            desc=f"{stage_name.split(':')[0]} {epoch + 1}/{epochs}",
+        )
 
         for start in pbar:
             batch_idx = indices[start : start + cfg.batch_size]
@@ -2196,7 +2457,7 @@ def run_staged_phase(
                 # counterfactual rewards see heterogeneous prompts.
                 probe_idx = random.sample(
                     range(len(train_data)),
-                    min(max(2, int(getattr(cfg, "router_rloo_batch_size", 8))), len(train_data)),
+                    min(effective_rloo_batch_size, len(train_data)),
                 )
                 probe_ids = torch.stack([train_data[i]["input_ids"] for i in probe_idx]).to(device)
                 probe_mask = torch.stack([train_data[i]["attention_mask"] for i in probe_idx]).to(device)
@@ -2224,6 +2485,7 @@ def run_staged_phase(
                     epoch_policy_loss += rloo_diag["policy_loss"]
                     epoch_mean_k += rloo_diag["mean_k_sampled"]
                     n_router_rloo_steps += 1
+                del router_loss, rloo_diag, probe_ids, probe_mask, probe_lbls, probe_shield, probe_calc, prompt_mask
             accum_count += 1
             is_last = start + cfg.batch_size >= len(indices)
             if accum_count == cfg.grad_accum or is_last:
@@ -2256,10 +2518,39 @@ def run_staged_phase(
                     global_step += 1
                     n_opt_steps += 1
 
-                    if global_step % 50 == 0:
-                        gc.collect()
-                        log_gpu_memory(f"run_staged_phase step {global_step}", cfg)
-                        enforce_gpu_memory_budget(f"{stage_name} step {global_step}", cfg)
+                    watchdog_every = max(1, int(getattr(cfg, "cuda_memory_watchdog_every_n_steps", 50)))
+                    state_every = max(1, int(getattr(cfg, "phase2_state_checkpoint_every_n_steps", watchdog_every)))
+                    should_checkpoint_state = global_step % state_every == 0
+                    memory_status = None
+                    if global_step % watchdog_every == 0:
+                        log_gpu_memory(f"run_staged_phase step {global_step}", cfg, reset_peak=False)
+                        memory_status = enforce_gpu_memory_budget(f"{stage_name} step {global_step}", cfg)
+                        if memory_status["action"] in {"reclaimed", "emergency"}:
+                            reduced = max(2, int(getattr(cfg, "cuda_memory_reduced_rloo_batch_size", 4)))
+                            if effective_rloo_batch_size > reduced:
+                                effective_rloo_batch_size = reduced
+                                print(
+                                    f"    [mem] Reducing subsequent/resumed RLOO probe batch to {reduced}."
+                                )
+                        should_checkpoint_state = should_checkpoint_state or memory_status["action"] == "emergency"
+
+                    next_batch_start = start + cfg.batch_size
+                    if should_checkpoint_state:
+                        save_phase2_training_state(
+                            cfg.phase2_training_state_path,
+                            model=model, optimizer=optimizer, scaler=scaler, lr_reducer=lr_reducer,
+                            stage_name=stage_name, epochs=epochs, epoch=epoch, next_batch_start=next_batch_start,
+                            indices=indices, global_step=global_step, best_acc=best_acc, best_val=best_val,
+                            patience_ctr=patience_ctr, baseline_ema=baseline_ema,
+                            effective_rloo_batch_size=effective_rloo_batch_size,
+                            train_steer=train_steer, train_gate=train_gate, train_router=train_router,
+                            save_path=save_path,
+                        )
+                    if memory_status is not None and memory_status["action"] == "emergency":
+                        model._phase2_memory_emergency = memory_status
+                        stop_for_memory = True
+                        print("  ⚠️ Phase 2 paused safely after a resumable state checkpoint; no allocator crash was raised.")
+                        break
 
                     if (
                         train_router
@@ -2285,6 +2576,8 @@ def run_staged_phase(
                 postfix_kwargs["mean_k"] = f"{epoch_mean_k / n_router_rloo_steps:.2f}"
             pbar.set_postfix(**postfix_kwargs)
 
+        if stop_for_memory:
+            break
         if patience_ctr >= patience:
             break
         avg_task = epoch_task / max(1, n_opt_steps * cfg.grad_accum)
@@ -2295,6 +2588,16 @@ def run_staged_phase(
         )
         if epoch_state is not None:
             best_state = epoch_state
+        save_phase2_training_state(
+            cfg.phase2_training_state_path,
+            model=model, optimizer=optimizer, scaler=scaler, lr_reducer=lr_reducer,
+            stage_name=stage_name, epochs=epochs, epoch=epoch + 1, next_batch_start=0, indices=[],
+            global_step=global_step, best_acc=best_acc, best_val=best_val,
+            patience_ctr=patience_ctr, baseline_ema=baseline_ema,
+            effective_rloo_batch_size=effective_rloo_batch_size,
+            train_steer=train_steer, train_gate=train_gate, train_router=train_router,
+            save_path=save_path,
+        )
         skip_note = f" | skipped_no_grad_windows={no_gradient_windows}" if no_gradient_windows else ""
         print(f"  {stage_name.split(':')[0]} Epoch {epoch + 1}: task={avg_task:.4f}  val={cur_val_loss:.4f}  acc={cur_acc:.3f}  {'✅' if improved else ''}{skip_note}")
 
@@ -2419,6 +2722,187 @@ def _fallback_to_certified_fixed_steernet(
     )
 
 
+def _evaluate_phase2_deployment(
+    model, tokenizer, confirm_rows, cfg: RSCConfig, device: torch.device, min_deployment_questions: int,
+) -> Dict[str, Any]:
+    """Run the final paired deployment decision after normal or resumed Phase 2.
+
+    Keeping this in a callable helper lets an interrupted Phase-2 run finish
+    the same held-out confirmation protocol after restart, instead of leaving
+    a model checkpoint without a deployment decision.
+    """
+    from src.evaluation.deployment import finalize_deployment_by_shot, paired_delta_ci
+
+    def evaluate_flags(override: Optional[str], n_shot: int) -> List[int]:
+        model.eval()
+        model.set_gate_freeze(False)
+        model.set_routing_override(override)
+        flags = []
+        for row in confirm_rows:
+            question = row.get("question") if isinstance(row, dict) else None
+            if not question and hasattr(row, "__getitem__"):
+                try:
+                    question = row["question"]
+                except (KeyError, IndexError, TypeError):
+                    question = None
+            if not question:
+                continue
+            prompt = build_benchmark_prompt("gsm8k", question, n_shot=n_shot)
+            response = generate_response(model, tokenizer, prompt, device, max_new_tokens=384)
+            final_num = row.get("final_num") if isinstance(row, dict) else None
+            if final_num is None and hasattr(row, "__getitem__"):
+                try:
+                    final_num = row["final_num"]
+                except (KeyError, IndexError, TypeError):
+                    final_num = None
+            flags.append(int(evaluate_sample_answer("gsm8k", response, final_num)["correct"]))
+        return flags
+
+    if not confirm_rows:
+        return {
+            "deployment_mode": "baseline",
+            "deployment_modes_by_shot": {"0": "baseline", "2": "baseline"},
+            "deployment_flags": {"baseline": [], "ars": [], "baseline_clusters": [], "ars_clusters": []},
+        }
+
+    print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across 0-shot and 2-shot...")
+    base_by_shot, ars_by_shot = [], []
+    for n_shot in (0, 2):
+        baseline = evaluate_flags("none", n_shot)
+        ars = evaluate_flags(None, n_shot)
+        if len(baseline) != len(confirm_rows) or len(ars) != len(confirm_rows) or len(baseline) != len(ars):
+            raise RuntimeError(
+                "Deployment confirmation did not produce one paired outcome per reserved question: "
+                f"shot={n_shot}, baseline={len(baseline)}, ars={len(ars)}, expected={len(confirm_rows)}"
+            )
+        base_by_shot.append(baseline)
+        ars_by_shot.append(ars)
+        delta, lower, upper = paired_delta_ci(baseline, ars)
+        print(
+            f"    {n_shot}-shot: Base={sum(baseline)}/{len(baseline)} ({sum(baseline)/len(baseline):.1%}) | "
+            f"ARS={sum(ars)}/{len(ars)} ({sum(ars)/len(ars):.1%}) | "
+            f"Δ={delta*100:+.2f}pp, 95% CI=[{lower*100:+.2f}, {upper*100:+.2f}]pp (n={len(baseline)})"
+        )
+
+    outcomes = {shot: (base_by_shot[index], ars_by_shot[index]) for index, shot in enumerate((0, 2))}
+    modes_by_shot = finalize_deployment_by_shot(outcomes, cfg.phase2_save_path, min_n=min_deployment_questions)
+    base_clusters = [list(values) for values in zip(*base_by_shot)]
+    ars_clusters = [list(values) for values in zip(*ars_by_shot)]
+    delta, lower, upper = paired_delta_ci(base_clusters, ars_clusters)
+    print(
+        "  [deployment] Multi-shot (0+2 clustered by question) "
+        f"Δ = {delta*100:+.2f}pp, 95% CI = [{lower*100:+.2f}, {upper*100:+.2f}]pp "
+        f"(questions={len(base_clusters)}, views={len(base_by_shot)})"
+    )
+    mode = "ars" if all(value == "ars" for value in modes_by_shot.values()) else "baseline"
+    if hasattr(model, "deployment_disabled"):
+        model.deployment_disabled = mode == "baseline"
+        model.deployment_modes_by_shot = modes_by_shot
+    print(f"  [deployment] Final deployment mode decided: {mode.upper()} (deployment_disabled={getattr(model, 'deployment_disabled', False)})")
+    return {
+        "deployment_mode": mode,
+        "deployment_modes_by_shot": modes_by_shot,
+        "deployment_flags": {
+            "baseline": [flag for flags in base_by_shot for flag in flags],
+            "ars": [flag for flags in ars_by_shot for flag in flags],
+            "baseline_clusters": base_clusters,
+            "ars_clusters": ars_clusters,
+        },
+    }
+
+
+def _resume_phase2_from_training_state(
+    model, tokenizer, router_data, eval_sel, confirm_rows, cfg: RSCConfig, device: torch.device,
+) -> Tuple[Dict[str, Any], float, float]:
+    """Resume the interrupted Phase-2 stage without replaying Phases 1--1.5.
+
+    The saved stage contract determines trainable components and the exact
+    intra-epoch cursor.  It is deliberately fail-closed: a state from another
+    stage or model topology cannot silently degrade into a model-only warm
+    start.
+    """
+    state = load_phase2_training_state(cfg.phase2_training_state_path, model, device)
+    progress = state["progress"]
+    stage_name = str(progress["stage_name"])
+    train_steer = bool(progress["train_steer"])
+    train_gate = bool(progress["train_gate"])
+    train_router = bool(progress["train_router"])
+    epochs = int(progress.get("epochs", 0))
+    if epochs <= 0:
+        raise RuntimeError("Phase-2 resume state has no valid total epoch count.")
+    if not (train_steer or train_gate or train_router):
+        raise RuntimeError("Phase-2 resume state has no trainable ARS component.")
+
+    steer_params, gate_params, router_params = [], [], list(model.router.parameters())
+    for steer_net in model.steer_nets.values():
+        for parameter in steer_net.parameters():
+            parameter.requires_grad = train_steer
+            steer_params.append(parameter)
+    for key in sorted(model.gates.keys(), key=lambda item: int(item)):
+        for parameter in model.gates[key].parameters():
+            parameter.requires_grad = train_gate
+            gate_params.append(parameter)
+    for parameter in router_params:
+        parameter.requires_grad = train_router
+
+    # Preserve the parameter-group ordering used by every Phase-2 stage.  The
+    # optimizer payload validates group cardinality when loaded in
+    # ``run_staged_phase``; a mismatch is an intentional hard failure.
+    groups = []
+    if train_steer:
+        groups.append({"params": steer_params, "lr": cfg.steer_finetune_lr})
+    if train_gate:
+        groups.append({"params": gate_params, "lr": cfg.gate_only_lr})
+    if train_router:
+        groups.append({"params": router_params, "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale})
+    expected_groups = len(state["optimizer"].get("param_groups", []))
+    if len(groups) != expected_groups:
+        raise RuntimeError(
+            f"Phase-2 resume optimizer-group mismatch: state={expected_groups}, reconstructed={len(groups)}."
+        )
+
+    print(f"\n  [Phase 2 Resume] Loading exact staged state from {cfg.phase2_training_state_path}...")
+    global_step, best_val, best_acc = run_staged_phase(
+        model, tokenizer, router_data, eval_sel, cfg, device,
+        stage_name=stage_name, epochs=epochs, param_groups=groups,
+        save_path=str(progress["save_path"]),
+        train_steer=train_steer, train_gate=train_gate, train_router=train_router,
+        global_step=int(progress["global_step"]),
+        baseline_ema=list(progress.get("baseline_ema", [0.0])),
+        patience=cfg.phase2_patience,
+        init_best_acc=float(progress["best_acc"]), init_best_val=float(progress["best_val"]),
+        resume_state=state,
+    )
+    if getattr(model, "_phase2_memory_emergency", None):
+        return {
+            "adaptive_phases_status": "PAUSED_MEMORY_PRESSURE",
+            "phase2_resume_state": cfg.phase2_training_state_path,
+            "phase2_memory": model._phase2_memory_emergency,
+            "global_step": global_step,
+        }, best_val, best_val
+
+    best_path = str(progress["save_path"])
+    if not os.path.exists(best_path):
+        raise RuntimeError("Resumed Phase 2 finished without a best model checkpoint.")
+    load_ars_checkpoint_strict(model, best_path, device=device)
+    save_ars_checkpoint(model, cfg.phase2_save_path, phase="phase2-resumed-complete", cfg=cfg)
+    model.set_router_exploration(False)
+    logs = {
+        "adaptive_phases_status": "RESUMED_PHASE2_COMPLETE",
+        "phase2_resume_state": cfg.phase2_training_state_path,
+        "p2b_val": best_val,
+        "p2b_acc": best_acc,
+        "ars_intervention_audit": audit_ars_intervention_health(model, eval_sel, cfg, device),
+    }
+    logs.update(
+        _evaluate_phase2_deployment(
+            model, tokenizer, confirm_rows, cfg, device,
+            int(getattr(cfg, "deployment_min_examples", 120)),
+        )
+    )
+    return logs, best_val, best_val
+
+
 def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device):
     """Complete multi-phase staged training pipeline:
     Phase 1: Pure SteerNet (Warmup Rotation, Gates=1.0)
@@ -2432,6 +2916,12 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         return train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg, device)
 
     logs = {}
+    resume_phase2 = bool(getattr(cfg, "resume_phase2", False))
+    if resume_phase2 and not os.path.exists(cfg.phase2_training_state_path):
+        raise FileNotFoundError(
+            "CFG.resume_phase2 is True but training state was not found at "
+            f"{cfg.phase2_training_state_path}. Refusing silent full retraining."
+        )
     # A notebook may invoke ``train_rsc`` more than once on the same wrapper.
     # Phase 1 must begin against the full catalog; its newly certified Phase
     # 1B pool is installed later before router bootstrap.
@@ -2439,13 +2929,14 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         model.set_eligible_routing_layers(None)
 
     # ISSUE-15: purge stale checkpoint files from previous runs before writing new ones
-    for _ckpt_path in (
-        getattr(cfg, "gate_only_save_path", None),
-        getattr(cfg, "steer_finetune_save_path", None),
-        getattr(cfg, "phase2_save_path", None),
-    ):
-        if _ckpt_path:
-            _purge_ckpt(_ckpt_path)
+    if not resume_phase2:
+        for _ckpt_path in (
+            getattr(cfg, "gate_only_save_path", None),
+            getattr(cfg, "steer_finetune_save_path", None),
+            getattr(cfg, "phase2_save_path", None),
+        ):
+            if _ckpt_path:
+                _purge_ckpt(_ckpt_path)
 
     # ISSUE-4: Split training rows into steer-set (80%) and router-set (20%)
     steer_data, router_data = split_steer_router(list(train_data), router_fraction=0.2, seed=cfg.seed)
@@ -2465,6 +2956,11 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     eval_sel = [eval_data[i] for i in range(len(eval_data) - n_dep)]
     confirm_rows = [eval_data[i] for i in range(len(eval_data) - n_dep, len(eval_data))]
     print(f"  [eval split] eval_data split: {len(eval_sel)} for selection/audits, {len(confirm_rows)} reserved for deployment confirmation.")
+
+    if resume_phase2:
+        return _resume_phase2_from_training_state(
+            model, tokenizer, router_data, eval_sel, confirm_rows, cfg, device,
+        )
 
     # PHASE 1: Pure SteerNet (uses steer_data, eval_sel)
     resume_phase1 = bool(getattr(cfg, "resume_phase1", False))

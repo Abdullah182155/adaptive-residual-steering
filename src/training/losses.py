@@ -70,6 +70,42 @@ class LRReducer:
             pg["lr"] = max(self.min_lr, self.base_lrs[i] * f)
         self.current_step += 1
 
+    def state_dict(self) -> Dict[str, Any]:
+        """Return scheduler state required for an exact staged-phase resume."""
+        return {
+            "total_steps": self.total_steps,
+            "warmup_steps": self.warmup_steps,
+            "current_step": self.current_step,
+            "factor": self.factor,
+            "patience": self.patience,
+            "min_lr": self.min_lr,
+            "delta": self.delta,
+            "best_loss": self.best_loss,
+            "wait": self.wait,
+            "base_lrs": list(self.base_lrs),
+            "original_base_lrs": list(self.original_base_lrs),
+            "n_reductions": self.n_reductions,
+        }
+
+    def load_state_dict(self, state: Dict[str, Any]) -> None:
+        """Restore a validated scheduler snapshot without resetting its progress."""
+        required = {"current_step", "best_loss", "wait", "base_lrs", "n_reductions"}
+        missing = sorted(required - set(state))
+        if missing:
+            raise ValueError(f"LRReducer resume state is missing fields: {missing}")
+        for name in (
+            "total_steps", "warmup_steps", "current_step", "factor", "patience",
+            "min_lr", "delta", "best_loss", "wait", "n_reductions",
+        ):
+            if name in state:
+                setattr(self, name, state[name])
+        self.base_lrs = list(state["base_lrs"])
+        self.original_base_lrs = list(state.get("original_base_lrs", self.base_lrs))
+        if len(self.base_lrs) != len(self.optimizer.param_groups):
+            raise ValueError("LRReducer resume state does not match optimizer parameter groups.")
+        for index, group in enumerate(self.optimizer.param_groups):
+            group["lr"] = max(self.min_lr, self.base_lrs[index] * self._schedule_factor())
+
 class CheckpointManager:
     def __init__(self, checkpoint_dir, keep_last=3):
         self.checkpoint_dir = checkpoint_dir
@@ -304,7 +340,12 @@ def compute_steer_norm_loss(
     return total_loss, stats
 
 def log_gpu_memory(label: str, cfg=None, reset_peak: bool = True):
-    """Memory diagnostic reporting CUDA peak allocated/reserved."""
+    """Report CUDA allocation/cache peaks without turning telemetry into a fatal guard.
+
+    PyTorch's ``reserved`` value includes reusable caching-allocator blocks.
+    Capacity policy belongs to ``trainer.enforce_gpu_memory_budget``, where a
+    cache flush can be attempted before a controlled checkpointed stop.
+    """
     if cfg is not None and not getattr(cfg, "log_gpu_memory", True):
         return
     if not torch.cuda.is_available():
@@ -312,13 +353,9 @@ def log_gpu_memory(label: str, cfg=None, reset_peak: bool = True):
     alloc_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
     reserved_mb = torch.cuda.max_memory_reserved() / (1024 ** 2)
     print(f"    [mem] {label}: peak_allocated={alloc_mb:,.0f}MB  peak_reserved={reserved_mb:,.0f}MB")
-    limit_mb = int(getattr(cfg, "cuda_reserved_memory_limit_mb", 0)) if cfg is not None else 0
-    if limit_mb > 0 and reserved_mb > limit_mb:
-        raise RuntimeError(
-            f"CUDA reserved-memory budget exceeded at {label}: peak={reserved_mb:.0f}MB limit={limit_mb}MB"
-        )
     if reset_peak:
         torch.cuda.reset_peak_memory_stats()
+    return {"peak_allocated_mb": float(alloc_mb), "peak_reserved_mb": float(reserved_mb)}
 
 def _extract_final_number(text: str) -> Optional[float]:
     """Helper using verifier extract_final_answer with fallback."""

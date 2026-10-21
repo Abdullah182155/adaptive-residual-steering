@@ -37,11 +37,15 @@ from src.training import (
 from src.training.trainer import (
     _small_run_waiver,
     _optimizer_has_gradients,
+    enforce_gpu_memory_budget,
+    load_phase2_training_state,
     _phase1_epoch_generation_screen,
     _phase1_confirmation_verdict,
     _phase1_pair_is_safe,
     phase1_steernet_acceptance,
+    save_phase2_training_state,
 )
+from src.training.losses import LRReducer, log_gpu_memory
 
 class TestARSModules(unittest.TestCase):
     def setUp(self):
@@ -2187,6 +2191,123 @@ class TestEngineV32SafetyAndProfile(unittest.TestCase):
         self.assertEqual(len(custom_digest), 64)
         with self.assertRaisesRegex(RuntimeError, "custom overrides"):
             assert_engine_v32_kaggle_profile(cfg, strict=True)
+
+
+class TestEngineV33MemoryRecovery(unittest.TestCase):
+    """CPU regression coverage for cache-aware safety and resumable Phase 2."""
+
+    @staticmethod
+    def _snapshot(*, allocated, peak_allocated, reserved, peak_reserved, free):
+        return {
+            "available": True,
+            "allocated_mb": float(allocated),
+            "peak_allocated_mb": float(peak_allocated),
+            "reserved_mb": float(reserved),
+            "peak_reserved_mb": float(peak_reserved),
+            "free_mb": float(free),
+            "total_mb": 15360.0,
+        }
+
+    def test_reserved_cache_pressure_reclaims_instead_of_failing(self):
+        """Cached reservation is flushed before an active-allocation decision."""
+        before = self._snapshot(allocated=8095, peak_allocated=8095, reserved=13602, peak_reserved=13602, free=1500)
+        after = self._snapshot(allocated=8095, peak_allocated=8095, reserved=8300, peak_reserved=13602, free=6500)
+        cfg = RSCConfig(cuda_active_memory_limit_mb=11500, cuda_reserved_memory_limit_mb=12000, cuda_memory_min_free_mb=512)
+        with patch("src.training.trainer._cuda_memory_snapshot", side_effect=[before, after]), \
+             patch("src.training.trainer.gc.collect"), \
+             patch("src.training.trainer.torch.cuda.empty_cache") as empty_cache, \
+             patch("src.training.trainer.torch.cuda.reset_peak_memory_stats"):
+            status = enforce_gpu_memory_budget("unit", cfg)
+        self.assertEqual(status["action"], "reclaimed")
+        empty_cache.assert_called_once()
+
+    def test_active_allocation_pressure_requests_resumable_emergency(self):
+        """Real allocation pressure becomes a controlled checkpointable pause, never a raw raise."""
+        before = self._snapshot(allocated=12010, peak_allocated=12010, reserved=12200, peak_reserved=12200, free=300)
+        after = self._snapshot(allocated=12010, peak_allocated=12010, reserved=12100, peak_reserved=12200, free=400)
+        cfg = RSCConfig(cuda_active_memory_limit_mb=11500, cuda_reserved_memory_limit_mb=14200, cuda_memory_min_free_mb=512)
+        with patch("src.training.trainer._cuda_memory_snapshot", side_effect=[before, after]), \
+             patch("src.training.trainer.gc.collect"), \
+             patch("src.training.trainer.torch.cuda.empty_cache"), \
+             patch("src.training.trainer.torch.cuda.reset_peak_memory_stats"):
+            status = enforce_gpu_memory_budget("unit", cfg)
+        self.assertEqual(status["action"], "emergency")
+        self.assertIn("active peak", status["reason"])
+
+    def test_log_gpu_memory_is_report_only(self):
+        """Telemetry does not resurrect the retired reserved-memory fatal guard."""
+        cfg = RSCConfig(cuda_reserved_memory_limit_mb=1)
+        with patch("src.training.losses.torch.cuda.is_available", return_value=True), \
+             patch("src.training.losses.torch.cuda.max_memory_allocated", return_value=8 * 1024 ** 2), \
+             patch("src.training.losses.torch.cuda.max_memory_reserved", return_value=16 * 1024 ** 2), \
+             patch("src.training.losses.torch.cuda.reset_peak_memory_stats"):
+            telemetry = log_gpu_memory("unit", cfg)
+        self.assertEqual(telemetry["peak_reserved_mb"], 16.0)
+
+    def test_phase2_state_round_trip_restores_model_optimizer_scheduler_and_cursor(self):
+        """Interrupted training retains all state needed for an exact cursor resume."""
+        class TinyARS(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.steer_nets = nn.ModuleDict({"11": nn.Linear(2, 2)})
+                self.gates = nn.ModuleDict({"11": nn.Linear(2, 1)})
+                self.router = nn.Linear(2, 2)
+                self._router_warmup = False
+                self._router_exploration = True
+                self._router_inference_mode = "sample"
+
+            def set_router_warmup(self, value):
+                self._router_warmup = value
+
+            def set_router_exploration(self, value):
+                self._router_exploration = value
+
+            def set_router_inference_mode(self, value):
+                self._router_inference_mode = value
+
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "phase2_state.pt")
+            model = TinyARS()
+            optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            loss = sum(parameter.square().sum() for parameter in model.parameters())
+            loss.backward()
+            optimizer.step()
+            scheduler = LRReducer(optimizer, total_steps=20, warmup_steps=2)
+            scheduler.scheduler_step()
+            expected_weight = model.steer_nets["11"].weight.detach().clone()
+            save_phase2_training_state(
+                path, model=model, optimizer=optimizer,
+                scaler=torch.amp.GradScaler("cuda", enabled=False), lr_reducer=scheduler,
+                stage_name="PHASE 2: Unified", epochs=3, epoch=1, next_batch_start=16,
+                indices=[3, 1, 2], global_step=50, best_acc=0.60, best_val=1.044,
+                patience_ctr=1, baseline_ema=[0.1], effective_rloo_batch_size=4,
+                train_steer=False, train_gate=True, train_router=True, save_path="best.pt",
+            )
+            with torch.no_grad():
+                model.steer_nets["11"].weight.zero_()
+            payload = load_phase2_training_state(path, model, torch.device("cpu"))
+            self.assertTrue(torch.equal(model.steer_nets["11"].weight, expected_weight))
+            self.assertEqual(payload["progress"]["epoch"], 1)
+            self.assertEqual(payload["progress"]["next_batch_start"], 16)
+            self.assertEqual(payload["progress"]["effective_rloo_batch_size"], 4)
+            restored_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+            restored_optimizer.load_state_dict(payload["optimizer"])
+            restored_scheduler = LRReducer(restored_optimizer, total_steps=1)
+            restored_scheduler.load_state_dict(payload["lr_reducer"])
+            self.assertEqual(restored_scheduler.current_step, scheduler.current_step)
+            self.assertTrue(restored_optimizer.state)
+
+    def test_resume_phase2_missing_state_fails_closed(self):
+        """An explicit Phase-2 resume request cannot silently begin a new run."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = RSCConfig(
+                resume_phase2=True,
+                phase2_training_state_path=os.path.join(directory, "missing_phase2_state.pt"),
+            )
+            with self.assertRaisesRegex(FileNotFoundError, "Refusing silent full retraining"):
+                train_rsc(None, None, [], [], cfg, torch.device("cpu"))
 
 
 

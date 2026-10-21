@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.13.7] - 2026-10-21
+
+### 🛡️ Engine v3.3: Cache-Aware Memory Recovery & Exact Phase-2 Resume
+- **Cache-aware watchdog (`src/training/trainer.py`, `src/training/losses.py`):** CUDA active allocation is now the primary safety limit (`11,500 MiB`). PyTorch reservation is treated as cache pressure: the runner collects garbage and calls `torch.cuda.empty_cache()` before judging capacity. The reservation ceiling is raised to `14,200 MiB`, preserving realistic T4 headroom without mistaking reusable cache for live tensors.
+- **Controlled recovery:** Watchdog pressure reduces subsequent (and persisted resumed) RLOO probe batches to four, checkpoints state atomically, and returns a recoverable `PAUSED_MEMORY_PRESSURE` status on genuine allocation pressure instead of raising a raw reserved-memory exception.
+- **Exact Phase-2 restart:** Added an atomic CPU-portable training-state file with ARS tensors, optimizer, AMP scaler, LR reducer, RNG, routing controls, epoch/batch cursor, shuffled order, and adaptive probe size. `CFG.resume_phase2=True` is fail-closed if the state is missing or incompatible, resumes only the interrupted Phase-2 stage, and then completes its held-out per-shot deployment decision.
+- **Regression coverage:** Added CPU tests for cache reclamation, controlled active-allocation emergency, non-fatal memory telemetry, state round-trip restoration, and fail-closed missing-state resume.
+
+---
+
 ## [1.13.6] - 2026-10-21
 
 ### 🧪 Run `exp_20261021_113159_ars_phi2_kaggle_engine_v3_2_memory_halt`: Engine v3.2 Cooperative-Routing Milestone

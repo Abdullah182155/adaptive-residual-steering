@@ -206,8 +206,15 @@ class RSCConfig:
     # Monitoring
     verifier_every_n: int = 10
     log_gpu_memory: bool = True
-    # Fail before allocator fragmentation becomes an unrecoverable T4 OOM.
-    cuda_reserved_memory_limit_mb: int = 12288
+    # Engine v3.3: allocation is the primary capacity signal.  ``reserved``
+    # includes reusable allocator cache, so it triggers reclamation rather
+    # than an immediate failure.  The reservation ceiling leaves ~1.1 GiB on
+    # a 15 GiB T4 for allocator/driver headroom after cache reclamation.
+    cuda_active_memory_limit_mb: int = 11500
+    cuda_reserved_memory_limit_mb: int = 14200
+    cuda_memory_min_free_mb: int = 512
+    cuda_memory_watchdog_every_n_steps: int = 50
+    cuda_memory_reduced_rloo_batch_size: int = 4
     pre_cap_telemetry_reservoir_size: int = 8192
 
     # Checkpoint selection
@@ -220,6 +227,12 @@ class RSCConfig:
     checkpoint_dir: str = "./checkpoints"
     phase1_report_save_path: str = "./checkpoints/phase1_report.json"
     resume_phase1: bool = False
+    # Full optimizer/scaler/scheduler/RNG state for a recoverable Phase-2
+    # interruption.  This is intentionally separate from portable ARS weight
+    # checkpoints, which remain tensor-only for evaluation compatibility.
+    phase2_training_state_path: str = "./checkpoints/phase2_training_state.pt"
+    resume_phase2: bool = False
+    phase2_state_checkpoint_every_n_steps: int = 50
 
     # Router bootstrap settings
     router_bootstrap_epochs: int = 3
@@ -393,6 +406,7 @@ class RSCConfig:
         for path in [
             self.lora_save_path,
             self.phase2_save_path,
+            self.phase2_training_state_path,
             self.router_bootstrap_save_path,
             self.steer_finetune_save_path,
             self.gate_only_save_path,
