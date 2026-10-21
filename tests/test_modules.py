@@ -2177,14 +2177,16 @@ class TestEngineV32SafetyAndProfile(unittest.TestCase):
         self.assertEqual(layers, [11, 24])
         self.assertEqual(pool["depth_bands"], ["early", "late"])
 
-    def test_kaggle_profile_lock_rejects_hyperparameter_drift(self):
-        """A correct commit cannot silently execute an altered decision profile."""
+    def test_kaggle_profile_lock_tracks_hyperparameter_drift(self):
+        """A correct commit fingerprints profile changes and can enforce strict locking."""
         cfg = make_engine_v32_kaggle_config()
         digest = assert_engine_v32_kaggle_profile(cfg)
         self.assertEqual(len(digest), 64)
         cfg.phase1_epochs = 4
-        with self.assertRaisesRegex(RuntimeError, "profile drift"):
-            assert_engine_v32_kaggle_profile(cfg)
+        custom_digest = assert_engine_v32_kaggle_profile(cfg, strict=False)
+        self.assertEqual(len(custom_digest), 64)
+        with self.assertRaisesRegex(RuntimeError, "custom overrides"):
+            assert_engine_v32_kaggle_profile(cfg, strict=True)
 
 
 

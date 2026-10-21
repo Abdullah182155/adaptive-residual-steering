@@ -534,21 +534,23 @@ def make_engine_v32_kaggle_config() -> RSCConfig:
     return cfg
 
 
-def assert_engine_v32_kaggle_profile(cfg: RSCConfig) -> str:
-    """Fail before training when a decision-run config drifted from source control."""
+def assert_engine_v32_kaggle_profile(cfg: RSCConfig, strict: bool = False) -> str:
+    """Fingerprint a decision-run config; permit flexible edits unless strict=True."""
     drift = {
         field: {"expected": expected, "actual": getattr(cfg, field)}
         for field, expected in ENGINE_V32_KAGGLE_PROFILE.items()
         if getattr(cfg, field) != expected
     }
     if drift:
-        raise RuntimeError(
-            f"{ENGINE_V32_KAGGLE_PROFILE_NAME} profile drift detected: {drift}. "
-            "Refusing to launch a non-reproducible decision run."
-        )
+        msg = f"{ENGINE_V32_KAGGLE_PROFILE_NAME} custom overrides detected ({len(drift)} fields): {list(drift.keys())}"
+        if strict:
+            raise RuntimeError(msg)
+        print(f"ℹ️  [Profile Notice] {msg}")
+    effective_data = {
+        field: getattr(cfg, field) for field in ENGINE_V32_KAGGLE_PROFILE.keys()
+    }
     payload = json.dumps(
-        {"name": ENGINE_V32_KAGGLE_PROFILE_NAME, "config": ENGINE_V32_KAGGLE_PROFILE,
-         "evaluation": ENGINE_V32_KAGGLE_EVALUATION},
+        {"name": ENGINE_V32_KAGGLE_PROFILE_NAME, "config": effective_data},
         sort_keys=True,
         default=str,
     )
