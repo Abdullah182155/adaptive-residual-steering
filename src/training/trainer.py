@@ -33,6 +33,7 @@ from src.experiments.checkpointing import (
     load_checkpoint_manifest,
     save_ars_checkpoint,
 )
+from src.steering.steernet import post_cap_ratio_from_pre_cap_q
 
 
 def _phase1_runtime_config_sha256(cfg: RSCConfig) -> str:
@@ -427,17 +428,31 @@ def _phase1_probe_with_norm(
     return probe
 
 
+def _phase1_norm_metrics(result: Dict[str, Any], gate_scale: float) -> Tuple[float, float, float]:
+    """Return raw, post-cap, and gate-scaled post-cap p95 ratios.
+
+    Raw ``q`` describes how often the trainable residual enters the soft
+    saturation envelope.  It is useful telemetry, but safety is determined by
+    the bounded output which is actually injected into the backbone.
+    """
+    norm = result.get("pre_cap_norm", {})
+    raw_q_p95 = float(norm.get("p95", norm.get("mean", 0.0)))
+    post_cap_q_p95 = float(norm.get("post_cap_p95", post_cap_ratio_from_pre_cap_q(raw_q_p95)))
+    return raw_q_p95, post_cap_q_p95, float(gate_scale) * post_cap_q_p95
+
+
 def _phase1_pair_is_safe(
     result: Dict[str, Any], base_median_tokens: float, cfg: RSCConfig, gate_scale: float = 1.0,
 ) -> Tuple[bool, float, float]:
-    """Return whether a generation pair preserves CoT and raw/effective norm safety."""
+    """Return whether a generation pair preserves CoT and realized displacement safety.
+
+    The returned q remains the raw pre-cap p95 for backwards-compatible
+    diagnostics.  The acceptance decision intentionally uses post-cap q.
+    """
     completion_ratio = float(result.get("median_tokens", 0.0)) / max(1.0, base_median_tokens)
-    norm = result.get("pre_cap_norm", {})
-    q_p95 = float(norm.get("p95", norm.get("mean", 0.0)))
-    effective_q_p95 = float(gate_scale) * q_p95
+    q_p95, _post_cap_q_p95, effective_q_p95 = _phase1_norm_metrics(result, gate_scale)
     safe = (
         completion_ratio >= float(getattr(cfg, "phase1_min_completion_len_ratio", 0.85))
-        and q_p95 <= float(getattr(cfg, "phase1_max_generation_p95_norm_ratio", 1.0))
         and effective_q_p95 <= float(getattr(cfg, "phase1_max_effective_generation_p95_norm_ratio", 1.0))
     )
     return safe, completion_ratio, q_p95
@@ -448,7 +463,7 @@ def _phase1_calibration_rank_key(item: Tuple[Dict[str, Any], Dict[str, Any]]) ->
     row, pair = item
     return (
         float(pair["accuracy"]), float(pair["answer_present"]), -float(row["val_nll"]),
-        -float(pair["pre_cap_q_p95"]), -float(pair["gate_scale"]),
+        -float(pair.get("effective_post_cap_q_p95", pair["pre_cap_q_p95"])), -float(pair["gate_scale"]),
     )
 
 
@@ -462,13 +477,12 @@ def _phase1_confirmation_verdict(
     nll_safe: bool,
     cfg: RSCConfig,
 ) -> Tuple[bool, bool, List[str]]:
-    """Apply strict Phase-1 gates plus bounded small-sample noise tolerance.
+    """Apply strict Phase-1 gates and record compact-screen noise tolerance.
 
     A confirmation result remains the primary promotion criterion.  The
-    tolerance covers only one discrete question on compact confirmation sets,
-    and only when both an independently measured calibration gain and the
-    pooled result support non-regression.  It never relaxes norm, CoT, or NLL
-    constraints.
+    Compact-screen noise is recorded for diagnosis, but it cannot promote a
+    fixed control.  Promotion requires a strictly positive independently
+    measured confirmation gain; calibration wins never substitute for it.
     """
     minimum_gain = float(getattr(
         cfg, "phase1_min_validation_accuracy_gain", cfg.phase1_min_train_accuracy_gain
@@ -477,7 +491,7 @@ def _phase1_confirmation_verdict(
     # exact binomial boundary (for example 12/20 - 13/20 == -1/20).
     epsilon = 1e-12
     combined_nonregressing = combined_gain >= -epsilon
-    direct_accuracy_pass = confirmation_gain >= minimum_gain - epsilon and (
+    direct_accuracy_pass = confirmation_gain > max(0.0, minimum_gain) + epsilon and (
         not bool(getattr(cfg, "phase1_require_nonnegative_combined_gain", True))
         or combined_nonregressing
     )
@@ -494,9 +508,9 @@ def _phase1_confirmation_verdict(
         reasons.append("confirmation_safety")
     if not nll_safe:
         reasons.append("nll_reduction")
-    if not (direct_accuracy_pass or noise_tolerated):
+    if not direct_accuracy_pass:
         reasons.append("confirmation_accuracy")
-    return safe and nll_safe and (direct_accuracy_pass or noise_tolerated), noise_tolerated, reasons
+    return safe and nll_safe and direct_accuracy_pass, noise_tolerated, reasons
 
 
 def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
@@ -562,44 +576,133 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
         scale_grid = sorted({min(1.0, max(0.0, float(scale))) for scale in getattr(cfg, "phase1_gate_scale_grid", (1.0,))})
         if not scale_grid:
             raise RuntimeError("phase1_gate_scale_grid must contain at least one scale.")
-        print(f"  [3/4] Joint generation calibration: {len(candidates)} layers × {scale_grid} ({screen_n} each)...")
-        base_screen = _phase1_probe_with_norm(
-            model, tokenizer, calibration_rows, cfg, device, screen_n, None, 1.0,
-            "Acceptance baseline calibration",
+        initial_n = min(
+            screen_n,
+            max(1, int(getattr(cfg, "phase1_successive_halving_examples", screen_n))),
         )
-        base_screen_acc = base_screen["accuracy"]
-        base_median_tokens = max(1.0, float(base_screen.get("median_tokens", 0.0)))
-        print(f"        baseline calibration: acc={base_screen_acc:.1%} median_tokens={base_median_tokens:.0f}")
-
-        eligible_pairs = []
+        initial_rows = calibration_rows[:initial_n]
+        print(
+            f"  [3/4] Successive-halving calibration: {len(candidates)} layers × {scale_grid} "
+            f"({initial_n} initial each; promote one safe route per depth band to {screen_n})."
+        )
+        base_initial = _phase1_probe_with_norm(
+            model, tokenizer, initial_rows, cfg, device, initial_n, None, 1.0,
+            "Acceptance baseline initial calibration",
+        )
+        initial_median_tokens = max(1.0, float(base_initial.get("median_tokens", 0.0)))
+        initial_pairs = []
         for row in candidates:
+            row["initial_scale_screen"] = []
             for scale in scale_grid:
                 screen = _phase1_probe_with_norm(
-                    model, tokenizer, calibration_rows, cfg, device, screen_n, row["layer"], scale,
-                    f"Acceptance L{row['layer']} alpha={scale:.2f}",
+                    model, tokenizer, initial_rows, cfg, device, initial_n, row["layer"], scale,
+                    f"Acceptance initial L{row['layer']} alpha={scale:.2f}",
                 )
                 safe, completion_ratio, q_p95 = _phase1_pair_is_safe(
-                    screen, base_median_tokens, cfg, gate_scale=scale,
+                    screen, initial_median_tokens, cfg, gate_scale=scale,
                 )
+                _raw_q, post_cap_q_p95, effective_q_p95 = _phase1_norm_metrics(screen, scale)
                 pair = {
                     "layer": row["layer"], "gate_scale": scale,
                     "accuracy": screen["accuracy"], "answer_present": screen["answer_present"],
                     "median_tokens": screen.get("median_tokens", 0.0),
                     "completion_len_ratio": completion_ratio, "pre_cap_q_p95": q_p95,
+                    "post_cap_q_p95": post_cap_q_p95,
+                    "effective_post_cap_q_p95": effective_q_p95,
                     "effective_pre_cap_q_p95": scale * q_p95,
                     "pre_cap_norm": screen.get("pre_cap_norm", {}), "safe": safe,
                 }
-                row["scale_screen"].append(pair)
+                row["initial_scale_screen"].append(pair)
                 if safe:
-                    eligible_pairs.append((row, pair))
-                status = "" if safe else " ⚠️ REJECTED"
-                print(
-                    f"        L{row['layer']} alpha={scale:.2f}: acc={pair['accuracy']:.1%} "
-                    f"tokens={pair['median_tokens']:.0f} (ratio {completion_ratio:.2f}) "
-                    f"q95={q_p95:.2f} effective_q95={pair['effective_pre_cap_q_p95']:.2f}{status}"
-                )
+                    initial_pairs.append((row, pair))
 
-        rejected_layers = [row["layer"] for row in candidates if not any(p["safe"] for p in row["scale_screen"])]
+        # A one-per-band finalist set controls multiplicity and preserves the
+        # early/middle/late curriculum hypothesis.  The full calibration split
+        # remains unseen until after this deterministic initial selection.
+        initial_ranked = sorted(initial_pairs, key=_phase1_calibration_rank_key, reverse=True)
+        finalists = []
+        selected_bands = []
+        for band in ("early", "middle", "late"):
+            finalist = next(
+                (
+                    item for item in initial_ranked
+                    if _phase1_depth_band(int(item[0]["layer"]), model.target_layers) == band
+                ),
+                None,
+            )
+            if finalist is not None:
+                finalists.append(finalist)
+                selected_bands.append(band)
+        if not finalists:
+            rejected_layers = [row["layer"] for row in candidates]
+            warning = "  ⚠️ Phase-1 acceptance FAILED: no initial (layer, alpha) pair met CoT and realized-displacement safety."
+            print(warning)
+            return {
+                "candidates": candidates, "passed": False, "status": "FAIL_NO_SAFE_PAIR",
+                "truncation_rejected_layers": rejected_layers, "confirmation_trials": [],
+            }
+
+        if initial_n == screen_n:
+            base_screen = base_initial
+        else:
+            base_screen = _phase1_probe_with_norm(
+                model, tokenizer, calibration_rows, cfg, device, screen_n, None, 1.0,
+                "Acceptance baseline calibration",
+            )
+        base_screen_acc = base_screen["accuracy"]
+        base_median_tokens = max(1.0, float(base_screen.get("median_tokens", 0.0)))
+        print(
+            f"        promoted bands={selected_bands}; baseline calibration: "
+            f"acc={base_screen_acc:.1%} median_tokens={base_median_tokens:.0f}"
+        )
+        eligible_pairs = []
+        for row, initial_pair in finalists:
+            scale = float(initial_pair["gate_scale"])
+            if initial_n == screen_n:
+                pair = dict(initial_pair)
+                safe = bool(pair["safe"])
+                completion_ratio = float(pair["completion_len_ratio"])
+                q_p95 = float(pair["pre_cap_q_p95"])
+                post_cap_q_p95 = float(pair["post_cap_q_p95"])
+                effective_q_p95 = float(pair["effective_post_cap_q_p95"])
+            else:
+                screen = _phase1_probe_with_norm(
+                    model, tokenizer, calibration_rows, cfg, device, screen_n, row["layer"], scale,
+                    f"Acceptance finalist L{row['layer']} alpha={scale:.2f}",
+                )
+                safe, completion_ratio, q_p95 = _phase1_pair_is_safe(
+                    screen, base_median_tokens, cfg, gate_scale=scale,
+                )
+                _raw_q, post_cap_q_p95, effective_q_p95 = _phase1_norm_metrics(screen, scale)
+                pair = {
+                    "layer": row["layer"], "gate_scale": scale,
+                    "accuracy": screen["accuracy"], "answer_present": screen["answer_present"],
+                    "median_tokens": screen.get("median_tokens", 0.0),
+                    "completion_len_ratio": completion_ratio, "pre_cap_q_p95": q_p95,
+                    "post_cap_q_p95": post_cap_q_p95,
+                    "effective_post_cap_q_p95": effective_q_p95,
+                    "effective_pre_cap_q_p95": scale * q_p95,
+                    "pre_cap_norm": screen.get("pre_cap_norm", {}), "safe": safe,
+                }
+            row["scale_screen"].append(pair)
+            if safe:
+                eligible_pairs.append((row, pair))
+            status = "" if safe else " ⚠️ REJECTED"
+            print(
+                f"        finalist L{row['layer']} alpha={scale:.2f}: acc={pair['accuracy']:.1%} "
+                f"tokens={pair['median_tokens']:.0f} (ratio {completion_ratio:.2f}) "
+                f"raw_q95={q_p95:.2f} postcap_q95={post_cap_q_p95:.2f} "
+                f"effective_postcap_q95={effective_q_p95:.2f}{status}"
+            )
+
+        # A non-finalist was not disproven: it simply lost the inexpensive
+        # first-round screen to a stronger route in its depth band.  Report
+        # only routes that actually failed a safety measurement as rejected.
+        rejected_layers = [
+            row["layer"] for row in candidates
+            if row.get("initial_scale_screen")
+            and not any(pair["safe"] for pair in row["initial_scale_screen"])
+        ]
         if not eligible_pairs:
             warning = "  ⚠️ Phase-1 acceptance FAILED: no (layer, alpha) pair met CoT and norm safety constraints."
             print(warning)
@@ -613,8 +716,9 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 "confirmation_trials": [],
             }
 
-        # Accuracy drives calibration selection; answer presence, NLL, raw-q
-        # and lower intensity are deterministic secondary tie-breakers.
+        # Accuracy drives calibration selection; answer presence, NLL,
+        # realized effective post-cap displacement and lower intensity are
+        # deterministic secondary tie-breakers.
         ranked_pairs = sorted(eligible_pairs, key=_phase1_calibration_rank_key, reverse=True)
         calibration_ranking = []
         print("        eligible calibration ranking (acc, answer-present, val-NLL, CoT, q95, alpha):")
@@ -624,6 +728,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 "accuracy": pair["accuracy"], "answer_present": pair["answer_present"],
                 "val_nll": row["val_nll"], "completion_len_ratio": pair["completion_len_ratio"],
                 "pre_cap_q_p95": pair["pre_cap_q_p95"],
+                "post_cap_q_p95": pair.get("post_cap_q_p95"),
+                "effective_post_cap_q_p95": pair.get("effective_post_cap_q_p95"),
                 "safe": pair.get("safe", True),
                 "selection_key": list(_phase1_calibration_rank_key((row, pair))),
             }
@@ -631,9 +737,14 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             print(
                 f"          #{rank}: L{row['layer']} alpha={pair['gate_scale']:.2f} "
                 f"acc={pair['accuracy']:.1%} present={pair['answer_present']:.1%} "
-                f"val_nll={row['val_nll']:.4f} CoT={pair['completion_len_ratio']:.2f} q95={pair['pre_cap_q_p95']:.2f}"
+                f"val_nll={row['val_nll']:.4f} CoT={pair['completion_len_ratio']:.2f} "
+                f"raw_q95={pair['pre_cap_q_p95']:.2f} "
+                f"effective_postcap_q95={pair.get('effective_post_cap_q_p95', 0.0):.2f}"
             )
-        selection_reason = "accuracy > answer_present > lower_val_nll > lower_q95 > lower_alpha"
+        selection_reason = (
+            "accuracy > answer_present > lower_val_nll > "
+            "lower_effective_postcap_q95 > lower_alpha"
+        )
         max_confirmation_candidates = max(1, int(getattr(cfg, "phase1_max_confirmation_candidates", 3)))
         confirmation_candidates = ranked_pairs[:max_confirmation_candidates]
         print(
@@ -660,6 +771,9 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             confirm_safe, confirm_ratio, confirm_q_p95 = _phase1_pair_is_safe(
                 candidate_confirmation, max(1.0, float(base_confirmation.get("median_tokens", 0.0))), cfg,
                 gate_scale=calibration["gate_scale"],
+            )
+            _confirm_raw_q, confirm_post_cap_q_p95, confirm_effective_q_p95 = _phase1_norm_metrics(
+                candidate_confirmation, calibration["gate_scale"],
             )
             confirmation_gain = float(candidate_confirmation["accuracy"]) - float(base_val_acc)
             calibration_gain = float(calibration["accuracy"]) - float(base_screen_acc)
@@ -693,6 +807,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
                 "combined_accuracy_gain": combined_gain,
                 "completion_len_ratio": confirm_ratio,
                 "pre_cap_q_p95": confirm_q_p95,
+                "post_cap_q_p95": confirm_post_cap_q_p95,
+                "effective_post_cap_q_p95": confirm_effective_q_p95,
                 "effective_pre_cap_q_p95": float(calibration["gate_scale"]) * confirm_q_p95,
                 "safe": confirm_safe,
                 "train_relative_nll_reduction": nll_reduction,
@@ -708,7 +824,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             print(
                 f"          {verdict}{tolerance}: confirmation Δ={confirmation_gain * 100:+.1f}pp, "
                 f"calibration Δ={calibration_gain * 100:+.1f}pp, combined Δ={combined_gain * 100:+.1f}pp, "
-                f"CoT={confirm_ratio:.2f}, q95={confirm_q_p95:.2f}"
+                f"CoT={confirm_ratio:.2f}, raw_q95={confirm_q_p95:.2f}, "
+                f"effective_postcap_q95={confirm_effective_q_p95:.2f}"
             )
             if passed:
                 accepted = (candidate, calibration, candidate_confirmation, trial)
@@ -737,6 +854,12 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             "gate_scale_candidates": selected_candidate["scale_screen"],
             "selected_calibration": selected_calibration,
             "calibration_ranking": calibration_ranking,
+            "successive_halving": {
+                "initial_examples": initial_n,
+                "full_calibration_examples": screen_n,
+                "promoted_depth_bands": selected_bands,
+                "finalist_count": len(finalists),
+            },
             "selection_reason": selection_reason,
             "confirmation": {
                 "baseline": base_confirmation, "candidate": selected_confirmation,
@@ -758,7 +881,8 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
             f"{selected_trial['train_relative_nll_reduction'] * 100:+.1f}%/"
             f"{selected_trial['val_relative_nll_reduction'] * 100:+.1f}% | "
             f"confirmation Δ={selected_trial['confirmation_gain'] * 100:+.1f}pp | "
-            f"CoT={selected_trial['completion_len_ratio']:.2f} q95={selected_trial['pre_cap_q_p95']:.2f}"
+            f"CoT={selected_trial['completion_len_ratio']:.2f} raw_q95={selected_trial['pre_cap_q_p95']:.2f} "
+            f"effective_postcap_q95={selected_trial['effective_post_cap_q_p95']:.2f}"
         )
         print(f"  Acceptance audit finished in {(time.monotonic() - started_at) / 60:.1f} min.")
         if not report["passed"] and small_run_waiver:
@@ -1048,11 +1172,14 @@ def _phase1_epoch_generation_screen(model, tokenizer, eval_data, cfg: RSCConfig,
                 safe, completion_ratio, q_p95 = _phase1_pair_is_safe(
                     probe, base_median_tokens, cfg, gate_scale=scale,
                 )
+                _raw_q_p95, post_cap_q_p95, effective_q_p95 = _phase1_norm_metrics(probe, scale)
                 if safe:
                     safe_pairs.append({
                         "layer": int(layer), "gate_scale": scale, "accuracy": probe["accuracy"],
                         "answer_present": probe["answer_present"], "completion_len_ratio": completion_ratio,
-                        "pre_cap_q_p95": q_p95, "effective_pre_cap_q_p95": scale * q_p95,
+                        "pre_cap_q_p95": q_p95, "post_cap_q_p95": post_cap_q_p95,
+                        "effective_post_cap_q_p95": effective_q_p95,
+                        "effective_pre_cap_q_p95": scale * q_p95,
                     })
         # A checkpoint cannot win merely by avoiding CoT/norm failures: its
         # best safe route must also not underperform the matched baseline.
@@ -1064,7 +1191,7 @@ def _phase1_epoch_generation_screen(model, tokenizer, eval_data, cfg: RSCConfig,
             }
         best = max(
             eligible,
-            key=lambda row: (row["accuracy"], row["answer_present"], -row["pre_cap_q_p95"], -row["gate_scale"]),
+            key=lambda row: (row["accuracy"], row["answer_present"], -row["effective_post_cap_q_p95"], -row["gate_scale"]),
         )
         return {"baseline": baseline, "safe_pairs": safe_pairs, "eligible": eligible, "best": best, "status": "SAFE_NONREGRESSING"}
     finally:

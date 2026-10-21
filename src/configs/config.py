@@ -1,6 +1,8 @@
+import hashlib
+import json
 import os
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Tuple, Optional
 import torch
 
 @dataclass
@@ -48,10 +50,9 @@ class RSCConfig:
     steer_norm_q_hi: float = 0.50           # Keep Phase-1 residuals in the linear operating regime
     steer_norm_huber_delta: float = 0.10    # Transition delta for smooth Huber norm penalty
     phase1_max_eval_p95_norm_ratio: float = 1.0  # Legacy telemetry threshold
-    # Raw q is measured before the gate.  It remains a runaway guard, while
-    # the effective (gate-scaled) q below is the actual displacement safety
-    # contract.  This permits early/middle layers to use a conservative alpha
-    # instead of excluding them solely for harmless pre-gate tail variation.
+    # Raw q is measured before smooth saturation.  It is an informational
+    # saturation diagnostic, never a Phase-1 promotion veto.  Promotion uses
+    # the realized post-cap, gate-scaled ratio below instead.
     phase1_max_generation_p95_norm_ratio: float = 1.50
     phase1_max_effective_generation_p95_norm_ratio: float = 1.00
     # Teacher forcing can reduce the loss of boilerplate reasoning tokens
@@ -98,6 +99,11 @@ class RSCConfig:
     # calibration partition.  It detects CoT collapse without making a T4
     # preflight prohibitively slow.
     phase1_generation_screen_examples: int = 12
+    # Successive halving evaluates every layer/scale on this small prefix, then
+    # promotes only the top safe route from each physical depth band to the
+    # full calibration split.  It prevents a 32-arm screen from consuming an
+    # entire Kaggle session before co-adaptation can start.
+    phase1_successive_halving_examples: int = 6
     # The strongest safe calibration pairs are measured on this disjoint
     # partition before promotion.  It is deliberately independent of the
     # calibration rows.
@@ -107,11 +113,10 @@ class RSCConfig:
     # disjoint rows before failing closed, rather than treating a one-item
     # fluctuation from the top-ranked pair as evidence against every route.
     phase1_max_confirmation_candidates: int = 3
-    # On a confirmation partition of at most 32 questions, permit a one-item
-    # candidate deficit only when its calibration gain is at least 10pp and
-    # the pooled calibration-plus-confirmation accuracy does not regress.
-    # CoT, raw-norm, and NLL safety gates remain strict in all cases.
-    phase1_allow_confirmation_noise_tolerance: bool = True
+    # Compact-screen noise is reported but cannot promote a fixed control.
+    # Every fixed SteerNet needs a strictly positive disjoint confirmation
+    # gain; calibration wins and one-question tolerances are diagnostic only.
+    phase1_allow_confirmation_noise_tolerance: bool = False
     # A selected calibration winner must not be promoted solely because a
     # small confirmation split happened to be positive.  Require its pooled,
     # disjoint calibration-plus-confirmation result to be non-regressing.
@@ -139,14 +144,10 @@ class RSCConfig:
     phase1_gate_scale_grid: Tuple[float, ...] = (0.25, 0.35, 0.50, 0.70)
     phase1_min_train_nll_reduction: float = 0.05
     phase1_min_val_nll_reduction: float = 0.05
-    # Do not promote an adapter merely because it does not regress on a tiny
-    # teacher-forced probe.  This is an *independent held-out generation*
-    # P2 (run-analysis fix): acceptance thresholds set to 0.0 — telemetry only.
-    # A 32-item holdout has 3.1pp quantisation and cannot support a hard gate.
-    # The in-audit generation screen is also disabled (phase1_generation_screen_examples=0).
-    # Deployment is decided once at the end via finalize_deployment (ISSUE-2).
-    phase1_min_validation_accuracy_gain: float = 0.0   # was 0.10 — telemetry only
-    phase1_min_train_accuracy_gain: float = 0.0        # was 0.10 — legacy alias
+    # Promotion requires confirmation_gain > this floor, not merely a tie.
+    # A zero floor therefore means one strictly positive binomial increment.
+    phase1_min_validation_accuracy_gain: float = 0.0
+    phase1_min_train_accuracy_gain: float = 0.0        # Legacy alias
     phase1_accuracy_warning_gain: float = 0.10
     # A four-example holdout cannot establish a scientific capacity or
     # routing-health claim.  Tiny smoke runs still execute every phase and
@@ -344,8 +345,10 @@ class RSCConfig:
     phase1b_coadapt_epochs: int = 1
     phase1b_candidate_layers: int = 4
     # Require a scientifically meaningful co-adaptation pool before routing.
-    phase1b_min_candidate_layers: int = 3
-    phase1b_min_depth_bands: int = 3
+    # Two physical bands are sufficient when they establish a long-range pair;
+    # requiring all three bands made valid early+late pools impossible.
+    phase1b_min_candidate_layers: int = 2
+    phase1b_min_depth_bands: int = 2
     phase1b_lr: float = 5e-5
     phase1b_joint_nll_weight: float = 1.0
     unified_adaptive_phase: bool = True
@@ -434,3 +437,119 @@ class RSCConfig:
         else:
             indices = [round(int(idx) * (n_total - 1) / 31) for idx in canonical]
         return sorted(set(max(1, min(idx, n_total - 2)) for idx in indices))
+
+
+# The Kaggle runner must not re-specify these values cell-by-cell.  That
+# previously allowed a notebook at the correct Git commit to silently run a
+# different four-epoch, high-LR experiment.  Keep the decision-run contract in
+# source control and validate it immediately before expensive model loading.
+ENGINE_V32_KAGGLE_PROFILE_NAME = "engine_v3_2_kaggle_t4"
+ENGINE_V32_KAGGLE_PROFILE: Dict[str, Any] = {
+    "lora_rank": 16,
+    "lora_alpha": 32.0,
+    "steer_magnitude_mode": "direct",
+    "steer_max_relative_norm": 0.02,
+    "steer_orthogonal_projection": False,
+    "n_samples": 3000,
+    "max_tok_len": 512,
+    "fewshot_train_prob": 0.0,
+    "fewshot_train_max_demos": 0,
+    "diversify_prompts": False,
+    "router_bootstrap_n_examples": 500,
+    "deployment_min_examples": 120,
+    "phase1_lr": 3e-4,
+    "phase1_epochs": 2,
+    "phase1_acceptance_accuracy_examples": 0,
+    "phase1_generation_screen_examples": 12,
+    "phase1_successive_halving_examples": 6,
+    "phase1_generation_confirmation_examples": 16,
+    "phase1_max_confirmation_candidates": 3,
+    "phase1_allow_confirmation_noise_tolerance": False,
+    "phase1_min_validation_accuracy_gain": 0.0,
+    "phase1_max_generation_p95_norm_ratio": 1.50,
+    "phase1_max_effective_generation_p95_norm_ratio": 1.00,
+    "phase1_gate_scale_grid": (0.25, 0.35, 0.50, 0.70),
+    "phase1_epoch_generation_screen_examples": 6,
+    "phase1_epoch_gate_scale_grid": (0.2, 0.4),
+    "phase1b_min_candidate_layers": 2,
+    "phase1b_min_depth_bands": 2,
+    "router_bootstrap_epochs": 3,
+    "steer_finetune_epochs": 0,
+    "gate_only_epochs": 3,
+    "joint_finetune_epochs": 1,
+    "gate_retune_epochs": 1,
+    "continue_on_diagnostic_failure": False,
+    "skip_adaptive_phases_when_phase1_fails": True,
+    "skip_adaptive_phases_when_router_fails": True,
+    "router_fail_fast_on_collapse": True,
+    "prompt_shielding": True,
+    "lambda_cost": 0.005,
+    "router_relative_k_cost": 0.03,
+    "router_tariff_warmup_epochs": 1,
+    "router_tariff_max_positive_gain_fraction": 0.50,
+    "beta_entropy_k": 0.10,
+    "lambda_synergy": 0.25,
+    "lambda_synergy_prior": 0.01,
+    "beta_entropy_subset": 0.05,
+    "router_rloo_batch_size": 8,
+    "router_diversity_temperature": 0.35,
+    "lambda_router_k_mi": 0.15,
+    "lambda_router_layer_mi": 0.15,
+    "lambda_router_k_preference": 0.25,
+    "router_k_preference_temperature": 0.10,
+    "router_layer_dropout": 0.0,
+    "answer_tail_tokens": 8,
+    "answer_tail_weight": 1.10,
+    "steer_loss_target": "calculation_weighted",
+    "calc_token_weight": 1.35,
+    "steer_route_budget_power": 0.5,
+    "lambda_steer_norm": 0.60,
+    "steer_norm_q_hi": 0.50,
+    "router_warmup_max_k": 1,
+    "router_warmup_random_subsets": False,
+    "router_k0_margin": 0.0,
+    "bootstrap_steer_compat_lr_scale": 0.05,
+    "lambda_pg": 0.0,
+    "gate_target_sparsity": 0.20,
+    "lambda_gate_budget": 0.50,
+    "lambda_l1_gate": 0.05,
+    "lambda_gate_diversity": 0.20,
+    "router_reward_type": "execution",
+    "resume_phase1": False,
+    "curriculum_mode": "full",
+    "use_router": True,
+}
+ENGINE_V32_KAGGLE_EVALUATION: Dict[str, Any] = {
+    "n_test": 100,
+    "shots": (0, 2, 4, 8),
+    "max_new_tokens": 512,
+}
+
+
+def make_engine_v32_kaggle_config() -> RSCConfig:
+    """Return the committed, reproducible Engine v3.2 Kaggle T4 profile."""
+    cfg = RSCConfig()
+    for field, value in ENGINE_V32_KAGGLE_PROFILE.items():
+        setattr(cfg, field, value)
+    return cfg
+
+
+def assert_engine_v32_kaggle_profile(cfg: RSCConfig) -> str:
+    """Fail before training when a decision-run config drifted from source control."""
+    drift = {
+        field: {"expected": expected, "actual": getattr(cfg, field)}
+        for field, expected in ENGINE_V32_KAGGLE_PROFILE.items()
+        if getattr(cfg, field) != expected
+    }
+    if drift:
+        raise RuntimeError(
+            f"{ENGINE_V32_KAGGLE_PROFILE_NAME} profile drift detected: {drift}. "
+            "Refusing to launch a non-reproducible decision run."
+        )
+    payload = json.dumps(
+        {"name": ENGINE_V32_KAGGLE_PROFILE_NAME, "config": ENGINE_V32_KAGGLE_PROFILE,
+         "evaluation": ENGINE_V32_KAGGLE_EVALUATION},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

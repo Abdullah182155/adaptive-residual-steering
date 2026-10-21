@@ -7,8 +7,12 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from src.configs.config import RSCConfig
-from src.steering.steernet import RSCSteerNet
+from src.configs.config import (
+    RSCConfig,
+    assert_engine_v32_kaggle_profile,
+    make_engine_v32_kaggle_config,
+)
+from src.steering.steernet import RSCSteerNet, post_cap_ratio_from_pre_cap_q
 from src.gating.gate import RSCUsefulnessGate
 from src.models.wrapper import Phi2WithRSC
 from src.routing.router import JointLayerRouter
@@ -34,6 +38,7 @@ from src.training.trainer import (
     _small_run_waiver,
     _optimizer_has_gradients,
     _phase1_epoch_generation_screen,
+    _phase1_confirmation_verdict,
     _phase1_pair_is_safe,
     phase1_steernet_acceptance,
 )
@@ -118,6 +123,7 @@ class TestARSModules(unittest.TestCase):
             phase1_acceptance_examples=16,
             phase1_acceptance_accuracy_examples=0,
             phase1_generation_screen_examples=8,
+            phase1_successive_halving_examples=8,
             phase1_generation_confirmation_examples=8,
             phase1_gate_scale_grid=(1.0,),
             phase1_min_train_nll_reduction=0.05,
@@ -153,6 +159,7 @@ class TestARSModules(unittest.TestCase):
             phase1_acceptance_examples=16,
             phase1_acceptance_accuracy_examples=0,
             phase1_generation_screen_examples=8,
+            phase1_successive_halving_examples=8,
             phase1_generation_confirmation_examples=8,
             phase1_gate_scale_grid=(1.0,),
             continue_on_diagnostic_failure=True,
@@ -187,6 +194,7 @@ class TestARSModules(unittest.TestCase):
         cfg = RSCConfig(
             phase1_acceptance_examples=16,
             phase1_generation_screen_examples=8,
+            phase1_successive_halving_examples=8,
             phase1_generation_confirmation_examples=8,
             phase1_gate_scale_grid=(0.2, 1.0),
             continue_on_diagnostic_failure=False,
@@ -194,10 +202,11 @@ class TestARSModules(unittest.TestCase):
         rows = [{"question": "q", "final_num": 1.0}] * 16
         baseline = {"accuracy": 0.5, "answer_present": 1.0, "median_tokens": 100.0}
         safe_low_alpha = {"accuracy": 0.5, "answer_present": 1.0, "median_tokens": 100.0}
+        winning_confirmation = {"accuracy": 0.625, "answer_present": 1.0, "median_tokens": 100.0}
         unsafe_full_alpha = {"accuracy": 1.0, "answer_present": 1.0, "median_tokens": 84.0}
         with patch("src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8]), patch(
             "src.training.trainer._phase1_zero_shot_generation_probe",
-            side_effect=[baseline, safe_low_alpha, unsafe_full_alpha, baseline, safe_low_alpha],
+            side_effect=[baseline, safe_low_alpha, unsafe_full_alpha, baseline, winning_confirmation],
         ):
             report = phase1_steernet_acceptance(
                 ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
@@ -214,7 +223,7 @@ class TestARSModules(unittest.TestCase):
     def test_phase1_confirmation_falls_back_to_next_ranked_candidate(self):
         """A failed top confirmation route must not discard the next safe route."""
         class ScreenOnlyModel:
-            target_layers = [11, 13]
+            target_layers = [11, 24]
             _routing_override = None
 
             def set_routing_override(self, mode=None, layers=None):
@@ -226,6 +235,7 @@ class TestARSModules(unittest.TestCase):
         cfg = RSCConfig(
             phase1_acceptance_examples=16,
             phase1_generation_screen_examples=8,
+            phase1_successive_halving_examples=8,
             phase1_generation_confirmation_examples=8,
             phase1_gate_scale_grid=(0.6,),
             phase1_max_confirmation_candidates=2,
@@ -237,7 +247,7 @@ class TestARSModules(unittest.TestCase):
         fallback_calibration = {"accuracy": 0.625, "answer_present": 1.0, "median_tokens": 100.0}
         baseline_confirmation = {"accuracy": 0.75, "answer_present": 1.0, "median_tokens": 100.0}
         top_confirmation = {"accuracy": 0.50, "answer_present": 1.0, "median_tokens": 100.0}
-        fallback_confirmation = {"accuracy": 0.75, "answer_present": 1.0, "median_tokens": 100.0}
+        fallback_confirmation = {"accuracy": 0.875, "answer_present": 1.0, "median_tokens": 100.0}
         with patch(
             "src.training.trainer.evaluate_loss", side_effect=[1.0, 1.0, 0.8, 0.8, 0.8, 0.8]
         ), patch(
@@ -252,13 +262,13 @@ class TestARSModules(unittest.TestCase):
             )
 
         self.assertTrue(report["passed"])
-        self.assertEqual(report["selected_layer"], 13)
+        self.assertEqual(report["selected_layer"], 24)
         self.assertEqual(len(report["confirmation_trials"]), 2)
         self.assertFalse(report["confirmation_trials"][0]["passed"])
         self.assertTrue(report["confirmation_trials"][1]["passed"])
 
-    def test_phase1_confirmation_allows_one_question_noise_with_positive_pool(self):
-        """A one-item compact-confirmation loss may pass only with corroborating gains."""
+    def test_phase1_confirmation_records_one_question_noise_without_promotion(self):
+        """A one-item compact-confirmation loss is diagnostic, never a promotion."""
         class ScreenOnlyModel:
             target_layers = [11]
             _routing_override = None
@@ -272,8 +282,10 @@ class TestARSModules(unittest.TestCase):
         cfg = RSCConfig(
             phase1_acceptance_examples=40,
             phase1_generation_screen_examples=20,
+            phase1_successive_halving_examples=20,
             phase1_generation_confirmation_examples=20,
             phase1_gate_scale_grid=(0.6,),
+            phase1_allow_confirmation_noise_tolerance=True,
             continue_on_diagnostic_failure=False,
         )
         rows = [{"question": "q", "final_num": 1.0}] * 40
@@ -291,14 +303,14 @@ class TestARSModules(unittest.TestCase):
                 ScreenOnlyModel(), None, rows, rows, cfg, torch.device("cpu")
             )
 
-        self.assertTrue(report["passed"])
+        self.assertFalse(report["passed"])
         self.assertTrue(report["confirmation_trials"][0]["noise_tolerance_used"])
         self.assertAlmostEqual(report["confirmation_trials"][0]["combined_accuracy_gain"], 0.05)
 
     def test_phase1_confirmation_fails_closed_when_every_candidate_regresses(self):
         """Fallback does not weaken fail-closed promotion when every route fails."""
         class ScreenOnlyModel:
-            target_layers = [11, 13]
+            target_layers = [11, 24]
             _routing_override = None
 
             def set_routing_override(self, mode=None, layers=None):
@@ -310,6 +322,7 @@ class TestARSModules(unittest.TestCase):
         cfg = RSCConfig(
             phase1_acceptance_examples=16,
             phase1_generation_screen_examples=8,
+            phase1_successive_halving_examples=8,
             phase1_generation_confirmation_examples=8,
             phase1_gate_scale_grid=(0.6,),
             phase1_max_confirmation_candidates=2,
@@ -365,8 +378,8 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(len(result["safe_pairs"]), 1)
         self.assertTrue(model._router_warmup)
 
-    def test_phase1_pair_uses_effective_envelope_and_rejects_runaway(self):
-        """Low-alpha early routes may pass, but raw runaway residuals cannot."""
+    def test_phase1_pair_uses_postcap_envelope_and_rejects_invalid_displacement(self):
+        """Raw saturation is diagnostic; impossible realized displacement is rejected."""
         cfg = RSCConfig()
         safe, ratio, q95 = _phase1_pair_is_safe(
             {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.16}}, 100.0, cfg, gate_scale=0.70,
@@ -375,7 +388,8 @@ class TestARSModules(unittest.TestCase):
         self.assertEqual(ratio, 1.0)
         self.assertEqual(q95, 1.16)
         runaway, _, _ = _phase1_pair_is_safe(
-            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.51}}, 100.0, cfg, gate_scale=0.25,
+            {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.51, "post_cap_p95": 1.10}},
+            100.0, cfg, gate_scale=0.95,
         )
         self.assertFalse(runaway)
 
@@ -1700,7 +1714,7 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
         """Raw tails are acceptable only when alpha-scaled displacement is safe."""
         cfg = RSCConfig(
             phase1_max_generation_p95_norm_ratio=1.50,
-            phase1_max_effective_generation_p95_norm_ratio=1.00,
+            phase1_max_effective_generation_p95_norm_ratio=0.60,
         )
         result = {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.40}}
         self.assertTrue(_phase1_pair_is_safe(result, 100.0, cfg, gate_scale=0.70)[0])
@@ -2102,6 +2116,75 @@ class TestEngineV3RoutingAndMemory(unittest.TestCase):
             )
             with self.assertRaisesRegex(FileNotFoundError, "Refusing silent full retraining"):
                 train_rsc(None, None, [], [{}, {}, {}, {}], cfg, torch.device("cpu"))
+
+
+class TestEngineV32SafetyAndProfile(unittest.TestCase):
+    """Regression coverage for post-cap admission and locked decision runs."""
+
+    def test_post_cap_displacement_not_raw_tail_controls_phase1_safety(self):
+        """A soft-capped route remains eligible despite a raw saturation tail."""
+        cfg = RSCConfig(phase1_max_effective_generation_p95_norm_ratio=1.0)
+        result = {"median_tokens": 100.0, "pre_cap_norm": {"p95": 1.64}}
+        safe, _, raw_q = _phase1_pair_is_safe(result, 100.0, cfg, gate_scale=0.50)
+        self.assertTrue(safe)
+        self.assertAlmostEqual(raw_q, 1.64)
+        self.assertLess(0.50 * post_cap_ratio_from_pre_cap_q(raw_q), 1.0)
+
+    def test_confirmation_tie_is_diagnostic_not_a_promotion(self):
+        """Calibration strength cannot promote a zero-gain confirmation tie."""
+        passed, noise, reasons = _phase1_confirmation_verdict(
+            confirmation_gain=0.0,
+            calibration_gain=0.20,
+            combined_gain=0.10,
+            confirmation_n=16,
+            safe=True,
+            nll_safe=True,
+            cfg=RSCConfig(phase1_allow_confirmation_noise_tolerance=True),
+        )
+        self.assertFalse(passed)
+        self.assertTrue(noise)  # Retained as telemetry only; it cannot promote.
+        self.assertIn("confirmation_accuracy", reasons)
+
+    def test_priority_reservoir_replaces_early_prefix_with_later_stream_samples(self):
+        """p95 telemetry samples the stream rather than retaining its prefix."""
+        steer = RSCSteerNet(8, 2, 4.0, telemetry_reservoir_size=7)
+        steer._update_pre_cap_reservoir(torch.zeros(7))
+        steer._update_pre_cap_reservoir(torch.ones(100))
+        values = steer._pre_cap_values[0]
+        self.assertEqual(values.numel(), 7)
+        self.assertTrue((values == 1.0).any())
+        self.assertTrue(values.device.type == "cpu")
+
+    def test_two_band_pool_is_valid_for_coadaptation(self):
+        """An early+late pool is sufficient for the long-range curriculum."""
+        from src.training.trainer import select_phase1b_candidate_layers
+
+        class PoolModel:
+            target_layers = [11, 13, 15, 18, 22, 24]
+
+        report = {
+            "calibration_ranking": [
+                {"layer": 11, "gate_scale": 0.25, "safe": True},
+                {"layer": 24, "gate_scale": 0.50, "safe": True},
+            ],
+            "confirmation_trials": [],
+            "candidates": [],
+        }
+        layers, _, pool = select_phase1b_candidate_layers(
+            PoolModel(), report,
+            RSCConfig(phase1b_candidate_layers=2, phase1b_min_candidate_layers=2, phase1b_min_depth_bands=2),
+        )
+        self.assertEqual(layers, [11, 24])
+        self.assertEqual(pool["depth_bands"], ["early", "late"])
+
+    def test_kaggle_profile_lock_rejects_hyperparameter_drift(self):
+        """A correct commit cannot silently execute an altered decision profile."""
+        cfg = make_engine_v32_kaggle_config()
+        digest = assert_engine_v32_kaggle_profile(cfg)
+        self.assertEqual(len(digest), 64)
+        cfg.phase1_epochs = 4
+        with self.assertRaisesRegex(RuntimeError, "profile drift"):
+            assert_engine_v32_kaggle_profile(cfg)
 
 
 

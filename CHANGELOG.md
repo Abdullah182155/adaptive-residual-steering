@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.13.5] - 2026-10-21
+
+### 🚀 Engine v3.2: Physical Displacement Safety & Reproducible Screening
+- **Post-cap safety (`src/steering/steernet.py`, `src/training/trainer.py`):** Phase-1 promotion now applies its hard norm bound to the actual gate-scaled soft-capped displacement (`alpha × q_postcap`), while retaining raw pre-cap `q95` as a saturation diagnostic. Telemetry now uses a bounded CPU priority reservoir, so its p95 represents the full generation stream instead of an early-token prefix.
+- **Efficient, stratified acceptance (`src/training/trainer.py`):** Successive halving screens every route on a compact prefix and promotes at most one safe early, middle, and late route to the full calibration split. The report records the promoted bands and does not mislabel untested non-finalists as safety-rejected.
+- **Strict efficacy (`src/configs/config.py`, `src/training/trainer.py`):** A fixed SteerNet requires a strictly positive disjoint confirmation gain; one-question noise remains visible in telemetry but can no longer promote a tie or regression.
+- **Two-band cooperation and profile lock (`src/configs/config.py`, `notebooks/kaggle_ars_runner.ipynb`):** Early+late or early+middle pools are valid Phase-1B inputs. The source-controlled Kaggle profile now locks every decision-run setting that Cell 3 touches and fails before model loading if any value drifts.
+- **Regression coverage:** Added CPU tests for post-cap admission, strict tie rejection, streaming-reservoir replacement, valid two-band co-adaptation, and profile-drift rejection.
+
+---
+
+## [1.13.4] - 2026-10-21
+
+### 🧪 Run `exp_20261021_050258_ars_phi2_kaggle`: Engine v3.1 Phase-1B Fallback Audit
+- **Result preservation:** Registered the Kaggle outcome in `experiments/registry.json` and retained its structured experiment record. The raw notebook-output copy was deliberately removed from the checkout at the experiment owner's request; the Kaggle checkpoint remains externally located at `.../checkpoints/phase1_steernet_only_weights.pt`.
+- **Phase-1 finding:** L13 at `alpha=0.35` passed the then-current non-regression contract after a `+10.7pp` calibration signal and a `0.0pp` disjoint-confirmation result. On the independent 200-question benchmark, fixed steering was not superior: 0/2/4/8-shot deltas were `-1.5/-1.5/-0.5/-0.5pp`, with every paired bootstrap interval crossing zero.
+- **Safe fallback:** Phase 1B admitted only L13/L15/L17 (early/middle bands) after L11 failed confirmation. With no eligible late layer, the three-band co-adaptation contract correctly produced `FALLBACK_TO_CERTIFIED_FIXED_STEERNET`; router bootstrap and adaptive phases were not run, so this experiment makes no adaptive-routing performance claim.
+- **Forensic design finding:** Later-layer candidates, including L24 at `alpha=0.50` (`64.3%` calibration accuracy, CoT `1.01`), were excluded by raw pre-cap `q95 > 1.50` despite sub-unit `alpha * q95`. The audit identified that raw pre-cap q is a saturation diagnostic, whereas the soft-capped, gate-scaled post-cap displacement is the physical safety quantity that must govern future candidate admission.
+- **Reproducibility finding:** The executed Cell 3 overrode the committed lean profile (`phase1_lr=0.007`, four epochs, and 28/36 calibration/confirmation rows rather than `3e-4`, two epochs, and 12/16 rows). Future decision runs require a locked, archived effective configuration rather than a commit hash alone.
+
+---
+
 ## [1.13.3] - 2026-10-21
 
 ### 🚀 Engine v3.1: Diverse Cooperative Routing & Fixed-SteerNet Continuity

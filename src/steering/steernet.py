@@ -1,5 +1,20 @@
+import math
+
 import torch
 import torch.nn as nn
+
+
+def post_cap_ratio_from_pre_cap_q(q):
+    """Convert raw pre-cap q to the smooth-envelope post-cap ratio.
+
+    For ``q = ||delta_raw|| / cap``, the saturation envelope emits
+    ``||delta_post|| / cap = q / sqrt(1 + q**2)``.  The result is bounded
+    below one and is the quantity a gate scale acts on at inference time.
+    """
+    if isinstance(q, torch.Tensor):
+        return q / torch.sqrt(1.0 + q.square())
+    value = float(q)
+    return value / math.sqrt(1.0 + value * value)
 
 class RSCSteerNet(nn.Module):
     """K-aware low-rank residual steering MLP with Bounded Relative Perturbation.
@@ -36,13 +51,16 @@ class RSCSteerNet(nn.Module):
         # forward.  RLOO evaluates several route arms per minibatch; the old
         # unbounded list therefore held millions of detached CUDA scalars until
         # the next report and could exhaust a T4 without retaining an autograd
-        # graph.  Keep exact count/sum/max plus a bounded CPU reservoir for
-        # quantiles instead.
+        # graph.  Keep exact count/sum/max plus a bounded CPU priority
+        # reservoir for unbiased streaming quantiles instead.
         self._pre_cap_sum = 0.0
         self._pre_cap_n = 0
         self._pre_cap_max = 0.0
         self._pre_cap_reservoir_size = max(1, int(telemetry_reservoir_size))
-        self._pre_cap_values = []  # bounded CPU samples; retained name is compatibility-safe
+        self._pre_cap_values = []  # one bounded CPU sample tensor; compatibility-safe name
+        self._pre_cap_priorities = []
+        self._pre_cap_generator = torch.Generator(device="cpu")
+        self._pre_cap_generator.manual_seed(0)
         self.last_pre_cap_q = None
         self._last_valid_mask = None
         self.norm = nn.LayerNorm(hidden_dim)
@@ -120,10 +138,7 @@ class RSCSteerNet(nn.Module):
                 self._pre_cap_sum += float(r.sum().item())
                 self._pre_cap_n += int(r.numel())
                 self._pre_cap_max = max(self._pre_cap_max, float(r.max().item()))
-                remaining = self._pre_cap_reservoir_size - sum(v.numel() for v in self._pre_cap_values)
-                if remaining > 0:
-                    stride = max(1, (r.numel() + remaining - 1) // remaining)
-                    self._pre_cap_values.append(r[::stride][:remaining].cpu())
+                self._update_pre_cap_reservoir(r)
                 self._last_pre_cap_ratio = r.mean().detach()
                 self._clip_stats = (delta_norm > cap).detach().float().mean()
             delta = delta * soft
@@ -140,12 +155,37 @@ class RSCSteerNet(nn.Module):
 
         return delta
 
+    def _update_pre_cap_reservoir(self, values: torch.Tensor) -> None:
+        """Merge a CPU priority reservoir without retaining CUDA telemetry.
+
+        Assigning each observed token an independent uniform priority and
+        retaining the lowest priorities is equivalent to uniform reservoir
+        sampling over the complete stream.  Unlike the previous fill-once
+        buffer, later decode tokens therefore remain represented in p95.
+        """
+        sample = values.detach().float().flatten().cpu()
+        if sample.numel() == 0:
+            return
+        priorities = torch.rand(sample.numel(), generator=self._pre_cap_generator)
+        if self._pre_cap_values:
+            sample = torch.cat((self._pre_cap_values[0], sample))
+            priorities = torch.cat((self._pre_cap_priorities[0], priorities))
+        keep = min(self._pre_cap_reservoir_size, int(sample.numel()))
+        if sample.numel() > keep:
+            chosen = torch.topk(priorities, keep, largest=False, sorted=False).indices
+            sample = sample.index_select(0, chosen)
+            priorities = priorities.index_select(0, chosen)
+        self._pre_cap_values = [sample]
+        self._pre_cap_priorities = [priorities]
+
     def reset_pre_cap_stats(self):
         """Reset accumulated pre-cap norm saturation statistics."""
         self._pre_cap_sum = 0.0
         self._pre_cap_n = 0
         self._pre_cap_max = 0.0
         self._pre_cap_values = []
+        self._pre_cap_priorities = []
+        self._pre_cap_generator.manual_seed(0)
 
 
 def pre_cap_report(model: torch.nn.Module, reset: bool = True) -> dict:
@@ -166,6 +206,7 @@ def pre_cap_report(model: torch.nn.Module, reset: bool = True) -> dict:
                 out[int(k) if str(k).isdigit() else k] = {
                     "mean": round(mean_val, 4),
                     "p95": round(p95_val, 4),
+                    "post_cap_p95": round(float(post_cap_ratio_from_pre_cap_q(p95_val)), 4),
                     "max": round(max_val, 4),
                     "tokens": int(n),
                 }

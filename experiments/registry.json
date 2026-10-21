@@ -64,6 +64,15 @@
       "git_commit": "unknown",
       "record_path": "experiments/runs/exp_20261019_172330_ars_phi2_kaggle/experiment_record.json",
       "artifact_provenance": "Kaggle run output supplied 2026-10-19; checkpoint recorded at /kaggle/working/experiments/runs/exp_20261019_172330_ars_phi2_kaggle/checkpoints/final_ars_weights.pt. Binaries have not been copied into this checkout."
+    },
+    {
+      "experiment_id": "exp_20261021_050258_ars_phi2_kaggle",
+      "tag": "ars_phi2_kaggle_engine_v3_1_phase1b_fallback",
+      "created_at": "2026-10-21T05:02:58+03:00",
+      "status": "partial_phase1_only_fixed_steernet_fallback",
+      "git_commit": "95ca790",
+      "record_path": "experiments/runs/exp_20261021_050258_ars_phi2_kaggle/experiment_record.json",
+      "artifact_provenance": "Kaggle output supplied 2026-10-21; its source checksum was c5c0507aceb9ea88f553698d4423ece113e37dcbaabf1a1ac5a1e2eb6b8dd892. The local raw-output copy was removed at the experiment owner's request. Checkpoint remains at /kaggle/working/experiments/runs/exp_20261021_050258_ars_phi2_kaggle/checkpoints/phase1_steernet_only_weights.pt and has not been copied into this checkout."
     }
   ]
 }
