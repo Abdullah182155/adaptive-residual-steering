@@ -73,6 +73,15 @@
       "git_commit": "95ca790",
       "record_path": "experiments/runs/exp_20261021_050258_ars_phi2_kaggle/experiment_record.json",
       "artifact_provenance": "Kaggle output supplied 2026-10-21; its source checksum was c5c0507aceb9ea88f553698d4423ece113e37dcbaabf1a1ac5a1e2eb6b8dd892. The local raw-output copy was removed at the experiment owner's request. Checkpoint remains at /kaggle/working/experiments/runs/exp_20261021_050258_ars_phi2_kaggle/checkpoints/phase1_steernet_only_weights.pt and has not been copied into this checkout."
+    },
+    {
+      "experiment_id": "exp_20261021_113159_ars_phi2_kaggle_engine_v3_2_memory_halt",
+      "tag": "ars_phi2_kaggle_engine_v3_2_cooperative_memory_halt",
+      "created_at": "2026-10-21T11:31:59+03:00",
+      "status": "CUDA_MEMORY_LIMIT_HALT_IN_PHASE_2",
+      "git_commit": "0d03ef3",
+      "record_path": "experiments/runs/exp_20261021_113159_ars_phi2_kaggle_engine_v3_2_memory_halt/experiment_record.json",
+      "artifact_provenance": "Verbatim Kaggle notebook output is retained at the record path as kaggle_output.txt (SHA-256 917f41bd882ab1875bc30706524f8c6d600ddb4694acc4ddbaa2be5e2c54160d). The run halted at Phase 2 step 50 when cached CUDA reserved memory reached 13602 MiB while peak allocated memory was 8095 MiB; no final benchmark was executed."
     }
   ]
 }
