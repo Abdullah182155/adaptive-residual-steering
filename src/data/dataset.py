@@ -60,10 +60,19 @@ _CALC_TOKEN_CACHE: Dict[Tuple[str, int, int], int] = {}
 
 def _calc_token_cache_key(tokenizer, token_id: int) -> Tuple[str, int, int]:
     """Identify token IDs within a tokenizer namespace, not globally."""
-    try:
-        vocab_size = int(getattr(tokenizer, "vocab_size", len(tokenizer)))
-    except TypeError:
-        vocab_size = int(getattr(tokenizer, "vocab_size", 0))
+    vocab_size = getattr(tokenizer, "_ars_cached_vocab_size", None)
+    if vocab_size is None:
+        try:
+            vocab_size = getattr(tokenizer, "vocab_size", None)
+            if vocab_size is None:
+                vocab_size = len(tokenizer)
+            vocab_size = int(vocab_size)
+        except Exception:
+            vocab_size = 0
+        try:
+            tokenizer._ars_cached_vocab_size = vocab_size
+        except Exception:
+            pass
     return (tokenizer.__class__.__name__, vocab_size, int(token_id))
 
 def _is_calc_token_id(tokenizer, token_id: int) -> int:
