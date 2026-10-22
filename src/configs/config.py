@@ -73,8 +73,8 @@ class RSCConfig:
     # zero-shot prompt.  Few-shot examples are an evaluation-time context
     # whose residual stream is protected by prompt shielding, not supervised
     # training data.
-    fewshot_train_prob: float = 0.0
-    fewshot_train_max_demos: int = 0
+    fewshot_train_prob: float = 0.30
+    fewshot_train_max_demos: int = 2
 
     # Phase 1: SteerNet only
     # Each candidate only sees roughly 1/N of a rotated Phase-1 epoch.  5e-3
@@ -197,9 +197,10 @@ class RSCConfig:
     # toward saturation.  The differentiable answer-aware task loss provides
     # the correct local gate signal; generation PG remains opt-in research.
     lambda_pg: float = 0.0
-    lambda_l1_gate: float = 0.05          # Engine v2: re-enabled L1 sparsity
-    lambda_gate_budget: float = 0.50      # Engine v2: quadratic budget pulling mean alpha to target_sparsity
-    gate_target_sparsity: float = 0.20     # Engine v2: target average gate activation
+    lambda_l1_gate: float = 0.01          # Engine v4.2: reduced sparsity pressure to prevent gate attenuation
+    lambda_gate_budget: float = 0.15      # Engine v4.2: relaxed quadratic budget
+    gate_target_sparsity: float = 0.25     # Engine v4.2: healthy target gate activation
+    gate_min_activation_floor: float = 0.35 # Engine v4.2: minimum alpha envelope when gate opens
     lambda_gate_usefulness: float = 0.0   # B-3: disabled (was 0.30)
     lambda_gate_antisat: float = 0.0      # B-3: disabled (was 0.25)
     lambda_gate_diversity: float = 0.20   # Engine v2.2: require token-selective gates
@@ -308,6 +309,10 @@ class RSCConfig:
     beta_entropy_k: float = 0.10
     beta_entropy_subset: float = 0.05
     router_balance_weight: float = 0.01  # was 0.10 — layer_dropout already prevents monopoly
+    router_tariff_k1_free: bool = True   # Engine v4.2: K=1 is free capacity (zero tariff)
+    router_min_active_k_fraction: float = 0.75 # Engine v4.2: at least 75% reasoning tokens steer
+    lambda_layer_coverage: float = 0.20  # Engine v4.2: anti-starvation layer coverage loss
+    layer_min_coverage_prob: float = 0.10 # Engine v4.2: minimum selection floor per candidate layer
     # Pair interactions are regressed to measured counterfactual interaction,
     # not pushed by an unbounded signed correlation objective.
     lambda_synergy: float = 0.25
@@ -597,7 +602,7 @@ def assert_engine_v32_kaggle_profile(cfg: RSCConfig, strict: bool = False) -> st
 ENGINE_V40_KAGGLE_PROFILE_NAME = "Engine v4.0 Kaggle T4 Decision-Run"
 ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     **ENGINE_V32_KAGGLE_PROFILE,
-    "max_active_layers": 2,
+    "max_active_layers": 3,
     "phase1b_candidate_layers": 6,
     "phase1b_candidates_per_band": 2,
     "router_layer_dropout": 0.15,
@@ -617,6 +622,16 @@ ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     "generation_anchor_n_prompts": 8,
     "deployment_eval_shots": (0, 2, 4, 8),
     "require_adaptive_beats_fixed": True,
+    "fewshot_train_prob": 0.30,
+    "fewshot_train_max_demos": 2,
+    "router_tariff_k1_free": True,
+    "router_min_active_k_fraction": 0.75,
+    "lambda_layer_coverage": 0.20,
+    "layer_min_coverage_prob": 0.10,
+    "gate_min_activation_floor": 0.35,
+    "lambda_gate_budget": 0.15,
+    "lambda_l1_gate": 0.01,
+    "calc_token_weight": 1.75,
 }
 ENGINE_V40_KAGGLE_EVALUATION: Dict[str, Any] = {
     "n_test": 100,

@@ -59,13 +59,20 @@ def evaluate_model_condition(
             model.set_gate_freeze(False)
     elif cond == "fixed_steernet":
         if hasattr(model, "set_routing_override"):
-            model.set_routing_override("balanced")
+            fixed_layers = list(getattr(getattr(model, "cfg", None), "fixed_steer_eval_layers", None) or [])
+            if not fixed_layers and hasattr(model, "_eligible_routing_layers") and model._eligible_routing_layers:
+                fixed_layers = list(model._eligible_routing_layers)
+            if fixed_layers:
+                model.set_routing_override("only", fixed_layers)
+            else:
+                model.set_routing_override("balanced")
         if hasattr(model, "set_gate_freeze"):
-            # Keep the harness usable with deliberately minimal test/dummy
-            # models while real wrappers receive the validation-calibrated
-            # fixed-control intensity from their configuration.
             cfg = getattr(model, "cfg", None)
-            model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+            scales = getattr(model, "_certified_gate_scales", None)
+            if scales:
+                model.set_gate_freeze(True, scales)
+            else:
+                model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
     elif cond == "steernet":
         if hasattr(model, "set_routing_override"):
             model.set_routing_override(None)
@@ -79,13 +86,19 @@ def evaluate_model_condition(
             disabled = (shot_mode == "baseline") if shot_mode is not None else getattr(model, "deployment_disabled", False)
             if shot_mode == "fixed_steernet":
                 fixed_layers = list(getattr(getattr(model, "cfg", None), "fixed_steer_eval_layers", None) or [])
-                model.set_routing_override("only", fixed_layers)
+                if not fixed_layers and hasattr(model, "_eligible_routing_layers") and model._eligible_routing_layers:
+                    fixed_layers = list(model._eligible_routing_layers)
+                model.set_routing_override("only", fixed_layers if fixed_layers else None)
             else:
                 model.set_routing_override("none" if disabled else None)
         if hasattr(model, "set_gate_freeze"):
             if shot_mode == "fixed_steernet":
                 cfg = getattr(model, "cfg", None)
-                model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+                scales = getattr(model, "_certified_gate_scales", None)
+                if scales:
+                    model.set_gate_freeze(True, scales)
+                else:
+                    model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
             else:
                 model.set_gate_freeze(False)
     elif cond == "ars_raw":

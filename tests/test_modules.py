@@ -2402,7 +2402,7 @@ class TestEngineV4(unittest.TestCase):
 
     def test_v40_profile_enables_decision_contract(self):
         cfg = make_engine_v40_kaggle_config()
-        self.assertEqual(cfg.max_active_layers, 2)
+        self.assertEqual(cfg.max_active_layers, 3)
         self.assertTrue(cfg.token_competitive_allocation)
         self.assertTrue(cfg.require_adaptive_beats_fixed)
         self.assertGreater(cfg.router_min_eval_route_tuple_entropy, 0.0)
@@ -2445,7 +2445,92 @@ class TestEngineV4(unittest.TestCase):
         allocation = token_competitive_allocation(torch.randn(1, 2, 3), torch.zeros(1, 3, dtype=torch.bool))
         self.assertEqual(float(allocation.abs().sum()), 0.0)
 
+    def test_k1_tariff_free(self):
+        from src.routing.rloo import capped_route_tariff
+        cost = torch.tensor([0.05])
+        k_actions = torch.tensor([[0, 1, 2]])
+        raw_delta = torch.tensor([[0.0, 0.5, 0.5]])
+        # With k1_tariff_free=True, K=0 and K=1 have 0 tariff, K=2 has positive tariff
+        tariff_free = capped_route_tariff(cost, k_actions, raw_delta, tariff_scale=1.0, max_positive_gain_fraction=0.5, k1_tariff_free=True)
+        self.assertEqual(float(tariff_free[0, 0]), 0.0)
+        self.assertEqual(float(tariff_free[0, 1]), 0.0)
+        self.assertGreater(float(tariff_free[0, 2]), 0.0)
 
+    def test_layer_coverage_loss(self):
+        from src.routing.rloo import layer_coverage_loss
+        # u_policy with large negative logits for some layers (starvation)
+        u_starved = torch.tensor([[-5.0, -5.0, 5.0, 5.0]])
+        loss_starved = layer_coverage_loss(u_starved, min_prob=0.10)
+        self.assertGreater(float(loss_starved), 0.0)
 
+        # u_policy with balanced logits
+        u_balanced = torch.tensor([[2.0, 2.0, 2.0, 2.0]])
+        loss_balanced = layer_coverage_loss(u_balanced, min_prob=0.10)
+        self.assertEqual(float(loss_balanced), 0.0)
 
+    def test_hierarchical_deployment_arbiter_3tier(self):
+        from src.evaluation.deployment import finalize_deployment_by_shot
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            ckpt = os.path.join(d, "ckpt.pt")
+            # Case 1: Adaptive doesn't beat fixed (tie), fixed beats base -> fixed_steernet
+            base = [0] * 50
+            fixed = [1] * 50
+            adaptive = [1] * 50
+            decisions = finalize_deployment_by_shot(
+                outcomes_by_shot={0: (base, adaptive)},
+                checkpoint_path=ckpt,
+                fixed_outcomes_by_shot={0: fixed},
+                require_adaptive_beats_fixed=True,
+                n_boot=100,
+                min_n=10,
+            )
+            self.assertEqual(decisions["0"], "fixed_steernet")
 
+            # Case 2: Adaptive beats fixed and baseline -> ars
+            base = [0] * 50
+            fixed = [0] * 25 + [1] * 25
+            adaptive = [1] * 50
+            decisions = finalize_deployment_by_shot(
+                outcomes_by_shot={0: (base, adaptive)},
+                checkpoint_path=ckpt,
+                fixed_outcomes_by_shot={0: fixed},
+                require_adaptive_beats_fixed=True,
+                n_boot=100,
+                min_n=10,
+            )
+            self.assertEqual(decisions["0"], "ars")
+
+            # Case 3: Neither beats baseline -> baseline
+            base = [1] * 50
+            fixed = [0] * 50
+            adaptive = [0] * 50
+            decisions = finalize_deployment_by_shot(
+                outcomes_by_shot={0: (base, adaptive)},
+                checkpoint_path=ckpt,
+                fixed_outcomes_by_shot={0: fixed},
+                require_adaptive_beats_fixed=True,
+                n_boot=100,
+                min_n=10,
+            )
+            self.assertEqual(decisions["0"], "baseline")
+
+    def test_phase2_state_preserves_certified_gate_scales(self):
+        from src.training.trainer import _phase2_runtime_state, _restore_phase2_runtime_state
+        class DummyModel:
+            def __init__(self):
+                self._certified_gate_scales = {11: 0.35, 18: 0.50}
+                self.target_layers = [11, 18]
+                self._restored_scales = None
+                self.device = torch.device("cpu")
+            def routing_eligibility_mask(self, device):
+                return torch.tensor([True, True])
+            def set_certified_gate_scales(self, scales):
+                self._restored_scales = scales
+
+        m = DummyModel()
+        state = _phase2_runtime_state(m)
+        self.assertEqual(state["certified_gate_scales"], {11: 0.35, 18: 0.50})
+        m2 = DummyModel()
+        _restore_phase2_runtime_state(m2, state)
+        self.assertEqual(m2._restored_scales, {11: 0.35, 18: 0.50})

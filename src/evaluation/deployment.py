@@ -185,14 +185,21 @@ def finalize_deployment_by_shot(
             delta, lo, hi = paired_delta_ci(base, candidate, n_boot=n_boot)
             mode = "ars" if lo > 0.0 else "baseline"
         row: Dict[str, float | int | str] = {"mode": mode, "n": n, "delta": delta, "ci_low": lo, "ci_high": hi}
-        if require_adaptive_beats_fixed and fixed_outcomes_by_shot is not None and shot in fixed_outcomes_by_shot:
+        if fixed_outcomes_by_shot is not None and shot in fixed_outcomes_by_shot:
+            fixed_flags = np.asarray(fixed_outcomes_by_shot[shot], dtype=float)
+            d_fb, lo_fb, hi_fb = paired_delta_ci(base, fixed_flags, n_boot=n_boot)
+            row.update({"fixed_vs_baseline_delta": d_fb, "fixed_vs_baseline_ci_low": lo_fb, "fixed_vs_baseline_ci_high": hi_fb})
             promotion = adaptive_vs_fixed_promotion(
-                fixed_outcomes_by_shot[shot], candidate, require_adaptive_beats_fixed=True, n_boot=n_boot,
+                fixed_flags, candidate, require_adaptive_beats_fixed=require_adaptive_beats_fixed, n_boot=n_boot,
             )
             row.update({f"adaptive_vs_fixed_{name}": value for name, value in promotion.items()})
-            if mode == "ars" and promotion["mode"] != "ars":
-                mode = "fixed_steernet"
-                row["mode"] = mode
+            if mode == "ars":
+                if require_adaptive_beats_fixed and promotion["mode"] != "ars":
+                    mode = "fixed_steernet" if lo_fb > 0.0 else "baseline"
+            else:
+                if lo_fb > 0.0:
+                    mode = "fixed_steernet"
+            row["mode"] = mode
         decisions[key] = mode
         evidence[key] = row
 

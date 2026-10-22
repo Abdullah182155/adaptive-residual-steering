@@ -223,11 +223,15 @@ def _phase2_runtime_state(model) -> Dict[str, Any]:
     """Capture non-tensor routing state required to continue Phase 2 exactly."""
     eligible = None
     if hasattr(model, "routing_eligibility_mask") and hasattr(model, "target_layers"):
-        device = getattr(model, "device", next(model.parameters()).device)
+        device = model.device if hasattr(model, "device") else next(model.parameters()).device
         mask = model.routing_eligibility_mask(device).detach().cpu().tolist()
         eligible = [int(layer) for layer, allowed in zip(model.target_layers, mask) if allowed]
+    certified_scales = None
+    if hasattr(model, "_certified_gate_scales") and model._certified_gate_scales:
+        certified_scales = {int(layer): float(scale) for layer, scale in model._certified_gate_scales.items()}
     return {
         "eligible_layers": eligible,
+        "certified_gate_scales": certified_scales,
         "router_warmup": bool(getattr(model, "_router_warmup", False)),
         "router_exploration": bool(getattr(model, "_router_exploration", False)),
         "router_inference_mode": getattr(model, "_router_inference_mode", "argmax"),
@@ -239,6 +243,9 @@ def _restore_phase2_runtime_state(model, state: Dict[str, Any]) -> None:
     eligible = state.get("eligible_layers")
     if eligible is not None and hasattr(model, "set_eligible_routing_layers"):
         model.set_eligible_routing_layers([int(layer) for layer in eligible])
+    scales = state.get("certified_gate_scales")
+    if scales is not None and hasattr(model, "set_certified_gate_scales"):
+        model.set_certified_gate_scales({int(layer): float(scale) for layer, scale in scales.items()})
     if hasattr(model, "set_router_warmup"):
         model.set_router_warmup(bool(state.get("router_warmup", False)))
     if hasattr(model, "set_router_exploration"):
@@ -829,17 +836,18 @@ def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSC
         initial_ranked = sorted(initial_pairs, key=_phase1_calibration_rank_key, reverse=True)
         finalists = []
         selected_bands = []
+        candidates_per_band = max(1, int(getattr(cfg, "phase1b_candidates_per_band", 2)))
         for band in ("early", "middle", "late"):
-            finalist = next(
-                (
-                    item for item in initial_ranked
-                    if _phase1_depth_band(int(item[0]["layer"]), model.target_layers) == band
-                ),
-                None,
-            )
-            if finalist is not None:
-                finalists.append(finalist)
-                selected_bands.append(band)
+            seen_band_layers = set()
+            for item in initial_ranked:
+                layer_id = int(item[0]["layer"])
+                if _phase1_depth_band(layer_id, model.target_layers) == band and layer_id not in seen_band_layers:
+                    finalists.append(item)
+                    seen_band_layers.add(layer_id)
+                    if band not in selected_bands:
+                        selected_bands.append(band)
+                    if len(seen_band_layers) >= candidates_per_band:
+                        break
         if not finalists:
             rejected_layers = [row["layer"] for row in candidates]
             warning = "  ⚠️ Phase-1 acceptance FAILED: no initial (layer, alpha) pair met CoT and realized-displacement safety."
@@ -1741,7 +1749,7 @@ def select_phase1b_candidate_layers(
             seen.add(layer)
 
     limit = int(getattr(cfg, "phase1b_candidate_layers", 6))
-    per_band = max(1, int(getattr(cfg, "phase1b_candidates_per_band", 1)))
+    per_band = max(1, int(getattr(cfg, "phase1b_candidates_per_band", 2)))
     chosen: List[int] = []
     scales: Dict[int, float] = {}
     covered_bands = []
@@ -2730,19 +2738,23 @@ def _fallback_to_certified_fixed_steernet(
     if steer_snapshot:
         model.load_state_dict(steer_snapshot, strict=False)
     fixed_layers = list(getattr(cfg, "fixed_steer_eval_layers", None) or [])
-    if len(fixed_layers) != 1:
+    if not fixed_layers:
         raise RuntimeError(
-            "Cannot activate certified fixed-SteerNet fallback without exactly one Phase-1 confirmed layer."
+            "Cannot activate certified fixed-SteerNet fallback without certified fixed SteerNet layers."
         )
     model.set_eligible_routing_layers(None)
     model.set_router_warmup(False)
     model.set_routing_override("only", fixed_layers)
-    model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+    scales = getattr(model, "_certified_gate_scales", None)
+    if scales:
+        model.set_gate_freeze(True, scales)
+    else:
+        model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
     save_ars_checkpoint(model, cfg.phase2_save_path, phase="certified-fixed-steernet-fallback", cfg=cfg)
     logs["adaptive_phases_status"] = "FALLBACK_TO_CERTIFIED_FIXED_STEERNET"
     logs["fixed_steernet_fallback"] = {
-        "layer": fixed_layers[0],
-        "gate_scale": float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)),
+        "layers": fixed_layers,
+        "gate_scales": scales or float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)),
         "reason": reason,
     }
     print(
@@ -2766,10 +2778,14 @@ def _evaluate_phase2_deployment(
         model.eval()
         if override == "fixed":
             fixed_layers = list(getattr(cfg, "fixed_steer_eval_layers", None) or [])
-            if len(fixed_layers) != 1:
-                raise RuntimeError("Adaptive-vs-fixed deployment gate requires one certified fixed SteerNet layer")
+            if not fixed_layers:
+                raise RuntimeError("Adaptive-vs-fixed deployment gate requires certified fixed SteerNet layers")
             model.set_routing_override("only", fixed_layers)
-            model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+            scales = getattr(model, "_certified_gate_scales", None)
+            if scales:
+                model.set_gate_freeze(True, scales)
+            else:
+                model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
         else:
             model.set_gate_freeze(False)
             model.set_routing_override(override)
@@ -3154,6 +3170,7 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         model.set_eligible_routing_layers(phase1b_layers)
         logs["eligible_routing_layers"] = list(phase1b_layers)
         print(f"  [routing contract] learned router restricted to Phase-1B layers: {phase1b_layers}")
+    cfg.fixed_steer_eval_layers = list(phase1b_layers)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -3366,10 +3383,14 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         target_model.eval()
         if override == "fixed":
             fixed_layers = list(getattr(cfg, "fixed_steer_eval_layers", None) or [])
-            if len(fixed_layers) != 1:
-                raise RuntimeError("Adaptive-vs-fixed deployment gate requires one certified fixed SteerNet layer")
+            if not fixed_layers:
+                raise RuntimeError("Adaptive-vs-fixed deployment gate requires certified fixed SteerNet layers")
             target_model.set_routing_override("only", fixed_layers)
-            target_model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+            scales = getattr(target_model, "_certified_gate_scales", None)
+            if scales:
+                target_model.set_gate_freeze(True, scales)
+            else:
+                target_model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
         else:
             target_model.set_gate_freeze(False)
             target_model.set_routing_override(override)

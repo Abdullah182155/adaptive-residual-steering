@@ -301,21 +301,46 @@ def capped_route_tariff(
     raw_delta: torch.Tensor,
     tariff_scale: float,
     max_positive_gain_fraction: float,
+    k1_tariff_free: bool = False,
 ) -> torch.Tensor:
     """Price route size without reversing a measured positive utility.
 
     The first bootstrap epoch linearly ramps ``tariff_scale`` from zero.  For
     a route that already improves on K=0, its total tariff is bounded by a
-    configured fraction of that measured improvement.  This keeps compute
-    pressure proportional while preventing a fixed K tariff from making a
-    genuinely useful K=2 route look worse than the baseline.
+    configured fraction of that measured improvement.  When ``k1_tariff_free``
+    is active, steering with one layer is free capacity, preventing K=0 collapse.
     """
     if not torch.isfinite(per_layer_cost).all() or not torch.isfinite(raw_delta).all():
         raise FloatingPointError("non-finite route tariff inputs")
     scale = max(0.0, min(1.0, float(tariff_scale)))
     fraction = max(0.0, min(1.0, float(max_positive_gain_fraction)))
-    base_tariff = per_layer_cost.unsqueeze(1) * k_actions.to(per_layer_cost.dtype) * scale
+    if k1_tariff_free:
+        effective_k = (k_actions - 1).clamp_min(0).to(per_layer_cost.dtype)
+    else:
+        effective_k = k_actions.to(per_layer_cost.dtype)
+    base_tariff = per_layer_cost.unsqueeze(1) * effective_k * scale
     return torch.minimum(base_tariff, raw_delta.clamp_min(0.0) * fraction)
+
+
+def layer_coverage_loss(
+    u_policy: torch.Tensor,
+    eligible_mask: Optional[torch.Tensor] = None,
+    min_prob: float = 0.10,
+) -> torch.Tensor:
+    """Penalize candidate layers whose empirical selection probability falls below a minimum floor.
+
+    Prevents single-layer monopoly and starvation, ensuring all eligible candidates
+    actively explore and receive gradient signal.
+    """
+    probs = torch.sigmoid(u_policy)
+    mean_probs = probs.mean(dim=0)
+    if eligible_mask is not None:
+        mean_probs = mean_probs[eligible_mask]
+    if mean_probs.numel() == 0:
+        return torch.zeros((), device=u_policy.device)
+    threshold = min(float(min_prob), 1.0 / mean_probs.numel())
+    starvation = torch.clamp(threshold - mean_probs, min=0.0)
+    return (starvation ** 2).sum()
 
 def compute_router_rloo_loss(
     model,
@@ -492,8 +517,9 @@ def compute_router_rloo_loss(
     )
     raw_delta = arm_rewards - reward_0.unsqueeze(1)
     max_fraction = float(getattr(cfg, "router_tariff_max_positive_gain_fraction", 0.50))
+    k1_free = bool(getattr(cfg, "router_tariff_k1_free", False))
     tariff = capped_route_tariff(
-        per_layer_cost, k_actions, raw_delta, tariff_scale, max_fraction,
+        per_layer_cost, k_actions, raw_delta, tariff_scale, max_fraction, k1_tariff_free=k1_free,
     )
     action_rewards = (arm_rewards - tariff).detach()
 
@@ -632,6 +658,13 @@ def compute_router_rloo_loss(
     k_center_loss = (mean_sampled_k - 2.2).pow(2)
     lambda_k_center = getattr(cfg, "lambda_k_center", 0.0)  # BUG-C1 fix: fallback 0.05→0.0 (matches config.py)
 
+    # Engine v4.2: Anti-starvation layer coverage loss
+    eligible_mask = model.routing_eligibility_mask(ids.device) if hasattr(model, "routing_eligibility_mask") else None
+    coverage_loss = layer_coverage_loss(
+        u_policy, eligible_mask=eligible_mask, min_prob=float(getattr(cfg, "layer_min_coverage_prob", 0.10))
+    )
+    lambda_coverage = float(getattr(cfg, "lambda_layer_coverage", 0.0))
+
     loss = (
         policy_loss
         - beta_k * h_k
@@ -643,6 +676,7 @@ def compute_router_rloo_loss(
         + lambda_layer_mi * layer_mi_loss
         + lambda_k_preference * k_preference_loss
         + lambda_synergy_prior * synergy_prior_loss
+        + lambda_coverage * coverage_loss
     )
 
     win_rate = (action_rewards > reward_0.unsqueeze(1)).float().mean().item()

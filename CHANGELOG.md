@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.16.0] - 2026-10-22
+
+### 🚀 Engine v4.2 / v5.0: Layer Diversity, Multi-Shot Co-adaptation & Hierarchical Arbiter
+- **Expanded Candidate Pool (6 Layers):** Replaced 1-per-band truncation in Phase 1 acceptance with up to `phase1b_candidates_per_band = 2` distinct layers per depth band, expanding the pool from 3 to 6 certified layers across early, middle, and late bands.
+- **Anti-Starvation Layer Coverage Loss ($\mathcal{L}_{\text{coverage}}$):** Implemented `layer_coverage_loss(u_policy, eligible_mask, min_prob=0.10)` in `src/routing/rloo.py` with `lambda_layer_coverage = 0.20`, preventing policy monopoly and ensuring all 6 candidate layers receive exploration and gradient signal.
+- **Free K=1 Capacity (`k1_tariff_free`):** Modified `capped_route_tariff` in `src/routing/rloo.py` so single-layer interventions incur zero tariff ($K=1$ is free), progressively taxing only $K \ge 2$. Eliminates the $K=0$ collapse on multi-shot contexts.
+- **Multi-Shot Co-adaptation Curriculum:** Enabled `fewshot_train_prob = 0.30` and `fewshot_train_max_demos = 2` in `RSCConfig` and `ENGINE_V40_KAGGLE_PROFILE`. Prompts with few-shot demonstrations are shielded during forward passes while teaching the router to maintain active non-zero routing across 2/4/8-shot inputs.
+- **Token Gate Re-energization:** Relaxed gate sparsity over-penalization: `lambda_gate_budget = 0.15` (down from 0.50), `lambda_l1_gate = 0.01` (down from 0.05), `gate_target_sparsity = 0.25`, and increased calculation boost `calc_token_weight = 1.75`. Prevents faint gate attenuation ($\\alpha \approx 0.15$) and strengthens downstream SteerNet modulation.
+- **5-Condition Experimental Taxonomy:** Rigorously separated all 5 experimental conditions in `src/evaluation/multi_benchmark_runner.py`:
+  1. `baseline`: Frozen backbone ($0\%$ steering).
+  2. `fixed_steernet`: Multi-layer fixed control with all certified candidate layers ($M \in [6, 8]$) active simultaneously, gate pinned at 1.0 scaled by certified Phase-1B scales $\alpha_l^*$.
+  3. `steernet`: Dynamic router subset selection across all 6 layers with token gate pinned at 1.0 (isolates routing intelligence).
+  4. `ars`: Full deployed ARS governed by the 3-tier Hierarchical Deployment Arbiter (`adaptive` $\to$ `fixed_steernet` $	o$ `baseline`).
+  5. `ars_raw`: Full unconstrained dynamic ARS with 100% active routing and token gating, strictly zero fallback, for complete scientific observability and heatmaps.
+- **3-Tier Hierarchical Deployment Arbiter:** Patched `src/evaluation/deployment.py` to evaluate both Adaptive-vs-Baseline and Fixed-vs-Baseline, promoting to `fixed_steernet` when Fixed SteerNet is proven superior over Baseline even if adaptive gating does not surpass fixed.
+- **Certified Gate Scale Persistence:** Added round-trip serialization and restoration of `_certified_gate_scales` in `_phase2_runtime_state` and `_restore_phase2_runtime_state` in `src/training/trainer.py`, guaranteeing that resumed Phase-2 models retain their calibrated per-layer intensities.
+- **Notebook & Test Suite Hardening:** Updated `notebooks/kaggle_ars_runner.ipynb` to align with the new profile parameters. Added unit tests for $K=1$ tariff-free pricing, layer coverage loss, 3-tier arbiter, and state persistence. Full test suite: **170 passed, 0 failed**.
+
+---
+
 ## [1.15.0] - 2026-10-22
 
 ### 🧪 Run: Engine v4.0 Full Decision Run (\exp_20261022_132141_ars_phi2_kaggle\)
