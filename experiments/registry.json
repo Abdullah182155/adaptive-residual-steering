@@ -82,6 +82,24 @@
       "git_commit": "0d03ef3",
       "record_path": "experiments/runs/exp_20261021_113159_ars_phi2_kaggle_engine_v3_2_memory_halt/experiment_record.json",
       "artifact_provenance": "Verbatim Kaggle notebook output is retained at the record path as kaggle_output.txt (SHA-256 917f41bd882ab1875bc30706524f8c6d600ddb4694acc4ddbaa2be5e2c54160d). The run halted at Phase 2 step 50 when cached CUDA reserved memory reached 13602 MiB while peak allocated memory was 8095 MiB; no final benchmark was executed."
+    },
+    {
+      "experiment_id": "exp_20261022_001815_ars_phi2_kaggle_engine_v3_3_small_scale",
+      "tag": "ars_phi2_kaggle_engine_v3_3_small_scale_k1_collapse",
+      "created_at": "2026-10-22T00:18:15+03:00",
+      "status": "DIAGNOSTIC_FAILURE_ROUTER_K1_COLLAPSE",
+      "git_commit": "6aa6c6f",
+      "record_path": "experiments/runs/exp_20261022_001815_ars_phi2_kaggle_engine_v3_3_small_scale/experiment_record.json",
+      "artifact_provenance": "Kaggle run output supplied 2026-10-22. Engine v3.3, rank=16, n_samples=3000. Phase 2 completed both epochs (acc=61.0%) but router collapsed to K=1 (L17 only). Health audit failed: K>=2 rate=0.000 < 0.020. Benchmark was NOT executed."
+    },
+    {
+      "experiment_id": "exp_20261022_001815_ars_phi2_kaggle_engine_v3_3_large_scale",
+      "tag": "ars_phi2_kaggle_engine_v3_3_large_scale_full_benchmark",
+      "created_at": "2026-10-22T00:18:15+03:00",
+      "status": "COMPLETED_BASELINE_DEPLOYMENT",
+      "git_commit": "6aa6c6f",
+      "record_path": "experiments/runs/exp_20261022_001815_ars_phi2_kaggle_engine_v3_3_large_scale/experiment_record.json",
+      "artifact_provenance": "Kaggle run output supplied 2026-10-22. Engine v3.3, rank=32, n_samples=4000. Full pipeline completed. Phase 1 accepted L11 (alpha=0.35, +11.5pp). Phase 2 passed health audit (K>=2 rate=39.1%). Benchmark: Baseline=56%%, Fixed SteerNet=59%%, ARS Raw=60%%. Deployment reverted to baseline (CI crosses zero). Memory watchdog passed (8098/13946 MiB)."
     }
   ]
 }

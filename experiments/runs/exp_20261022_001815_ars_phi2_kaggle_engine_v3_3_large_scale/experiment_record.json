@@ -1,0 +1,146 @@
+{
+  "experiment_id": "exp_20261022_001815_ars_phi2_kaggle_engine_v3_3_large_scale",
+  "tag": "ars_phi2_kaggle_engine_v3_3_large_scale_full_benchmark",
+  "created_at": "2026-10-22T00:18:15+03:00",
+  "engine": "v3.3",
+  "git_commit": "6aa6c6f",
+  "status": "COMPLETED_BASELINE_DEPLOYMENT",
+  "hardware": "Kaggle Tesla T4 (15,360 MiB)",
+  "configuration": {
+    "lora_rank": 32,
+    "n_samples": 4000,
+    "phase1_epochs": 4,
+    "phase1b_candidate_layers": 4,
+    "phase1_calibration_rows": 28,
+    "phase1_confirmation_rows": 26,
+    "unified_adaptive_epochs": 2,
+    "eval_n_test": 100,
+    "eval_shots": [0, 4],
+    "continue_on_diagnostic_failure": false
+  },
+  "phase1": {
+    "accepted_layer": 11,
+    "accepted_alpha": 0.35,
+    "confirmation_gain_pp": 11.5,
+    "baseline_confirmation_acc": 0.500,
+    "candidate_confirmation_acc": 0.615,
+    "cot_ratio": 1.03,
+    "postcap_q95": 0.27,
+    "train_nll_reduction_pct": 16.7,
+    "val_nll_reduction_pct": 18.3,
+    "audit_duration_min": 41.2,
+    "calibration_ranking": [
+      {"rank": 1, "layer": 11, "alpha": 0.35, "acc": 0.643, "present": 0.964, "val_nll": 0.8857, "cot": 1.02, "postcap_q95": 0.27},
+      {"rank": 2, "layer": 20, "alpha": 0.25, "acc": 0.607, "present": 0.964, "val_nll": 0.9078, "cot": 1.01, "postcap_q95": 0.21},
+      {"rank": 3, "layer": 17, "alpha": 0.50, "acc": 0.607, "present": 0.964, "val_nll": 0.9097, "cot": 1.01, "postcap_q95": 0.40}
+    ]
+  },
+  "phase1b": {
+    "candidate_pool": [11, 17, 20],
+    "depth_bands": ["early", "middle", "late"],
+    "pairs": 2,
+    "scales": {"11": 0.35, "17": 0.50, "20": 0.25}
+  },
+  "phase1_5_bootstrap": {
+    "epochs": 3,
+    "best_probe_loss": 0.2002,
+    "nan_count": 0,
+    "epoch_details": [
+      {"epoch": 1, "loss": 0.2474, "win_base_pct": 75.0, "p_k0": 0.23, "argmax_k": {"0": 0.0, "1": 0.75, "2": 0.0, "3": 0.25, "4": 0.0}},
+      {"epoch": 2, "loss": 0.2098, "win_base_pct": 100.0, "p_k0": 0.21, "argmax_k": {"0": 0.0, "1": 0.75, "2": 0.0, "3": 0.25, "4": 0.0}},
+      {"epoch": 3, "loss": 0.2002, "win_base_pct": 75.0, "p_k0": 0.20, "argmax_k": {"0": 0.0, "1": 1.0, "2": 0.0, "3": 0.0, "4": 0.0}}
+    ],
+    "top_synergy_bootstrap": [
+      {"pair": "L17+L20", "score": -0.33},
+      {"pair": "L11+L17", "score": -0.40}
+    ],
+    "preflight": {
+      "realized_k_distribution": {"0": 0.0, "1": 0.758, "2": 0.0, "3": 0.242, "4": 0.0},
+      "k_ge2_rate": 0.242,
+      "active_layers": [11, 17, 20],
+      "active_depth_bands": ["early", "middle", "late"],
+      "status": "PASS"
+    }
+  },
+  "phase2": {
+    "memory_watchdog_step50": {
+      "peak_allocated_mib": 8098,
+      "peak_reserved_mib": 13946,
+      "limit_mib": 14200,
+      "status": "PASS"
+    },
+    "epoch_1": {
+      "task_loss": 1.0321,
+      "val_loss": 1.0295,
+      "accuracy": 0.560,
+      "checkpoint_saved": true,
+      "realized_k_distribution": {"1": 0.07, "3": 0.93}
+    },
+    "epoch_2": {
+      "task_loss": 1.0501,
+      "val_loss": 1.0355,
+      "accuracy": 0.560,
+      "checkpoint_saved": false,
+      "realized_k_distribution": {"1": 0.07, "3": 0.93}
+    },
+    "health_audit": {
+      "realized_k_distribution": {"0": 0.0, "1": 0.609, "2": 0.0, "3": 0.391, "4": 0.0},
+      "realized_k_ge2_rate": 0.391,
+      "active_layer_union": [11, 17, 20],
+      "active_depth_bands": ["early", "middle", "late"],
+      "status": "PASS"
+    }
+  },
+  "deployment_confirmation": {
+    "0_shot": {"baseline": 0.494, "ars": 0.506, "delta_pp": 1.25, "ci_95": [-4.38, 6.88]},
+    "2_shot": {"baseline": 0.506, "ars": 0.531, "delta_pp": 2.50, "ci_95": [0.00, 5.62]},
+    "multishot_delta_pp": 1.88,
+    "multishot_ci_95": [-1.56, 5.31],
+    "decision": "BASELINE"
+  },
+  "benchmark": {
+    "gsm8k_0shot": {
+      "baseline": 0.56, "fixed_steernet": 0.59, "steernet": 0.58,
+      "ars_deployed": 0.56, "ars_raw": 0.60
+    },
+    "gsm8k_4shot": {
+      "baseline": 0.62, "fixed_steernet": 0.61, "steernet": 0.62,
+      "ars_deployed": 0.62, "ars_raw": 0.62
+    },
+    "paired_bootstrap_ci": {
+      "ars_raw_vs_baseline_0shot": {"delta_pp": 4.0, "ci_95": [-2.02, 11.0]},
+      "ars_raw_vs_fixed_0shot": {"delta_pp": 1.0, "ci_95": [-5.0, 7.0]},
+      "fixed_vs_baseline_0shot": {"delta_pp": 3.0, "ci_95": [-4.0, 11.0]}
+    }
+  },
+  "routing_diagnostics": {
+    "layer_selection": {
+      "L11": {"ema_rate": 1.0, "activations": 56838},
+      "L17": {"ema_rate": 0.958, "activations": 54455},
+      "L20": {"ema_rate": 0.958, "activations": 54455}
+    },
+    "realized_k_benchmark": {"0": 0.0, "1": 0.042, "2": 0.0, "3": 0.958, "4": 0.0},
+    "route_entropy_by_shot": {"0": 0.4999, "4": 0.0},
+    "route_collapse_warnings": [
+      "Router selected identical route (11,17,20) across 100% of 100 items (4-shot)"
+    ],
+    "gate_health": {
+      "L11": {"mean_alpha": 0.289, "token_std": 0.144, "low_sat_pct": 0.0, "high_sat_pct": 2.0},
+      "L17": {"mean_alpha": 0.233, "token_std": 0.089, "low_sat_pct": 0.0, "high_sat_pct": 0.0},
+      "L20": {"mean_alpha": 0.040, "token_std": 0.147, "low_sat_pct": 84.7, "high_sat_pct": 0.0, "effective_norm": 0.0002}
+    },
+    "synergy_matrix": {
+      "top_synergistic": [["L18", "L24", 0.470], ["L13", "L18", 0.467], ["L18", "L22", 0.464]],
+      "top_antagonistic": [["L17", "L20", -0.174], ["L11", "L17", -0.124], ["L11", "L20", -0.067]],
+      "mean_normalized": 0.310
+    }
+  },
+  "forensic_findings": [
+    "Bimodal K-distribution: K=1 (60.9%) and K=3 (39.1%), K=0 and K=2 both 0%. Argmax censorship eliminates minority classes.",
+    "Inverted synergy paradox: selected triad has negative synergy while unobserved pairs retain positive prior.",
+    "L20 gate vanishing: selected in 95.8% of routes but effectively dead (low_sat=84.7%, eff_norm=0.0002).",
+    "4-shot route entropy = 0.0 bits: router blind to few-shot context due to prompt shielding excluding demos from pooling.",
+    "Adaptive routing adds only +1.0pp over Fixed SteerNet (59% vs 60%), within noise at N=100.",
+    "Candidate pool starvation: 9 layers showed calibration gains but only 3 entered routing pool."
+  ]
+}

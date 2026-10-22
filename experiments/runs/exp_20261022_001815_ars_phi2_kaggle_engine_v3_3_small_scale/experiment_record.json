@@ -1,0 +1,64 @@
+{
+  "experiment_id": "exp_20261022_001815_ars_phi2_kaggle_engine_v3_3_small_scale",
+  "tag": "ars_phi2_kaggle_engine_v3_3_small_scale_k1_collapse",
+  "created_at": "2026-10-22T00:18:15+03:00",
+  "engine": "v3.3",
+  "git_commit": "6aa6c6f",
+  "status": "DIAGNOSTIC_FAILURE_ROUTER_K1_COLLAPSE",
+  "hardware": "Kaggle Tesla T4 (15,360 MiB)",
+  "configuration": {
+    "lora_rank": 16,
+    "n_samples": 3000,
+    "phase1_epochs": 3,
+    "phase1b_candidate_layers": 4,
+    "phase1_calibration_rows": 12,
+    "phase1_confirmation_rows": 16,
+    "unified_adaptive_epochs": 2,
+    "eval_n_test": 50,
+    "eval_shots": [0, 2, 8],
+    "continue_on_diagnostic_failure": false
+  },
+  "phase1": {
+    "accepted_layer": 17,
+    "accepted_alpha": 0.25,
+    "confirmation_gain_pp": 6.2,
+    "baseline_confirmation_acc": 0.688,
+    "candidate_confirmation_acc": 0.750,
+    "audit_duration_min": 36.1
+  },
+  "phase1b": {
+    "candidate_pool": [17, 20],
+    "depth_bands": ["middle", "late"],
+    "pairs": 1,
+    "scales": {"17": 0.25, "20": 0.25}
+  },
+  "phase1_5_bootstrap": {
+    "best_probe_loss": 0.1707,
+    "nan_count": 0,
+    "k_ge2_rate": 0.233,
+    "preflight": "PASS"
+  },
+  "phase2": {
+    "memory_watchdog_step50": {
+      "peak_allocated_mib": 7991,
+      "peak_reserved_mib": 12588,
+      "status": "PASS"
+    },
+    "epoch_1": {
+      "task_loss": null,
+      "val_loss": null,
+      "accuracy": 0.610,
+      "realized_k_distribution": {"1": 1.0, "2": 0.0}
+    },
+    "epoch_2": {
+      "realized_k_distribution": {"1": 1.0, "2": 0.0}
+    }
+  },
+  "terminal_failure": {
+    "cause": "audit_ars_intervention_health RuntimeError",
+    "details": "Router collapsed to K=1 (L17 only, 100%). L20 received 0% selection. K>=2 rate=0.000 < 0.020 threshold. active_layers=1 < 2 required.",
+    "phase2_accuracy_at_halt": 0.610,
+    "continue_on_diagnostic_failure": false
+  },
+  "benchmark": "NOT_EXECUTED (halted by health audit before benchmark)"
+}

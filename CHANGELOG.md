@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.14.0] - 2026-10-22
+
+### 🧪 Runs: Engine v3.3 Small-Scale & Large-Scale Decision Runs
+- **Small-scale run** (rank=16, n_samples=3000, phase1_epochs=3): Phase 1 accepted L17 at alpha=0.25 (+6.2pp). Phase 2 completed both epochs with acc=61.0%, but the router collapsed to K=1 (L17 only, 100%). Post-Phase-2 health audit failed: K>=2 rate=0.000 < 0.020, active_layers=1 < 2. Pipeline halted before benchmark execution.
+- **Large-scale run** (rank=32, n_samples=4000, phase1_epochs=4): Full pipeline completed. Phase 1 accepted L11 at alpha=0.35 (+11.5pp confirmation gain, CoT=1.03, postcap q95=0.27). Phase 1B formed 3-layer pool [11, 17, 20] across all depth bands. Phase 2 passed health audit (K>=2 rate=39.1%, all 3 bands active). Benchmark: Baseline 56%, Fixed SteerNet 59%, ARS Raw 60% (0-shot, N=100).
+- **Memory watchdog v3.3 proven:** Both runs survived Phase 2 step 50 without CUDA OOM (peak allocated ~8.1 GiB, reserved ~13.9 GiB < 14.2 GiB limit).
+
+### Forensic Findings (Engine v3.3 Post-Mortem)
+- **Bimodal K-distribution:** Realized K was strictly bimodal (K=1: 60.9%, K=3: 39.1%, K=0 and K=2 both 0.0%) due to deterministic argmax evaluation censoring minority classes despite the policy learning non-trivial K=0 probability (p(K=0) approx 21%).
+- **Inverted synergy paradox:** The selected triad (L11, L17, L20) had the only negative pairwise interactions in the model (L17+L20: -0.17, L11+L17: -0.12) while unselected/unobserved pairs retained positive priors.
+- **L20 gate vanishing:** L20 was selected on 95.8% of examples but low_saturation_pct=84.7% and effective_norm=0.0002. The router claimed K=3 while physically operating as a single dominant L11 controller.
+- **4-shot route collapse:** Route entropy dropped to 0.0 bits (identical route on 100/100 items). Prompt shielding excluded demonstrations from router pooling, leaving the router blind to few-shot context.
+- **Candidate pool starvation:** 9 layers showed calibration gains in Phase 1, but only 3 entered the routing pool due to the 1-per-band admission policy.
+- **Marginal adaptive value:** ARS Raw added only +1.0pp over Fixed SteerNet (59% vs 60%), within noise at N=100.
+- **Deployment gate correct:** Deployment confirmation CI crossed zero; fallback to baseline was scientifically sound.
+
 ## [1.13.7] - 2026-10-21
 
 ### 🛡️ Engine v3.3: Cache-Aware Memory Recovery & Exact Phase-2 Resume
