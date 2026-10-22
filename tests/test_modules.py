@@ -2409,6 +2409,28 @@ class TestEngineV4(unittest.TestCase):
         decision = adaptive_vs_fixed_promotion(fixed, adaptive, require_adaptive_beats_fixed=True, n_boot=100)
         self.assertEqual(decision["mode"], "fixed_steernet")
 
+    def test_k0_can_be_disabled_without_masking_valid_k(self):
+        model = Phi2WithRSC.__new__(Phi2WithRSC)
+        model.cfg = RSCConfig(max_active_layers=2, router_k0_enabled=False)
+        model.target_layers = [11, 20]
+        model._eligible_routing_layers = {11, 20}
+        model.device = torch.device("cpu")
+        masked = model.mask_routing_k_logits(torch.zeros(1, 3))
+        self.assertLess(masked[0, 0].item(), -1000)
+        self.assertTrue(torch.isfinite(masked[0, 1:]).all())
+
+    def test_pair_evidence_is_neutral_until_observed(self):
+        self.assertEqual(PairEvidenceTable().estimate(11, 24), 0.0)
+
+    def test_v40_profile_expands_stratified_pool(self):
+        cfg = make_engine_v40_kaggle_config()
+        self.assertEqual(cfg.phase1b_candidate_layers, 6)
+        self.assertEqual(cfg.phase1b_candidates_per_band, 2)
+
+    def test_token_competitive_k0_is_exactly_zero(self):
+        allocation = token_competitive_allocation(torch.randn(1, 2, 3), torch.zeros(1, 3, dtype=torch.bool))
+        self.assertEqual(float(allocation.abs().sum()), 0.0)
+
 
 
 
