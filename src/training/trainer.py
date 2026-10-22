@@ -1168,6 +1168,15 @@ def audit_ars_intervention_health(model, eval_data, cfg: RSCConfig, device: torc
             )
         if report["layer_selection_entropy"] < float(cfg.router_min_eval_layer_entropy):
             failures.append(f"layer entropy={report['layer_selection_entropy']:.3f} < {cfg.router_min_eval_layer_entropy}")
+        min_route_entropy = float(getattr(cfg, "router_min_eval_route_tuple_entropy", 0.0))
+        if report.get("route_tuple_entropy", 0.0) < min_route_entropy:
+            failures.append(
+                f"route-tuple entropy={report.get('route_tuple_entropy', 0.0):.3f} < {min_route_entropy:.3f}"
+            )
+        if report.get("effective_layer_count", 0) < int(cfg.router_min_eval_active_layers):
+            failures.append(
+                f"effective layers={report.get('effective_layer_count', 0)} < {cfg.router_min_eval_active_layers}"
+            )
         active_gates = [row for row in report["gate"].values() if row["intervened_tokens"] > 0]
         if not active_gates:
             failures.append("no gate received intervened tokens")
@@ -2765,9 +2774,10 @@ def _evaluate_phase2_deployment(
             "deployment_flags": {"baseline": [], "ars": [], "baseline_clusters": [], "ars_clusters": []},
         }
 
-    print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across 0-shot and 2-shot...")
+    deployment_shots = tuple(getattr(cfg, "deployment_eval_shots", None) or (0, 2))
+    print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across shots={deployment_shots}...")
     base_by_shot, ars_by_shot = [], []
-    for n_shot in (0, 2):
+    for n_shot in deployment_shots:
         baseline = evaluate_flags("none", n_shot)
         ars = evaluate_flags(None, n_shot)
         if len(baseline) != len(confirm_rows) or len(ars) != len(confirm_rows) or len(baseline) != len(ars):
@@ -2784,13 +2794,13 @@ def _evaluate_phase2_deployment(
             f"Δ={delta*100:+.2f}pp, 95% CI=[{lower*100:+.2f}, {upper*100:+.2f}]pp (n={len(baseline)})"
         )
 
-    outcomes = {shot: (base_by_shot[index], ars_by_shot[index]) for index, shot in enumerate((0, 2))}
+    outcomes = {shot: (base_by_shot[index], ars_by_shot[index]) for index, shot in enumerate(deployment_shots)}
     modes_by_shot = finalize_deployment_by_shot(outcomes, cfg.phase2_save_path, min_n=min_deployment_questions)
     base_clusters = [list(values) for values in zip(*base_by_shot)]
     ars_clusters = [list(values) for values in zip(*ars_by_shot)]
     delta, lower, upper = paired_delta_ci(base_clusters, ars_clusters)
     print(
-        "  [deployment] Multi-shot (0+2 clustered by question) "
+        f"  [deployment] Multi-shot ({'+'.join(str(shot) for shot in deployment_shots)} clustered by question) "
         f"Δ = {delta*100:+.2f}pp, 95% CI = [{lower*100:+.2f}, {upper*100:+.2f}]pp "
         f"(questions={len(base_clusters)}, views={len(base_by_shot)})"
     )
@@ -3342,13 +3352,14 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         return flags
 
     if len(confirm_rows) > 0:
-        print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across 0-shot and 2-shot...")
+        deployment_shots = tuple(getattr(cfg, "deployment_eval_shots", None) or (0, 2))
+        print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across shots={deployment_shots}...")
         base_flags = []
         ars_flags = []
         base_flags_by_shot = []
         ars_flags_by_shot = []
         base_clusters, ars_clusters = [], []
-        for n_shot in (0, 2):
+        for n_shot in deployment_shots:
             bf = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override="none", n_shot=n_shot)
             af = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override=None, n_shot=n_shot)
             if len(bf) != len(confirm_rows) or len(af) != len(confirm_rows) or len(bf) != len(af):
@@ -3368,16 +3379,16 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
                     f"Δ={d_s*100:+.2f}pp, 95% CI=[{lo_s*100:+.2f}, {hi_s*100:+.2f}]pp (n={len(bf)})"
                 )
 
-        outcomes_by_shot = {shot: (base_flags_by_shot[i], ars_flags_by_shot[i]) for i, shot in enumerate((0, 2))}
+        outcomes_by_shot = {shot: (base_flags_by_shot[i], ars_flags_by_shot[i]) for i, shot in enumerate(deployment_shots)}
         dep_modes_by_shot = finalize_deployment_by_shot(
             outcomes_by_shot, cfg.phase2_save_path, min_n=min_deployment_questions,
         )
-        if len(base_flags_by_shot) == 2 and len(ars_flags_by_shot) == 2:
+        if len(base_flags_by_shot) == len(deployment_shots) and len(ars_flags_by_shot) == len(deployment_shots):
             base_clusters = [list(values) for values in zip(*base_flags_by_shot)]
             ars_clusters = [list(values) for values in zip(*ars_flags_by_shot)]
             d, lo, hi = paired_delta_ci(base_clusters, ars_clusters)
             print(
-                "  [deployment] Multi-shot (0+2 clustered by question) "
+                f"  [deployment] Multi-shot ({'+'.join(str(shot) for shot in deployment_shots)} clustered by question) "
                 f"Δ = {d*100:+.2f}pp, 95% CI = [{lo*100:+.2f}, {hi*100:+.2f}]pp "
                 f"(questions={len(base_clusters)}, views={len(base_flags_by_shot)})"
             )
@@ -3385,11 +3396,12 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         else:
             print("  [deployment] No valid evaluated confirmation items; defaulting to BASELINE deployment.")
             dep_mode = "baseline"
-            dep_modes_by_shot = {"0": "baseline", "2": "baseline"}
+            dep_modes_by_shot = {str(shot): "baseline" for shot in deployment_shots}
     else:
         print("\n  [deployment] No held-out confirmation rows available; defaulting to BASELINE deployment.")
         dep_mode = "baseline"
-        dep_modes_by_shot = {"0": "baseline", "2": "baseline"}
+        fallback_shots = tuple(getattr(cfg, "deployment_eval_shots", None) or (0, 2))
+        dep_modes_by_shot = {str(shot): "baseline" for shot in fallback_shots}
         base_flags, ars_flags = [], []
         base_clusters, ars_clusters = [], []
 

@@ -133,6 +133,8 @@ class RSCConfig:
     # resamples questions as clusters rather than treating those two outcomes
     # as independent observations.
     deployment_min_examples: int = 120
+    # Confirmation must cover each shot condition claimed for deployment.
+    deployment_eval_shots: Tuple[int, ...] = (0, 2)
     # A larger held-out zero-shot screen, rather than a training-prompt
     # accuracy proxy, decides whether the final Phase-1 adapter is usable.
     phase1_generation_max_new_tokens: int = 256
@@ -178,6 +180,10 @@ class RSCConfig:
     factorized_gate_allocation: bool = True
     gate_allocation_temperature: float = 0.70
     lambda_gate_overlap: float = 0.10
+    # Engine v4: a nominal route member is effective only when it owns a
+    # material fraction of realised gate-scaled residual energy.
+    effective_k_min_energy_fraction: float = 0.05
+    router_min_eval_route_tuple_entropy: float = 0.0
 
     # Gate loss regularisation
     # Do not use one global ON/OFF reward to update every token gate.  That

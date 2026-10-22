@@ -28,6 +28,8 @@ CHECKPOINT_CONFIG_FIELDS = frozenset({
     "steer_route_budget_power", "gate_dim", "gate_dropout", "gate_init_alpha",
     "gating_mode", "gate_constant_value", "router_difficulty_aware",
     "router_synergy_limit", "router_eval_mode", "prompt_shielding",
+    "effective_k_min_energy_fraction", "router_min_eval_route_tuple_entropy",
+    "deployment_eval_shots",
 })
 
 
@@ -156,6 +158,8 @@ def save_ars_checkpoint(
     }
     if hasattr(model, "deployment_modes_by_shot"):
         manifest["deployment_modes_by_shot"] = dict(getattr(model, "deployment_modes_by_shot"))
+    if hasattr(model, "get_routing_manifest"):
+        manifest["routing_manifest"] = model.get_routing_manifest()
     if extra_metadata:
         manifest["extra"] = extra_metadata
     manifest_path = destination.with_suffix(destination.suffix + ".manifest.json")
@@ -197,4 +201,6 @@ def load_ars_checkpoint_strict(
             model.deployment_disabled = (manifest.get("deployment_mode") == "baseline")
         if hasattr(model, "deployment_modes_by_shot") and manifest.get("deployment_modes_by_shot"):
             model.deployment_modes_by_shot = dict(manifest["deployment_modes_by_shot"])
+        if hasattr(model, "load_routing_manifest"):
+            model.load_routing_manifest(manifest.get("routing_manifest"))
     return {"saved_ars_tensors": len(saved), "manifest": manifest, "non_ars_missing": len(result.missing_keys)}

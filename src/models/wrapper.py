@@ -1,3 +1,5 @@
+import math
+import warnings
 import weakref
 from typing import List, Optional, Tuple, Dict, Any, Set
 import torch
@@ -89,6 +91,9 @@ class Phi2WithRSC(nn.Module):
         self.last_gate_trace = None
         self._trace_cached_decode = False
         self._steering_telemetry = {}
+        # Python-only diagnostic state: it must not become a checkpoint tensor
+        # or retain a computation graph between micro-batches.
+        self._route_tuple_counts: Dict[Tuple[int, ...], int] = {}
         self._active_pre_cap_records = []
 
         self.register_buffer(
@@ -203,13 +208,20 @@ class Phi2WithRSC(nn.Module):
                                 effective = delta * alpha * route_budget
                                 effective_ratio = (effective.norm(dim=-1) / h_fp.norm(dim=-1).clamp_min(1e-6))[valid]
                                 metrics = wrapper._steering_telemetry.setdefault(
-                                    int(layer_idx), {"count": 0, "raw_sum": 0.0, "effective_sum": 0.0, "raw_max": 0.0, "effective_max": 0.0}
+                                    int(layer_idx), {
+                                        "count": 0, "raw_sum": 0.0, "effective_sum": 0.0,
+                                        "raw_max": 0.0, "effective_max": 0.0,
+                                        "energy_sum": 0.0, "energy_max": 0.0,
+                                    }
                                 )
                                 metrics["count"] += int(valid.sum().item())
                                 metrics["raw_sum"] += float(raw_ratio.sum().item())
                                 metrics["effective_sum"] += float(effective_ratio.sum().item())
                                 metrics["raw_max"] = max(metrics["raw_max"], float(raw_ratio.max().item()))
                                 metrics["effective_max"] = max(metrics["effective_max"], float(effective_ratio.max().item()))
+                                effective_energy = effective.norm(dim=-1)[valid]
+                                metrics["energy_sum"] += float(effective_energy.sum().item())
+                                metrics["energy_max"] = max(metrics["energy_max"], float(effective_energy.max().item()))
                         if wrapper._routing_override is None:
                             g.record_diagnostics(alpha, steer_mask)
                         if wrapper._joint_grad_mode:
@@ -347,6 +359,44 @@ class Phi2WithRSC(nn.Module):
         self._cached_decode_active_k = None
         self._cached_decode_allocation = None
 
+    def get_routing_manifest(self) -> Dict[str, Any]:
+        """Return non-tensor routing decisions required for reproducible reload.
+
+        ARS weights alone do not encode the certified Phase-1B pool or the
+        per-shot deployment decision.  Keeping this state in the manifest
+        prevents a newly constructed wrapper from silently exposing its full
+        catalog after loading a portable component checkpoint.
+        """
+        return {
+            "eligible_routing_layers": (
+                sorted(int(layer) for layer in self._eligible_routing_layers)
+                if self._eligible_routing_layers is not None else None
+            ),
+            "deployment_disabled": bool(self.deployment_disabled),
+            "deployment_modes_by_shot": {
+                str(shot): str(mode) for shot, mode in self.deployment_modes_by_shot.items()
+            },
+        }
+
+    def load_routing_manifest(self, manifest: Optional[Dict[str, Any]]) -> None:
+        """Restore validated non-tensor routing state from a checkpoint sidecar."""
+        if manifest is None:
+            return
+        if not isinstance(manifest, dict):
+            raise TypeError("routing manifest must be a dictionary")
+        eligible = manifest.get("eligible_routing_layers")
+        if eligible is None:
+            self.set_eligible_routing_layers(None)
+        else:
+            if not isinstance(eligible, (list, tuple)):
+                raise TypeError("routing manifest eligible_routing_layers must be a list or null")
+            self.set_eligible_routing_layers([int(layer) for layer in eligible])
+        self.deployment_disabled = bool(manifest.get("deployment_disabled", False))
+        modes = manifest.get("deployment_modes_by_shot", {})
+        if not isinstance(modes, dict):
+            raise TypeError("routing manifest deployment_modes_by_shot must be a dictionary")
+        self.deployment_modes_by_shot = {str(shot): str(mode) for shot, mode in modes.items()}
+
     def routing_eligibility_mask(self, device: Optional[torch.device] = None) -> torch.Tensor:
         """Return the learned-routing eligibility mask in catalog order."""
         target_device = device or self.device
@@ -430,9 +480,27 @@ class Phi2WithRSC(nn.Module):
                 unshielded = fallback_mask & (~sh_aligned)
                 if unshielded.any():
                     mask = unshielded
+                else:
+                    warnings.warn(
+                        "Prompt shielding left no router-context tokens; falling back to the full attention mask.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
         if mask is None or mask.ndim != 2 or mask.shape[0] != h.shape[0] or mask.shape[1] < h.shape[1]:
+            if self.prompt_shielding and self._prompt_shield_mask_active is not None:
+                warnings.warn(
+                    "Prompt shielding router context was invalid; falling back to the full attention mask.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
             return fallback_mask
         aligned = mask[:, -h.shape[1] :].to(device=h.device, dtype=torch.bool)
+        if not bool(aligned.any(dim=1).all()):
+            warnings.warn(
+                "Prompt shielding router context was empty for one or more rows; using the full attention mask for those rows.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         return torch.where(aligned.any(dim=1, keepdim=True), aligned, fallback_mask)
 
     def _finalize_selection(self, selected_matrix: torch.Tensor, margins: torch.Tensor) -> torch.Tensor:
@@ -587,6 +655,10 @@ class Phi2WithRSC(nn.Module):
         self._last_inferred_k = self._desired_k
         self._precomputed_routes = selected_matrix
         self._active_k_realized = selected_matrix.sum(dim=-1)
+        if self._routing_override is None and not self._router_warmup:
+            for row in selected_matrix.detach().cpu().tolist():
+                route = tuple(layer for layer, selected in zip(self.target_layers, row) if selected)
+                self._route_tuple_counts[route] = self._route_tuple_counts.get(route, 0) + 1
         if self._routing_override is not None:
             # Forced Phase-1B/audit routes are an intervention contract, not
             # a chance for the immature router logits to attenuate one member
@@ -650,6 +722,7 @@ class Phi2WithRSC(nn.Module):
         self._prompt_level_selected_count = [0] * len(self.target_layers)
         self._prompt_level_total = 0
         self._steering_telemetry = {}
+        self._route_tuple_counts = {}
         for gate in self.gates.values():
             gate.reset_diagnostics()
 
@@ -673,6 +746,54 @@ class Phi2WithRSC(nn.Module):
         total = max(1, int(self.routing_forwards.item()))
         return {k: int(count.item()) / total for k, count in enumerate(self.routing_k_hist)}
 
+    def route_tuple_entropy(self) -> float:
+        """Return Shannon entropy in bits over observed complete route tuples."""
+        total = sum(self._route_tuple_counts.values())
+        if total <= 0:
+            return 0.0
+        return float(-sum(
+            (count / total) * math.log2(count / total)
+            for count in self._route_tuple_counts.values() if count > 0
+        ))
+
+    def effective_intervention_energy(self) -> Dict[int, Dict[str, float]]:
+        """Summarize realised gate-scaled residual energy by layer.
+
+        Calculation/prose labels are intentionally omitted here because the
+        wrapper only receives attention/shield masks; training can enrich this
+        telemetry later without retaining labels in model hooks.
+        """
+        total_energy = sum(float(row.get("energy_sum", 0.0)) for row in self._steering_telemetry.values())
+        result: Dict[int, Dict[str, float]] = {}
+        for layer in self.target_layers:
+            row = self._steering_telemetry.get(int(layer), {})
+            count = max(1, int(row.get("count", 0)))
+            energy = float(row.get("energy_sum", 0.0))
+            result[int(layer)] = {
+                "mean_effective_norm": energy / count,
+                "total_effective_energy": energy,
+                "energy_fraction": energy / total_energy if total_energy > 0 else 0.0,
+                "dominant_token_fraction": 0.0,
+                "prose_energy": 0.0,
+                "calculation_energy": 0.0,
+            }
+        return result
+
+    def effective_k_diagnostics(self, min_energy_fraction: float = 0.05) -> Dict[str, Any]:
+        """Identify selected layers with a material share of total intervention energy."""
+        energy = self.effective_intervention_energy()
+        threshold = max(0.0, float(min_energy_fraction))
+        effective = [
+            layer for layer, row in energy.items()
+            if row["total_effective_energy"] > 0.0 and row["energy_fraction"] >= threshold
+        ]
+        return {
+            "min_energy_fraction": threshold,
+            "effective_layers": effective,
+            "effective_layer_count": len(effective),
+            "energy": energy,
+        }
+
     def intervention_diagnostics(self):
         """Summarize batch-union K/layer usage and token-gate diversity."""
         k_dist = self.routing_k_distribution()
@@ -688,6 +809,9 @@ class Phi2WithRSC(nn.Module):
             entropy = -sum(p * float(torch.log(torch.tensor(p)).item()) for p in probs)
             return entropy / float(torch.log(torch.tensor(float(support))).item())
         gate_metrics = {int(layer): gate.get_saturation_metrics() for layer, gate in self.gates.items()}
+        effective = self.effective_k_diagnostics(
+            float(getattr(self.cfg, "effective_k_min_energy_fraction", 0.05))
+        )
         routing = self.routing_diagnostics()
         active_union = [
             layer for layer, allowed in zip(self.target_layers, eligible)
@@ -722,7 +846,12 @@ class Phi2WithRSC(nn.Module):
             "active_depth_bands": active_bands,
             "active_depth_band_count": len(active_bands),
             "layer_selection_entropy": round(normalized_entropy(layer_probs, len(layer_rates)), 4),
+            "route_tuple_entropy": round(self.route_tuple_entropy(), 4),
+            "route_tuple_counts": {"+".join(map(str, route)) or "K0": count for route, count in self._route_tuple_counts.items()},
             "active_layer_count": len(active_union),
+            "effective_layer_count": effective["effective_layer_count"],
+            "effective_layers": effective["effective_layers"],
+            "effective_energy": effective["energy"],
             "gate": gate_metrics,
             "steering": self.steering_diagnostics(),
         }

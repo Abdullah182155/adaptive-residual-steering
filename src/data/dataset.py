@@ -55,12 +55,22 @@ class PromptTemplateBank:
             cls.render(question, steps, final_answer, r2),
         )
 
-_CALC_TOKEN_CACHE: Dict[int, int] = {}
+_CALC_TOKEN_CACHE: Dict[Tuple[str, int, int], int] = {}
+
+
+def _calc_token_cache_key(tokenizer, token_id: int) -> Tuple[str, int, int]:
+    """Identify token IDs within a tokenizer namespace, not globally."""
+    try:
+        vocab_size = int(getattr(tokenizer, "vocab_size", len(tokenizer)))
+    except TypeError:
+        vocab_size = int(getattr(tokenizer, "vocab_size", 0))
+    return (tokenizer.__class__.__name__, vocab_size, int(token_id))
 
 def _is_calc_token_id(tokenizer, token_id: int) -> int:
     """Classify token as math/calculation/outcome token vs English prose."""
-    if token_id in _CALC_TOKEN_CACHE:
-        return _CALC_TOKEN_CACHE[token_id]
+    cache_key = _calc_token_cache_key(tokenizer, token_id)
+    if cache_key in _CALC_TOKEN_CACHE:
+        return _CALC_TOKEN_CACHE[cache_key]
     try:
         s = tokenizer.decode([token_id])
     except Exception:
@@ -71,7 +81,7 @@ def _is_calc_token_id(tokenizer, token_id: int) -> int:
         res = 1
     else:
         res = 0
-    _CALC_TOKEN_CACHE[token_id] = res
+    _CALC_TOKEN_CACHE[cache_key] = res
     return res
 
 
