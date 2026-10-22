@@ -278,6 +278,7 @@ def compute_router_rloo_loss(
     shield_mask: torch.Tensor = None,
     calc_mask: Optional[torch.Tensor] = None,
     tariff_scale: float = 1.0,
+    k_preference_temperature: Optional[float] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """RLOO subset selection loss for training cooperative router policy with leave-one-out advantage."""
     if prompt_mask is None:
@@ -541,9 +542,13 @@ def compute_router_rloo_loss(
     # that was never updated when these hyperparams were added to config.
     lambda_k_mi = float(getattr(cfg, "lambda_router_k_mi", 0.10))
     lambda_layer_mi = float(getattr(cfg, "lambda_router_layer_mi", 0.10))
+    preference_temperature = (
+        float(k_preference_temperature) if k_preference_temperature is not None
+        else float(getattr(cfg, "router_k_preference_temperature", 0.10))
+    )
     k_preference_loss = counterfactual_k_preference_loss(
         k_logits_policy, k_actions, reward_0, action_rewards,
-        temperature=float(getattr(cfg, "router_k_preference_temperature", 0.10)),
+        temperature=preference_temperature,
     )
     lambda_k_preference = float(getattr(cfg, "lambda_router_k_preference", 0.25))
     synergy_prior_loss = model.router.synergy_prior_loss(synergy) if synergy is not None else torch.zeros((), device=ids.device)
@@ -612,6 +617,7 @@ def compute_router_rloo_loss(
         "k_mi_loss": float(k_mi_loss.detach().item()),
         "layer_mi_loss": float(layer_mi_loss.detach().item()),
         "k_preference_loss": float(k_preference_loss.detach().item()),
+        "k_preference_temperature": preference_temperature,
         "synergy_prior_loss": float(synergy_prior_loss.detach().item()),
         "k0_probability": float(F.softmax(k_logits_policy.detach(), dim=-1)[:, 0].mean().item()),
         "mean_per_layer_cost": float(per_layer_cost.mean().item()),

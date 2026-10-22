@@ -18,7 +18,8 @@ class JointLayerRouter(nn.Module):
                  d_model: int = 32, n_heads: int = 2,
                  layer_dropout: float = 0.15,
                  difficulty_aware: bool = True,
-                 synergy_limit: float = 0.75):
+                 synergy_limit: float = 0.75,
+                 use_demo_features: bool = False):
         super().__init__()
         self.target_layers = list(target_layers)
         n_candidates = len(self.target_layers)
@@ -29,6 +30,7 @@ class JointLayerRouter(nn.Module):
         self.layer_dropout = layer_dropout
         self.difficulty_aware = difficulty_aware
         self.synergy_limit = float(synergy_limit)
+        self.use_demo_features = bool(use_demo_features)
         depths = torch.tensor(
             [idx / max(1, n_layers - 1) for idx in self.target_layers], dtype=torch.float32
         )
@@ -42,7 +44,8 @@ class JointLayerRouter(nn.Module):
         self.identity_embed = nn.Embedding(n_candidates, d_model)
         nn.init.normal_(self.identity_embed.weight, mean=0.0, std=0.1)
         
-        n_scalar_dim = 5 if difficulty_aware else 3
+        self.base_scalar_dim = 5 if difficulty_aware else 3
+        n_scalar_dim = self.base_scalar_dim * (2 if self.use_demo_features else 1)
         self.input_proj = nn.Linear(n_scalar_dim + 1 + candidate_semantic_dim, d_model)
 
         # Pass 1: initial joint scoring
@@ -110,7 +113,8 @@ class JointLayerRouter(nn.Module):
             pooled.shape[0], self.n_candidates, self.candidate_semantic_dim
         )
 
-    def _base_features(self, h: torch.Tensor, valid_mask: torch.Tensor):
+    def _summary_features(self, h: torch.Tensor, valid_mask: torch.Tensor):
+        """Return detached scalar and pooled features for one token region."""
         h_det = h.detach().float()
         rms = h_det.square().mean(dim=-1).sqrt()
         valid = valid_mask.float()
@@ -127,10 +131,35 @@ class JointLayerRouter(nn.Module):
             norm_len = (torch.log1p(denom) / 6.24).clamp(0.0, 1.0)
             # 2. Hidden state dispersion (mean absolute token deviation from sequence mean)
             dispersion = (centered.abs().sum(dim=1) / denom).clamp(min=0.0)
-            self._last_scalars = torch.stack([mean_rms, rms_std, coverage, norm_len, dispersion], dim=-1).detach()
+            scalars = torch.stack([mean_rms, rms_std, coverage, norm_len, dispersion], dim=-1).detach()
         else:
-            self._last_scalars = torch.stack([mean_rms, rms_std, coverage], dim=-1).detach()
+            scalars = torch.stack([mean_rms, rms_std, coverage], dim=-1).detach()
+        return scalars, pooled
 
+    def _base_features(
+        self,
+        h: torch.Tensor,
+        valid_mask: torch.Tensor,
+        demo_h: Optional[torch.Tensor] = None,
+        demo_mask: Optional[torch.Tensor] = None,
+    ):
+        """Build question features plus optional detached demo-context features.
+
+        Demonstrations remain shielded from steering.  Their summary only lets
+        the router condition its route budget on the presence and character
+        of few-shot context.
+        """
+        scalars, pooled = self._summary_features(h, valid_mask)
+        if self.use_demo_features:
+            if demo_h is None or demo_mask is None:
+                demo_scalars = torch.zeros_like(scalars)
+            else:
+                if demo_h.shape[:2] != demo_mask.shape:
+                    raise ValueError("demo_h and demo_mask must align on (B, T)")
+                demo_scalars, _ = self._summary_features(demo_h, demo_mask)
+            scalars = torch.cat([scalars, demo_scalars], dim=-1)
+
+        self._last_scalars = scalars
         self._last_pooled = pooled.detach()
         per_candidate_semantic = self._semantic_from_pooled(pooled)
         return self._last_scalars, per_candidate_semantic
@@ -202,8 +231,15 @@ class JointLayerRouter(nn.Module):
         values = matrix.masked_select(~eye)
         return values.square().mean() if values.numel() else matrix.new_zeros(())
 
-    def forward(self, h: torch.Tensor, valid_mask: torch.Tensor, return_synergy: bool = False):
-        scalars, per_candidate_semantic = self._base_features(h, valid_mask)
+    def forward(
+        self,
+        h: torch.Tensor,
+        valid_mask: torch.Tensor,
+        return_synergy: bool = False,
+        demo_h: Optional[torch.Tensor] = None,
+        demo_mask: Optional[torch.Tensor] = None,
+    ):
+        scalars, per_candidate_semantic = self._base_features(h, valid_mask, demo_h=demo_h, demo_mask=demo_mask)
         return self._score_from_base(scalars, per_candidate_semantic, return_synergy=return_synergy)
 
     def recompute_from_cache(self, return_synergy: bool = False):

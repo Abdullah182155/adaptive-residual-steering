@@ -35,6 +35,7 @@ class Phi2WithRSC(nn.Module):
             layer_dropout=getattr(cfg, "router_layer_dropout", 0.0),  # BUG-C2 fix: fallback 0.15→0.0 (matches config.py; avoids train/eval mismatch)
             difficulty_aware=getattr(cfg, "router_difficulty_aware", True),
             synergy_limit=getattr(cfg, "router_synergy_limit", 0.75),
+            use_demo_features=getattr(cfg, "router_demo_features", False),
         ).to(self.device)
 
         self._hooks = []
@@ -426,6 +427,8 @@ class Phi2WithRSC(nn.Module):
         # K=1..Kmax head so older checkpoints can still be inspected.
         if k_logits.shape[-1] > self.cfg.max_active_layers:
             legal = torch.arange(k_logits.shape[-1], device=k_logits.device) <= max_k
+            if not bool(getattr(self.cfg, "router_k0_enabled", True)):
+                legal[0] = False
         else:
             legal = torch.arange(1, k_logits.shape[-1] + 1, device=k_logits.device) <= max_k
         return k_logits.masked_fill(~legal.unsqueeze(0), -1.0e4)
@@ -524,7 +527,14 @@ class Phi2WithRSC(nn.Module):
             raise RuntimeError("RSC router state was not initialised by the model forward pre-hook")
 
         router_mask = self._router_mask_for(h, mask)
-        u, k_logits = self.router(h, router_mask)
+        demo_mask = None
+        if bool(getattr(self.cfg, "router_demo_features", False)):
+            shield = self._prompt_shield_mask_active
+            if shield is not None and shield.ndim == 2 and shield.shape[0] == h.shape[0] and shield.shape[1] >= h.shape[1]:
+                demo_mask = mask & shield[:, -h.shape[1]:].to(device=h.device, dtype=torch.bool)
+            else:
+                demo_mask = torch.zeros_like(mask, dtype=torch.bool)
+        u, k_logits = self.router(h, router_mask, demo_h=h if demo_mask is not None else None, demo_mask=demo_mask)
         learned_logits = self.mask_routing_logits(u)
         learned_k_logits = self.mask_routing_k_logits(k_logits)
         # A prescribed audit route may intentionally inspect any catalog

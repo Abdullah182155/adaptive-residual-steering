@@ -1739,16 +1739,23 @@ def select_phase1b_candidate_layers(
             candidate_rows.append({"layer": layer, "gate_scale": best.get("gate_scale", 1.0), "safe": True})
             seen.add(layer)
 
-    limit = int(getattr(cfg, "phase1b_candidate_layers", 4))
+    limit = int(getattr(cfg, "phase1b_candidate_layers", 6))
+    per_band = max(1, int(getattr(cfg, "phase1b_candidates_per_band", 1)))
     chosen: List[int] = []
     scales: Dict[int, float] = {}
     covered_bands = []
     for band in ("early", "middle", "late"):
-        row = next((item for item in candidate_rows if _phase1_depth_band(int(item["layer"]), model.target_layers) == band), None)
-        if row is not None and len(chosen) < limit:
+        band_rows = [
+            item for item in candidate_rows
+            if _phase1_depth_band(int(item["layer"]), model.target_layers) == band
+        ][:per_band]
+        for row in band_rows:
+            if len(chosen) >= limit:
+                break
             layer = int(row["layer"])
             chosen.append(layer)
             scales[layer] = float(row.get("gate_scale", 1.0))
+        if band_rows:
             covered_bands.append(band)
     for row in candidate_rows:
         if len(chosen) >= limit:
@@ -2015,10 +2022,16 @@ def train_router_bootstrap(model, train_data, eval_data, cfg: RSCConfig, device:
             warmup_epochs = max(1, int(getattr(cfg, "router_tariff_warmup_epochs", 1)))
             epoch_progress = float(epoch) + float(start) / max(1, len(subset_idx))
             tariff_scale = min(1.0, epoch_progress / float(warmup_epochs))
+            temperature_final = float(getattr(cfg, "router_k_preference_temperature_final", cfg.router_k_preference_temperature))
+            temperature_start = float(getattr(cfg, "router_k_preference_temperature", 0.10))
+            anneal_epochs = int(getattr(cfg, "router_k_preference_anneal_epochs", 0))
+            anneal_progress = min(1.0, epoch_progress / max(1, anneal_epochs)) if anneal_epochs > 0 else 0.0
+            preference_temperature = temperature_start + (temperature_final - temperature_start) * anneal_progress
             try:
                 loss, rloo_diag = compute_router_rloo_loss(
                     model, ids, mask, lbls, cfg, prompt_mask=prompt_mask,
                     shield_mask=shield, calc_mask=calc_mask, tariff_scale=tariff_scale,
+                    k_preference_temperature=preference_temperature,
                 )
             except FloatingPointError as exc:
                 compatibility_telemetry["nonfinite_loss_steps"] += 1

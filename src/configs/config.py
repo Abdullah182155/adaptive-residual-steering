@@ -327,6 +327,8 @@ class RSCConfig:
     # and allowed a global K=3 bias to survive at argmax deployment.
     lambda_router_k_preference: float = 0.25
     router_k_preference_temperature: float = 0.10
+    router_k_preference_temperature_final: float = 0.15
+    router_k_preference_anneal_epochs: int = 0
     # Retained in checkpoint-visible configuration for compatibility.  Engine
     # v2.2 uses symmetric K-value distillation, so the neutral value is 0.0.
     router_k0_margin: float = 0.0
@@ -334,6 +336,10 @@ class RSCConfig:
     # not mask utilities only during training: that produces a policy which
     # differs from deterministic deployment and can fake diversity.
     router_layer_dropout: float = 0.0
+    router_k0_enabled: bool = True
+    # Preserve checkpoint topology by keeping augmented few-shot features
+    # opt-in; Engine v4's committed profile enables them.
+    router_demo_features: bool = False
     router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
     router_eval_mode: str = "argmax"  # deterministic: argmax; stochastic sampling is training-only by default
 
@@ -362,7 +368,8 @@ class RSCConfig:
     # a balanced pool of safe K=1/K=2 routes before router bootstrap.  The
     # unified adaptive stage then replaces the former 2B->2C->2D sequence.
     phase1b_coadapt_epochs: int = 1
-    phase1b_candidate_layers: int = 4
+    phase1b_candidate_layers: int = 6
+    phase1b_candidates_per_band: int = 2
     # Require a scientifically meaningful co-adaptation pool before routing.
     # Two physical bands are sufficient when they establish a long-range pair;
     # requiring all three bands made valid early+late pools impossible.
