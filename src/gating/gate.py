@@ -25,6 +25,29 @@ def masked_route_allocation(
     # route, so represent it as all zeros.
     allocation = torch.where(selected.any(dim=-1, keepdim=True), allocation, torch.zeros_like(allocation))
     return allocation.to(dtype=layer_logits.dtype)
+
+
+def token_competitive_allocation(
+    gate_logits: torch.Tensor,
+    selected: torch.Tensor,
+    temperature: float = 0.8,
+) -> torch.Tensor:
+    """Allocate token-level gate mass over selected layers plus a null action.
+
+    ``selected`` is sequence-level ``(B, L)`` while logits are ``(B, T, L)``.
+    The returned tensor excludes the null column, hence every token has total
+    allocated layer mass in ``[0, 1]``.  A K=0 route is represented exactly by
+    all zero allocation rather than an undefined all-masked softmax.
+    """
+    if gate_logits.ndim != 3 or selected.ndim != 2 or gate_logits.shape[0] != selected.shape[0] or gate_logits.shape[2] != selected.shape[1]:
+        raise ValueError("gate_logits must be (B, T, L) and selected must be (B, L)")
+    temp = max(float(temperature), 1e-4)
+    mask = selected.bool().unsqueeze(1).expand_as(gate_logits)
+    routed = gate_logits.float().masked_fill(~mask, float("-inf"))
+    # A learned zero-logit null option permits abstention at individual tokens.
+    null = torch.zeros((*gate_logits.shape[:2], 1), device=gate_logits.device, dtype=routed.dtype)
+    probs = F.softmax(torch.cat([routed, null], dim=-1) / temp, dim=-1)[..., :-1]
+    return torch.where(mask, probs, torch.zeros_like(probs)).to(dtype=gate_logits.dtype)
 from src.configs.config import RSCConfig
 
 class RSCUsefulnessGate(nn.Module):
@@ -112,29 +135,8 @@ class RSCUsefulnessGate(nn.Module):
                 stats["sequence_count"] += 1
                 stats["sequence_std_sum"] += float(row_values.std(unbiased=False).item())
 
-    def forward(self, h: torch.Tensor, delta: torch.Tensor, global_context: torch.Tensor = None) -> torch.Tensor:
-        if self._freeze_gate:
-            val = torch.full(
-                (h.size(0), h.size(1), 1),
-                self._freeze_gate_value,
-                dtype=h.dtype,
-                device=h.device,
-            )
-            self.last_alpha = val.detach()
-            self._alpha_for_aux = val
-            return val
-
-        if self.gating_mode == "constant":
-            val = torch.full(
-                (h.size(0), h.size(1), 1),
-                self.gate_constant_value,
-                dtype=h.dtype,
-                device=h.device,
-            )
-            self.last_alpha = val.detach()
-            self._alpha_for_aux = val
-            return val
-
+    def gate_logits(self, h: torch.Tensor, delta: torch.Tensor, global_context: torch.Tensor = None, *, update_cache: bool = True) -> torch.Tensor:
+        """Compute unclamped gate logits; preview mode leaves decode state intact."""
         h_fp = h.detach().float()
         d_det = delta.detach().float()  # No gradient from gate into SteerNet
 
@@ -158,7 +160,8 @@ class RSCUsefulnessGate(nn.Module):
             # Cache *pre-convolution* features.  Caching the residual output
             # would feed an already-convolved value back into the next decode
             # step, making token-by-token generation differ from prefill.
-            self._conv_cache = x[:, -2:, :].detach()
+            if update_cache:
+                self._conv_cache = x[:, -2:, :].detach()
             x = x + self.drop(self.act(x_conv))
         else:
             # Autoregressive single-step decode (T == 1): maintain temporal context via streaming cache
@@ -166,14 +169,32 @@ class RSCUsefulnessGate(nn.Module):
                 x_cat = torch.cat([self._conv_cache, x], dim=1)  # (B, 3, D)
                 conv_out = self.causal_conv(x_cat.transpose(1, 2))[:, :, :3].transpose(1, 2)
                 x = x + self.drop(self.act(conv_out[:, -1:, :]))
-                self._conv_cache = x_cat[:, 1:, :].detach()
+                if update_cache:
+                    self._conv_cache = x_cat[:, 1:, :].detach()
             else:
                 pre = x  # pre-conv features of this token
                 x_conv = self.causal_conv(pre.transpose(1, 2))[:, :, :1].transpose(1, 2)
                 x = pre + self.drop(self.act(x_conv))
-                self._conv_cache = torch.cat([torch.zeros_like(pre), pre], dim=1).detach()  # [pad, token0]
+                if update_cache:
+                    self._conv_cache = torch.cat([torch.zeros_like(pre), pre], dim=1).detach()  # [pad, token0]
+        return torch.clamp(self.fc2(x), min=-10.0, max=10.0)
 
-        gate_logit = torch.clamp(self.fc2(x), min=-10.0, max=10.0)
+    def forward(self, h: torch.Tensor, delta: torch.Tensor, global_context: torch.Tensor = None) -> torch.Tensor:
+        if self._freeze_gate:
+            val = torch.full(
+                (h.size(0), h.size(1), 1), self._freeze_gate_value, dtype=h.dtype, device=h.device,
+            )
+            self.last_alpha = val.detach()
+            self._alpha_for_aux = val
+            return val
+        if self.gating_mode == "constant":
+            val = torch.full(
+                (h.size(0), h.size(1), 1), self.gate_constant_value, dtype=h.dtype, device=h.device,
+            )
+            self.last_alpha = val.detach()
+            self._alpha_for_aux = val
+            return val
+        gate_logit = self.gate_logits(h, delta, global_context, update_cache=True)
         alpha = torch.sigmoid(gate_logit)  # (B, T, 1)
 
         self.last_alpha = alpha.detach()

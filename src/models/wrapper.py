@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from src.configs.config import RSCConfig
 from src.steering.steernet import RSCSteerNet
-from src.gating.gate import RSCUsefulnessGate, masked_route_allocation
+from src.gating.gate import RSCUsefulnessGate, masked_route_allocation, token_competitive_allocation
 from src.routing.router import JointLayerRouter
 from src.routing.rloo import sample_k, sample_subset_plackett_luce
 
@@ -47,6 +47,7 @@ class Phi2WithRSC(nn.Module):
         self._router_logits = None
         self._router_margins = None
         self._route_allocation = None
+        self._token_competitive_alpha = None
         self._last_inferred_k = None
         self._router_context_mask_pending = None
         self._router_context_mask_active = None
@@ -152,12 +153,25 @@ class Phi2WithRSC(nn.Module):
                         if wrapper._routing_override is None:
                             wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
                         delta = s(h_fp, active_k=wrapper._active_k_realized)
-                        alpha = g(h_fp, delta, global_context=wrapper.router._last_semantic_shared)
+                        if wrapper._token_competitive_alpha is not None:
+                            # Advance the causal gate cache using the native
+                            # layer state, then substitute the shared
+                            # competitive allocation for its amplitude.
+                            _ = g(h_fp, delta, global_context=wrapper.router._last_semantic_shared)
+                            alpha = wrapper._token_competitive_alpha[:, :, layer_pos:layer_pos + 1].to(dtype=h_fp.dtype)
+                            g.last_alpha = alpha.detach()
+                            g._alpha_for_aux = alpha
+                        else:
+                            alpha = g(h_fp, delta, global_context=wrapper.router._last_semantic_shared)
                         # A route has one shared intervention budget.  Gates
                         # retain token-level strength, while selected layers
                         # receive a masked-softmax allocation instead of each
                         # injecting a full residual on the same tokens.
-                        allocation = wrapper._route_allocation[:, layer_pos].to(alpha.dtype).view(-1, 1, 1)
+                        allocation = (
+                            torch.ones_like(alpha)
+                            if wrapper._token_competitive_alpha is not None
+                            else wrapper._route_allocation[:, layer_pos].to(alpha.dtype).view(-1, 1, 1)
+                        )
                         alpha = alpha * allocation
                         g._alpha_for_aux = alpha
                         g.last_alpha = alpha.detach()
@@ -260,6 +274,10 @@ class Phi2WithRSC(nn.Module):
             for sn in self.steer_nets.values():
                 sn.last_pre_cap_q = None
                 sn._last_valid_mask = None
+            for gate in self.gates.values():
+                gate.last_alpha = None
+                gate._alpha_for_aux = None
+                gate._valid_mask = None
 
             if is_cached_decode and self._cached_decode_routes is not None:
                 self._precomputed_routes = self._cached_decode_routes
@@ -269,6 +287,7 @@ class Phi2WithRSC(nn.Module):
                 self._router_margins = self._cached_decode_margins
                 self._active_k_realized = self._cached_decode_active_k
                 self._route_allocation = self._cached_decode_allocation
+                self._token_competitive_alpha = None
                 self._prompt_shield_mask_active = None
             else:
                 self._desired_k = None
@@ -278,6 +297,7 @@ class Phi2WithRSC(nn.Module):
                 self._router_margins = None
                 self._active_k_realized = None
                 self._route_allocation = None
+                self._token_competitive_alpha = None
                 if not is_cached_decode:
                     self._cached_decode_routes = None
                     self._cached_decode_k = None
@@ -506,6 +526,35 @@ class Phi2WithRSC(nn.Module):
             )
         return torch.where(aligned.any(dim=1, keepdim=True), aligned, fallback_mask)
 
+    def _prepare_token_competitive_allocation(self, h: torch.Tensor, selected_matrix: torch.Tensor) -> None:
+        """Prepare per-token selected-layer allocation without mutating gate caches."""
+        self._token_competitive_alpha = None
+        use_competitive = (
+            bool(getattr(self.cfg, "token_competitive_allocation", False))
+            and self._routing_override is None
+            and not any(gate._freeze_gate or gate.gating_mode == "constant" for gate in self.gates.values())
+        )
+        if not use_competitive:
+            return
+        global_ctx = getattr(self.router, "_last_semantic_shared", None)
+        logits = []
+        for layer in self.target_layers:
+            gate = self.gates[str(layer)]
+            with torch.no_grad():
+                preview_delta = self.steer_nets[str(layer)](h)
+            logits.append(gate.gate_logits(h, preview_delta, global_ctx, update_cache=False).squeeze(-1))
+        gate_logits = torch.stack(logits, dim=-1)
+        beta = token_competitive_allocation(
+            gate_logits, selected_matrix,
+            temperature=float(getattr(self.cfg, "gate_allocation_temperature", 0.80)),
+        )
+        masked_logits = gate_logits.masked_fill(~selected_matrix.unsqueeze(1), float("-inf"))
+        total_strength = torch.sigmoid(masked_logits.max(dim=-1, keepdim=True).values)
+        total_strength = torch.where(
+            selected_matrix.any(dim=-1, keepdim=True).unsqueeze(1), total_strength, torch.zeros_like(total_strength)
+        )
+        self._token_competitive_alpha = beta * total_strength
+
     def _finalize_selection(self, selected_matrix: torch.Tensor, margins: torch.Tensor) -> torch.Tensor:
         K = self.cfg.max_active_layers
         counts = selected_matrix.sum(dim=-1)
@@ -522,6 +571,7 @@ class Phi2WithRSC(nn.Module):
             # fixed-route controls must not dilute their denominator.
             if self._routing_override is None:
                 self.router.seen_forwards += h.shape[0]
+            self._prepare_token_competitive_allocation(h, self._precomputed_routes)
             return
         if self._selected_counts is None or self._selected_counts.shape[0] != h.shape[0]:
             raise RuntimeError("RSC router state was not initialised by the model forward pre-hook")
@@ -681,6 +731,8 @@ class Phi2WithRSC(nn.Module):
             )
         else:
             self._route_allocation = selected_matrix.to(dtype=self._router_logits.dtype)
+
+        self._prepare_token_competitive_allocation(h, selected_matrix)
 
         if h.shape[1] > 1:
             self._cached_decode_routes = selected_matrix.detach()

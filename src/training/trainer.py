@@ -23,6 +23,7 @@ from src.training.losses import (
     compute_antisat_gate,
     compute_gate_diversity_loss,
     compute_gate_overlap_loss,
+    compute_route_activity_floor_loss,
     compute_pg_advantage_lite,
     compute_pg_gate_loss_from_live_alphas,
     log_gpu_memory,
@@ -2439,6 +2440,9 @@ def run_staged_phase(
                 contrast_loss = compute_contrastive_gate_loss(model, ids, lbls, tokenizer, device)
                 diversity_loss = compute_gate_diversity_loss(model, floor=cfg.gate_diversity_floor)
                 overlap_loss = compute_gate_overlap_loss(model)
+                activity_floor_loss = compute_route_activity_floor_loss(
+                    model, min_fraction=float(getattr(cfg, "route_activity_min_fraction", 0.05))
+                )
                 epoch_gate_l1 += l1_loss.item()
                 epoch_gate_div += diversity_loss.item()
                 epoch_gate_antisat += asat_loss.item()
@@ -2451,6 +2455,7 @@ def run_staged_phase(
                     + cfg.lambda_gate_usefulness * contrast_loss
                     + cfg.lambda_gate_diversity * diversity_loss
                     + float(getattr(cfg, "lambda_gate_overlap", 0.0)) * overlap_loss
+                    + float(getattr(cfg, "lambda_route_activity_floor", 0.0)) * activity_floor_loss
                 ) / cfg.grad_accum
                 if torch.isfinite(aux_loss) and aux_loss.requires_grad:
                     micro_loss = aux_loss if micro_loss is None else (micro_loss + aux_loss)

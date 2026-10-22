@@ -179,11 +179,15 @@ class RSCConfig:
     # masked-softmax allocation shares the route-level intervention budget.
     factorized_gate_allocation: bool = True
     gate_allocation_temperature: float = 0.70
+    gate_allocation_temperature_final: float = 0.50
+    token_competitive_allocation: bool = False
     lambda_gate_overlap: float = 0.10
     # Engine v4: a nominal route member is effective only when it owns a
     # material fraction of realised gate-scaled residual energy.
     effective_k_min_energy_fraction: float = 0.05
     router_min_eval_route_tuple_entropy: float = 0.0
+    lambda_route_activity_floor: float = 0.0
+    route_activity_min_fraction: float = 0.05
 
     # Gate loss regularisation
     # Do not use one global ON/OFF reward to update every token gate.  That
@@ -329,6 +333,9 @@ class RSCConfig:
     router_k_preference_temperature: float = 0.10
     router_k_preference_temperature_final: float = 0.15
     router_k_preference_anneal_epochs: int = 0
+    generation_anchor_interval: int = 200
+    generation_anchor_n_prompts: int = 8
+    generation_anchor_weight: float = 0.0
     # Retained in checkpoint-visible configuration for compatibility.  Engine
     # v2.2 uses symmetric K-value distillation, so the neutral value is 0.0.
     router_k0_margin: float = 0.0
@@ -340,6 +347,7 @@ class RSCConfig:
     # Preserve checkpoint topology by keeping augmented few-shot features
     # opt-in; Engine v4's committed profile enables them.
     router_demo_features: bool = False
+    require_adaptive_beats_fixed: bool = False
     router_difficulty_aware: bool = True  # Sequence length & dispersion difficulty features for candidate scoring
     router_eval_mode: str = "argmax"  # deterministic: argmax; stochastic sampling is training-only by default
 
@@ -582,3 +590,33 @@ def assert_engine_v32_kaggle_profile(cfg: RSCConfig, strict: bool = False) -> st
         default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+ENGINE_V40_KAGGLE_PROFILE_NAME = "Engine v4.0 Kaggle T4 Decision-Run"
+ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
+    **ENGINE_V32_KAGGLE_PROFILE,
+    "max_active_layers": 2,
+    "phase1b_candidate_layers": 6,
+    "phase1b_candidates_per_band": 2,
+    "router_layer_dropout": 0.15,
+    "router_k_preference_temperature": 0.40,
+    "router_k_preference_temperature_final": 0.15,
+    "router_k_preference_anneal_epochs": 2,
+    "router_k0_enabled": True,
+    "router_demo_features": True,
+    "token_competitive_allocation": True,
+    "gate_allocation_temperature": 0.80,
+    "gate_allocation_temperature_final": 0.50,
+    "effective_k_min_energy_fraction": 0.05,
+    "lambda_route_activity_floor": 0.10,
+    "route_activity_min_fraction": 0.05,
+    "require_adaptive_beats_fixed": True,
+}
+
+
+def make_engine_v40_kaggle_config() -> RSCConfig:
+    """Return the committed Engine v4.0 T4 decision-run profile."""
+    cfg = RSCConfig()
+    for field, value in ENGINE_V40_KAGGLE_PROFILE.items():
+        setattr(cfg, field, value)
+    return cfg

@@ -273,6 +273,29 @@ def compute_gate_overlap_loss(model) -> torch.Tensor:
         return torch.zeros((), device=device)
     return pair_mass[valid_pairs].mean()
 
+
+def compute_route_activity_floor_loss(model, min_fraction: float = 0.05) -> torch.Tensor:
+    """Penalise selected layers that receive a negligible share of gate mass.
+
+    This is a differentiable micro-batch surrogate for effective-K health: it
+    does not force equal gates, but prevents a nominal K>=2 route from hiding
+    a fully starved member behind a selected-layer telemetry count.
+    """
+    device = next(iter(p for g in model.gates.values() for p in g.parameters()), torch.tensor(0.0)).device
+    masses = []
+    for gate in model.gates.values():
+        alpha = getattr(gate, "_alpha_for_aux", None)
+        valid = getattr(gate, "_valid_mask", None)
+        if alpha is None or valid is None or valid.shape != alpha.shape[:2]:
+            continue
+        masses.append((alpha.float().squeeze(-1) * valid.float()).sum())
+    if len(masses) < 2:
+        return torch.zeros((), device=device)
+    mass = torch.stack(masses)
+    total = mass.sum().clamp_min(1e-8)
+    fractions = mass / total
+    return F.relu(float(min_fraction) - fractions).square().mean()
+
 def compute_antisat_gate(model, threshold: float = 0.92) -> torch.Tensor:
     """Penalise gate values above threshold to prevent saturation."""
     device = next(iter(p for g in model.gates.values() for p in g.parameters()), torch.tensor(0.0)).device

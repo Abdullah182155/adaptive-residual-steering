@@ -30,6 +30,8 @@ CHECKPOINT_CONFIG_FIELDS = frozenset({
     "router_synergy_limit", "router_eval_mode", "prompt_shielding",
     "effective_k_min_energy_fraction", "router_min_eval_route_tuple_entropy",
     "deployment_eval_shots",
+    "router_k0_enabled", "router_demo_features", "token_competitive_allocation",
+    "gate_allocation_temperature", "gate_allocation_temperature_final",
 })
 
 

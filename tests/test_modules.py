@@ -11,9 +11,10 @@ from src.configs.config import (
     RSCConfig,
     assert_engine_v32_kaggle_profile,
     make_engine_v32_kaggle_config,
+    make_engine_v40_kaggle_config,
 )
 from src.steering.steernet import RSCSteerNet, post_cap_ratio_from_pre_cap_q
-from src.gating.gate import RSCUsefulnessGate
+from src.gating.gate import RSCUsefulnessGate, token_competitive_allocation
 from src.models.wrapper import Phi2WithRSC
 from src.routing.router import JointLayerRouter
 from src.routing.rloo import (
@@ -24,6 +25,7 @@ from src.routing.rloo import (
     counterfactual_k_preference_loss,
     capped_route_tariff,
     per_example_answer_nll,
+    PairEvidenceTable,
 )
 from src.training import (
     train_rsc,
@@ -45,7 +47,8 @@ from src.training.trainer import (
     phase1_steernet_acceptance,
     save_phase2_training_state,
 )
-from src.training.losses import LRReducer, log_gpu_memory
+from src.training.losses import LRReducer, log_gpu_memory, compute_route_activity_floor_loss
+from src.evaluation.deployment import adaptive_vs_fixed_promotion
 
 class TestARSModules(unittest.TestCase):
     def setUp(self):
@@ -2308,6 +2311,103 @@ class TestEngineV33MemoryRecovery(unittest.TestCase):
             )
             with self.assertRaisesRegex(FileNotFoundError, "Refusing silent full retraining"):
                 train_rsc(None, None, [], [], cfg, torch.device("cpu"))
+
+
+class TestEngineV4(unittest.TestCase):
+    """CPU-only contracts for Engine v4 routing, allocation, and evidence."""
+
+    def test_routing_manifest_round_trip(self):
+        model = Phi2WithRSC.__new__(Phi2WithRSC)
+        model.target_layers = [11, 17, 20]
+        model._eligible_routing_layers = {11, 20}
+        model.deployment_disabled = True
+        model.deployment_modes_by_shot = {"0": "ars", "4": "baseline"}
+        for name in (
+            "_cached_decode_routes", "_cached_decode_k", "_cached_decode_probs", "_cached_decode_logits",
+            "_cached_decode_margins", "_cached_decode_active_k", "_cached_decode_allocation",
+        ):
+            setattr(model, name, None)
+        manifest = model.get_routing_manifest()
+        restored = Phi2WithRSC.__new__(Phi2WithRSC)
+        restored.target_layers = [11, 17, 20]
+        restored._eligible_routing_layers = None
+        restored.deployment_disabled = False
+        restored.deployment_modes_by_shot = {}
+        for name in (
+            "_cached_decode_routes", "_cached_decode_k", "_cached_decode_probs", "_cached_decode_logits",
+            "_cached_decode_margins", "_cached_decode_active_k", "_cached_decode_allocation",
+        ):
+            setattr(restored, name, None)
+        restored.load_routing_manifest(manifest)
+        self.assertEqual(restored._eligible_routing_layers, {11, 20})
+        self.assertTrue(restored.deployment_disabled)
+        self.assertEqual(restored.deployment_modes_by_shot["4"], "baseline")
+
+    def test_effective_k_rejects_silenced_nominal_triad(self):
+        model = Phi2WithRSC.__new__(Phi2WithRSC)
+        model.target_layers = [11, 17, 20]
+        model._steering_telemetry = {
+            11: {"count": 10, "energy_sum": 8.0},
+            17: {"count": 10, "energy_sum": 0.3},
+            20: {"count": 10, "energy_sum": 0.01},
+        }
+        report = model.effective_k_diagnostics(0.05)
+        self.assertEqual(report["effective_layers"], [11])
+        self.assertEqual(report["effective_layer_count"], 1)
+
+    def test_route_tuple_entropy_detects_static_triad(self):
+        model = Phi2WithRSC.__new__(Phi2WithRSC)
+        model._route_tuple_counts = {(11, 17, 20): 100}
+        self.assertEqual(model.route_tuple_entropy(), 0.0)
+        model._route_tuple_counts[(11, 20)] = 100
+        self.assertGreater(model.route_tuple_entropy(), 0.9)
+
+    def test_token_competitive_allocation_has_null_option(self):
+        logits = torch.tensor([[[2.0, 1.0, 9.0], [0.0, 0.0, 0.0]]])
+        selected = torch.tensor([[True, True, False]])
+        allocation = token_competitive_allocation(logits, selected, temperature=0.8)
+        self.assertTrue(torch.all(allocation[..., 2] == 0))
+        self.assertTrue(torch.all(allocation.sum(dim=-1) <= 1.0 + 1e-6))
+        self.assertGreater(allocation[0, 0, 0], allocation[0, 0, 1])
+
+    def test_route_activity_floor_penalizes_starved_selected_layer(self):
+        class Gate(nn.Module):
+            def __init__(self, alpha):
+                super().__init__()
+                self.weight = nn.Parameter(torch.ones(()))
+                self._alpha_for_aux = alpha
+                self._valid_mask = torch.ones(alpha.shape[:2], dtype=torch.bool)
+        class Model:
+            def __init__(self):
+                self.gates = {"11": Gate(torch.ones(1, 3, 1)), "20": Gate(torch.zeros(1, 3, 1))}
+        self.assertGreater(compute_route_activity_floor_loss(Model(), 0.05).item(), 0.0)
+
+    def test_pair_evidence_shrinkage(self):
+        table = PairEvidenceTable(shrinkage=8)
+        table.update(11, 20, 0.8)
+        self.assertAlmostEqual(table.estimate(20, 11), 0.8 / 9.0, places=6)
+        self.assertEqual(table.as_dict()["L11+L20"]["observations"], 1)
+
+    def test_k_preference_tiny_temperature_and_k0_are_finite(self):
+        loss = counterfactual_k_preference_loss(
+            torch.tensor([[0.0, -4.0, -5.0]], requires_grad=True),
+            torch.tensor([[1, 2]]), torch.tensor([1.0]), torch.tensor([[0.9, 0.8]]),
+            temperature=1e-6,
+        )
+        self.assertTrue(torch.isfinite(loss))
+        loss.backward()
+
+    def test_v40_profile_enables_decision_contract(self):
+        cfg = make_engine_v40_kaggle_config()
+        self.assertEqual(cfg.max_active_layers, 2)
+        self.assertTrue(cfg.token_competitive_allocation)
+        self.assertTrue(cfg.require_adaptive_beats_fixed)
+
+    def test_adaptive_promotion_requires_positive_ci_over_fixed(self):
+        fixed = [1] * 40
+        adaptive = [1] * 40
+        decision = adaptive_vs_fixed_promotion(fixed, adaptive, require_adaptive_beats_fixed=True, n_boot=100)
+        self.assertEqual(decision["mode"], "fixed_steernet")
 
 
 

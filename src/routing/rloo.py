@@ -2,6 +2,50 @@ import torch
 import torch.nn.functional as F
 from typing import Tuple, Dict, Any, Optional
 
+
+class PairEvidenceTable:
+    """Count-weighted empirical interaction evidence for candidate layer pairs."""
+
+    def __init__(self, shrinkage: float = 8.0):
+        self.shrinkage = max(0.0, float(shrinkage))
+        self._rows: Dict[Tuple[int, int], Dict[str, float]] = {}
+
+    def update(self, first: int, second: int, interaction: float) -> None:
+        key = tuple(sorted((int(first), int(second))))
+        if key[0] == key[1]:
+            return
+        row = self._rows.setdefault(key, {"count": 0.0, "sum": 0.0})
+        row["count"] += 1.0
+        row["sum"] += float(interaction)
+
+    def estimate(self, first: int, second: int) -> float:
+        row = self._rows.get(tuple(sorted((int(first), int(second)))))
+        if not row or row["count"] <= 0:
+            return 0.0
+        mean = row["sum"] / row["count"]
+        return float((row["count"] / (row["count"] + self.shrinkage)) * mean)
+
+    def as_dict(self) -> Dict[str, Dict[str, float]]:
+        return {
+            f"L{first}+L{second}": {
+                "observations": int(row["count"]),
+                "mean_interaction": row["sum"] / max(1.0, row["count"]),
+                "shrunken_interaction": self.estimate(first, second),
+            }
+            for (first, second), row in sorted(self._rows.items())
+        }
+
+
+def generation_anchor_reward(*args, **kwargs) -> torch.Tensor:
+    """Optional generated-answer reward hook; disabled unless a runner supplies it.
+
+    RLOO remains teacher-forced by default so its memory profile is unchanged.
+    The training loop may later inject a detached exact-answer anchor estimate
+    at a sparse interval without coupling autoregressive graphs to bootstrap.
+    """
+    device = kwargs.get("device", torch.device("cpu"))
+    return torch.zeros((), device=device)
+
 def per_example_answer_nll(
     logits: torch.Tensor,
     labels: torch.Tensor,
@@ -495,6 +539,13 @@ def compute_router_rloo_loss(
             # collapsed into a scalar loss.  This makes positive synergy
             # auditable against both its raw reward and the K=2 tariff.
             for b in torch.nonzero(valid_pair, as_tuple=False).flatten().tolist():
+                first_layer = int(model.target_layers[int(first[b].item())])
+                second_layer = int(model.target_layers[int(second[b].item())])
+                evidence = getattr(model.router, "pair_evidence", None)
+                if evidence is None:
+                    evidence = PairEvidenceTable()
+                    model.router.pair_evidence = evidence
+                evidence.update(first_layer, second_layer, float(interaction[b].item()))
                 key = f"L{int(model.target_layers[int(first[b].item())])}+L{int(model.target_layers[int(second[b].item())])}"
                 row = pair_utility.setdefault(key, {"observations": 0, "raw_reward_sum": 0.0, "net_reward_sum": 0.0, "interaction_sum": 0.0})
                 row["observations"] += 1
@@ -520,6 +571,8 @@ def compute_router_rloo_loss(
         row["raw_reward"] = row.pop("raw_reward_sum") / n_obs
         row["cost_adjusted_reward"] = row.pop("net_reward_sum") / n_obs
         row["interaction"] = row.pop("interaction_sum") / n_obs
+    if hasattr(model.router, "pair_evidence"):
+        pair_utility["evidence_table"] = model.router.pair_evidence.as_dict()
 
     h_k, h_subset = policy_entropy_bonus(u_policy, k_logits_policy, K_max)
     diversity_temp = float(getattr(cfg, "router_diversity_temperature", 1.0))

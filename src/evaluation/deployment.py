@@ -160,6 +160,8 @@ def finalize_deployment_by_shot(
     checkpoint_path: str,
     n_boot: int = 4000,
     min_n: int = 200,
+    fixed_outcomes_by_shot: Optional[Dict[int | str, Sequence[int | float]]] = None,
+    require_adaptive_beats_fixed: bool = False,
 ) -> Dict[str, str]:
     """Make independent paired deployment decisions for each shot condition.
 
@@ -182,8 +184,17 @@ def finalize_deployment_by_shot(
         else:
             delta, lo, hi = paired_delta_ci(base, candidate, n_boot=n_boot)
             mode = "ars" if lo > 0.0 else "baseline"
+        row: Dict[str, float | int | str] = {"mode": mode, "n": n, "delta": delta, "ci_low": lo, "ci_high": hi}
+        if require_adaptive_beats_fixed and fixed_outcomes_by_shot is not None and shot in fixed_outcomes_by_shot:
+            promotion = adaptive_vs_fixed_promotion(
+                fixed_outcomes_by_shot[shot], candidate, require_adaptive_beats_fixed=True, n_boot=n_boot,
+            )
+            row.update({f"adaptive_vs_fixed_{name}": value for name, value in promotion.items()})
+            if mode == "ars" and promotion["mode"] != "ars":
+                mode = "fixed_steernet"
+                row["mode"] = mode
         decisions[key] = mode
-        evidence[key] = {"mode": mode, "n": n, "delta": delta, "ci_low": lo, "ci_high": hi}
+        evidence[key] = row
 
     manifest_path = checkpoint_path + ".manifest.json"
     if os.path.exists(manifest_path):
@@ -200,6 +211,24 @@ def finalize_deployment_by_shot(
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
     return decisions
+
+
+def adaptive_vs_fixed_promotion(
+    fixed_flags: Sequence[int | float],
+    adaptive_flags: Sequence[int | float],
+    *,
+    require_adaptive_beats_fixed: bool = False,
+    n_boot: int = 4000,
+) -> Dict[str, float | str]:
+    """Return the evidence-backed winner between adaptive and fixed steering.
+
+    A positive point estimate is insufficient for an adaptive deployment
+    claim: when requested, the paired lower confidence bound against the
+    already-certified fixed controller must be strictly positive.
+    """
+    delta, lower, upper = paired_delta_ci(fixed_flags, adaptive_flags, n_boot=n_boot)
+    mode = "ars" if (not require_adaptive_beats_fixed or lower > 0.0) else "fixed_steernet"
+    return {"mode": mode, "delta": delta, "ci_low": lower, "ci_high": upper}
 
 
 def alpha_jitter_floor(
