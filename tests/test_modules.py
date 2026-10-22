@@ -2407,6 +2407,16 @@ class TestEngineV4(unittest.TestCase):
         self.assertTrue(cfg.require_adaptive_beats_fixed)
         self.assertGreater(cfg.router_min_eval_route_tuple_entropy, 0.0)
 
+    def test_v40_profile_requires_declared_run_override(self):
+        from src.configs.config import assert_engine_v40_kaggle_profile
+        cfg = make_engine_v40_kaggle_config()
+        cfg.n_samples = 4000
+        with self.assertRaisesRegex(RuntimeError, "undeclared overrides"):
+            assert_engine_v40_kaggle_profile(cfg, strict=True)
+        self.assertIsInstance(
+            assert_engine_v40_kaggle_profile(cfg, strict=True, allowed_overrides=("n_samples",)), str,
+        )
+
     def test_adaptive_promotion_requires_positive_ci_over_fixed(self):
         fixed = [1] * 40
         adaptive = [1] * 40

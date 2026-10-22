@@ -633,18 +633,37 @@ def make_engine_v40_kaggle_config() -> RSCConfig:
     return cfg
 
 
-def assert_engine_v40_kaggle_profile(cfg: RSCConfig, strict: bool = False) -> str:
-    """Fingerprint the Engine v4 decision contract and report configuration drift."""
+def assert_engine_v40_kaggle_profile(
+    cfg: RSCConfig,
+    strict: bool = False,
+    allowed_overrides: Tuple[str, ...] = (),
+) -> str:
+    """Fingerprint the Engine v4 contract while allowing declared run-scope edits.
+
+    Kaggle decision runs sometimes intentionally vary capacity or evaluation
+    coverage.  Such changes must be named in the notebook, not silently
+    accepted.  Declared fields remain part of the returned fingerprint; every
+    other drift remains fail-closed when ``strict`` is enabled.
+    """
+    allowed = {str(field) for field in allowed_overrides}
+    unknown = allowed - set(ENGINE_V40_KAGGLE_PROFILE)
+    if unknown:
+        raise ValueError(f"Engine v4 override allowlist contains unknown fields: {sorted(unknown)}")
     drift = {
         field: {"expected": expected, "actual": getattr(cfg, field)}
         for field, expected in ENGINE_V40_KAGGLE_PROFILE.items()
         if getattr(cfg, field) != expected
     }
-    if drift:
-        msg = f"{ENGINE_V40_KAGGLE_PROFILE_NAME} custom overrides detected ({len(drift)} fields): {list(drift.keys())}"
+    blocked = {field: change for field, change in drift.items() if field not in allowed}
+    if blocked:
+        msg = f"{ENGINE_V40_KAGGLE_PROFILE_NAME} undeclared overrides detected ({len(blocked)} fields): {list(blocked.keys())}"
         if strict:
             raise RuntimeError(msg)
         print(f"ℹ️  [Profile Notice] {msg}")
+    if drift:
+        permitted = sorted(set(drift) & allowed)
+        if permitted:
+            print(f"ℹ️  [Profile Notice] declared run overrides: {permitted}")
     payload = json.dumps(
         {"name": ENGINE_V40_KAGGLE_PROFILE_NAME,
          "config": {field: getattr(cfg, field) for field in ENGINE_V40_KAGGLE_PROFILE}},
