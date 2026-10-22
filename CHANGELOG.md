@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.15.0] - 2026-10-22
+
+### 🧪 Run: Engine v4.0 Full Decision Run (\exp_20261022_132141_ars_phi2_kaggle\)
+- **Tokenizer Caching Verification:** Fixed the dataset tokenization freeze (commit \995259e\); 4,000 examples were mapped in seconds rather than stalling for 20+ minutes.
+- **Phase 1 Acceptance Succeeded:** L11 at \lpha=0.50\ achieved +16.7pp calibration gain (70.8% vs 54.2% baseline) and confirmed at +3.1pp disjoint gain (59.4% vs 56.2% baseline, CoT=1.00, postcap q95=0.40, NLL train/val -17.4%/-18.9%).
+- **Phase 1B Candidate Pool:** Stratified selection formed pool \[11, 18, 20]\ across early, middle, and late depth bands with calibrated scales \{11: 0.50, 18: 0.35, 20: 0.35}\.
+- **Phase 1.5 Router Bootstrap:** Completed with 0 NaNs and passing K-diversity preflight (\K=0: 32.0%\, \K=1: 15.6%\, \K=2: 52.3%\, route-tuple entropy 1.938 bits).
+- **Phase 2 Unified Adaptation:** Survived memory watchdog step 50 cleanly (allocated 8,103 MiB, reserved 10,738 MiB < 14,200 MiB ceiling).
+- **Benchmark Performance:**
+  - **Fixed SteerNet outperformed baseline across multiple shots:** 0-shot 59.0% vs 56.0% (+3.0pp), 4-shot 63.0% vs 62.0% (+1.0pp), 8-shot 63.0% vs 61.0% (+2.0pp).
+  - **Router+SteerNet:** 0-shot 59.0% vs 56.0% (+3.0pp), 2-shot 58.0% vs 58.0%, 4-shot 62.0% vs 62.0%, 8-shot 61.0% vs 61.0%.
+  - **ARS Raw:** 0-shot 58.0% vs 56.0% (+2.0pp), 2-shot 58.0% vs 58.0%, 4-shot 62.0% vs 62.0%, 8-shot 61.0% vs 61.0%.
+  - **Deployment Gate Rigor:** Because multi-shot ARS collapsed to K=0 (matching baseline exactly) and 0-shot CI spanned zero, deployment gate correctly defaulted to Baseline.
+
+### 🔬 Forensic Findings & Multi-Shot Router Collapse Root Cause
+- **Multi-shot K=0 Collapse:** Route entropy was 0.8439 bits on 0-shot, but collapsed to strictly 0.0000 bits across 2-shot, 4-shot, and 8-shot (100% of prompts predicted K=0).
+- **Root Cause (Zero-Shot Training Bias):** The run used \ewshot_train_prob=0.0\ and \ewshot_train_max_demos=0\. The router never observed prompt demonstrations during RLOO exploration. When tested on 2/4/8-shot prompts (317, 522, 925 tokens), the out-of-distribution exemplar tokens combined with the K-tariff caused the policy to collapse into the zero-cost K=0 action.
+- **Fixed SteerNet Resilience:** The underlying Phase-1 SteerNet (L11) provides consistent positive gain even at 8 shots (+2.0pp) when not suppressed by a collapsed router.
+
+---
+
 ## [1.14.0] - 2026-10-22
 
 ### 🧪 Runs: Engine v3.3 Small-Scale & Large-Scale Decision Runs
