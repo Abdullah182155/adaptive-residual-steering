@@ -14,9 +14,10 @@ class PairEvidenceTable:
         key = tuple(sorted((int(first), int(second))))
         if key[0] == key[1]:
             return
-        row = self._rows.setdefault(key, {"count": 0.0, "sum": 0.0})
+        row = self._rows.setdefault(key, {"count": 0.0, "sum": 0.0, "sum_sq": 0.0})
         row["count"] += 1.0
         row["sum"] += float(interaction)
+        row["sum_sq"] += float(interaction) ** 2
 
     def estimate(self, first: int, second: int) -> float:
         row = self._rows.get(tuple(sorted((int(first), int(second)))))
@@ -26,14 +27,18 @@ class PairEvidenceTable:
         return float((row["count"] / (row["count"] + self.shrinkage)) * mean)
 
     def as_dict(self) -> Dict[str, Dict[str, float]]:
-        return {
-            f"L{first}+L{second}": {
+        result = {}
+        for (first, second), row in sorted(self._rows.items()):
+            count = max(1.0, row["count"])
+            mean = row["sum"] / count
+            variance = max(0.0, row.get("sum_sq", 0.0) / count - mean ** 2)
+            result[f"L{first}+L{second}"] = {
                 "observations": int(row["count"]),
-                "mean_interaction": row["sum"] / max(1.0, row["count"]),
+                "mean_interaction": mean,
+                "standard_error": (variance / count) ** 0.5,
                 "shrunken_interaction": self.estimate(first, second),
             }
-            for (first, second), row in sorted(self._rows.items())
-        }
+        return result
 
 
 def generation_anchor_reward(*args, **kwargs) -> torch.Tensor:
@@ -554,7 +559,21 @@ def compute_router_rloo_loss(
                 row["interaction_sum"] += float(interaction[b].item())
             pair_syn = synergy[torch.arange(ids.shape[0], device=ids.device), first, second]
             target_scale = max(float(getattr(cfg, "router_synergy_target_scale", 0.10)), 1e-4)
-            interaction_target = torch.tanh(interaction / target_scale)
+            # An individual counterfactual is noisy.  Regress the neural
+            # synergy score to a count-shrunken empirical estimate rather
+            # than repeatedly chasing the latest sampled batch.
+            evidence_target = torch.tensor(
+                [
+                    model.router.pair_evidence.estimate(
+                        int(model.target_layers[int(first[b].item())]),
+                        int(model.target_layers[int(second[b].item())]),
+                    )
+                    for b in range(ids.shape[0])
+                ],
+                device=ids.device,
+                dtype=interaction.dtype,
+            )
+            interaction_target = torch.tanh(evidence_target / target_scale)
             if not (
                 torch.isfinite(pair_syn[valid_pair]).all()
                 and torch.isfinite(interaction_target[valid_pair]).all()

@@ -275,7 +275,7 @@ def compute_gate_overlap_loss(model) -> torch.Tensor:
 
 
 def compute_route_activity_floor_loss(model, min_fraction: float = 0.05) -> torch.Tensor:
-    """Penalise selected layers that receive a negligible share of gate mass.
+    """Penalise selected layers that receive negligible effective residual energy.
 
     This is a differentiable micro-batch surrogate for effective-K health: it
     does not force equal gates, but prevents a nominal K>=2 route from hiding
@@ -288,7 +288,12 @@ def compute_route_activity_floor_loss(model, min_fraction: float = 0.05) -> torc
         valid = getattr(gate, "_valid_mask", None)
         if alpha is None or valid is None or valid.shape != alpha.shape[:2]:
             continue
-        masses.append((alpha.float().squeeze(-1) * valid.float()).sum())
+        energy = getattr(gate, "_effective_energy_for_aux", None)
+        if energy is not None and energy.shape == alpha.shape[:2]:
+            masses.append((energy.float() * valid.float()).sum())
+        else:
+            # Compatibility with minimal unit-test doubles.
+            masses.append((alpha.float().squeeze(-1) * valid.float()).sum())
     if len(masses) < 2:
         return torch.zeros((), device=device)
     mass = torch.stack(masses)

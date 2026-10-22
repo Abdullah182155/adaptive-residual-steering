@@ -2320,6 +2320,7 @@ class TestEngineV4(unittest.TestCase):
         model = Phi2WithRSC.__new__(Phi2WithRSC)
         model.target_layers = [11, 17, 20]
         model._eligible_routing_layers = {11, 20}
+        model._certified_gate_scales = {11: 0.35, 20: 0.70}
         model.deployment_disabled = True
         model.deployment_modes_by_shot = {"0": "ars", "4": "baseline"}
         for name in (
@@ -2331,6 +2332,7 @@ class TestEngineV4(unittest.TestCase):
         restored = Phi2WithRSC.__new__(Phi2WithRSC)
         restored.target_layers = [11, 17, 20]
         restored._eligible_routing_layers = None
+        restored._certified_gate_scales = {}
         restored.deployment_disabled = False
         restored.deployment_modes_by_shot = {}
         for name in (
@@ -2342,6 +2344,7 @@ class TestEngineV4(unittest.TestCase):
         self.assertEqual(restored._eligible_routing_layers, {11, 20})
         self.assertTrue(restored.deployment_disabled)
         self.assertEqual(restored.deployment_modes_by_shot["4"], "baseline")
+        self.assertEqual(restored._certified_gate_scales, {11: 0.35, 20: 0.70})
 
     def test_effective_k_rejects_silenced_nominal_triad(self):
         model = Phi2WithRSC.__new__(Phi2WithRSC)
@@ -2402,6 +2405,7 @@ class TestEngineV4(unittest.TestCase):
         self.assertEqual(cfg.max_active_layers, 2)
         self.assertTrue(cfg.token_competitive_allocation)
         self.assertTrue(cfg.require_adaptive_beats_fixed)
+        self.assertGreater(cfg.router_min_eval_route_tuple_entropy, 0.0)
 
     def test_adaptive_promotion_requires_positive_ci_over_fixed(self):
         fixed = [1] * 40

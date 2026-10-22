@@ -185,6 +185,8 @@ class RSCConfig:
     # Engine v4: a nominal route member is effective only when it owns a
     # material fraction of realised gate-scaled residual energy.
     effective_k_min_energy_fraction: float = 0.05
+    # Zero preserves historical profiles; the v4 decision profile turns this
+    # into a non-zero fail-closed contract.
     router_min_eval_route_tuple_entropy: float = 0.0
     lambda_route_activity_floor: float = 0.0
     route_activity_min_fraction: float = 0.05
@@ -608,9 +610,18 @@ ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     "gate_allocation_temperature": 0.80,
     "gate_allocation_temperature_final": 0.50,
     "effective_k_min_energy_fraction": 0.05,
+    "router_min_eval_route_tuple_entropy": 0.10,
     "lambda_route_activity_floor": 0.10,
     "route_activity_min_fraction": 0.05,
+    "generation_anchor_interval": 200,
+    "generation_anchor_n_prompts": 8,
+    "deployment_eval_shots": (0, 2, 4, 8),
     "require_adaptive_beats_fixed": True,
+}
+ENGINE_V40_KAGGLE_EVALUATION: Dict[str, Any] = {
+    "n_test": 100,
+    "shots": (0, 2, 4, 8),
+    "max_new_tokens": 512,
 }
 
 
@@ -620,3 +631,24 @@ def make_engine_v40_kaggle_config() -> RSCConfig:
     for field, value in ENGINE_V40_KAGGLE_PROFILE.items():
         setattr(cfg, field, value)
     return cfg
+
+
+def assert_engine_v40_kaggle_profile(cfg: RSCConfig, strict: bool = False) -> str:
+    """Fingerprint the Engine v4 decision contract and report configuration drift."""
+    drift = {
+        field: {"expected": expected, "actual": getattr(cfg, field)}
+        for field, expected in ENGINE_V40_KAGGLE_PROFILE.items()
+        if getattr(cfg, field) != expected
+    }
+    if drift:
+        msg = f"{ENGINE_V40_KAGGLE_PROFILE_NAME} custom overrides detected ({len(drift)} fields): {list(drift.keys())}"
+        if strict:
+            raise RuntimeError(msg)
+        print(f"ℹ️  [Profile Notice] {msg}")
+    payload = json.dumps(
+        {"name": ENGINE_V40_KAGGLE_PROFILE_NAME,
+         "config": {field: getattr(cfg, field) for field in ENGINE_V40_KAGGLE_PROFILE}},
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()

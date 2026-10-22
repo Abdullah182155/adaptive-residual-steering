@@ -1829,6 +1829,8 @@ def train_phase1b_coadaptation(
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
     steps, norm_total = 0, 0.0
     model.base_model.eval()
+    if hasattr(model, "set_certified_gate_scales"):
+        model.set_certified_gate_scales(layer_scales)
     model.set_gate_freeze(True, layer_scales)
     model.set_router_warmup(False)
     print(

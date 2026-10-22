@@ -65,6 +65,9 @@ class Phi2WithRSC(nn.Module):
         # co-adaptation updates.  ``None`` preserves the complete catalog for
         # Phase-1 audits and fixed experimental controls.
         self._eligible_routing_layers: Optional[Set[int]] = None
+        # Calibrated Phase-1 scales are part of the routing contract. They are
+        # separate from transient gate-freeze state so reloads remain faithful.
+        self._certified_gate_scales: Dict[int, float] = {}
         if not getattr(cfg, "use_router", True) or getattr(cfg, "fixed_layers", None) is not None:
             fl = cfg.fixed_layers or list(self.target_layers)
             self.set_routing_override("only", fl)
@@ -215,6 +218,11 @@ class Phi2WithRSC(nn.Module):
                         g._valid_mask = steer_mask
                         valid = steer_mask & selected.view(-1, 1)
                         s._last_valid_mask = valid
+                        # The activity-floor loss needs physical intervention
+                        # energy, not merely a large gate on a zero residual.
+                        g._effective_energy_for_aux = (
+                            delta.norm(dim=-1) * alpha.squeeze(-1) * route_budget.squeeze(-1)
+                        )
                         if valid.any() and getattr(s, "last_pre_cap_q", None) is not None:
                             wrapper._active_pre_cap_records.append((s, s.last_pre_cap_q, valid))
                         if wrapper._routing_override is None:
@@ -339,6 +347,19 @@ class Phi2WithRSC(nn.Module):
                 values.get(int(layer), 1.0) if values is not None else value
             )
 
+    def set_certified_gate_scales(self, scales: Optional[Dict[int, float]]) -> None:
+        """Record validated Phase-1B layer scales for checkpoint portability."""
+        if scales is None:
+            self._certified_gate_scales = {}
+            return
+        normalized = {int(layer): float(scale) for layer, scale in scales.items()}
+        unknown = set(normalized) - set(self.target_layers)
+        if unknown:
+            raise ValueError(f"certified gate scales contain non-candidates: {sorted(unknown)}")
+        if any(not math.isfinite(scale) or scale < 0.0 for scale in normalized.values()):
+            raise ValueError("certified gate scales must be finite and non-negative")
+        self._certified_gate_scales = normalized
+
     def set_router_warmup(self, enabled: bool):
         self._router_warmup = enabled
 
@@ -397,6 +418,10 @@ class Phi2WithRSC(nn.Module):
             "deployment_modes_by_shot": {
                 str(shot): str(mode) for shot, mode in self.deployment_modes_by_shot.items()
             },
+            "certified_gate_scales": {
+                str(layer): float(scale)
+                for layer, scale in getattr(self, "_certified_gate_scales", {}).items()
+            },
         }
 
     def load_routing_manifest(self, manifest: Optional[Dict[str, Any]]) -> None:
@@ -417,6 +442,10 @@ class Phi2WithRSC(nn.Module):
         if not isinstance(modes, dict):
             raise TypeError("routing manifest deployment_modes_by_shot must be a dictionary")
         self.deployment_modes_by_shot = {str(shot): str(mode) for shot, mode in modes.items()}
+        scales = manifest.get("certified_gate_scales", {})
+        if not isinstance(scales, dict):
+            raise TypeError("routing manifest certified_gate_scales must be a dictionary")
+        self.set_certified_gate_scales({int(layer): float(scale) for layer, scale in scales.items()})
 
     def routing_eligibility_mask(self, device: Optional[torch.device] = None) -> torch.Tensor:
         """Return the learned-routing eligibility mask in catalog order."""
@@ -496,6 +525,12 @@ class Phi2WithRSC(nn.Module):
 
     def _router_mask_for(self, h: torch.Tensor, fallback_mask: torch.Tensor) -> torch.Tensor:
         mask = self._router_context_mask_active
+        def mask_stats(value: Optional[torch.Tensor]) -> str:
+            if value is None:
+                return "mask=None"
+            valid = value.detach().to(dtype=torch.bool)
+            counts = valid.sum(dim=1).detach().cpu().tolist() if valid.ndim == 2 else []
+            return f"shape={tuple(valid.shape)}, valid_tokens_per_row={counts}"
         if mask is None and self.prompt_shielding and self._prompt_shield_mask_active is not None:
             sh = self._prompt_shield_mask_active
             if sh.ndim == 2 and sh.shape[0] == h.shape[0] and sh.shape[1] >= h.shape[1]:
@@ -505,14 +540,16 @@ class Phi2WithRSC(nn.Module):
                     mask = unshielded
                 else:
                     warnings.warn(
-                        "Prompt shielding left no router-context tokens; falling back to the full attention mask.",
+                        "Prompt shielding left no router-context tokens; falling back to the full attention mask "
+                        f"({mask_stats(sh_aligned)}; fallback {mask_stats(fallback_mask)}).",
                         RuntimeWarning,
                         stacklevel=2,
                     )
         if mask is None or mask.ndim != 2 or mask.shape[0] != h.shape[0] or mask.shape[1] < h.shape[1]:
             if self.prompt_shielding and self._prompt_shield_mask_active is not None:
                 warnings.warn(
-                    "Prompt shielding router context was invalid; falling back to the full attention mask.",
+                    "Prompt shielding router context was invalid; falling back to the full attention mask "
+                    f"({mask_stats(mask)}; fallback {mask_stats(fallback_mask)}).",
                     RuntimeWarning,
                     stacklevel=2,
                 )
@@ -520,7 +557,8 @@ class Phi2WithRSC(nn.Module):
         aligned = mask[:, -h.shape[1] :].to(device=h.device, dtype=torch.bool)
         if not bool(aligned.any(dim=1).all()):
             warnings.warn(
-                "Prompt shielding router context was empty for one or more rows; using the full attention mask for those rows.",
+                "Prompt shielding router context was empty for one or more rows; using the full attention mask for those rows "
+                f"({mask_stats(aligned)}; fallback {mask_stats(fallback_mask)}).",
                 RuntimeWarning,
                 stacklevel=2,
             )
