@@ -2762,8 +2762,15 @@ def _evaluate_phase2_deployment(
 
     def evaluate_flags(override: Optional[str], n_shot: int) -> List[int]:
         model.eval()
-        model.set_gate_freeze(False)
-        model.set_routing_override(override)
+        if override == "fixed":
+            fixed_layers = list(getattr(cfg, "fixed_steer_eval_layers", None) or [])
+            if len(fixed_layers) != 1:
+                raise RuntimeError("Adaptive-vs-fixed deployment gate requires one certified fixed SteerNet layer")
+            model.set_routing_override("only", fixed_layers)
+            model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+        else:
+            model.set_gate_freeze(False)
+            model.set_routing_override(override)
         flags = []
         for row in confirm_rows:
             question = row.get("question") if isinstance(row, dict) else None
@@ -2794,10 +2801,11 @@ def _evaluate_phase2_deployment(
 
     deployment_shots = tuple(getattr(cfg, "deployment_eval_shots", None) or (0, 2))
     print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across shots={deployment_shots}...")
-    base_by_shot, ars_by_shot = [], []
+    base_by_shot, ars_by_shot, fixed_by_shot = [], [], []
     for n_shot in deployment_shots:
         baseline = evaluate_flags("none", n_shot)
         ars = evaluate_flags(None, n_shot)
+        fixed = evaluate_flags("fixed", n_shot) if bool(getattr(cfg, "require_adaptive_beats_fixed", False)) else None
         if len(baseline) != len(confirm_rows) or len(ars) != len(confirm_rows) or len(baseline) != len(ars):
             raise RuntimeError(
                 "Deployment confirmation did not produce one paired outcome per reserved question: "
@@ -2805,6 +2813,10 @@ def _evaluate_phase2_deployment(
             )
         base_by_shot.append(baseline)
         ars_by_shot.append(ars)
+        if fixed is not None:
+            if len(fixed) != len(confirm_rows):
+                raise RuntimeError("Fixed SteerNet deployment confirmation did not produce one outcome per reserved question")
+            fixed_by_shot.append(fixed)
         delta, lower, upper = paired_delta_ci(baseline, ars)
         print(
             f"    {n_shot}-shot: Base={sum(baseline)}/{len(baseline)} ({sum(baseline)/len(baseline):.1%}) | "
@@ -2813,7 +2825,12 @@ def _evaluate_phase2_deployment(
         )
 
     outcomes = {shot: (base_by_shot[index], ars_by_shot[index]) for index, shot in enumerate(deployment_shots)}
-    modes_by_shot = finalize_deployment_by_shot(outcomes, cfg.phase2_save_path, min_n=min_deployment_questions)
+    fixed_outcomes = {shot: fixed_by_shot[index] for index, shot in enumerate(deployment_shots)} if fixed_by_shot else None
+    modes_by_shot = finalize_deployment_by_shot(
+        outcomes, cfg.phase2_save_path, min_n=min_deployment_questions,
+        fixed_outcomes_by_shot=fixed_outcomes,
+        require_adaptive_beats_fixed=bool(getattr(cfg, "require_adaptive_beats_fixed", False)),
+    )
     base_clusters = [list(values) for values in zip(*base_by_shot)]
     ars_clusters = [list(values) for values in zip(*ars_by_shot)]
     delta, lower, upper = paired_delta_ci(base_clusters, ars_clusters)
@@ -2822,7 +2839,11 @@ def _evaluate_phase2_deployment(
         f"Δ = {delta*100:+.2f}pp, 95% CI = [{lower*100:+.2f}, {upper*100:+.2f}]pp "
         f"(questions={len(base_clusters)}, views={len(base_by_shot)})"
     )
-    mode = "ars" if all(value == "ars" for value in modes_by_shot.values()) else "baseline"
+    mode = (
+        "ars" if all(value == "ars" for value in modes_by_shot.values())
+        else "fixed_steernet" if modes_by_shot and all(value == "fixed_steernet" for value in modes_by_shot.values())
+        else "baseline"
+    )
     if hasattr(model, "deployment_disabled"):
         model.deployment_disabled = mode == "baseline"
         model.deployment_modes_by_shot = modes_by_shot
@@ -3341,8 +3362,15 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
 
     def _eval_deployment_flags(target_model, target_tokenizer, rows, target_device, override="none", n_shot=0):
         target_model.eval()
-        target_model.set_gate_freeze(False)
-        target_model.set_routing_override(override)
+        if override == "fixed":
+            fixed_layers = list(getattr(cfg, "fixed_steer_eval_layers", None) or [])
+            if len(fixed_layers) != 1:
+                raise RuntimeError("Adaptive-vs-fixed deployment gate requires one certified fixed SteerNet layer")
+            target_model.set_routing_override("only", fixed_layers)
+            target_model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+        else:
+            target_model.set_gate_freeze(False)
+            target_model.set_routing_override(override)
         flags = []
         for r in rows:
             q = None
@@ -3374,12 +3402,14 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         print(f"\n  [deployment] Evaluating {len(confirm_rows)} reserved confirmation rows across shots={deployment_shots}...")
         base_flags = []
         ars_flags = []
+        fixed_flags_by_shot = []
         base_flags_by_shot = []
         ars_flags_by_shot = []
         base_clusters, ars_clusters = [], []
         for n_shot in deployment_shots:
             bf = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override="none", n_shot=n_shot)
             af = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override=None, n_shot=n_shot)
+            ff = _eval_deployment_flags(model, tokenizer, confirm_rows, device, override="fixed", n_shot=n_shot) if bool(getattr(cfg, "require_adaptive_beats_fixed", False)) else None
             if len(bf) != len(confirm_rows) or len(af) != len(confirm_rows) or len(bf) != len(af):
                 raise RuntimeError(
                     "Deployment confirmation did not produce one paired outcome per reserved question: "
@@ -3387,6 +3417,10 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
                 )
             base_flags_by_shot.append(bf)
             ars_flags_by_shot.append(af)
+            if ff is not None:
+                if len(ff) != len(confirm_rows):
+                    raise RuntimeError("Fixed SteerNet deployment confirmation did not produce one outcome per reserved question")
+                fixed_flags_by_shot.append(ff)
             base_flags.extend(bf)
             ars_flags.extend(af)
             if len(bf) > 0 and len(af) == len(bf):
@@ -3400,6 +3434,11 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         outcomes_by_shot = {shot: (base_flags_by_shot[i], ars_flags_by_shot[i]) for i, shot in enumerate(deployment_shots)}
         dep_modes_by_shot = finalize_deployment_by_shot(
             outcomes_by_shot, cfg.phase2_save_path, min_n=min_deployment_questions,
+            fixed_outcomes_by_shot=(
+                {shot: fixed_flags_by_shot[i] for i, shot in enumerate(deployment_shots)}
+                if fixed_flags_by_shot else None
+            ),
+            require_adaptive_beats_fixed=bool(getattr(cfg, "require_adaptive_beats_fixed", False)),
         )
         if len(base_flags_by_shot) == len(deployment_shots) and len(ars_flags_by_shot) == len(deployment_shots):
             base_clusters = [list(values) for values in zip(*base_flags_by_shot)]
@@ -3410,7 +3449,11 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
                 f"Δ = {d*100:+.2f}pp, 95% CI = [{lo*100:+.2f}, {hi*100:+.2f}]pp "
                 f"(questions={len(base_clusters)}, views={len(base_flags_by_shot)})"
             )
-            dep_mode = "ars" if all(mode == "ars" for mode in dep_modes_by_shot.values()) else "baseline"
+            dep_mode = (
+                "ars" if all(mode == "ars" for mode in dep_modes_by_shot.values())
+                else "fixed_steernet" if dep_modes_by_shot and all(mode == "fixed_steernet" for mode in dep_modes_by_shot.values())
+                else "baseline"
+            )
         else:
             print("  [deployment] No valid evaluated confirmation items; defaulting to BASELINE deployment.")
             dep_mode = "baseline"

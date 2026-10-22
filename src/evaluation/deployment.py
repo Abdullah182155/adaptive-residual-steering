@@ -205,9 +205,15 @@ def finalize_deployment_by_shot(
             manifest = {}
         manifest["deployment_modes_by_shot"] = decisions
         manifest["deployment_evidence_by_shot"] = evidence
-        # Legacy consumers still read one field.  It is ARS only when every
-        # explicitly evaluated shot was validated; callers should use the map.
-        manifest["deployment_mode"] = "ars" if decisions and all(v == "ars" for v in decisions.values()) else "baseline"
+        # Legacy consumers still read one field.  Per-shot consumers should
+        # use the map, but a uniformly superior fixed controller remains a
+        # valid deployment rather than being mislabeled as baseline.
+        if decisions and all(v == "ars" for v in decisions.values()):
+            manifest["deployment_mode"] = "ars"
+        elif decisions and all(v == "fixed_steernet" for v in decisions.values()):
+            manifest["deployment_mode"] = "fixed_steernet"
+        else:
+            manifest["deployment_mode"] = "baseline"
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
     return decisions

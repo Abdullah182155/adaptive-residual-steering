@@ -72,13 +72,22 @@ def evaluate_model_condition(
         if hasattr(model, "set_gate_freeze"):
             model.set_gate_freeze(True, 1.0)
     elif cond == "ars":
+        shot_mode = None
         if hasattr(model, "set_routing_override"):
             per_shot = getattr(model, "deployment_modes_by_shot", {})
             shot_mode = per_shot.get(str(n_shot), per_shot.get(n_shot)) if isinstance(per_shot, dict) else None
             disabled = (shot_mode == "baseline") if shot_mode is not None else getattr(model, "deployment_disabled", False)
-            model.set_routing_override("none" if disabled else None)
+            if shot_mode == "fixed_steernet":
+                fixed_layers = list(getattr(getattr(model, "cfg", None), "fixed_steer_eval_layers", None) or [])
+                model.set_routing_override("only", fixed_layers)
+            else:
+                model.set_routing_override("none" if disabled else None)
         if hasattr(model, "set_gate_freeze"):
-            model.set_gate_freeze(False)
+            if shot_mode == "fixed_steernet":
+                cfg = getattr(model, "cfg", None)
+                model.set_gate_freeze(True, float(getattr(cfg, "fixed_steer_eval_gate_scale", 1.0)))
+            else:
+                model.set_gate_freeze(False)
     elif cond == "ars_raw":
         # Unconditionally evaluate the learned ARS model without deployment safety fallback
         if hasattr(model, "set_routing_override"):
