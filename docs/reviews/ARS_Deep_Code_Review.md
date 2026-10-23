@@ -467,7 +467,7 @@ class RSCSteerNet(nn.Module):
         if magnitude_mode == "decoupled":
             self.mag_head = nn.Linear(rank, 1)           # per-token bounded magnitude
             nn.init.zeros_(self.mag_head.weight)
-            nn.init.constant_(self.mag_head.bias, -6.0)  # sigmoid(-6) ~ 0.0025 -> near-identity
+            nn.init.constant_(self.mag_head.bias, [−6.0→deprecated])  # sigmoid(-6) ~ 0.0025 -> near-identity
 
         # down/mid keep PyTorch's default init so activations are O(1); `up` = 0 gives delta == 0 at init.
         nn.init.zeros_(self.up.weight)

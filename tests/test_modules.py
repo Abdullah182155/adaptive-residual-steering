@@ -484,7 +484,7 @@ class TestARSModules(unittest.TestCase):
         dummy = DummyModel()
         cfg = RSCConfig()
         wrapper = Phi2WithRSC(dummy, cfg, device=torch.device("cpu"))
-        wrapper.set_routing_override("all")
+        wrapper.set_routing_override("only", wrapper.target_layers)
         self.assertEqual(wrapper._routing_override[0], "only")
         self.assertEqual(wrapper._routing_override[1], set(wrapper.target_layers))
         wrapper.set_routing_override("none")
@@ -641,7 +641,7 @@ class TestARSModules(unittest.TestCase):
         wrapper.set_prompt_shield_mask(shield_mask)
 
         # Force a steering layer active
-        wrapper.set_routing_override("all")
+        wrapper.set_routing_override("only", wrapper.target_layers)
         wrapper.set_gate_freeze(True, 1.0)
         # Ensure non-zero steering intervention (since identity init starts at delta=0)
         with torch.no_grad():

@@ -138,7 +138,7 @@ def test_desired_k_matches_realized(tiny_model, char_tokenizer):
 
 
 # ---------------------------------------------------------------------------
-# Test: set_routing_override("all") raises ValueError (F4)
+# Test: set_routing_override(deprecated "all" mode) raises ValueError (F4)
 # ---------------------------------------------------------------------------
 def test_override_all_raises(tiny_model):
     """Invalid override mode must raise ValueError."""

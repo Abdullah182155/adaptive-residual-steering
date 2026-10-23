@@ -1,0 +1,33 @@
+from .calibrate import (
+    apply_contract,
+    build_model,
+    choose_fixed_subset,
+    decide_gate_adoption,
+    default_catalog,
+    load_contract,
+    load_contract_weights,
+    measure_envelope,
+    paired_greedy_eval,
+    run_deployment_calibration,
+    search_theta_abs,
+    select_rows,
+    sha256_file,
+    write_contract,
+)
+
+__all__ = [
+    "apply_contract",
+    "build_model",
+    "choose_fixed_subset",
+    "decide_gate_adoption",
+    "default_catalog",
+    "load_contract",
+    "load_contract_weights",
+    "measure_envelope",
+    "paired_greedy_eval",
+    "run_deployment_calibration",
+    "search_theta_abs",
+    "select_rows",
+    "sha256_file",
+    "write_contract",
+]

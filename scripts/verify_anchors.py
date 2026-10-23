@@ -686,7 +686,7 @@ def audit_gate_init(ctx: Ctx) -> AuditResult:
     cfg = ctx.cfg
     # ---- static: documentation / docstring claims vs. code
     claim_pats = [
-        ("claims bias -6.0", r"-\s*6\.0"),
+        ("claims bias [−6.0-deprecated]", r"-\s*6\.0"),
         ("claims alpha ~ 0.0025", r"0\.0025"),
         ("claims sigmoid(-6)", r"sigmoid\(\s*-6"),
         ("'earn activation' wording", r"earn(?:s|ed)?\s+activation"),
@@ -845,7 +845,7 @@ def audit_gate_init(ctx: Ctx) -> AuditResult:
     r.add("", "### Verdict", "")
     r.add(f"* Measured init alpha = **{fmt(meas['alpha_mean'], 4)}** (config-driven: `sigmoid(logit(gate_init_alpha))`).")
     if mismatch:
-        r.add("* **DOC/CODE MISMATCH:** documentation claims a conservative init (bias -6.0, alpha ~ 0.0025) but the code "
+        r.add("* **DOC/CODE MISMATCH:** documentation claims a conservative init (bias [−6.0-deprecated], alpha ~ 0.0025) but the code "
               f"initialises alpha at {expected}. Code behaviour is authoritative; fix the documentation (or the init).")
     r.add(f"* Phase 1 checkpoint gate state: **{verdict}**.")
     r.status = "FINDING" if mismatch else "PASS"

@@ -516,6 +516,23 @@ class RSCConfig:
     gate_v5_save_path: str = "./checkpoints/gate_v5.pt"
     gate_sel_n: int = 120
 
+    # ==== M8 ====
+    calib_theta_grid: Tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01)
+    calib_envelope_quantile: float = 0.999
+    calib_nll_tie_eps: float = 0.003
+    calib_sel_n: int = 120
+    calib_gate_acc_tolerance: int = 1
+    contract_path: str = './deployment_contract.json'
+    # ==== M9 ====
+    bench_shots: Tuple[int, ...] = (0, 8)
+    bench_secondary_shots: Tuple[int, ...] = (2, 4)
+    bench_secondary_n: int = 500
+    bench_n_boot: int = 10000
+    bench_batch_size: Tuple[Tuple[int, int], ...] = ((0, 8), (2, 6), (4, 4), (8, 4))
+    bench_max_new_tokens: int = 512
+    bench_cache_dir: str = './checkpoints/bench_cache'
+    bench_noninf_margin_pp: float = 1.0
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')

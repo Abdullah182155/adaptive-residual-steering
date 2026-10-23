@@ -1,104 +1,47 @@
 # Methodology & Algorithmic Formulation
 
-This document provides the formal mathematical formulation and algorithmic specification for **Adaptive Residual Steering (ARS)**.
+## 1. SteerNet: K-Conditioned Low-Rank Residual Correction
 
----
+For candidate layer $l$ the correction is a low-rank bottleneck MLP:
 
-## 1. SteerNet: $K$-Conditioned Low-Rank Residual Correction
+$$\tilde{x} = \text{Dropout}(\text{GELU}(W_{\text{down}} \cdot \text{LN}(h))),\quad \tilde{x}_K = \tilde{x} + W_K\left(\tfrac{K}{4}\right)$$
 
-SteerNet operates as a non-invasive residual-stream intervention attached via PyTorch forward hooks at selected transformer blocks $l \in \mathcal{L}_{\text{target}}$.  For Phi-2, the checkpoint-visible canonical candidate set is $\{11, 13, 15, 17, 18, 20, 22, 24\}$ (zero-based `base_model.model.layers` indices); it is never inferred from a percentage range.
+$$\Delta h = W_{\text{up}}\left(\tilde{x}_K + \text{Dropout}(\text{GELU}(W_{\text{mid}}\tilde{x}_K))\right)\cdot\tfrac{\alpha_{\text{lora}}}{r}$$
 
-### 1.1 Architectural Formulation
-For hidden state $h_l^{(t)} \in \mathbb{R}^d$ at layer $l$ and sequence position $t$, SteerNet computes candidate correction $\Delta h_l^{(t)}$:
+$W_K$ is zero-initialised so that K-information starts as a no-op; $\alpha_{\text{lora}}/r = 2.0$.  The injected correction is divided by $\sqrt{K}$ so total steering energy stays bounded as more layers fire.
 
-$$\tilde{x}_l^{(t)} = \text{Dropout}\left(\text{GELU}\left(W_{\text{down}}^{(l)} \cdot \text{LN}\left(h_l^{(t)}\right)\right)\right) \in \mathbb{R}^r$$
+## 2. Usefulness Gate: Per-Token Activation
 
-To prevent signal dilution when multiple layers steer concurrently, SteerNet explicitly conditions on the realized number of active layers $K = |S| \in \{1, \dots, K_{\max}\}$:
+$$f_t = [\text{LN}(h_t), \text{LN}(\Delta h_t^{\text{detach}}), \|\Delta h_t\|_2, \cos(h_t,\Delta h_t), c]$$
 
-$$\tilde{x}_{K, l}^{(t)} = \tilde{x}_l^{(t)} + W_K^{(l)} \cdot \left(\frac{K}{K_{\max}}\right) \in \mathbb{R}^r$$
+$$\alpha_t = \sigma(W_2\,\text{GELU}(W_1 f_t + b_1) + b_2)$$
 
-The candidate residual update vector is then projected back to model dimension $d$:
+- $\Delta h$ is detached: the gate never back-propagates into SteerNet.
+- **Initialisation:** $W_2 = 0$ and the output bias $b_2 = 2$, so $\alpha_{\text{init}} = \sigma(2) \approx 0.88$.  The gate starts nearly open, preserving the already-trained SteerNet correction, and must *learn* to close on tokens where steering does not help.
+- **Dominance hinge (S3):** the gate is trained directly on the task loss; a hinge term penalises any configuration in which the gated model is worse than the ungated (const-gate) model, so the learned gate is only allowed to improve on passthrough.  Deployment re-checks this on the selection split (Section 5).
 
-$$\Delta h_l^{(t)} = W_{\text{up}}^{(l)} \cdot \left(\tilde{x}_{K, l}^{(t)} + \text{Dropout}\left(\text{GELU}\left(W_{\text{mid}}^{(l)} \cdot \tilde{x}_{K, l}^{(t)}\right)\right)\right) \times \left(\frac{\alpha_{\text{lora}}}{r}\right) \in \mathbb{R}^d$$
+## 3. Catalog Router: Distillation over Counterfactual Subsets
 
-### 1.2 Parameter Constraints
-- **Rank $r$**: Low-rank bottleneck (`lora_rank = 16`, where $d = 2560$ for Phi-2).
-- **Zero-Initialization**: $W_K$ is initialized to zero ($W_K \leftarrow 0$) so that initialization matches standard execution.
-- **Scaling Factor**: $\frac{\alpha_{\text{lora}}}{r} = \frac{32.0}{16} = 2.0$, ensuring stable gradient scale across rank variations.
+Layer selection is a decision over a fixed **catalog** of subsets $\mathcal{C}$ (the empty subset is a legal action).
 
----
+- **Counterfactual table (S0):** for every prompt and every $S \in \mathcal{C}$, the answer NLL under steering with subset $S$ is measured with the gate held constant.
+- **Distillation (S2):** the router is trained to reproduce the best-subset distribution implied by $R(S) = -\text{NLL}_{\text{answer}}(S) - \lambda_{\text{cost}}|S|$, rather than by sampled policy gradients.
+- **Question-span pooling:** router features are pooled only over the question span (prompt tokens, via the router context mask), so the decision is made before any answer token exists and is identical during prefill and cached decode.
+- **Abstention:** a threshold $\theta_{\text{abs}}$ maps low-benefit predictions to $S=\emptyset$; $\theta=1.01$ disables abstention.
 
-## 2. Dynamic Usefulness Token Gate
+## 4. Failure Policy and Guards
 
-The Token Gate module evaluates whether applying the proposed steering delta $\Delta h_l^{(t)}$ improves reasoning confidence at sequence position $t$.
+Per injected token the relative norm $\|\delta_{\text{injected}}\|/\|h\|$ is monitored against `rel_norm_cap`.  Non-finite values, a cap violation, or more than `k_max` active layers trip the guard; a tripped item reverts to $K=0$ (the unsteered generation).  "Raw ARS" runs with guards and abstention disabled for ablation.
 
-### 2.1 Multi-Feature Concatenation
-The gate evaluates four complementary geometric and semantic features:
-$$f_l^{(t)} = \left[ \text{LN}\left(h_l^{(t)}\right), \; \text{LN}\left(\Delta h_l^{(t), \text{detach}}\right), \; \left\|\Delta h_l^{(t)}\right\|_2, \; \cos\left(h_l^{(t)}, \Delta h_l^{(t)}\right) \right] \in \mathbb{R}^{2d + 2}$$
+## 5. Deployment Calibration (S5)
 
-### 2.2 Activation Computation
-$$\alpha_l^{(t)} = \sigma\left(W_2 \cdot \text{GELU}\left(W_1 f_l^{(t)} + b_1\right) + b_2\right) \in [0, 1]$$
+All deployment hyper-parameters are fixed on a dedicated selection split ($n=120$) and frozen in `deployment_contract.json`:
 
-### 2.3 Regularization Objectives
-During Stage 2B training, the gate is optimized using a composite regularized objective:
-$$\mathcal{L}_{\text{gate}} = \mathcal{L}_{\text{usefulness}} + \lambda_{\text{L1}} \mathcal{L}_{\text{sparsity}} + \lambda_{\text{antisat}} \mathcal{L}_{\text{antisat}} + \lambda_{\text{div}} \mathcal{L}_{\text{diversity}} + \lambda_{\text{inv}} \mathcal{L}_{\text{invariance}}$$
+1. $s^*_{\text{fixed}}$: lowest paired NLL subset; candidates within `calib_nll_tie_eps` are decided by greedy accuracy, then smaller $K$.
+2. $\theta^*_{\text{abs}}$: grid search maximising paired NLL gain over baseline (ties: accuracy, then larger $\theta$).
+3. Gate adoption: `learned` iff mean paired NLL diff $<0$ **and** gated accuracy $\ge$ ungated $- \text{tol}/n$; otherwise `passthrough`.
+4. Envelope: quantiles of the relative injected norm under the learned routes/gates; `W_ENVELOPE_MISMATCH` is raised if the measured cap differs from 0.02 by more than $2\times$.
 
-1. **L1 Sparsity Loss**: Encourages dormant states on non-critical tokens:
-   $$\mathcal{L}_{\text{sparsity}} = \frac{1}{T} \sum_{t=1}^T \alpha_t$$
-2. **Anti-Saturation Loss**: Prevents gate collapse to binary limits ($0$ or $1$):
-   $$\mathcal{L}_{\text{antisat}} = \frac{1}{T} \sum_{t=1}^T \left(\alpha_t^2 (1 - \alpha_t) + \alpha_t (1 - \alpha_t)^2\right)$$
-3. **Diversity Floor Loss**: Enforces minimum variance across the sequence to prevent all-zero collapse:
-   $$\mathcal{L}_{\text{diversity}} = \max\left(0, \tau_{\text{floor}} - \text{Var}_t(\alpha_t)\right)$$
-4. **Prompt Invariance Loss**: Forces consistent gating across paraphrased CoT prompt templates.
+## 6. Evaluation Protocol (5 arms)
 
----
-
-## 3. Cooperative Layer Router & Anchor-Grounded 3-Arm RLOO
-
-### 3.1 Two-Pass Attention Router Architecture
-The router evaluates candidate layers $l \in \mathcal{L}_{\text{target}}$ through a 2-pass cross-attention mechanism:
-1. **Pass 1 (Layer Utility Head)**: Computes unnormalized layer utilities $u_l \in \mathbb{R}$ for each candidate layer.
-2. **Pass 2 ($K$-Distribution Head)**: Computes logits over the cardinality distribution $P(K) = \text{Softmax}(\pi_K)$ for $K \in \{0, \dots, K_{\max}\}$.  $K=0$ is the explicit frozen-backbone action.
-
-### 3.2 Tanh-Normalized Pairwise Synergy Matrix
-Cross-layer interaction is modeled via a learnable symmetric matrix $W_{\text{syn}} \in \mathbb{R}^{N \times N}$. To prevent gradient saturation, the synergy matrix is strictly bounded:
-$$S_{ij} = \tanh\left(\frac{W_{\text{syn}} + W_{\text{syn}}^\top}{2}\right) \in [-1, 1]$$
-- $S_{ij} > 0$: Synergistic cooperation (both layers activate concurrently).
-- $S_{ij} < 0$: Antagonistic interference (one layer suppresses the other).
-
-### 3.3 Anchor-Grounded 3-Arm RLOO Estimator
-At each bootstrap step, three distinct arms are evaluated:
-- **Arm 0 (Anchor Baseline)**: Empty action $S_0 = \emptyset$ (frozen backbone, unsteered baseline reward $R_0$).
-- **Arm A**: Sampled layer subset $S_A \sim P(S)$.
-- **Arm B**: Independent sample $S_B \sim P(S)$.
-
-The counterfactual leave-one-out baselines incorporate the anchor $R_0$:
-$$b_A = \frac{R_B + R_0}{2}, \quad b_B = \frac{R_A + R_0}{2}$$
-$$\Delta R_A = R_A - b_A, \quad \Delta R_B = R_B - b_B$$
-
-The policy gradient loss is computed as:
-$$\mathcal{L}_{\text{RLOO}} = -\frac{1}{2}\left[\Delta R_A^{\text{detach}} \log P(S_A) + \Delta R_B^{\text{detach}} \log P(S_B)\right]$$
-
-### 3.4 Direct Pairwise Synergy Alignment Loss
-The synergy matrix $S_{ij}$ is directly aligned with empirical RLOO reward differentials:
-$$\mathcal{L}_{\text{synergy\_align}} = -0.5 \left[\Delta R_A^{\text{detach}} \cdot \bar{S}(S_A) + \Delta R_B^{\text{detach}} \cdot \bar{S}(S_B)\right]$$
-where $\bar{S}(S)$ denotes the mean pairwise synergy among active layers in subset $S$.
-
-### 3.5 Anti-Monopoly Balance Loss
-To guarantee exploratory coverage and prevent layer monopolization:
-$$\mathcal{L}_{\text{balance}} = \text{MSE}\left(p_{\text{batch}}, \; \frac{1}{N} \mathbf{1}\right)$$
-where $p_{\text{batch}} \in \mathbb{R}^N$ is the batch-averaged layer selection probability.
-
----
-
-## 4. Prompt Shielding Forward Pass Integration
-
-The full end-to-end forward pass at target layer $l$ is defined as:
-
-$$h_l^{(t)} \leftarrow h_l^{(t)} + \mathbb{I}(l \in S) \cdot M_{\text{shield}}(t) \cdot \alpha_l^{(t)} \cdot \Delta h_l^{(t)}$$
-
-where:
-- $\mathbb{I}(l \in S) \in \{0, 1\}$: Binary indicator whether layer $l$ is in active subset $S$.
-- $M_{\text{shield}}(t) \in \{0, 1\}$: Prompt shield mask ($0$ for few-shot demonstrations, $1$ for target reasoning).
-- $\alpha_l^{(t)} \in [0, 1]$: Dynamic token usefulness gate.
-- $\Delta h_l^{(t)} \in \mathbb{R}^d$: $K$-conditioned low-rank residual steering delta.
+Baseline, Fixed-control, Router-only, Full ARS, Raw ARS on GSM8K test ($n=1319$), 0- and 8-shot.  Paired exact McNemar tests, paired bootstrap 95% CIs ($B=10{,}000$) and Holm-Bonferroni correction over the four treatments.

@@ -88,7 +88,7 @@ def main():
             model.set_routing_override("none")
             stage_name = "Stage A - Frozen Baseline"
         elif args.eval_stage == "steernet":
-            model.set_routing_override("all")
+            model.set_routing_override("only", model.target_layers)
             model.set_gate_freeze(True, 1.0)
             stage_name = "Stage B - SteerNet Only"
         else:

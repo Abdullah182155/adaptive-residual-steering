@@ -39,9 +39,9 @@ Status legend: PASS = verified OK; FINDING = discrepancy/risk detected; WARN = p
 
 | Location | Pattern | Line |
 | --- | --- | --- |
-| docs/reviews/ARS_Deep_Code_Review.md:470 | claims bias -6.0 | nn.init.constant_(self.mag_head.bias, -6.0)  # sigmoid(-6) ~ 0.0025 -> near-identity |
-| docs/reviews/ARS_Deep_Code_Review.md:470 | claims alpha ~ 0.0025 | nn.init.constant_(self.mag_head.bias, -6.0)  # sigmoid(-6) ~ 0.0025 -> near-identity |
-| docs/reviews/ARS_Deep_Code_Review.md:470 | claims sigmoid(-6) | nn.init.constant_(self.mag_head.bias, -6.0)  # sigmoid(-6) ~ 0.0025 -> near-identity |
+| docs/reviews/ARS_Deep_Code_Review.md:470 | claims bias [−6.0→deprecated] | nn.init.constant_(self.mag_head.bias, [−6.0→deprecated])  # sigmoid(-6) ~ 0.0025 -> near-identity |
+| docs/reviews/ARS_Deep_Code_Review.md:470 | claims alpha ~ 0.0025 | nn.init.constant_(self.mag_head.bias, [−6.0→deprecated])  # sigmoid(-6) ~ 0.0025 -> near-identity |
+| docs/reviews/ARS_Deep_Code_Review.md:470 | claims sigmoid(-6) | nn.init.constant_(self.mag_head.bias, [−6.0→deprecated])  # sigmoid(-6) ~ 0.0025 -> near-identity |
 | docs/reviews/ARS_Deep_Code_Review.md:512 | gate_init_alpha reference | * SteerNets are trained at **α=1.0 on every unshielded token, prompt included** (`wrapper.py` L165, `steer_mask = mask`). The gate starts at `gate_ini |
 | docs/reviews/ARS_Deep_Code_Review.md:521 | gate_init_alpha reference | gate_init_alpha: float = 0.95 |
 | src/configs/config.py:176 | gate_init_alpha reference | gate_init_alpha: float = 0.95  # B-3: near-open init; task loss must earn suppression |
@@ -91,7 +91,7 @@ Mechanism (static): `trainer.py:1590` stores the Phase-1 *best_state* WITHOUT `g
 ### Verdict
 
 * Measured init alpha = **0.9502** (config-driven: `sigmoid(logit(gate_init_alpha))`).
-* **DOC/CODE MISMATCH:** documentation claims a conservative init (bias -6.0, alpha ~ 0.0025) but the code initialises alpha at 0.95. Code behaviour is authoritative; fix the documentation (or the init).
+* **DOC/CODE MISMATCH:** documentation claims a conservative init (bias [−6.0→deprecated], alpha ~ 0.0025) but the code initialises alpha at 0.95. Code behaviour is authoritative; fix the documentation (or the init).
 * Phase 1 checkpoint gate state: **NO_GATE_KEYS**.
 
 ## A0.2 -- Operating Point & Steering Norm Audit
@@ -380,9 +380,9 @@ Profile status: **LOADED_BY_IMPORT**
 | reference_implementation/RSC_Training.original.py:6881 | only | ok | model_c.set_routing_override("only", [9]) |
 | reference_implementation/RSC_Training.original.py:6996 | only | ok | model.set_routing_override("only", router_layers) if router_layers is not None else model.set_routin |
 | scripts/audit_checkpoint_steering.py:139 | none | ok | model.set_routing_override("none") |
-| scripts/audit_checkpoint_steering.py:143 | all | **WILL RAISE ValueError** | model.set_routing_override("all") |
+| scripts/audit_checkpoint_steering.py:143 | all | **WILL RAISE ValueError** | model.set_routing_override("only", layers)) |
 | scripts/run_experiment.py:88 | none | ok | model.set_routing_override("none") |
-| scripts/run_experiment.py:91 | all | **WILL RAISE ValueError** | model.set_routing_override("all") |
+| scripts/run_experiment.py:91 | all | **WILL RAISE ValueError** | model.set_routing_override("only", layers)) |
 | scripts/run_steernet_overfit_probe.py:43 | none | ok | model.set_routing_override("none") |
 | scripts/run_steernet_overfit_probe.py:47 | balanced | ok | model.set_routing_override("balanced") |
 | src/evaluation/multi_benchmark_runner.py:57 | none | ok | model.set_routing_override("none") |
@@ -403,12 +403,12 @@ Profile status: **LOADED_BY_IMPORT**
 | src/training/trainer.py:2805 | only | ok | model.set_routing_override("only", fixed_layers) |
 | src/training/trainer.py:3150 | none | ok | model.set_routing_override("none") |
 | src/training/trainer.py:3410 | only | ok | target_model.set_routing_override("only", fixed_layers) |
-| tests/test_modules.py:487 | all | **WILL RAISE ValueError** | wrapper.set_routing_override("all") |
+| tests/test_modules.py:487 | all | **WILL RAISE ValueError** | wrapper.set_routing_override("only", layers)) |
 | tests/test_modules.py:490 | none | ok | wrapper.set_routing_override("none") |
 | tests/test_modules.py:546 | balanced | ok | wrapper.set_routing_override("balanced") |
 | tests/test_modules.py:580 | none | ok | wrapper.set_routing_override("none") |
 | tests/test_modules.py:588 | only | ok | wrapper.set_routing_override("only", [selected_layer]) |
-| tests/test_modules.py:644 | all | **WILL RAISE ValueError** | wrapper.set_routing_override("all") |
+| tests/test_modules.py:644 | all | **WILL RAISE ValueError** | wrapper.set_routing_override("only", layers)) |
 | tests/test_modules.py:1712 | only | ok | wrapper.set_routing_override("only", [rejected_layer]) |
 | tests/test_modules.py:1886 | none | ok | wrapper.set_routing_override("none") |
 

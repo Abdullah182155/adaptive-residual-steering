@@ -140,7 +140,7 @@ def forward_difference_proof(model: Phi2WithRSC, input_ids: torch.Tensor) -> Dic
     model.set_gate_freeze(False)
     baseline = model(input_ids=input_ids, attention_mask=attention_mask).logits.float()
 
-    model.set_routing_override("all")
+    model.set_routing_override("only", model.target_layers)
     model.set_gate_freeze(True, 1.0)
     steered = model(input_ids=input_ids, attention_mask=attention_mask).logits.float()
     difference = steered - baseline

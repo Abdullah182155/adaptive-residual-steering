@@ -137,35 +137,41 @@ adaptive-residual-steering/
 ```bash
 git clone https://github.com/Abdullah182155/adaptive-residual-steering.git
 cd adaptive-residual-steering
+git checkout development
 pip install -r requirements.txt
+python -m unittest discover -s tests -v  # unit + hygiene tests
 ```
 
-### Run Test Suite (87 Tests)
+### Full Reproduction
 ```bash
-pytest tests/ -q --tb=short
+# 1. Train (S0 -> S1 -> S0b -> S2 -> S3)
+python scripts/run_ars_pipeline.py --stage all  # runs every stage incl. S5 + bench
+
+# ...or stage by stage:
+python scripts/run_ars_pipeline.py --stage S0
+python scripts/run_ars_pipeline.py --stage S1
+python scripts/run_ars_pipeline.py --stage S0b
+python scripts/run_ars_pipeline.py --stage S2
+python scripts/run_ars_pipeline.py --stage S3
+
+# 2. Calibrate the deployment contract (selection split n=120)
+python scripts/run_calibration.py --contract_path deployment_contract.json
+
+# 3. 5-arm benchmark (GSM8K test n=1319; 0- and 8-shot; add --secondary for 2/4-shot)
+python scripts/run_benchmark.py --contract deployment_contract.json --out experiment_record.json
+
+# 4. Report (Markdown + LaTeX)
+python scripts/make_report.py --record experiment_record.json --out_dir report
 ```
 
-### Check Architectural Integrity
-```bash
-python scripts/check_architecture_diagrams.py
-```
+Outputs: `deployment_contract.json`, `experiment_record.json`, `report/REPORT.md`, `report/tables/*.tex`.
 
-### Run ARS Training & Evaluation
-```bash
-# Full staged training curriculum on GSM8K
-python scripts/run_experiment.py --curriculum_mode staged --batch_size 1 --grad_accum 16
+Generations are cached in `checkpoints/bench_cache`, so interrupted benchmark runs resume without recomputation.
 
-# Format control diagnostic run
-python scripts/format_control.py --layer 18 --samples 50
-```
-
-### Kaggle Execution
-The repository is fully optimized for Kaggle (NVIDIA Tesla T4 ×2 or P100):
-1. **Curriculum Training & Multi-Shot Evaluation**: Run [`notebooks/kaggle_ars_runner.ipynb`](notebooks/kaggle_ars_runner.ipynb).
-2. **Multi-Dataset Paper Benchmark Suite**: Run [`notebooks/paper_evaluation_suite.ipynb`](notebooks/paper_evaluation_suite.ipynb) across GSM8K, SVAMP, ARC, MATH-500, and GSM-Plus.
+### Reproducible Kaggle Execution
+See [notebooks/kaggle_ars_runner.ipynb](notebooks/kaggle_ars_runner.ipynb) for a self-contained execution notebook.
 
 ---
-
 ## 📚 Documentation Links
 
 - 📐 **[Methodology & Derivations](docs/methodology.md)**: Derivations of $K$-conditioned SteerNet, causal gating, and 3-arm RLOO advantage estimators.

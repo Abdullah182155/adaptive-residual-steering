@@ -1,30 +1,26 @@
 # Training & Staged Execution Pipeline
 
-## Staged Curriculum
-Because joint end-to-end gradient updates across SteerNet, Gate, and Router lead to destabilization, ARS utilizes a carefully staged curriculum:
+Run end-to-end with `python scripts/run_ars_pipeline.py --stage all`, or one stage at a time.
 
-### Phase 1: SteerNet Alone (Fixed Full Steering)
-- **Gate:** Pinned at $\alpha = 1.0$.
-- **Router:** Fixed single layer or uniform candidate subset.
-- **Objective:** Standard cross-entropy task loss on GSM8K CoT trajectories.
-- **Goal:** Learn a high-magnitude, valid arithmetic correction signal before introducing selectivity.
+| Stage | Purpose | Output / decision |
+|---|---|---|
+| S0  | Counterfactual table over the subset catalog + signal audit | Decision 1 (is there routable signal?) |
+| S1  | SteerNet subset trainer (on-policy traces + layer-dropout), gate fixed open | SteerNet checkpoint |
+| S0b | On-policy reasoning trace sampler | Trace set used by S1/S2 |
+| S2  | Catalog router distillation (26-subset catalog, question-span pooling) | Router checkpoint |
+| S3  | Direct task-loss token gate with dominance hinge | Gate checkpoint |
+| S5  | Deployment calibration on the selection split ($n=120$) | `deployment_contract.json` |
+| bench | 5-arm production benchmark (GSM8K test, 0/8-shot) | `experiment_record.json` |
 
-### Phase 2: Staged Refinement & Decomposition
-1. **Phase 2A (Router Bootstrap):**
-   - SteerNet & Gate are frozen.
-   - Router policy is trained via counterfactual subset forwards under RLOO to discover layer synergies and identify when steering hurts.
-2. **Phase 2B (SteerNet Fine-Tuning):**
-   - Fine-tune SteerNet under the newly learned routing distributions with paraphrase invariance loss.
-3. **Phase 2C (Gate Tuning):**
-   - SteerNet and Router are frozen.
-   - Gate is trained using auxiliary objectives (Policy Gradient / L1 sparsity / Contrastive token loss / Anti-saturation).
-4. **Phase 2D (Joint Low-LR Fine-Tuning):**
-   - Extremely low learning rate joint pass with accuracy-based early stopping.
+Report: `python scripts/make_report.py --record experiment_record.json` -> `report/REPORT.md`, `report/tables/*.tex`.
 
-## Evaluation Protocol
-- **Stage A:** Frozen Base Model Baseline.
-- **Stage B:** SteerNet Only (Phase 1 weights, Gate=1.0, single/fixed layer).
-- **Stage C:** Full ARS (Trained SteerNet + Dynamic Router + Token Gate).
-- **Stage D / Diagnostics (2x2 Grid):**
-  - {Router: Fixed vs Dynamic} $\times$ {Gate: 1.0 vs Trained Live}.
-  - Isolates whether performance regressions stem from router layer selection or gate token suppression.
+## Failure policy
+
+- A stage may return `{"halt": true}`; the orchestrator stops (exit code 2) and persists all prior decisions in `checkpoints/pipeline_state.json`.
+- Runtime guards (finite check, relative-norm envelope, `k_max`) flag an item; a flagged item reverts to the unsteered ($K=0$) output.
+- The deployment contract is immutable: checkpoint SHA-256s are verified before the benchmark loads any weights.
+- Gate adoption is conservative: the learned gate is used only if it is paired-NLL-better and not accuracy-worse than passthrough.
+
+## Evaluation arms
+
+Baseline (`override="none"`), Fixed-control ($s^*_{\text{fixed}}$, const gate), Router-only ($\theta^*$, const gate), Full ARS ($\theta^*$, adopted gate, guards), Raw ARS ($\theta=1.01$, learned gate, no guards).  Generations are cached by `(prompt, route_key)`; every empty route shares the single baseline generation.
