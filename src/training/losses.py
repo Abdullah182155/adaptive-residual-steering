@@ -685,3 +685,114 @@ def run_pg_loss(
         attention_masks,
         train_batch_ids,
     )
+
+
+# ==== M4 additions ====
+from typing import Sequence
+
+
+def compute_calc_token_weights(tokenizer, labels: torch.Tensor, ids: torch.Tensor, w: float = 1.75) -> torch.Tensor:
+    """Return per-token weight tensor (same shape as labels).
+
+    Weight = w for supervised tokens whose id is in contrastive._CONTRAST_MATH_IDS
+             (digits, operators, =, $, %, .).
+    Weight = 1.0 for all other non-masked tokens.
+    Weight = 0.0 where labels == -100.
+
+    If _CONTRAST_MATH_IDS is None or empty, falls back to uniform weight 1.0
+    (non-masked tokens only). The id set is read at call time because it is
+    populated lazily by the contrastive module.
+    """
+    from src.training import contrastive as _contrastive
+
+    valid = labels.ne(-100)
+    weights = valid.to(torch.float32)
+    math_ids = getattr(_contrastive, "_CONTRAST_MATH_IDS", None)
+    if math_ids:
+        math_t = torch.tensor(sorted(math_ids), dtype=torch.long, device=labels.device)
+        is_math = torch.isin(ids.to(labels.device), math_t) & valid
+        weights = torch.where(is_math, torch.full_like(weights, float(w)), weights)
+    return weights
+
+
+def weighted_answer_nll(logits: torch.Tensor, labels: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """Compute weighted cross-entropy loss.
+
+    logits: (B, T, V)
+    labels: (B, T)   -100 for masked positions
+    weights: (B, T)  0 for masked positions, positive elsewhere
+
+    Returns scalar mean loss (sum of weight*ce / sum of weights).
+    Raises ValueError if all weights are zero.
+    """
+    shift_logits = logits[:, :-1, :].float()
+    shift_labels = labels[:, 1:]
+    shift_w = weights[:, 1:].to(shift_logits.dtype) * shift_labels.ne(-100).to(shift_logits.dtype)
+    denom = shift_w.sum()
+    if float(denom.item()) <= 0.0:
+        raise ValueError("weighted_answer_nll: all weights are zero")
+    ce = F.cross_entropy(shift_logits.transpose(1, 2), shift_labels, ignore_index=-100, reduction="none")
+    return (ce * shift_w).sum() / denom
+
+
+def unlikelihood_on_divergence(logits_neg: torch.Tensor, neg_labels: torch.Tensor, div_token_mask: torch.BoolTensor) -> torch.Tensor:
+    """Unlikelihood loss on divergent-line tokens: mean[-log(1 - p(tok))] over divergent tokens.
+
+    logits_neg: (B, T, V)
+    neg_labels:  (B, T) with -100 on prompt
+    div_token_mask: (B, T) bool, subset of (neg_labels != -100) positions
+
+    Returns scalar >= 0. Returns 0.0 if div_token_mask has no True entries.
+    """
+    shift_labels = neg_labels[:, 1:]
+    mask = div_token_mask[:, 1:].to(torch.bool) & shift_labels.ne(-100)
+    if not bool(mask.any()):
+        return torch.tensor(0.0, device=logits_neg.device)
+    sel_logits = logits_neg[:, :-1, :][mask].float()  # (N, V)
+    tgt = shift_labels[mask]
+    logp = F.log_softmax(sel_logits, dim=-1).gather(1, tgt.unsqueeze(-1)).squeeze(-1)
+    p = logp.exp().clamp(max=1.0 - 1e-6)
+    return (-torch.log1p(-p)).mean()
+
+
+def collate_pad(rows: Sequence[dict], pad_id: int) -> dict:
+    """Pad a list of row dicts to uniform length along dim=1.
+
+    Each row must have 'input_ids' (LongTensor 1-D) and 'labels' (LongTensor 1-D).
+    Optional keys 'neg_input_ids', 'neg_labels', 'div_token_mask' are padded too
+    (only when every row carries a non-None value for that key).
+    Returns a single batch dict with tensors of shape (B, T_max). Also returns
+    'attention_mask' (and 'neg_attention_mask' when neg_input_ids is present).
+    Missing optional keys are absent in the output.
+    """
+    if len(rows) == 0:
+        raise ValueError("collate_pad: empty rows")
+
+    def _pad(seqs, fill, dtype):
+        t_max = max(int(s.numel()) for s in seqs)
+        out = torch.full((len(seqs), t_max), fill, dtype=dtype)
+        for i, s in enumerate(seqs):
+            out[i, : s.numel()] = s.to(dtype)
+        return out
+
+    def _seqs(key, dtype):
+        return [torch.as_tensor(r[key]).to(dtype).reshape(-1) for r in rows]
+
+    def _has(key):
+        return all((key in r) and (r[key] is not None) for r in rows)
+
+    batch = {}
+    id_seqs = _seqs("input_ids", torch.long)
+    batch["input_ids"] = _pad(id_seqs, pad_id, torch.long)
+    batch["labels"] = _pad(_seqs("labels", torch.long), -100, torch.long)
+    batch["attention_mask"] = _pad([torch.ones(s.numel(), dtype=torch.long) for s in id_seqs], 0, torch.long)
+
+    if _has("neg_input_ids"):
+        neg_seqs = _seqs("neg_input_ids", torch.long)
+        batch["neg_input_ids"] = _pad(neg_seqs, pad_id, torch.long)
+        batch["neg_attention_mask"] = _pad([torch.ones(s.numel(), dtype=torch.long) for s in neg_seqs], 0, torch.long)
+    if _has("neg_labels"):
+        batch["neg_labels"] = _pad(_seqs("neg_labels", torch.long), -100, torch.long)
+    if _has("div_token_mask"):
+        batch["div_token_mask"] = _pad(_seqs("div_token_mask", torch.bool), False, torch.bool)
+    return batch

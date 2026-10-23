@@ -536,10 +536,13 @@ def collect_pre_cap_ratio(model: torch.nn.Module, reset: bool = True) -> dict:
 
 
 def save_steer_weights(
-    model, path: str, cfg: Optional[RSCConfig] = None, phase: str = "ars", prefixes=None
+    model, path: str, cfg: Optional[RSCConfig] = None, phase: str = "ars", prefixes=None,
+    metadata: Optional[Dict[str, Any]] = None, extra_metadata: Optional[Dict[str, Any]] = None,
 ):
     """Save ARS tensors with an auditable phase/config/hash sidecar."""
-    report = save_ars_checkpoint(model, path, phase=phase, cfg=cfg or model.cfg, prefixes=prefixes)
+    extra = metadata or extra_metadata
+    model_cfg = getattr(model, "cfg", None) or cfg
+    report = save_ars_checkpoint(model, path, phase=phase, cfg=cfg or model_cfg, prefixes=prefixes, extra_metadata=extra)
     print(f"✅ Saved {phase} ARS weights to {path} ({report['tensor_count']} tensors; manifest={report['manifest_path']})")
 
 
@@ -3701,3 +3704,501 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     manifest.flush()
 
     return logs, best_val_p1, best_val_p2
+
+
+# --------------------------------------------------------------------------- #
+# M4: S1' SteerNet subset trainer additions
+# --------------------------------------------------------------------------- #
+import copy
+import math
+from contextlib import nullcontext
+
+import numpy as np
+
+from src.routing.catalog import Catalog
+from src.routing.rloo import per_example_answer_nll
+from src.training.losses import (
+    compute_calc_token_weights,
+    weighted_answer_nll,
+    unlikelihood_on_divergence,
+    collate_pad,
+)
+
+
+def sample_training_subset(catalog: "Catalog", rng: random.Random, k_choices: Tuple[int, ...] = (1, 2, 3)) -> Tuple[int, ...]:
+    """Draw a random non-empty subset. K ~ Uniform(k_choices), subset ~ Uniform(C(5,K))."""
+    k = rng.choice(list(k_choices))
+    candidates = [s for s in catalog.subsets if len(s) == k]
+    if not candidates:
+        raise ValueError(f"No catalog subsets of size {k}")
+    return rng.choice(candidates)
+
+
+def _autocast(device: torch.device):
+    return torch.amp.autocast("cuda", enabled=device.type == "cuda")
+
+
+def _set_ctx(model, mask: torch.Tensor, lbls: torch.Tensor) -> None:
+    if hasattr(model, "_attn_mask_cache"):
+        model._attn_mask_cache = mask
+    if hasattr(model, "set_router_context_mask"):
+        model.set_router_context_mask(mask.bool() & (lbls == -100))
+
+
+def _restore_override(model, old) -> None:
+    if old is None:
+        model.set_routing_override(None)
+    else:
+        model.set_routing_override(old[0], old[1])
+
+
+def _catalog_from_cfg(cfg, model) -> "Catalog":
+    layers = getattr(cfg, "catalog_layers", None)
+    if layers is None:
+        layers = model.target_layers
+    return Catalog.build(tuple(layers), getattr(cfg, "catalog_max_k", 3))
+
+
+def _manifest():
+    from src.utils.failure_policy import get_manifest
+    return get_manifest()
+
+
+def _ensure_contrast_sets(tokenizer, device: torch.device) -> bool:
+    from src.training import contrastive as _c
+    if getattr(_c, "_CONTRAST_MATH_IDS", None):
+        return True
+    builder = getattr(_c, "build_contrast_sets", None)
+    try:
+        if builder is not None:
+            builder(tokenizer, device)
+        else:
+            _c.build_contrast_id_cache(tokenizer)
+    except Exception as exc:  # noqa: BLE001
+        _manifest().warn("S1_CALC_WEIGHTS_UNAVAILABLE", f"contrast sets not built ({exc}); using uniform token weights")
+        return False
+    ok = bool(getattr(_c, "_CONTRAST_MATH_IDS", None))
+    if not ok:
+        _manifest().warn("S1_CALC_WEIGHTS_EMPTY", "math token id set is empty; using uniform token weights")
+    return ok
+
+
+def evaluate_subset_nll(model, rows: List[dict], catalog: "Catalog", cfg, device: torch.device) -> np.ndarray:
+    """Evaluate NLL for all 25 non-empty catalog subsets on the given rows.
+
+    Returns (len(rows), C) float32 array where [:, 0] is NLL under empty subset
+    and [:, 1:] are NLL for non-empty subsets.
+    Uses model.counterfactual_mode() and model.set_routing_override("matrix", ...).
+    """
+    n_cols = len(catalog)
+    out = np.zeros((len(rows), n_cols), dtype=np.float32)
+    if not rows:
+        return out
+    eval_bs = max(1, int(getattr(cfg, "s1_eval_batch_size", 4)))
+    old_override = getattr(model, "_routing_override", None)
+    try:
+        with model.counterfactual_mode(), torch.no_grad():
+            for start in range(0, len(rows), eval_bs):
+                chunk = rows[start : start + eval_bs]
+                batch = collate_pad(chunk, 0)
+                ids = batch["input_ids"].to(device)
+                mask = batch["attention_mask"].to(device)
+                lbls = batch["labels"].to(device)
+                bsz = ids.size(0)
+                for c, subset in enumerate(catalog.subsets):
+                    matrix = model.subset_matrix([subset] * bsz).to(device)
+                    model.set_routing_override("matrix", matrix)
+                    _set_ctx(model, mask, lbls)
+                    with _autocast(device):
+                        logits = model(input_ids=ids, attention_mask=mask).logits
+                    nll = per_example_answer_nll(logits, lbls)
+                    out[start : start + bsz, c] = nll.float().cpu().numpy()
+    finally:
+        _restore_override(model, old_override)
+    return out
+
+
+def _k_uniform_gain(nll: np.ndarray, catalog: "Catalog", k_choices: Tuple[int, ...]):
+    """Mean NLL gain (empty - subset) with K uniform over k_choices, plus per-subset mean gains."""
+    n_sub = nll.shape[1] - 1
+    if nll.shape[0] == 0 or n_sub <= 0:
+        return 0.0, np.zeros(max(0, n_sub), dtype=np.float64)
+    gains = nll[:, :1] - nll[:, 1:]
+    per_subset = gains.mean(axis=0).astype(np.float64)
+    sizes = catalog.sizes().cpu().numpy()[1:]
+    vals = [per_subset[sizes == k].mean() for k in k_choices if (sizes == k).any()]
+    score = float(np.mean(vals)) if vals else float(per_subset.mean())
+    return score, per_subset
+
+
+def _draw_rows(rng: random.Random, pool: List[dict], n: int) -> List[dict]:
+    if len(pool) >= n:
+        return rng.sample(pool, n)
+    return [rng.choice(pool) for _ in range(n)]
+
+
+def _rows_to_questions_golds(tokenizer, rows: List[dict], n_max: int):
+    """Decode prompt text and numeric gold from rows (prompt = labels == -100, non-pad)."""
+    from src.evaluation.answers import extract_numeric_answer
+
+    pad_id = tokenizer.pad_token_id
+    questions, golds = [], []
+    for r in rows:
+        if len(questions) >= n_max:
+            break
+        ids = torch.as_tensor(r["input_ids"]).reshape(-1)
+        lbl = torch.as_tensor(r["labels"]).reshape(-1)
+        prompt_mask = lbl.eq(-100)
+        if pad_id is not None:
+            prompt_mask = prompt_mask & ids.ne(pad_id)
+        ans_mask = lbl.ne(-100)
+        if not bool(prompt_mask.any()) or not bool(ans_mask.any()):
+            continue
+        gold = extract_numeric_answer(tokenizer.decode(ids[ans_mask], skip_special_tokens=True))
+        if gold is None:
+            continue
+        questions.append(tokenizer.decode(ids[prompt_mask], skip_special_tokens=True))
+        golds.append(float(gold))
+    return questions, golds
+
+
+def _s1_fit(
+    model, tokenizer, gold_rows: List[dict], onpolicy_rows: List[dict], sel_rows: List[dict],
+    cfg, device: torch.device, catalog: "Catalog", epochs: int, lr: float, rng: random.Random,
+    ckpt_mgr=None, label: str = "S1'",
+) -> Dict[str, Any]:
+    """Shared S1' training loop (subset-level layer-dropout). Returns logs + best state."""
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    for p in model.parameters():
+        p.requires_grad = False
+    steer_params = []
+    for sn in model.steer_nets.values():
+        for p in sn.parameters():
+            p.requires_grad = True
+            steer_params.append(p)
+    model.set_steer_scale(getattr(cfg, "steer_scale", 1.0))
+    if hasattr(model, "set_router_warmup"):
+        model.set_router_warmup(False)
+
+    n_total = len(gold_rows) + len(onpolicy_rows)
+    if n_total == 0:
+        raise ValueError("train_s1: no training rows")
+
+    optimizer = torch.optim.AdamW(
+        steer_params, lr=lr, weight_decay=cfg.weight_decay, betas=(0.9, 0.98), eps=1e-6
+    )
+    bs = max(1, cfg.batch_size)
+    micro_per_epoch = max(1, math.ceil(n_total / bs))
+    steps_per_epoch = max(1, math.ceil(micro_per_epoch / cfg.grad_accum))
+    total_steps = max(1, steps_per_epoch * max(1, epochs))
+    warmup = int(total_steps * cfg.phase1_warmup_ratio)
+    lr_reducer = LRReducer(
+        optimizer, total_steps, factor=cfg.lr_reduce_factor, patience=cfg.lr_reduce_patience,
+        min_lr=cfg.lr_reduce_min_lr, delta=cfg.early_stop_delta, warmup_steps=warmup,
+    )
+    lr_reducer.base_lrs = [lr]
+    optimizer.param_groups[0]["lr"] = lr
+    grad_mon = GradientMonitor(cfg.grad_warn_threshold)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+
+    train_loss_history: List[float] = []
+    val_gain_history: List[float] = []
+    best_gain = -float("inf")
+    best_state = None
+    best_subset = None
+    best_subset_gain = None
+    patience_ctr = 0
+    micro_counter = 0
+    frac = float(cfg.s1_onpolicy_fraction)
+
+    for epoch in range(max(0, epochs)):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        accum, epoch_loss, n_loss = 0, 0.0, 0
+        pbar = tqdm(range(micro_per_epoch), desc=f"{label} {epoch + 1}/{epochs}", leave=False)
+        for m in pbar:
+            use_onp = bool(onpolicy_rows) and (not gold_rows or rng.random() < frac)
+            pool = onpolicy_rows if use_onp else gold_rows
+            batch_rows = _draw_rows(rng, pool, bs)
+            batch = collate_pad(batch_rows, pad_id)
+            ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            lbls = batch["labels"].to(device)
+            bsz = ids.size(0)
+
+            subset = sample_training_subset(catalog, rng, cfg.s1_k_choices)
+            model.set_routing_override("matrix", model.subset_matrix([subset] * bsz).to(device))
+            _set_ctx(model, mask, lbls)
+            with _autocast(device):
+                out = model(input_ids=ids, attention_mask=mask)
+            weights = compute_calc_token_weights(tokenizer, lbls, ids, cfg.s1_calc_token_weight)
+            try:
+                task_loss = weighted_answer_nll(out.logits, lbls, weights)
+            except ValueError:
+                continue
+            total = task_loss
+
+            micro_counter += 1
+            if cfg.s1_lambda_unl > 0 and micro_counter % max(1, cfg.s1_unl_every_n_steps) == 0:
+                paired = [
+                    r for r in batch_rows
+                    if r.get("neg_input_ids") is not None
+                    and r.get("neg_labels") is not None
+                    and r.get("div_token_mask") is not None
+                ]
+                if paired:
+                    pb = collate_pad(paired, pad_id)
+                    n_ids = pb["neg_input_ids"].to(device)
+                    n_mask = pb["neg_attention_mask"].to(device)
+                    n_lbl = pb["neg_labels"].to(device)
+                    n_div = pb["div_token_mask"].to(device)
+                    model.set_routing_override("matrix", model.subset_matrix([subset] * n_ids.size(0)).to(device))
+                    _set_ctx(model, n_mask, n_lbl)
+                    with _autocast(device):
+                        out_neg = model(input_ids=n_ids, attention_mask=n_mask)
+                    ul = unlikelihood_on_divergence(out_neg.logits, n_lbl, n_div)
+                    if ul.requires_grad:
+                        total = total + cfg.s1_lambda_unl * ul
+
+            loss = total / cfg.grad_accum
+            if not torch.isfinite(loss):
+                continue
+            scaler.scale(loss).backward()
+            accum += 1
+            epoch_loss += float(task_loss.detach().item())
+            n_loss += 1
+
+            is_last = m == micro_per_epoch - 1
+            if accum == cfg.grad_accum or is_last:
+                scaler.unscale_(optimizer)
+                for p in steer_params:
+                    if p.grad is not None and not torch.isfinite(p.grad).all():
+                        p.grad.zero_()
+                torch.nn.utils.clip_grad_norm_(steer_params, cfg.clip_grad)
+                if cfg.use_gradient_monitor:
+                    grad_mon.check(steer_params, micro_counter)
+                scaler.step(optimizer)
+                scaler.update()
+                lr_reducer.scheduler_step()
+                optimizer.zero_grad(set_to_none=True)
+                accum = 0
+            pbar.set_postfix(loss=f"{float(task_loss.detach().item()):.4f}")
+
+        model.set_routing_override(None)
+        avg_loss = epoch_loss / max(1, n_loss)
+        train_loss_history.append(avg_loss)
+
+        nll = evaluate_subset_nll(model, sel_rows, catalog, cfg, device)
+        gain, per_subset = _k_uniform_gain(nll, catalog, cfg.s1_k_choices)
+        val_gain_history.append(gain)
+        lr_reducer.step(-gain)
+
+        improved = (not sel_rows) or gain > best_gain + cfg.early_stop_delta
+        if improved:
+            best_gain = gain
+            patience_ctr = 0
+            best_state = {k: v.detach().clone() for k, v in model.steer_nets.state_dict().items()}
+            if per_subset.size:
+                idx = int(np.argmax(per_subset))
+                best_subset = catalog.subsets[idx + 1]
+                best_subset_gain = float(per_subset[idx])
+        else:
+            patience_ctr += 1
+        print(
+            f"  {label} Epoch {epoch + 1}: train={avg_loss:.4f}  val_gain(K-uniform)={gain:+.4f}  "
+            f"best_subset={best_subset}  {'✅' if improved else ''}"
+        )
+        if ckpt_mgr is not None and (epoch + 1) % cfg.checkpoint_every_n == 0:
+            ckpt_mgr.save(model, optimizer, epoch, -gain, "s1")
+        if patience_ctr >= cfg.phase1_patience:
+            print(f"  {label} early stopping (no improvement for {cfg.phase1_patience} epochs)")
+            break
+
+    grad_mon.summary()
+    return {
+        "train_loss_history": train_loss_history,
+        "val_nll_gain_history": val_gain_history,
+        "best_state": best_state,
+        "best_gain": best_gain,
+        "best_subset": best_subset,
+        "best_subset_gain": best_subset_gain,
+    }
+
+
+def train_s1_steernet(
+    model,
+    tokenizer,
+    gold_rows: List[dict],
+    onpolicy_rows: List[dict],
+    sel_rows: List[dict],
+    cfg,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Train S1' SteerNets on on-policy + gold data with random subset-level layer-dropout.
+
+    Router and gate are frozen (set_steer_scale(cfg.steer_scale)); only steer_nets train.
+    Per epoch: evaluate_subset_nll on sel_rows. After the final epoch: paired greedy
+    check (best subset vs baseline) on up to s1_final_gen_n rows, recorded as a manifest
+    advisory. Saves weights with metadata.
+
+    Returns logs dict with keys: train_loss_history, val_nll_gain_history,
+    best_subset, final_gen_check.
+    """
+    print("\n" + "=" * 80)
+    print("S1': SteerNet subset trainer (on-policy + gold, subset-level layer-dropout)")
+    print(f"     epochs={cfg.s1_epochs}  lr={cfg.s1_lr}  onpolicy_fraction={cfg.s1_onpolicy_fraction}")
+    print("=" * 80)
+
+    catalog = _catalog_from_cfg(cfg, model)
+    rng = random.Random(cfg.seed)
+    _ensure_contrast_sets(tokenizer, device)
+
+    fit = _s1_fit(
+        model, tokenizer, gold_rows, onpolicy_rows, sel_rows, cfg, device, catalog,
+        epochs=cfg.s1_epochs, lr=cfg.s1_lr, rng=rng,
+        ckpt_mgr=CheckpointManager(cfg.checkpoint_dir),
+    )
+    if fit["best_state"] is not None:
+        model.steer_nets.load_state_dict(fit["best_state"])
+    best_subset = fit["best_subset"]
+
+    final_gen = None
+    n_gen = int(getattr(cfg, "s1_final_gen_n", 0))
+    if n_gen > 0 and best_subset is not None and sel_rows:
+        from src.evaluation.paired_generation import paired_greedy_eval
+
+        questions, golds = _rows_to_questions_golds(tokenizer, sel_rows, n_gen)
+        if questions:
+            subset_layers = list(best_subset)
+            res = paired_greedy_eval(
+                model, tokenizer, questions, golds,
+                lambda m: m.set_routing_override("none", None),
+                lambda m: m.set_routing_override("only", subset_layers),
+                device, batch_size=8, max_new_tokens=512,
+            )
+            final_gen = {
+                "n": len(questions),
+                "subset": subset_layers,
+                "acc_baseline": res["acc_a"],
+                "acc_best_subset": res["acc_b"],
+                "b": res["b"],
+                "c": res["c"],
+                "delta": res["delta"],
+            }
+            _manifest().advisory("s1_final_gen_check", final_gen, "discordant counts (b,c)")
+            print(
+                f"  Final gen check: baseline={res['acc_a']:.3f}  best_subset={res['acc_b']:.3f}  "
+                f"b={res['b']} c={res['c']}"
+            )
+
+    metadata = {
+        "steer_scale": getattr(cfg, "steer_scale", 1.0),
+        "k_scale_mode": getattr(getattr(model, "cfg", cfg), "k_scale_mode", getattr(cfg, "k_scale_mode", "sqrt")),
+        "steernet_k_conditioning": getattr(
+            getattr(model, "cfg", cfg), "steernet_k_conditioning", getattr(cfg, "steernet_k_conditioning", True)
+        ),
+        "best_subset": list(best_subset) if best_subset is not None else None,
+        "catalog_layers": list(catalog.layers),
+    }
+    save_steer_weights(model, cfg.s1_save_path, metadata=metadata)
+    model.set_routing_override(None)
+
+    return {
+        "train_loss_history": fit["train_loss_history"],
+        "val_nll_gain_history": fit["val_nll_gain_history"],
+        "best_subset": best_subset,
+        "final_gen_check": final_gen,
+    }
+
+
+def _get_k_options(model, cfg):
+    mcfg = getattr(model, "cfg", cfg)
+    return getattr(mcfg, "k_scale_mode", "sqrt"), getattr(mcfg, "steernet_k_conditioning", True)
+
+
+def _set_k_options(model, cfg, mode: str, cond: bool) -> None:
+    targets = [cfg]
+    mcfg = getattr(model, "cfg", None)
+    if mcfg is not None and mcfg is not cfg:
+        targets.append(mcfg)
+    for t in targets:
+        t.k_scale_mode = mode
+        t.steernet_k_conditioning = cond
+    if hasattr(model, "set_k_scale_mode"):
+        model.set_k_scale_mode(mode)
+    if hasattr(model, "set_k_conditioning"):
+        model.set_k_conditioning(cond)
+
+
+def run_k_scaling_ablation(
+    model,
+    tokenizer,
+    rows: List[dict],
+    sel_rows: List[dict],
+    cfg,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Run short ablation over {sqrt, none} x {k_cond on, off}.
+
+    For each of 4 combinations: short train (s1_ablation_epochs, s1_ablation_n_train rows),
+    score by mean val NLL gain with K uniform. Record all 4 to manifest as advisory.
+    The best-scoring combination gives the recommended k_scaling and k_cond.
+
+    Returns dict with keys: results (list of 4 dicts), winner_k_scaling, winner_k_cond.
+    """
+    catalog = _catalog_from_cfg(cfg, model)
+    _ensure_contrast_sets(tokenizer, device)
+
+    subsample_rng = random.Random(cfg.seed)
+    n_train = int(cfg.s1_ablation_n_train)
+    train_rows = list(rows)
+    if len(train_rows) > n_train:
+        train_rows = subsample_rng.sample(train_rows, n_train)
+    onp = [r for r in train_rows if r.get("is_onpolicy")]
+    gold = [r for r in train_rows if not r.get("is_onpolicy")]
+
+    init_steer = copy.deepcopy(model.steer_nets.state_dict())
+    init_mode, init_cond = _get_k_options(model, cfg)
+
+    results: List[Dict[str, Any]] = []
+    try:
+        for mode in ("sqrt", "none"):
+            for cond in (True, False):
+                model.steer_nets.load_state_dict(init_steer)
+                _set_k_options(model, cfg, mode, cond)
+                fit = _s1_fit(
+                    model, tokenizer, gold, onp, sel_rows, cfg, device, catalog,
+                    epochs=cfg.s1_ablation_epochs, lr=cfg.s1_lr, rng=random.Random(cfg.seed),
+                    ckpt_mgr=None, label=f"S1'-abl[{mode},k_cond={cond}]",
+                )
+                score = float(fit["best_gain"]) if np.isfinite(fit["best_gain"]) else 0.0
+                res = {
+                    "k_scaling": mode,
+                    "k_cond": cond,
+                    "score": score,
+                    "final_train_loss": fit["train_loss_history"][-1] if fit["train_loss_history"] else None,
+                }
+                results.append(res)
+                _manifest().advisory(
+                    f"s1_k_ablation_{mode}_kcond_{'on' if cond else 'off'}",
+                    res,
+                    "mean val NLL gain with K uniform (higher is better)",
+                )
+    finally:
+        model.steer_nets.load_state_dict(init_steer)
+        _set_k_options(model, cfg, init_mode, init_cond)
+        model.set_routing_override(None)
+
+    best = max(results, key=lambda r: r["score"])
+    winner_k_scaling, winner_k_cond = best["k_scaling"], best["k_cond"]
+    _manifest().advisory(
+        "s1_k_scaling_winner",
+        {"k_scaling": winner_k_scaling, "k_cond": winner_k_cond, "score": best["score"]},
+        "recommended k_scale_mode and steernet_k_conditioning from the 4-way ablation",
+    )
+    return {
+        "results": results,
+        "winner_k_scaling": winner_k_scaling,
+        "winner_k_cond": winner_k_cond,
+    }

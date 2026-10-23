@@ -467,6 +467,20 @@ class RSCConfig:
     onpolicy_max_tok_len: int = 1280
     onpolicy_gold_mix: float = 0.4
 
+    # ==== M4 ====
+    s1_epochs: int = 4
+    s1_lr: float = 5e-3
+    s1_onpolicy_fraction: float = 0.6
+    s1_lambda_unl: float = 0.1
+    s1_unl_every_n_steps: int = 4
+    s1_calc_token_weight: float = 1.75
+    s1_val_onpolicy_n: int = 120
+    s1_k_choices: Tuple[int, ...] = (1, 2, 3)
+    s1_save_path: str = "./checkpoints/s1_steernet.pt"
+    s1_final_gen_n: int = 240
+    s1_ablation_epochs: int = 1
+    s1_ablation_n_train: int = 1000
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')
