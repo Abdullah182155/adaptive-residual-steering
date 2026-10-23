@@ -449,6 +449,14 @@ class RSCConfig:
     cf_audit_plan: Tuple[Tuple[int, int], ...] = ((0, 300), (4, 150), (8, 150))            # (n_shot, n_rows)
     cf_heldout_n: int = 120                                  # 0-shot rows from eval_data
 
+    # ==== M2 ====
+    audit_g_fixed_min: float = 0.01
+    audit_h_low: float = 0.005
+    audit_h_high: float = 0.02
+    audit_g_zero_eps: float = 0.005
+    audit_n_boot: int = 2000
+    audit_inflation_margin: float = 0.01
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')
