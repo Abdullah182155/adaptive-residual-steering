@@ -435,6 +435,11 @@ class RSCConfig:
     max_consecutive_nonfinite_loss: int = 20
     steer_scale: float = 0.30                     # s_ref: certified Phase 1 scale
 
+    # ==== M6a ====
+    k_scale_mode: str = "sqrt"            # "sqrt" | "none"
+    steernet_k_conditioning: bool = True
+    gate_task_gradient: bool = False      # consumed in M6b/M7; declared now to avoid later churn
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')

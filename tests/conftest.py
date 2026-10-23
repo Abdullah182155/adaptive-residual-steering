@@ -207,9 +207,74 @@ def tiny_model(tiny_cfg) -> Phi2WithRSC:
                 out.logits = logits
                 return out
 
+            def generate(self, input_ids=None, attention_mask=None,
+                         max_new_tokens=4, do_sample=False, **kwargs):
+                B = input_ids.shape[0] if input_ids is not None else 1
+                extra = torch.zeros(B, max_new_tokens, dtype=torch.long)
+                return torch.cat([input_ids, extra], dim=1) if input_ids is not None else extra
+
         base = _DummyModel(hidden_size=64, num_layers=12, vocab_size=128)
 
-    model = Phi2WithRSC(base, tiny_cfg, device=torch.device("cpu"))
+    return _finish_build(base, tiny_cfg)
+
+
+def _build_tiny_model(cfg: RSCConfig) -> Phi2WithRSC:
+    """Helper to build a tiny model from a given cfg (used by M6a tests)."""
+    torch.manual_seed(0)
+    base = None
+    try:
+        from transformers.models.phi.modeling_phi import PhiForCausalLM
+        from transformers.models.phi.configuration_phi import PhiConfig
+        phi_cfg = PhiConfig(
+            vocab_size=128, hidden_size=64, intermediate_size=128,
+            num_hidden_layers=12, num_attention_heads=4,
+            max_position_embeddings=256, pad_token_id=0,
+            bos_token_id=1, eos_token_id=1,
+        )
+        base = PhiForCausalLM(phi_cfg).float()
+    except Exception:
+        pass
+    if base is None:
+        class _DL(torch.nn.Module):
+            def __init__(self, d):
+                super().__init__()
+                self.linear = torch.nn.Linear(d, d)
+            def forward(self, hidden_states, *a, **kw):
+                return (self.linear(hidden_states),)
+        class _DM(torch.nn.Module):
+            def __init__(self, hidden_size=64, num_layers=12, vocab_size=128):
+                super().__init__()
+                self.config = type("Config", (), {
+                    "num_hidden_layers": num_layers,
+                    "hidden_size": hidden_size,
+                    "vocab_size": vocab_size,
+                })()
+                self.model = type("Model", (), {
+                    "layers": torch.nn.ModuleList([_DL(hidden_size) for _ in range(num_layers)])
+                })()
+                self.embed = torch.nn.Embedding(vocab_size, hidden_size)
+                self.lm_head = torch.nn.Linear(hidden_size, vocab_size)
+            def forward(self, input_ids=None, attention_mask=None, labels=None, **kw):
+                h = self.embed(input_ids) if input_ids is not None else torch.zeros(1, 4, 64)
+                for layer in self.model.layers:
+                    h = layer(h)[0]
+                logits = self.lm_head(h)
+                loss = torch.tensor(0.5, requires_grad=True) if labels is not None else None
+                class _Out:
+                    pass
+                out = _Out(); out.loss = loss; out.logits = logits
+                return out
+            def generate(self, input_ids=None, attention_mask=None, max_new_tokens=4, **kw):
+                # Greedy: just append zeros
+                B = input_ids.shape[0] if input_ids is not None else 1
+                extra = torch.zeros(B, max_new_tokens, dtype=torch.long)
+                return torch.cat([input_ids, extra], dim=1) if input_ids is not None else extra
+        base = _DM(hidden_size=64, num_layers=12, vocab_size=128)
+    return _finish_build(base, cfg)
+
+
+def _finish_build(base, cfg):
+    model = Phi2WithRSC(base, cfg, device=torch.device("cpu"))
     model.eval()
     return model
 

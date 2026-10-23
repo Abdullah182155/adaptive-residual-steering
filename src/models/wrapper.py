@@ -11,6 +11,9 @@ from src.steering.steernet import RSCSteerNet
 from src.gating.gate import RSCUsefulnessGate, masked_route_allocation, token_competitive_allocation
 from src.routing.router import JointLayerRouter
 from src.routing.rloo import sample_k, sample_subset_plackett_luce
+from contextlib import contextmanager
+from typing import Sequence as _Sequence
+from src.utils.failure_policy import FatalContractError, get_manifest
 
 class Phi2WithRSC(nn.Module):
     """Wraps Phi-2 backbone with RSC forward hooks for steering, gating, and routing."""
@@ -90,6 +93,10 @@ class Phi2WithRSC(nn.Module):
         self._active_k_realized = None
         self._collect_routing_trace = False
         self.last_routing_trace = None
+        self._hooks_disabled = False
+        self._steer_scale = None
+        self.routing_step_log = []
+        self.guard_state = {}
         # Per-generation evidence used by the qualitative evaluator.  Values
         # are detached scalar alphas only; tracing never retains a model graph.
         self._collect_gate_trace = False
@@ -140,6 +147,8 @@ class Phi2WithRSC(nn.Module):
                     wrapper = self_ref()
                     if wrapper is None:
                         return output
+                    if wrapper._hooks_disabled:
+                        return output
                     is_tuple = isinstance(output, tuple)
                     h = output[0] if is_tuple else output
                     orig_2d = False
@@ -155,7 +164,7 @@ class Phi2WithRSC(nn.Module):
                             return output
                         if wrapper._routing_override is None:
                             wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
-                        delta = s(h_fp, active_k=wrapper._active_k_realized)
+                        delta = s(h_fp, active_k=wrapper._active_k_realized if getattr(wrapper.cfg, 'steernet_k_conditioning', True) else None)
                         if wrapper._token_competitive_alpha is not None:
                             # Advance the causal gate cache using the native
                             # layer state, then substitute the shared
@@ -251,6 +260,7 @@ class Phi2WithRSC(nn.Module):
                             h_new = h_fp + route_st * alpha * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1)
                         else:
                             h_new = h_fp + route_st * alpha.detach() * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1)
+                        wrapper._record_envelope(layer_pos, route_st * alpha.detach() * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1), h_fp, steer_mask, h_new)
                     h_out = h_new.to(h.dtype)
                     if orig_2d:
                         h_out = h_out.squeeze(0)
@@ -314,6 +324,7 @@ class Phi2WithRSC(nn.Module):
                     self._cached_decode_margins = None
                     self._cached_decode_active_k = None
                     self._cached_decode_allocation = None
+                    self.guard_state.clear()
                     self._prompt_shield_mask_active = self._prompt_shield_mask_pending
                     for g in self.gates.values():
                         if hasattr(g, "reset_conv_cache"):
@@ -747,7 +758,14 @@ class Phi2WithRSC(nn.Module):
                 selected_matrix = self._finalize_selection((scores > float("-inf")) & eligible.unsqueeze(0), scores)
             # Overrides are measured controls: a "none" baseline requests and
             # realizes K=0.  Do not clamp its telemetry to one.
-            self._desired_k = selected_matrix.long().sum(dim=-1).clamp(min=0, max=K_max)
+            if mode == "matrix":
+                if selected_matrix.size(-1) != len(self.target_layers):
+                    raise FatalContractError("E_SHAPE", f"matrix width {selected_matrix.size(-1)} != n_candidates {len(self.target_layers)}")
+                if (selected_matrix.sum(-1) > self.cfg.max_active_layers).any():
+                    get_manifest().warn("W_K_EXCEEDS_CAP", f"Some rows exceed max_active_layers={self.cfg.max_active_layers}")
+                self._desired_k = selected_matrix.long().sum(dim=-1)  # F2: uncapped, min 0
+            else:
+                self._desired_k = selected_matrix.long().sum(dim=-1).clamp(min=0, max=K_max)
 
         self.router._last_prediction = self._desired_k
         self._last_inferred_k = self._desired_k
@@ -784,6 +802,11 @@ class Phi2WithRSC(nn.Module):
     def _select_layer(self, layer_idx: int, layer_pos: int, h: torch.Tensor, mask: torch.Tensor):
         if layer_idx == self.target_layers[0]:
             self._prepare_routes(h, mask)
+            if self._collect_routing_trace:
+                self.routing_step_log.append({
+                    "routes": self.current_route_tuples(),
+                    "q_len": int(h.shape[1]),
+                })
         if self._precomputed_routes is None or self._desired_k is None:
             raise RuntimeError("RSC routes were not prepared at the first candidate layer")
         selected = self._precomputed_routes[:, layer_pos]
@@ -1039,6 +1062,81 @@ class Phi2WithRSC(nn.Module):
         ]
         return self.router.get_cooperation_analysis(eligible_layers=eligible)
 
+
+    def set_steer_scale(self, s):
+        """Set constant steering bypass scale (float). None disables bypass (uses learned gate)."""
+        self._steer_scale = s
+
+    @contextmanager
+    def hooks_disabled(self):
+        """Reference 'unwrapped' forward; keeps pre-hook running for router features."""
+        old = self._hooks_disabled
+        self._hooks_disabled = True
+        try:
+            yield
+        finally:
+            self._hooks_disabled = old
+
+    @contextmanager
+    def counterfactual_mode(self):
+        """eval(), no_grad context; saves/restores training flag, routing override,
+        steer_scale, gate_freeze, router context mask. Used by table builder and RLOO."""
+        was_training = self.training
+        old_override = self._routing_override
+        old_scale = self._steer_scale
+        old_freeze = [(g, g._freeze_gate, g._freeze_gate_value) for g in self.gates.values()]
+        old_ctx_pending = self._router_context_mask_pending
+        self.eval()
+        try:
+            with torch.no_grad():
+                yield
+        finally:
+            self.train(was_training)
+            self._routing_override = old_override
+            self._steer_scale = old_scale
+            for g, freeze_flag, freeze_val in old_freeze:
+                g._freeze_gate = freeze_flag
+                g._freeze_gate_value = freeze_val
+            self._router_context_mask_pending = old_ctx_pending
+
+    def subset_matrix(self, subsets):
+        """Convert layer-id subsets to (B, n_candidates) bool matrix.
+        Raises ValueError if any layer id is not a candidate."""
+        nc = len(self.target_layers)
+        mat = torch.zeros(len(subsets), nc, dtype=torch.bool)
+        idx_map = {l: i for i, l in enumerate(self.target_layers)}
+        for row, subset in enumerate(subsets):
+            for lid in subset:
+                if lid not in idx_map:
+                    raise ValueError(
+                        f"Layer {lid} is not a candidate layer. Valid: {self.target_layers}"
+                    )
+                mat[row, idx_map[lid]] = True
+        return mat
+
+    def current_route_tuples(self):
+        """Layer ids per batch row from _precomputed_routes (valid at prefill AND cached decode)."""
+        if self._precomputed_routes is None:
+            return []
+        return [
+            tuple(self.target_layers[i] for i, v in enumerate(row) if v)
+            for row in self._precomputed_routes.tolist()
+        ]
+
+    def _record_envelope(self, layer_pos, step, h_fp, mask, h_new):
+        """Record per-item rel-norm and non-finite status into guard_state. Always runs (cheap)."""
+        with torch.no_grad():
+            norm_h = h_fp.norm(dim=-1).clamp(min=1e-8)          # (B, T)
+            rel = (step.norm(dim=-1) / norm_h * mask).max(dim=-1).values  # (B,)
+            nonfinite = (~torch.isfinite(h_new)).any(dim=-1).any(dim=-1)   # (B,)
+            if "rel_max" not in self.guard_state:
+                self.guard_state["rel_max"] = rel
+                self.guard_state["nonfinite"] = nonfinite
+            else:
+                prev_rel = self.guard_state["rel_max"]
+                if prev_rel.shape == rel.shape:
+                    self.guard_state["rel_max"] = torch.maximum(prev_rel, rel)
+                    self.guard_state["nonfinite"] = self.guard_state["nonfinite"] | nonfinite
     def remove_hooks(self):
         for h in self._hooks:
             h.remove()
