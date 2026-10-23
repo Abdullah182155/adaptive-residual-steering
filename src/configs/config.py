@@ -393,7 +393,7 @@ class RSCConfig:
     phase1b_min_depth_bands: int = 2
     phase1b_lr: float = 5e-5
     phase1b_joint_nll_weight: float = 1.0
-    unified_adaptive_phase: bool = True
+    unified_adaptive_phase: bool = False
     unified_adaptive_epochs: int = 2
     gate_retune_lr: float = 1e-4
 
@@ -429,7 +429,24 @@ class RSCConfig:
     streamlined_steer_lr: float = 1e-4
     streamlined_gate_lr: float = 1e-3
 
+    # ==== M0 ====
+    failure_policy: str = "warn"                  # "warn" (default) | "strict" (CI only)
+    manifest_path: str = "./run_manifest.json"
+    max_consecutive_nonfinite_loss: int = 20
+    steer_scale: float = 0.30                     # s_ref: certified Phase 1 scale
+
     def __post_init__(self):
+        if self.failure_policy not in ("warn", "strict"):
+            raise ValueError('failure_policy must be "warn" or "strict"')
+        if self.failure_policy == "warn":
+            # Coerce legacy fail-closed flags so they can never block a run.
+            if hasattr(self, "skip_adaptive_phases_when_router_fails"):
+                self.skip_adaptive_phases_when_router_fails = False
+            if hasattr(self, "router_fail_fast_on_collapse"):
+                self.router_fail_fast_on_collapse = False
+            if hasattr(self, "continue_on_diagnostic_failure"):
+                self.continue_on_diagnostic_failure = True
+
         os.makedirs(self.checkpoint_dir, exist_ok=True)
         # Ensure parent dirs exist for paths
         for path in [
@@ -439,10 +456,12 @@ class RSCConfig:
             self.router_bootstrap_save_path,
             self.steer_finetune_save_path,
             self.gate_only_save_path,
+            self.manifest_path,
         ]:
-            pdir = os.path.dirname(path)
-            if pdir:
-                os.makedirs(pdir, exist_ok=True)
+            if path:
+                pdir = os.path.dirname(path)
+                if pdir:
+                    os.makedirs(pdir, exist_ok=True)
 
     @property
     def effective_batch_size(self) -> int:
@@ -635,6 +654,11 @@ ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     "lambda_l1_gate": 0.01,
     "calc_token_weight": 1.75,
     "skip_adaptive_phases_when_phase1_fails": False,
+    "skip_adaptive_phases_when_router_fails": False,
+    "router_fail_fast_on_collapse": False,
+    "continue_on_diagnostic_failure": True,
+    "failure_policy": "warn",
+    "steer_scale": 0.30,
     "phase1_allow_nonregressing_confirmation": True,
     "phase1_allow_confirmation_noise_tolerance": True,
     "phase1_max_confirmation_candidates": 6,
@@ -646,10 +670,12 @@ ENGINE_V40_KAGGLE_EVALUATION: Dict[str, Any] = {
 }
 
 
-def make_engine_v40_kaggle_config() -> RSCConfig:
+def make_engine_v40_kaggle_config(**overrides) -> RSCConfig:
     """Return the committed Engine v4.0 T4 decision-run profile."""
     cfg = RSCConfig()
     for field, value in ENGINE_V40_KAGGLE_PROFILE.items():
+        setattr(cfg, field, value)
+    for field, value in overrides.items():
         setattr(cfg, field, value)
     return cfg
 

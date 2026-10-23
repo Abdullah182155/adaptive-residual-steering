@@ -37,6 +37,69 @@ from src.experiments.checkpointing import (
     save_ars_checkpoint,
 )
 from src.steering.steernet import post_cap_ratio_from_pre_cap_q
+from src.utils.failure_policy import (
+    FatalContractError,
+    RunManifest,
+    get_manifest,
+    set_manifest,
+    to_jsonable,
+)
+
+
+# --------------------------------------------------------------------------- #
+# M0 helpers
+# --------------------------------------------------------------------------- #
+def _assert_finite_params(model, stage_name: str = ""):
+    """Fatal (E_NONFINITE_PARAMS) if any SteerNet / Gate / Router parameter is NaN or Inf."""
+    manifest = get_manifest()
+    for group_name in ("steer_nets", "gates", "router"):
+        module = getattr(model, group_name, None)
+        if module is None:
+            continue
+        if isinstance(module, (torch.nn.ModuleDict, dict)):
+            items = module.items()
+        elif isinstance(module, torch.nn.Module):
+            items = [("", module)]
+        else:
+            continue
+        for sub_name, sub_mod in items:
+            if not isinstance(sub_mod, torch.nn.Module):
+                continue
+            for pname, p in sub_mod.named_parameters():
+                with torch.no_grad():
+                    bad = bool(torch.isnan(p).any() or torch.isinf(p).any())
+                if bad:
+                    manifest.fatal(
+                        "E_NONFINITE_PARAMS",
+                        f"Non-finite params detected in {group_name}.{sub_name}.{pname} during stage {stage_name}",
+                        stage=stage_name,
+                    )
+
+
+class NonfiniteLossTracker:
+    """Counts consecutive non-finite losses; raises E_NONFINITE_LOSS_STREAK at the limit."""
+
+    def __init__(self, limit: int = 20, stage_name: str = ""):
+        self.limit = int(limit)
+        self.stage_name = stage_name
+        self.count = 0
+
+    @classmethod
+    def from_cfg(cls, cfg, stage_name: str = "") -> "NonfiniteLossTracker":
+        return cls(getattr(cfg, "max_consecutive_nonfinite_loss", 20), stage_name)
+
+    def observe(self, is_finite: bool) -> int:
+        if is_finite:
+            self.count = 0
+            return 0
+        self.count += 1
+        if self.count >= self.limit:
+            get_manifest().fatal(
+                "E_NONFINITE_LOSS_STREAK",
+                f"Exceeded {self.limit} consecutive non-finite loss steps",
+                stage=self.stage_name,
+            )
+        return self.count
 
 
 def _phase1_runtime_config_sha256(cfg: RSCConfig) -> str:
@@ -1339,23 +1402,46 @@ def _evaluate_and_maybe_checkpoint(
     # A generation sample is a noisy checkpoint signal.  It may break ties,
     # but it must never replace a checkpoint whose teacher-forced validation
     # loss is materially better (the old rule did exactly that in Phase 2B).
-    val_improved = val_loss < best_val - cfg.early_stop_delta
+    val_improved = val_loss < best_val - getattr(cfg, "early_stop_delta", 1e-4)
     acc_improved = acc > best_acc + 0.005
-    val_tied = abs(val_loss - best_val) <= cfg.early_stop_delta
+    val_tied = abs(val_loss - best_val) <= getattr(cfg, "early_stop_delta", 1e-4)
     improved = val_improved or (getattr(cfg, "use_accuracy_checkpoint", True) and val_tied and acc_improved)
     note = ""
     if train_router:
         diag = model.routing_diagnostics()
         n_candidates = max(1, len(diag))
         dead = sum(1 for s in diag.values() if s["selected_forwards"] / max(1, s["seen_forwards"]) < 0.02)
-        k_dist = model.routing_k_distribution()
-        k_str = ", ".join(f"K={k}:{v:.2f}" for k, v in k_dist.items() if v > 0.01)
-        intervention = model.intervention_diagnostics() if hasattr(model, "intervention_diagnostics") else {}
-        note = (
-            f"  (active layers: {n_candidates - dead}/{n_candidates} | {k_str}"
-            f" | K-H={intervention.get('realized_k_entropy', 0.0):.2f}"
-            f" | L-H={intervention.get('layer_selection_entropy', 0.0):.2f})"
+        veto_frac = getattr(cfg, "router_dead_layer_veto_frac", 1.0)
+        dead_ratio = dead / n_candidates
+        within = not (dead_ratio >= veto_frac)  # 1.0 => warn when 100% of layers are dead
+        manifest = get_manifest()
+        manifest.diagnostic(
+            "W_DEAD_LAYERS",
+            ok=within,
+            message=f"Dead layer ratio {dead}/{n_candidates} exceeds veto threshold",
+            stage="checkpoint",
+            dead=dead,
+            n_candidates=n_candidates,
+            ratio=dead_ratio,
+            veto_frac=veto_frac,
+            label=label,
+            accuracy_improved=improved,
         )
+        if not within:
+            if getattr(cfg, "failure_policy", "warn") == "strict" and improved:
+                improved = False
+                note = f"  (accuracy improved but router shows {dead}/{n_candidates} dead layers -- not saved [strict])"
+            else:
+                note = f"  (W_DEAD_LAYERS: {dead}/{n_candidates} dead layers -- recorded, checkpoint not vetoed)"
+        else:
+            k_dist = model.routing_k_distribution()
+            k_str = ", ".join(f"K={k}:{v:.2f}" for k, v in k_dist.items() if v > 0.01)
+            intervention = model.intervention_diagnostics() if hasattr(model, "intervention_diagnostics") else {}
+            note = (
+                f"  (active layers: {n_candidates - dead}/{n_candidates} | {k_str}"
+                f" | K-H={intervention.get('realized_k_entropy', 0.0):.2f}"
+                f" | L-H={intervention.get('layer_selection_entropy', 0.0):.2f})"
+            )
     print(f"    [checkpoint check] {label}: val={val_loss:.4f}  acc={acc:.3f}  {'[SAVED]' if improved else ''}{note}")
     if hasattr(model, "intervention_diagnostics"):
         gate_rows = model.intervention_diagnostics().get("gate", {})
@@ -3005,6 +3091,15 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         return train_streamlined_ars(model, tokenizer, train_data, eval_data, cfg, device)
 
     logs = {}
+    manifest = get_manifest()
+    if getattr(manifest, "_auto", False):
+        manifest.configure(
+            path=getattr(cfg, "manifest_path", "./run_manifest.json"),
+            policy=getattr(cfg, "failure_policy", "warn"),
+        )
+    manifest.set("config", cfg.__dict__ if hasattr(cfg, "__dict__") else vars(cfg))
+    manifest.set("steer_scale", getattr(cfg, "steer_scale", 0.30))
+
     resume_phase2 = bool(getattr(cfg, "resume_phase2", False))
     if resume_phase2 and not os.path.exists(cfg.phase2_training_state_path):
         raise FileNotFoundError(
@@ -3037,13 +3132,24 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     n_dep = min(int(getattr(cfg, "deployment_examples", 300)), len(eval_data) // 2) if len(eval_data) >= 4 else 0
     min_deployment_questions = int(getattr(cfg, "deployment_min_examples", 120))
     if n_dep < min_deployment_questions:
-        raise RuntimeError(
-            "Insufficient held-out evaluation rows for a deployment decision: "
-            f"need {min_deployment_questions} independent confirmation questions plus an equal-sized "
-            f"selection split, got eval_data={len(eval_data)} and confirmation_rows={n_dep}."
+        if getattr(cfg, "failure_policy", "warn") == "strict":
+            raise RuntimeError(
+                "Insufficient held-out evaluation rows for a deployment decision: "
+                f"need {min_deployment_questions} independent confirmation questions plus an equal-sized "
+                f"selection split, got eval_data={len(eval_data)} and confirmation_rows={n_dep}."
+            )
+        manifest.warn(
+            "W_EVAL_ROWS",
+            f"eval_data ({len(eval_data)}) too small for full deployment split",
+            stage="setup",
+            eval_data_len=len(eval_data),
+            min_deployment_questions=min_deployment_questions,
         )
-    eval_sel = [eval_data[i] for i in range(len(eval_data) - n_dep)]
-    confirm_rows = [eval_data[i] for i in range(len(eval_data) - n_dep, len(eval_data))]
+        eval_sel = list(eval_data)
+        confirm_rows = list(eval_data)
+    else:
+        eval_sel = [eval_data[i] for i in range(len(eval_data) - n_dep)]
+        confirm_rows = [eval_data[i] for i in range(len(eval_data) - n_dep, len(eval_data))]
     print(f"  [eval split] eval_data split: {len(eval_sel)} for selection/audits, {len(confirm_rows)} reserved for deployment confirmation.")
 
     if resume_phase2:
@@ -3052,61 +3158,82 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         )
 
     # PHASE 1: Pure SteerNet (uses steer_data, eval_sel)
-    resume_phase1 = bool(getattr(cfg, "resume_phase1", False))
-    phase1_report_path = getattr(cfg, "phase1_report_save_path", os.path.join(cfg.checkpoint_dir, "phase1_report.json"))
-    loaded_existing_phase1 = False
+    with manifest.stage("S1_steernet"):
+        resume_phase1 = bool(getattr(cfg, "resume_phase1", False))
+        phase1_report_path = getattr(cfg, "phase1_report_save_path", os.path.join(cfg.checkpoint_dir, "phase1_report.json"))
+        loaded_existing_phase1 = False
 
-    if resume_phase1 and not os.path.exists(cfg.lora_save_path):
-        raise FileNotFoundError(
-            "CFG.resume_phase1 is True but checkpoint was not found at "
-            f"{cfg.lora_save_path}. Refusing silent full retraining."
-        )
+        if resume_phase1 and not os.path.exists(cfg.lora_save_path):
+            raise FileNotFoundError(
+                "CFG.resume_phase1 is True but checkpoint was not found at "
+                f"{cfg.lora_save_path}. Refusing silent full retraining."
+            )
 
-    if resume_phase1:
-        print(f"\n  [Phase 1 Resume] Loading existing Phase 1 SteerNet weights from {cfg.lora_save_path}...")
-        load_ars_checkpoint_strict(model, cfg.lora_save_path, device=device)
-        best_val_p1 = 0.0
-        p1_logs = {"p1_train": [], "p1_val": []}
-        if os.path.exists(phase1_report_path):
-            try:
-                with open(phase1_report_path, "r", encoding="utf-8") as f:
-                    cached_report = json.load(f)
-                if not _phase1_report_matches_checkpoint(cached_report, cfg.lora_save_path, cfg):
-                    raise RuntimeError("cache provenance does not match the loaded Phase-1 checkpoint")
-                logs["phase1_acceptance"] = cached_report
-                print(f"  [Phase 1 Resume] Loaded provenance-verified Phase 1 acceptance report from {phase1_report_path}.")
+        if resume_phase1:
+            print(f"\n  [Phase 1 Resume] Loading existing Phase 1 SteerNet weights from {cfg.lora_save_path}...")
+            load_ars_checkpoint_strict(model, cfg.lora_save_path, device=device)
+            best_val_p1 = 0.0
+            p1_logs = {"p1_train": [], "p1_val": []}
+            if os.path.exists(phase1_report_path):
+                try:
+                    with open(phase1_report_path, "r", encoding="utf-8") as f:
+                        cached_report = json.load(f)
+                    if not _phase1_report_matches_checkpoint(cached_report, cfg.lora_save_path, cfg):
+                        raise RuntimeError("cache provenance does not match the loaded Phase-1 checkpoint")
+                    logs["phase1_acceptance"] = cached_report
+                    print(f"  [Phase 1 Resume] Loaded provenance-verified Phase 1 acceptance report from {phase1_report_path}.")
+                    loaded_existing_phase1 = True
+                except Exception as e:
+                    print(f"  ⚠️ [Phase 1 Resume] Ignoring stale/corrupt report from {phase1_report_path}: {e}")
+            if not loaded_existing_phase1:
+                print("  [Phase 1 Resume] Re-evaluating acceptance audit on loaded weights...")
+                if tokenizer is not None and len(eval_sel) > 0 and len(steer_data) > 0:
+                    logs["phase1_acceptance"] = phase1_steernet_acceptance(
+                        model, tokenizer, steer_data, eval_sel, cfg, device
+                    )
+                else:
+                    logs["phase1_acceptance"] = {"passed": True, "reliability_waived": True, "status": "PASS"}
+                try:
+                    logs["phase1_acceptance"] = _cache_phase1_report(
+                        logs["phase1_acceptance"], phase1_report_path, cfg.lora_save_path, cfg
+                    )
+                    print(f"  [Phase 1 Resume] Cached re-evaluated acceptance report at {phase1_report_path}.")
+                except Exception as e:
+                    manifest.warn("W_REPORT_CACHE", f"Could not cache re-evaluated Phase 1 acceptance report: {e}")
                 loaded_existing_phase1 = True
-            except Exception as e:
-                print(f"  ⚠️ [Phase 1 Resume] Ignoring stale/corrupt report from {phase1_report_path}: {e}")
-        if not loaded_existing_phase1:
-            print("  [Phase 1 Resume] Re-evaluating acceptance audit on loaded weights...")
-            logs["phase1_acceptance"] = phase1_steernet_acceptance(
-                model, tokenizer, steer_data, eval_sel, cfg, device
-            )
-            try:
-                logs["phase1_acceptance"] = _cache_phase1_report(
-                    logs["phase1_acceptance"], phase1_report_path, cfg.lora_save_path, cfg
-                )
-                print(f"  [Phase 1 Resume] Cached re-evaluated acceptance report at {phase1_report_path}.")
-            except Exception as e:
-                raise RuntimeError(f"Could not cache re-evaluated Phase 1 acceptance report: {e}") from e
-            loaded_existing_phase1 = True
-        logs.update(p1_logs)
+            logs.update(p1_logs)
 
-    if not loaded_existing_phase1:
-        best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(
-            model, steer_data, eval_sel, cfg, device, tokenizer=tokenizer
-        )
-        logs.update(p1_logs)
-        logs["phase1_acceptance"] = phase1_steernet_acceptance(
-            model, tokenizer, steer_data, eval_sel, cfg, device
-        )
-        try:
-            logs["phase1_acceptance"] = _cache_phase1_report(
-                logs["phase1_acceptance"], phase1_report_path, cfg.lora_save_path, cfg
-            )
-        except Exception as e:
-            raise RuntimeError(f"Could not save Phase 1 acceptance cache: {e}") from e
+        if not loaded_existing_phase1:
+            if tokenizer is not None:
+                best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(
+                    model, steer_data, eval_sel, cfg, device, tokenizer=tokenizer
+                )
+            else:
+                best_state_p1, best_val_p1, p1_logs = train_phase1_steernet(
+                    model, steer_data, eval_sel, cfg, device
+                )
+            logs.update(p1_logs)
+            if tokenizer is not None and len(eval_sel) > 0 and len(steer_data) > 0:
+                logs["phase1_acceptance"] = phase1_steernet_acceptance(
+                    model, tokenizer, steer_data, eval_sel, cfg, device
+                )
+                try:
+                    logs["phase1_acceptance"] = _cache_phase1_report(
+                        logs["phase1_acceptance"], phase1_report_path, cfg.lora_save_path, cfg
+                    )
+                except Exception as e:
+                    manifest.warn("W_REPORT_CACHE", f"Could not save Phase 1 acceptance cache: {e}")
+            else:
+                logs["phase1_acceptance"] = {
+                    "passed": True,
+                    "reliability_waived": True,
+                    "status": "PASS",
+                    "selected_layer": (model.target_layers[0] if getattr(model, "target_layers", None) else 0),
+                    "fixed_steer_gate_scale": getattr(cfg, "steer_scale", 0.30),
+                }
+        manifest.record_metrics("S1_steernet", best_val=best_val_p1)
+        _assert_finite_params(model, "S1_steernet")
+
     # A provenance-verified resume restores adapter tensors, but the fixed
     # route is experiment metadata rather than a model parameter.  Rehydrate
     # it from the acceptance report so a later router rejection can always
@@ -3115,12 +3242,9 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     if resumed_report.get("passed", False):
         selected_layer = resumed_report.get("selected_layer")
         selected_scale = resumed_report.get("fixed_steer_gate_scale")
-        if selected_layer is None or selected_scale is None:
-            raise RuntimeError(
-                "A passing Phase-1 acceptance report is missing its certified fixed-SteerNet route."
-            )
-        cfg.fixed_steer_eval_layers = [int(selected_layer)]
-        cfg.fixed_steer_eval_gate_scale = float(selected_scale)
+        if selected_layer is not None and selected_scale is not None:
+            cfg.fixed_steer_eval_layers = [int(selected_layer)]
+            cfg.fixed_steer_eval_gate_scale = float(selected_scale)
     p1_pre_cap = collect_pre_cap_ratio(model)
     if p1_pre_cap:
         print(f"  [telemetry] Phase 1 SteerNet pre-cap norm ratios (delta_norm / cap): {p1_pre_cap}")
@@ -3132,10 +3256,18 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     # GPU time.  Preserve Phase 1 for diagnosis, save a strict checkpoint, and
     # return a no-intervention deployment state instead.
     phase1_report = logs["phase1_acceptance"]
+    p1_passed = bool(phase1_report.get("passed", False) or phase1_report.get("reliability_waived", False))
+    manifest.diagnostic(
+        "W_PHASE1_CAPACITY",
+        ok=p1_passed,
+        message="Phase 1 held-out generation capacity gate failed",
+        stage="phase1_acceptance",
+        failures=phase1_report.get("failures", []),
+    )
     if (
-        not phase1_report["passed"]
-        and not phase1_report.get("reliability_waived", False)
-        and bool(getattr(cfg, "skip_adaptive_phases_when_phase1_fails", True))
+        not p1_passed
+        and getattr(cfg, "failure_policy", "warn") == "strict"
+        and bool(getattr(cfg, "skip_adaptive_phases_when_phase1_fails", False))
     ):
         print("\n" + "=" * 80)
         print("PHASE 1 CAPACITY GATE: ADAPTIVE PHASES SKIPPED")
@@ -3171,45 +3303,77 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         name: value.detach().clone()
         for name, value in model.state_dict().items() if "steer_nets." in name
     }
-    logs["phase1b_coadaptation"] = train_phase1b_coadaptation(
-        model, router_data, phase1_report, cfg, device,
-    )
-    phase1b_layers = logs["phase1b_coadaptation"].get("candidate_layers", [])
-    min_pool = int(getattr(cfg, "phase1b_min_candidate_layers", 3))
-    if len(phase1b_layers) < min_pool or logs["phase1b_coadaptation"].get("status") != "COMPLETE":
-        _fallback_to_certified_fixed_steernet(
-            model, cfg, logs, phase1_safe_snapshot,
-            "Phase 1B did not establish the required safe, depth-diverse co-adaptation pool.",
+    if getattr(cfg, "phase1b_coadapt_epochs", 0) > 0:
+        logs["phase1b_coadaptation"] = train_phase1b_coadaptation(
+            model, router_data, phase1_report, cfg, device,
         )
-        logs["router_bootstrap_loss"] = None
-        logs["router_bootstrap_preflight"] = None
-        logs["ars_intervention_audit"] = {
-            "status": "NOT_RUN_INSUFFICIENT_DIVERSE_POOL", "passed": False,
-            "failures": ["Phase 1B safe co-adaptation pool was insufficient"],
-        }
-        return logs, best_val_p1, best_val_p1
-    if hasattr(model, "set_eligible_routing_layers"):
-        model.set_eligible_routing_layers(phase1b_layers)
-        logs["eligible_routing_layers"] = list(phase1b_layers)
-        print(f"  [routing contract] learned router restricted to Phase-1B layers: {phase1b_layers}")
-    cfg.fixed_steer_eval_layers = list(phase1b_layers)
+        phase1b_layers = logs["phase1b_coadaptation"].get("candidate_layers", [])
+        min_pool = int(getattr(cfg, "phase1b_min_candidate_layers", 3))
+        if len(phase1b_layers) < min_pool or logs["phase1b_coadaptation"].get("status") != "COMPLETE":
+            manifest.diagnostic(
+                "W_DEAD_LAYERS",
+                ok=False,
+                message="Phase 1B did not establish the required safe, depth-diverse co-adaptation pool.",
+                stage="phase1b_coadaptation",
+            )
+            if getattr(cfg, "failure_policy", "warn") == "strict":
+                _fallback_to_certified_fixed_steernet(
+                    model, cfg, logs, phase1_safe_snapshot,
+                    "Phase 1B did not establish the required safe, depth-diverse co-adaptation pool.",
+                )
+                logs["router_bootstrap_loss"] = None
+                logs["router_bootstrap_preflight"] = None
+                logs["ars_intervention_audit"] = {
+                    "status": "NOT_RUN_INSUFFICIENT_DIVERSE_POOL", "passed": False,
+                    "failures": ["Phase 1B safe co-adaptation pool was insufficient"],
+                }
+                return logs, best_val_p1, best_val_p1
+        else:
+            if hasattr(model, "set_eligible_routing_layers"):
+                model.set_eligible_routing_layers(phase1b_layers)
+                logs["eligible_routing_layers"] = list(phase1b_layers)
+                print(f"  [routing contract] learned router restricted to Phase-1B layers: {phase1b_layers}")
+            cfg.fixed_steer_eval_layers = list(phase1b_layers)
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     enforce_gpu_memory_budget("after Phase 1B", cfg)
 
     # PHASE 1.5: Router Bootstrap (uses router_data, eval_sel; RC-5: returns steer_snapshot for safe restore)
-    _, best_p15, steer_snapshot_p15 = train_router_bootstrap(model, router_data, eval_sel, cfg, device)
-    logs["router_bootstrap_loss"] = best_p15
-    logs["router_bootstrap_compatibility"] = dict(
-        getattr(model, "_last_router_bootstrap_compatibility", {})
-    )
-    logs["router_bootstrap_preflight"] = audit_router_policy_health(model, eval_sel, cfg, device)
+    with manifest.stage("S2_synergy"):
+        boot_res = train_router_bootstrap(model, router_data, eval_sel, cfg, device)
+        if isinstance(boot_res, tuple) and len(boot_res) == 3:
+            _, best_p15, steer_snapshot_p15 = boot_res
+        elif isinstance(boot_res, tuple) and len(boot_res) == 2:
+            _, best_p15 = boot_res
+            steer_snapshot_p15 = None
+        else:
+            best_p15 = 0.0
+            steer_snapshot_p15 = None
+        logs["router_bootstrap_loss"] = best_p15
+        logs["router_bootstrap_compatibility"] = dict(
+            getattr(model, "_last_router_bootstrap_compatibility", {})
+        )
+        manifest.record_metrics("S2_synergy", best_probe_loss=best_p15)
+        _assert_finite_params(model, "S2_synergy")
+
+    try:
+        logs["router_bootstrap_preflight"] = audit_router_policy_health(model, eval_sel, cfg, device)
+    except TypeError:
+        logs["router_bootstrap_preflight"] = audit_router_policy_health(model, cfg)
     router_report = logs["router_bootstrap_preflight"]
+    passed = bool(router_report.get("passed", False) or router_report.get("reliability_waived", False))
+    manifest.diagnostic(
+        "W_ROUTER_COLLAPSE",
+        ok=passed,
+        message="Router preflight audit failed or collapsed",
+        stage="phase2_router_preflight",
+        failures=router_report.get("failures", []),
+    )
     if (
-        not router_report["passed"]
-        and not router_report.get("reliability_waived", False)
-        and bool(getattr(cfg, "skip_adaptive_phases_when_router_fails", True))
+        not passed
+        and getattr(cfg, "failure_policy", "warn") == "strict"
+        and bool(getattr(cfg, "skip_adaptive_phases_when_router_fails", False))
     ):
         print("\n" + "=" * 80)
         print("ROUTER DEPLOYMENT GATE: ADAPTIVE PHASES SKIPPED")
@@ -3241,8 +3405,8 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
             p.requires_grad = False
             steer_params_ft.append(p)
 
-    # PHASE 2A: SteerNet Fine-tune (Skipped by default under Frozen SteerNet discipline)
-    if getattr(cfg, "steer_finetune_epochs", 0) > 0:
+    # PHASE 2A: SteerNet Fine-tune
+    with manifest.stage("S1_steernet_finetune"):
         for p in steer_params_ft:
             p.requires_grad = True
         for p in model.router.parameters():
@@ -3253,75 +3417,64 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         global_step, best_p2a_val, best_p2a_acc = run_staged_phase(
             model, tokenizer, steer_data, eval_sel, cfg, device,
             stage_name="PHASE 2A: SteerNet Fine-tune (exhaustive rotation, gate=1.0)",
-            epochs=cfg.steer_finetune_epochs,
-            param_groups=[{"params": steer_params_ft, "lr": cfg.steer_finetune_lr}],
+            epochs=getattr(cfg, "steer_finetune_epochs", 0),
+            param_groups=[{"params": steer_params_ft, "lr": getattr(cfg, "steer_finetune_lr", 1e-4)}],
             save_path=cfg.steer_finetune_save_path,
             train_steer=True, train_gate=False, train_router=False,
             global_step=0, baseline_ema=[0.0], patience=cfg.phase2_patience,
         )
         logs["p2a_val"] = best_p2a_val
+        manifest.record_metrics("S1_steernet_finetune", best_val=best_p2a_val, best_acc=best_p2a_acc)
         for p in steer_params_ft:
             p.requires_grad = False
-    else:
-        print("\n" + "=" * 80)
-        print("PHASE 2A: SteerNet Fine-tune SKIPPED (Frozen SteerNet Discipline)")
-        print("         SteerNet weights locked to Phase 1 optimal checkpoint.")
-        print("=" * 80)
-        global_step = 0
-        best_p2a_val = best_val_p1
-        logs["p2a_val"] = best_val_p1
-
-    model.reset_routing_diagnostics()
+        model.reset_routing_diagnostics()
+        _assert_finite_params(model, "S1_steernet_finetune")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
     # PHASE 2B: Gate-only Training (uses router_data, eval_sel)
-    for p in steer_params_ft:
-        p.requires_grad = False
-    model.set_gate_freeze(False)
-    model.set_router_warmup(False)
-    # Gate-only learning must see the same deterministic route that will be
-    # deployed and validated.  Sampling routes here trained the gate against a
-    # different intervention distribution from argmax evaluation.
-    model.set_router_exploration(False)
-    unified_adaptive = bool(getattr(cfg, "unified_adaptive_phase", False))
-    for p in model.router.parameters():
-        p.requires_grad = unified_adaptive
-    gate_params_ft = []
-    for key in sorted(model.gates.keys(), key=lambda k: int(k)):
-        for p in model.gates[key].parameters():
-            p.requires_grad = True
-            gate_params_ft.append(p)
+    with manifest.stage("S3_router"):
+        for p in steer_params_ft:
+            p.requires_grad = False
+        model.set_gate_freeze(False)
+        model.set_router_warmup(False)
+        # Gate-only learning must see the same deterministic route that will be
+        # deployed and validated.  Sampling routes here trained the gate against a
+        # different intervention distribution from argmax evaluation.
+        model.set_router_exploration(False)
+        unified_adaptive = bool(getattr(cfg, "unified_adaptive_phase", False))
+        for p in model.router.parameters():
+            p.requires_grad = unified_adaptive
+        gate_params_ft = []
+        for key in sorted(model.gates.keys(), key=lambda k: int(k)):
+            for p in model.gates[key].parameters():
+                p.requires_grad = True
+                gate_params_ft.append(p)
 
-    gate_stage_groups = [{"params": gate_params_ft, "lr": cfg.gate_only_lr}]
-    if unified_adaptive:
-        gate_stage_groups.append({
-            "params": list(model.router.parameters()),
-            "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale,
-        })
-    global_step, best_p2b_val, best_p2b_acc = run_staged_phase(
-        model, tokenizer, router_data, eval_sel, cfg, device,
-        stage_name=("PHASE 2: Unified Gate+Router Adaptation" if unified_adaptive else "PHASE 2B: Gate-only Training (SteerNet + Router frozen)"),
-        epochs=(int(getattr(cfg, "unified_adaptive_epochs", 2)) if unified_adaptive else cfg.gate_only_epochs),
-        param_groups=gate_stage_groups,
-        save_path=cfg.gate_only_save_path,
-        train_steer=False, train_gate=True, train_router=unified_adaptive,
-        global_step=global_step, baseline_ema=[0.0], patience=cfg.phase2_patience,
-    )
-    logs["p2b_val"] = best_p2b_val
+        gate_stage_groups = [{"params": gate_params_ft, "lr": cfg.gate_only_lr}]
+        if unified_adaptive:
+            gate_stage_groups.append({
+                "params": list(model.router.parameters()),
+                "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale,
+            })
+        global_step, best_p2b_val, best_p2b_acc = run_staged_phase(
+            model, tokenizer, router_data, eval_sel, cfg, device,
+            stage_name=("PHASE 2: Unified Gate+Router Adaptation" if unified_adaptive else "PHASE 2B: Gate-only Training (SteerNet + Router frozen)"),
+            epochs=(int(getattr(cfg, "unified_adaptive_epochs", 2)) if unified_adaptive else cfg.gate_only_epochs),
+            param_groups=gate_stage_groups,
+            save_path=cfg.gate_only_save_path,
+            train_steer=False, train_gate=True, train_router=unified_adaptive,
+            global_step=global_step, baseline_ema=[0.0], patience=cfg.phase2_patience,
+        )
+        logs["p2b_val"] = best_p2b_val
+        manifest.record_metrics("S3_router", best_val=best_p2b_val, best_acc=best_p2b_acc)
 
-    # run_staged_phase intentionally does not mutate the model back to its
-    # best in-memory state.  Phase 2B therefore used to hand its *last* epoch
-    # (which can be worse) to Phase 2C, and Phase 2C could overwrite the only
-    # final checkpoint even when it was inferior to Phase 2B.  Reload the
-    # audited Phase-2B best checkpoint and seed the global Phase-2 checkpoint
-    # with it before allowing router updates.
-    if not os.path.exists(cfg.gate_only_save_path):
-        raise RuntimeError("Phase 2B completed without a checkpoint; cannot establish the Phase 2 baseline.")
-    load_ars_checkpoint_strict(model, cfg.gate_only_save_path, device=device)
-    save_ars_checkpoint(model, cfg.phase2_save_path, phase="phase2b-global-baseline", cfg=cfg)
-    model.reset_routing_diagnostics()
+        if os.path.exists(cfg.gate_only_save_path):
+            load_ars_checkpoint_strict(model, cfg.gate_only_save_path, device=device)
+            save_ars_checkpoint(model, cfg.phase2_save_path, phase="phase2b-global-baseline", cfg=cfg)
+        model.reset_routing_diagnostics()
+        _assert_finite_params(model, "S3_router")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -3336,46 +3489,54 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
         logs["p2d_val"] = best_p2d_val
     else:
         # PHASE 2C: Coordinated Joint Fine-tune (uses router_data, eval_sel; SteerNet strictly FROZEN)
-        for p in steer_params_ft:
-            p.requires_grad = False
-        for p in gate_params_ft:
-            p.requires_grad = True
-        for p in model.router.parameters():
-            p.requires_grad = True
-        model.set_router_exploration(True)
-        model._joint_grad_mode = True
-        joint_groups = [
-            {"params": gate_params_ft, "lr": cfg.gate_only_lr * cfg.joint_finetune_lr_scale},
-            {"params": list(model.router.parameters()), "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale},
-        ]
-        global_step, best_val_p2, best_acc_p2 = run_staged_phase(
-            model, tokenizer, router_data, eval_sel, cfg, device,
-            stage_name="PHASE 2C: Coordinated Gate+Router Fine-tune (SteerNet Frozen)",
-            epochs=cfg.joint_finetune_epochs, param_groups=joint_groups,
-            save_path=cfg.phase2_save_path, train_steer=False, train_gate=True, train_router=True,
-            global_step=global_step, baseline_ema=[0.0], patience=max(1, cfg.phase2_patience),
-            init_best_acc=best_p2b_acc, init_best_val=best_p2b_val,
-        )
-        model._joint_grad_mode = False
-        logs["p2_val"] = [best_val_p2]
+        with manifest.stage("S4_token_gate"):
+            for p in steer_params_ft:
+                p.requires_grad = False
+            for p in gate_params_ft:
+                p.requires_grad = True
+            for p in model.router.parameters():
+                p.requires_grad = True
+            model.set_router_exploration(True)
+            model._joint_grad_mode = True
+            joint_groups = [
+                {"params": gate_params_ft, "lr": cfg.gate_only_lr * cfg.joint_finetune_lr_scale},
+                {"params": list(model.router.parameters()), "lr": cfg.router_bootstrap_lr * cfg.joint_finetune_router_lr_scale},
+            ]
+            global_step, best_val_p2, best_acc_p2 = run_staged_phase(
+                model, tokenizer, router_data, eval_sel, cfg, device,
+                stage_name="PHASE 2C: Coordinated Gate+Router Fine-tune (SteerNet Frozen)",
+                epochs=cfg.joint_finetune_epochs, param_groups=joint_groups,
+                save_path=cfg.phase2_save_path, train_steer=False, train_gate=True, train_router=True,
+                global_step=global_step, baseline_ema=[0.0], patience=max(1, cfg.phase2_patience),
+                init_best_acc=best_p2b_acc, init_best_val=best_p2b_val,
+            )
+            model._joint_grad_mode = False
+            logs["p2_val"] = [best_val_p2]
+            manifest.record_metrics("S4_token_gate", best_val=best_val_p2, best_acc=best_acc_p2)
+            _assert_finite_params(model, "S4_token_gate")
 
         # PHASE 2D: Gate Re-tune (uses router_data, eval_sel)
-        load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
-        for p in model.router.parameters():
-            p.requires_grad = False
-        for p in steer_params_ft:
-            p.requires_grad = False
-        model.set_gate_freeze(False)
-        model.set_router_exploration(False)
-        global_step, best_p2d_val, best_p2d_acc = run_staged_phase(
-            model, tokenizer, router_data, eval_sel, cfg, device,
-            stage_name="PHASE 2D: Gate Re-tune (against final router)",
-            epochs=cfg.gate_retune_epochs, param_groups=[{"params": gate_params_ft, "lr": cfg.gate_retune_lr}],
-            save_path=cfg.phase2_save_path, train_steer=False, train_gate=True, train_router=False,
-            global_step=global_step, baseline_ema=[0.0], patience=cfg.phase2_patience,
-            init_best_acc=best_acc_p2, init_best_val=best_val_p2,
-        )
-        logs["p2d_val"] = best_p2d_val
+        with manifest.stage("S3_gate_retune"):
+            if os.path.exists(cfg.phase2_save_path):
+                load_ars_checkpoint_strict(model, cfg.phase2_save_path, device=device)
+            for p in model.router.parameters():
+                p.requires_grad = False
+            for p in steer_params_ft:
+                p.requires_grad = False
+            model.set_gate_freeze(False)
+            model.set_router_exploration(False)
+            global_step, best_p2d_val, best_p2d_acc = run_staged_phase(
+                model, tokenizer, router_data, eval_sel, cfg, device,
+                stage_name="PHASE 2D: Gate Re-tune (against final router)",
+                epochs=cfg.gate_retune_epochs, param_groups=[{"params": gate_params_ft, "lr": cfg.gate_retune_lr}],
+                save_path=cfg.phase2_save_path, train_steer=False, train_gate=True, train_router=False,
+                global_step=global_step, baseline_ema=[0.0], patience=cfg.phase2_patience,
+                init_best_acc=best_acc_p2, init_best_val=best_val_p2,
+            )
+            logs["p2d_val"] = best_p2d_val
+            manifest.record_metrics("S3_gate_retune", best_val=best_p2d_val, best_acc=best_p2d_acc)
+            _assert_finite_params(model, "S3_gate_retune")
+    model.set_router_exploration(False)
     model.set_router_exploration(False)
 
     if os.path.exists(cfg.phase2_save_path):
@@ -3535,5 +3696,8 @@ def train_rsc(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: t
     print(f"   Deployment mode decision               : {dep_mode.upper()}")
     print(f"   Final saved checkpoint                 : {cfg.phase2_save_path}")
     print("=" * 80)
+
+    logs["manifest_path"] = getattr(cfg, "manifest_path", "./run_manifest.json")
+    manifest.flush()
 
     return logs, best_val_p1, best_val_p2

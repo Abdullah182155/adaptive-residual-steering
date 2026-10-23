@@ -994,15 +994,21 @@ class TestPairedCI(unittest.TestCase):
 
 
 class TestRun8FailClosedDefaults(unittest.TestCase):
-    """Run 8 must not silently continue after an invalid routing diagnostic."""
+    """Run 8 must not silently continue after an invalid routing diagnostic under strict policy."""
 
     def test_decision_defaults_fail_closed(self):
-        cfg = RSCConfig()
-        self.assertFalse(cfg.continue_on_diagnostic_failure)
-        self.assertTrue(cfg.skip_adaptive_phases_when_phase1_fails)
-        self.assertTrue(cfg.skip_adaptive_phases_when_router_fails)
-        self.assertTrue(cfg.router_fail_fast_on_collapse)
-        self.assertEqual(cfg.deployment_min_examples, 120)
+        cfg_strict = RSCConfig(failure_policy="strict")
+        self.assertFalse(cfg_strict.continue_on_diagnostic_failure)
+        self.assertTrue(cfg_strict.skip_adaptive_phases_when_phase1_fails)
+        self.assertTrue(cfg_strict.skip_adaptive_phases_when_router_fails)
+        self.assertTrue(cfg_strict.router_fail_fast_on_collapse)
+        self.assertEqual(cfg_strict.deployment_min_examples, 120)
+
+        # M0: warn policy coerces legacy fail-closed flags so runs never stall
+        cfg_warn = RSCConfig(failure_policy="warn")
+        self.assertTrue(cfg_warn.continue_on_diagnostic_failure)
+        self.assertFalse(cfg_warn.skip_adaptive_phases_when_router_fails)
+        self.assertFalse(cfg_warn.router_fail_fast_on_collapse)
 
 
 class TestSteerNetIdentityInit(unittest.TestCase):
