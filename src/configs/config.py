@@ -481,6 +481,20 @@ class RSCConfig:
     s1_ablation_epochs: int = 1
     s1_ablation_n_train: int = 1000
 
+    # ==== M5 ====
+    router_policy: str = "catalog"                        # "legacy" | "catalog"
+    router_c_size: float = 1e-3
+    router_eps_tie: float = 0.01
+    router_tau: float = 0.01
+    router_lambda_bal: float = 0.02
+    router_lambda_cons: float = 0.1
+    router_distill_epochs: int = 60
+    router_distill_lr: float = 1e-3
+    router_distill_wd: float = 1e-2
+    router_distill_val_frac: float = 0.2
+    router_catalog_save_path: str = "./checkpoints/router_catalog_v5.pt"
+    router_loss_mode: str = "catalog_distill"             # "catalog_distill" | "rloo_legacy"
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')

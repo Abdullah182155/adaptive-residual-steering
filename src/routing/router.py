@@ -19,7 +19,9 @@ class JointLayerRouter(nn.Module):
                  layer_dropout: float = 0.15,
                  difficulty_aware: bool = True,
                  synergy_limit: float = 0.75,
-                 use_demo_features: bool = False):
+                 use_demo_features: bool = False,
+                 n_catalog: Optional[int] = None,
+                 shot_buckets: Tuple[int, ...] = (0, 2, 4, 8)):
         super().__init__()
         self.target_layers = list(target_layers)
         n_candidates = len(self.target_layers)
@@ -31,6 +33,8 @@ class JointLayerRouter(nn.Module):
         self.difficulty_aware = difficulty_aware
         self.synergy_limit = float(synergy_limit)
         self.use_demo_features = bool(use_demo_features)
+        self.shot_buckets = tuple(shot_buckets)
+        self.hidden_dim = hidden_dim
         depths = torch.tensor(
             [idx / max(1, n_layers - 1) for idx in self.target_layers], dtype=torch.float32
         )
@@ -101,8 +105,20 @@ class JointLayerRouter(nn.Module):
         self.register_buffer("selected_forwards", torch.zeros(n_candidates, dtype=torch.long), persistent=False)
         self.register_buffer("seen_forwards", torch.zeros(n_candidates, dtype=torch.long), persistent=False)
 
+        # M5: catalog head (one logit per catalog subset; class 0 = abstain / empty set)
+        self.catalog_head = nn.Linear(d_model, n_catalog) if n_catalog is not None else None
+        if self.catalog_head is not None:
+            nn.init.zeros_(self.catalog_head.weight)
+            nn.init.zeros_(self.catalog_head.bias)
+
+        # M5: per-shot-bucket standardization statistics for pooled features
+        self.register_buffer("bucket_mean", torch.zeros(len(shot_buckets), hidden_dim))
+        self.register_buffer("bucket_var", torch.ones(len(shot_buckets), hidden_dim))
+        self.register_buffer("bucket_count", torch.zeros(len(shot_buckets)))
+
         self._last_scalars = None
         self._last_pooled = None
+        self._last_pooled_2 = None
         self._last_semantic_shared = None
         self._last_prediction = None
 
@@ -182,6 +198,7 @@ class JointLayerRouter(nn.Module):
         attended_2 = self.attend_refine(tokens_2)
         u_final = self.utility_head_refine(attended_2).squeeze(-1)
         pooled_2 = attended_2.mean(dim=1)
+        self._last_pooled_2 = pooled_2
         k_logits = self.k_head(pooled_2)
 
         # Stochastic Layer Dropout during training:
@@ -313,3 +330,103 @@ class JointLayerRouter(nn.Module):
             "mean_synergy": float(np.mean(finite_values)) if finite_values else 0.0,
         }
 
+
+    # ------------------------------------------------------------------ M5
+    def shot_to_bucket(self, n_shot) -> torch.Tensor:
+        """Map raw shot counts (array / tensor) to indices into self.shot_buckets (nearest bucket)."""
+        if torch.is_tensor(n_shot):
+            shots = n_shot.detach().cpu().long()
+        else:
+            shots = torch.as_tensor(list(n_shot) if not hasattr(n_shot, "shape") else n_shot).long()
+        buckets = torch.tensor(self.shot_buckets, dtype=torch.long)
+        return (shots.view(-1, 1) - buckets.view(1, -1)).abs().argmin(dim=1)
+
+    @torch.no_grad()
+    def _update_bucket_stats(self, pooled: torch.Tensor, shot_bucket: torch.Tensor):
+        """Merge a batch into the running per-bucket mean / variance (parallel-variance update)."""
+        pooled = pooled.detach().float().to(self.bucket_mean.device)
+        sb = shot_bucket.detach().long().to(self.bucket_mean.device)
+        for b in torch.unique(sb).tolist():
+            x = pooled[sb == b]
+            n_b = float(x.shape[0])
+            if n_b == 0:
+                continue
+            bm = x.mean(dim=0)
+            bv = x.var(dim=0, unbiased=False)
+            n_old = float(self.bucket_count[b].item())
+            if n_old <= 0.0:
+                self.bucket_mean[b] = bm
+                self.bucket_var[b] = bv
+                self.bucket_count[b] = n_b
+                continue
+            tot = n_old + n_b
+            delta = bm - self.bucket_mean[b]
+            new_mean = self.bucket_mean[b] + delta * (n_b / tot)
+            new_var = (n_old * self.bucket_var[b] + n_b * bv + delta.square() * (n_old * n_b / tot)) / tot
+            self.bucket_mean[b] = new_mean
+            self.bucket_var[b] = new_var
+            self.bucket_count[b] = tot
+
+    @torch.no_grad()
+    def fit_bucket_stats(self, pooled: torch.Tensor, shot_bucket: torch.Tensor):
+        """Reset and fit per-bucket standardization statistics from scratch."""
+        self.bucket_mean.zero_()
+        self.bucket_var.fill_(1.0)
+        self.bucket_count.zero_()
+        self._update_bucket_stats(pooled, shot_bucket)
+
+    def _standardize_pooled(self, pooled: torch.Tensor, shot_bucket: Optional[torch.Tensor] = None):
+        """Standardize pooled features with the stats of their shot bucket.
+
+        Rows whose bucket has never been seen fall back to global (count-weighted) pooled stats.
+        If no stats have been fitted at all, pooled is returned unchanged.
+        """
+        counts = self.bucket_count
+        total = counts.sum()
+        if float(total) <= 0.0:
+            return pooled
+        w = (counts / total).unsqueeze(-1)
+        g_mean = (w * self.bucket_mean).sum(dim=0)
+        g_var = (w * (self.bucket_var + (self.bucket_mean - g_mean).square())).sum(dim=0)
+        B = pooled.shape[0]
+        mean = g_mean.unsqueeze(0).expand(B, -1)
+        var = g_var.unsqueeze(0).expand(B, -1)
+        if shot_bucket is not None:
+            sb = shot_bucket.to(pooled.device).long().clamp(0, len(self.shot_buckets) - 1)
+            seen = (counts[sb] > 0).unsqueeze(-1)
+            mean = torch.where(seen, self.bucket_mean[sb], mean)
+            var = torch.where(seen, self.bucket_var[sb], var)
+        return (pooled - mean) / torch.sqrt(var.clamp_min(0.0) + 1e-6)
+
+    def catalog_logits_from_features(self, pooled: torch.Tensor, scalars: torch.Tensor,
+                                     shot_bucket: Optional[torch.Tensor] = None,
+                                     update_stats: bool = False) -> torch.Tensor:
+        """Catalog logits (B, n_catalog) from cached pooled / scalar features.
+
+        shot_bucket holds indices into self.shot_buckets (see shot_to_bucket).
+        """
+        if self.catalog_head is None:
+            raise RuntimeError("JointLayerRouter was built without n_catalog; no catalog_head available")
+        pooled = pooled.float()
+        scalars = scalars.float()
+        B = scalars.shape[0]
+        expected_scalar_dim = self.input_proj.in_features - 1 - self.candidate_semantic_dim
+        if scalars.shape[-1] < expected_scalar_dim:
+            pad = torch.zeros(B, expected_scalar_dim - scalars.shape[-1], device=scalars.device, dtype=scalars.dtype)
+            scalars = torch.cat([scalars, pad], dim=-1)
+        elif scalars.shape[-1] > expected_scalar_dim:
+            scalars = scalars[:, :expected_scalar_dim]
+
+        if update_stats and shot_bucket is not None:
+            self._update_bucket_stats(pooled, shot_bucket)
+        pooled_std = self._standardize_pooled(pooled, shot_bucket)
+        per_candidate_semantic = self._semantic_from_pooled(pooled_std)  # sets _last_semantic_shared
+        self._score_from_base(scalars, per_candidate_semantic)
+        pooled_2 = self._last_pooled_2                                   # (B, d_model)
+        return self.catalog_head(pooled_2)
+
+    def catalog_logits(self, h: torch.Tensor, valid_mask: torch.Tensor,
+                       shot_bucket: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Catalog logits straight from a hidden state (B, T, hidden_dim) and its valid mask."""
+        self._base_features(h, valid_mask)
+        return self.catalog_logits_from_features(self._last_pooled, self._last_scalars, shot_bucket)

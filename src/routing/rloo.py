@@ -1,3 +1,4 @@
+import contextlib
 import torch
 import torch.nn.functional as F
 from typing import Tuple, Dict, Any, Optional
@@ -436,6 +437,9 @@ def compute_router_rloo_loss(
     calc_target_mode = getattr(cfg, "steer_loss_target", "calculation")
     calc_weight = float(getattr(cfg, "calc_token_weight", 3.0))
 
+    cm = getattr(model, "counterfactual_mode", None)
+    cf_ctx = cm() if callable(cm) else contextlib.nullcontext()
+
     def counterfactual_score(route_mask: Optional[torch.Tensor]) -> Tuple[torch.Tensor, torch.Tensor]:
         """Evaluate one route (or baseline if None). Returns (reward, nll)."""
         if route_mask is None:
@@ -485,18 +489,19 @@ def compute_router_rloo_loss(
                 module.train(was_training)
 
     try:
-        model.eval()
-        arm_rewards_list = []
-        arm_nlls_list = []
-        for route_mask in subset_masks:
-            rew, nll_val = counterfactual_score(route_mask)
-            arm_rewards_list.append(rew)
-            arm_nlls_list.append(nll_val)
-        arm_rewards = torch.stack(arm_rewards_list, dim=1)
-        arm_nll = torch.stack(arm_nlls_list, dim=1)
+        with cf_ctx:
+            model.eval()
+            arm_rewards_list = []
+            arm_nlls_list = []
+            for route_mask in subset_masks:
+                rew, nll_val = counterfactual_score(route_mask)
+                arm_rewards_list.append(rew)
+                arm_nlls_list.append(nll_val)
+            arm_rewards = torch.stack(arm_rewards_list, dim=1)
+            arm_nll = torch.stack(arm_nlls_list, dim=1)
 
-        # Arm 0: Ground-truth unsteered baseline anchor
-        reward_0, nll_0 = counterfactual_score(None)
+            # Arm 0: Ground-truth unsteered baseline anchor
+            reward_0, nll_0 = counterfactual_score(None)
     finally:
         if old_override is None:
             model.set_routing_override(None)
