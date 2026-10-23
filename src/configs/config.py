@@ -440,6 +440,15 @@ class RSCConfig:
     steernet_k_conditioning: bool = True
     gate_task_gradient: bool = False      # consumed in M6b/M7; declared now to avoid later churn
 
+    # ==== M1 ====
+    catalog_layers: Tuple[int, ...] = (13, 15, 18, 20, 22)   # must be subset of model.target_layers
+    catalog_max_k: int = 3
+    cf_table_dir: str = "./checkpoints/cf_tables"            # under checkpoints/ (git-ignored)
+    cf_shard_size: int = 25
+    cf_rows_per_forward: Tuple[Tuple[int, int], ...] = ((0, 13), (2, 8), (4, 7), (8, 5))   # (n_shot, rows per forward)
+    cf_audit_plan: Tuple[Tuple[int, int], ...] = ((0, 300), (4, 150), (8, 150))            # (n_shot, n_rows)
+    cf_heldout_n: int = 120                                  # 0-shot rows from eval_data
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')
