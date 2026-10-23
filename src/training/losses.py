@@ -796,3 +796,275 @@ def collate_pad(rows: Sequence[dict], pad_id: int) -> dict:
     if _has("div_token_mask"):
         batch["div_token_mask"] = _pad(_seqs("div_token_mask", torch.bool), False, torch.bool)
     return batch
+
+
+# ===========================================================================
+# M7: Dominance Hinge, Token Labels, Gate BCE, and Paired Gate Evaluation
+# ===========================================================================
+
+def dominance_hinge(nll_gated: torch.Tensor, nll_ungated: torch.Tensor, margin: float = 0.0) -> torch.Tensor:
+    """Per-example dominance hinge loss: mean(relu(nll_gated - nll_ungated.detach() + margin)).
+
+    Gradient flows ONLY through nll_gated.
+    """
+    diff = nll_gated - nll_ungated.detach() + float(margin)
+    return F.relu(diff).mean()
+
+
+class TokenLabelStore:
+    """Keyed (split, qid, n_shot) -> (labels: torch.BoolTensor[T_ans], weights: torch.Tensor)."""
+
+    def __init__(self, data: Optional[Dict[Tuple[str, str, int], Tuple[torch.Tensor, torch.Tensor]]] = None):
+        self._data = data if data is not None else {}
+
+    def get(self, key: Tuple[str, str, int]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        return self._data.get(key)
+
+    def __contains__(self, key: Tuple[str, str, int]) -> bool:
+        return key in self._data
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+
+def counterfactual_token_labels(table, router_choice: np.ndarray, tau_u: float = 0.005) -> TokenLabelStore:
+    """Build TokenLabelStore from counterfactual table and router argmax classes.
+
+    u_t = token_nll[n, 0, t] - token_nll[n, c_n, t] where c_n = router_choice[n].
+    label = 1[u_t > tau_u]. Rows with c_n == 0 have no label (empty / abstain class).
+    Weights balance positive and negative tokens on valid positions.
+    """
+    store_dict = {}
+    N = len(table.qid) if hasattr(table, "qid") else len(table)
+    choices = np.asarray(router_choice)
+    for i in range(N):
+        c_n = int(choices[i])
+        if c_n == 0:
+            continue
+        u_t = table.token_nll[i, 0, :] - table.token_nll[i, c_n, :]
+        mask = table.token_mask[i]
+        u_valid = u_t[mask]
+        if len(u_valid) == 0:
+            continue
+        lbls_bool = torch.as_tensor(u_valid > float(tau_u), dtype=torch.bool)
+        n_pos = int(lbls_bool.sum().item())
+        n_neg = int((~lbls_bool).sum().item())
+        n_tot = len(lbls_bool)
+        if n_pos > 0 and n_neg > 0:
+            w_pos = n_tot / (2.0 * n_pos)
+            w_neg = n_tot / (2.0 * n_neg)
+            weights = torch.where(
+                lbls_bool,
+                torch.full((n_tot,), w_pos, dtype=torch.float32),
+                torch.full((n_tot,), w_neg, dtype=torch.float32),
+            )
+        else:
+            weights = torch.ones(n_tot, dtype=torch.float32)
+        key = (str(table.split[i]), str(table.qid[i]), int(table.n_shot[i]))
+        store_dict[key] = (lbls_bool, weights)
+    return TokenLabelStore(store_dict)
+
+
+def gate_bce_tokens(
+    model,
+    rows: Sequence[dict],
+    store: Optional[TokenLabelStore],
+    device: torch.device,
+) -> torch.Tensor:
+    """Weighted BCE on gate._alpha_for_aux over selected layers on valid answer tokens."""
+    if store is None or len(store) == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    bce_terms = []
+    weight_terms = []
+
+    for b, r in enumerate(rows):
+        key = (str(r.get("split", "")), str(r.get("qid", "")), int(r.get("n_shot", 0)))
+        item = store.get(key)
+        if item is None:
+            continue
+        target_labels, target_weights = item
+        lbls = torch.as_tensor(r.get("labels", [])).reshape(-1)
+        ans_positions = (lbls != -100).nonzero(as_tuple=True)[0]
+        if len(ans_positions) == 0 or len(target_labels) == 0:
+            continue
+        t_m = min(len(ans_positions), len(target_labels))
+        ans_idx = ans_positions[-t_m:].to(device)
+        tgt = target_labels[-t_m:].to(device).float()
+        w = target_weights[-t_m:].to(device).float()
+
+        for gate in model.gates.values():
+            alpha = getattr(gate, "_alpha_for_aux", None)
+            if alpha is None or alpha.shape[0] <= b:
+                continue
+            # alpha: (B, T, 1)
+            pred = alpha[b, ans_idx, 0].float().clamp(1e-7, 1.0 - 1e-7)
+            term = F.binary_cross_entropy(pred, tgt, weight=w, reduction="sum")
+            bce_terms.append(term)
+            weight_terms.append(w.sum())
+
+    if not bce_terms or sum(weight_terms) <= 0.0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    total_bce = sum(bce_terms)
+    total_w = sum(weight_terms)
+    return total_bce / total_w.clamp(min=1e-6)
+
+
+def gate_total_loss(
+    nll_gated: torch.Tensor,
+    nll_ungated: torch.Tensor,
+    bce_tok: torch.Tensor,
+    mean_alpha: torch.Tensor,
+    cfg,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """Compute combined V5 gate loss: NLL_gated + lambda_dom*L_dom + lambda_tok*BCE + lambda_l1*mean_alpha."""
+    margin = float(getattr(cfg, "gate_dom_margin", 0.0))
+    l_dom = dominance_hinge(nll_gated, nll_ungated, margin=margin)
+    lambda_dom = float(getattr(cfg, "lambda_dom", 1.0))
+    lambda_tok = float(getattr(cfg, "lambda_tok", 0.3))
+    lambda_l1 = float(getattr(cfg, "lambda_l1_gate_v5", 0.005))
+
+    bce_val = bce_tok if torch.is_tensor(bce_tok) else torch.tensor(float(bce_tok), device=nll_gated.device)
+    alpha_val = mean_alpha if torch.is_tensor(mean_alpha) else torch.tensor(float(mean_alpha), device=nll_gated.device)
+
+    total = nll_gated.mean() + lambda_dom * l_dom + lambda_tok * bce_val + lambda_l1 * alpha_val
+    metrics = {
+        "loss_total": float(total.detach().item()),
+        "nll_gated": float(nll_gated.mean().detach().item()),
+        "nll_ungated": float(nll_ungated.mean().detach().item()),
+        "loss_dom": float(l_dom.detach().item()),
+        "loss_bce_tok": float(bce_val.detach().item()),
+        "mean_alpha": float(alpha_val.detach().item()),
+    }
+    return total, metrics
+
+
+def gate_label_auc(
+    model,
+    rows: Sequence[dict],
+    store: TokenLabelStore,
+    device: torch.device,
+) -> float:
+    """Advisory diagnostic: ROC AUC between gate alphas and counterfactual token labels."""
+    all_preds, all_tgts = [], []
+    with torch.no_grad():
+        for r in rows:
+            key = (str(r.get("split", "")), str(r.get("qid", "")), int(r.get("n_shot", 0)))
+            item = store.get(key)
+            if item is None:
+                continue
+            target_labels, _ = item
+            lbls = torch.as_tensor(r.get("labels", [])).reshape(-1)
+            ans_positions = (lbls != -100).nonzero(as_tuple=True)[0]
+            if len(ans_positions) == 0 or len(target_labels) == 0:
+                continue
+            t_m = min(len(ans_positions), len(target_labels))
+            ans_idx = ans_positions[-t_m:].to(device)
+            tgt = target_labels[-t_m:].cpu().numpy()
+
+            layer_preds = []
+            for gate in model.gates.values():
+                alpha = getattr(gate, "last_alpha", None)
+                if alpha is not None:
+                    layer_preds.append(alpha[0, ans_idx, 0].float().cpu().numpy())
+            if layer_preds:
+                mean_p = np.mean(layer_preds, axis=0)
+                all_preds.extend(mean_p.tolist())
+                all_tgts.extend(tgt.tolist())
+
+    if len(all_tgts) < 2:
+        return 0.5
+    y = np.asarray(all_tgts, dtype=bool)
+    p = np.asarray(all_preds, dtype=np.float32)
+    n_pos = int(y.sum())
+    n_neg = int((~y).sum())
+    if n_pos == 0 or n_neg == 0:
+        return 0.5
+
+    pos_p = p[y]
+    neg_p = p[~y]
+    # Fast Mann-Whitney U calculation
+    u = sum((pos_p[:, None] > neg_p[None, :]).sum() + 0.5 * (pos_p[:, None] == neg_p[None, :]).sum())
+    return float(u / (n_pos * n_neg))
+
+
+def paired_gate_vs_ungated(
+    model,
+    rows: Sequence[dict],
+    cfg,
+    device: torch.device,
+    pad_id: int = 0,
+) -> Dict[str, Any]:
+    """Compute per-example NLL diffs between gated and ungated (full pass-through) steering."""
+    was_training = model.training
+    model.eval()
+    nll_gated_list = []
+    nll_ungated_list = []
+
+    with torch.no_grad():
+        for r in rows:
+            batch = collate_pad([r], pad_id)
+            ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            lbls = batch["labels"].to(device)
+
+            # Gated forward
+            model.set_gate_mode("learned")
+            model.set_routing_override(None)
+            if hasattr(model, "set_router_context_mask"):
+                model.set_router_context_mask(mask.bool() & (lbls == -100))
+            out_g = model(input_ids=ids, attention_mask=mask)
+            valid = lbls[:, 1:].ne(-100)
+            if not valid.any():
+                continue
+            nll_g = F.cross_entropy(
+                out_g.logits[:, :-1, :].transpose(1, 2),
+                lbls[:, 1:],
+                ignore_index=-100,
+                reduction="sum",
+            ) / valid.sum().clamp(min=1)
+
+            # Ungated counterfactual forward with the same route
+            routes = model.current_route_tuples()
+            with model.counterfactual_mode():
+                model.set_gate_mode("const", scale=getattr(cfg, "steer_scale", 1.0))
+                model.set_routing_override("matrix", model.subset_matrix(routes).to(device))
+                out_u = model(input_ids=ids, attention_mask=mask)
+                nll_u = F.cross_entropy(
+                    out_u.logits[:, :-1, :].transpose(1, 2),
+                    lbls[:, 1:],
+                    ignore_index=-100,
+                    reduction="sum",
+                ) / valid.sum().clamp(min=1)
+                model.set_routing_override(None)
+                model.set_gate_mode("learned")
+
+            nll_gated_list.append(float(nll_g.item()))
+            nll_ungated_list.append(float(nll_u.item()))
+
+    if was_training:
+        model.train()
+
+    g_arr = np.asarray(nll_gated_list, dtype=np.float32)
+    u_arr = np.asarray(nll_ungated_list, dtype=np.float32)
+    diffs = g_arr - u_arr
+    mean_diff = float(diffs.mean()) if len(diffs) > 0 else 0.0
+
+    # 95% bootstrap CI
+    ci_low, ci_high = mean_diff, mean_diff
+    if len(diffs) > 1:
+        rng = np.random.default_rng(42)
+        boot_means = [rng.choice(diffs, size=len(diffs), replace=True).mean() for _ in range(1000)]
+        ci_low = float(np.percentile(boot_means, 2.5))
+        ci_high = float(np.percentile(boot_means, 97.5))
+
+    return {
+        "nll_gated": [float(x) for x in g_arr],
+        "nll_ungated": [float(x) for x in u_arr],
+        "diffs": [float(x) for x in diffs],
+        "mean_diff": mean_diff,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "gate_adopted_nll": bool(mean_diff < 0.0),
+    }

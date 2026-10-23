@@ -502,6 +502,20 @@ class RSCConfig:
     guard_k_max: int = 3
     gate_task_gradient: bool = False
 
+    # ==== M7 ====
+    gate_init_logit: float = 2.0                          # alpha_init = sigmoid(2) = 0.8808
+    gate_loss_mode: str = "v5"                            # "v5" | "legacy"
+    lambda_dom: float = 1.0
+    lambda_tok: float = 0.3
+    lambda_l1_gate_v5: float = 0.005
+    gate_tau_u: float = 0.005
+    gate_dom_margin: float = 0.0
+    gate_epochs: int = 3
+    gate_lr: float = 1e-3
+    gate_label_row_frac: float = 0.5
+    gate_v5_save_path: str = "./checkpoints/gate_v5.pt"
+    gate_sel_n: int = 120
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')

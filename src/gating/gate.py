@@ -82,10 +82,16 @@ class RSCUsefulnessGate(nn.Module):
 
         self.fc2 = nn.Linear(gate_dim, 1)
 
-        # Small non-zero initialization ensures gradient flow back into fc1 from step 0
-        nn.init.normal_(self.fc2.weight, std=0.02)
-        init_logit = math.log(cfg.gate_init_alpha / (1.0 - cfg.gate_init_alpha))
-        self.fc2.bias.data.fill_(init_logit)
+        # M7: gate_init_logit takes precedence, weight is zero-initialized in v5 mode
+        init_logit = getattr(cfg, "gate_init_logit", None)
+        if init_logit is None:
+            init_logit = math.log(cfg.gate_init_alpha / (1.0 - cfg.gate_init_alpha))
+        self.fc2.bias.data.fill_(float(init_logit))
+
+        if getattr(cfg, "gate_loss_mode", "legacy") == "v5":
+            nn.init.zeros_(self.fc2.weight)
+        else:
+            nn.init.normal_(self.fc2.weight, std=0.02)
 
         self._freeze_gate = False
         self._freeze_gate_value = 1.0

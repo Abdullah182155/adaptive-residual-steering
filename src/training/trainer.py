@@ -4202,3 +4202,198 @@ def run_k_scaling_ablation(
         "winner_k_scaling": winner_k_scaling,
         "winner_k_cond": winner_k_cond,
     }
+
+
+# ===========================================================================
+# M7: S3 Token Gate Trainer
+# ===========================================================================
+
+def train_s3_gate(
+    model,
+    tokenizer,
+    train_rows: List[dict],
+    val_rows: List[dict],
+    cfg,
+    device: torch.device,
+    table=None,
+) -> Dict[str, Any]:
+    """Train token gates using direct task-loss, dominance hinge, and counterfactual BCE.
+
+    SteerNets and router are strictly frozen; only gate parameters train.
+    """
+    import torch.nn.functional as F
+    from src.training.losses import (
+        TokenLabelStore,
+        counterfactual_token_labels,
+        gate_bce_tokens,
+        gate_total_loss,
+        compute_l1_gate,
+        paired_gate_vs_ungated,
+    )
+
+    print("\n" + "=" * 80)
+    print("S3: Direct Task-Loss Token Gate Trainer (Dominance Hinge + Counterfactual BCE)")
+    print(f"     epochs={cfg.gate_epochs}  lr={cfg.gate_lr}  dom_margin={cfg.gate_dom_margin}")
+    print("=" * 80)
+
+    # 1. Freeze everything except gates
+    for p in model.parameters():
+        p.requires_grad = False
+
+    gate_params = []
+    for g in model.gates.values():
+        for p in g.parameters():
+            p.requires_grad = True
+            gate_params.append(p)
+
+    model.cfg.gate_task_gradient = True
+    model.set_router_policy("catalog")
+    if hasattr(model, "set_router_warmup"):
+        model.set_router_warmup(False)
+
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+
+    # 2. Build counterfactual token label store if table is provided
+    store = None
+    if table is not None:
+        try:
+            with torch.no_grad():
+                pooled_t = torch.as_tensor(table.pooled, dtype=torch.float32, device=device)
+                scalars_t = torch.as_tensor(table.scalars, dtype=torch.float32, device=device)
+                cat_logits = model.router.catalog_logits_from_features(pooled_t, scalars_t)
+                choices = cat_logits.argmax(dim=-1).cpu().numpy()
+            tau_u = getattr(cfg, "gate_tau_u", 0.005)
+            store = counterfactual_token_labels(table, choices, tau_u=tau_u)
+            print(f"  [S3] Loaded {len(store)} labeled counterfactual examples from table.")
+        except Exception as e:
+            print(f"  [S3] Warning: could not build counterfactual token labels: {e}")
+
+    optimizer = torch.optim.AdamW(
+        gate_params,
+        lr=cfg.gate_lr,
+        weight_decay=getattr(cfg, "weight_decay", 1e-2),
+        betas=(0.9, 0.98),
+        eps=1e-6,
+    )
+
+    bs = max(1, cfg.batch_size)
+    micro_per_epoch = max(1, math.ceil(len(train_rows) / bs))
+    rng = random.Random(cfg.seed)
+
+    train_loss_history = []
+    best_mean_diff = float("inf")
+    best_gate_state = {k: v.cpu().clone() for k, v in model.gates.state_dict().items()}
+    best_paired_eval = None
+
+    for epoch in range(max(1, cfg.gate_epochs)):
+        model.train()
+        optimizer.zero_grad(set_to_none=True)
+        epoch_losses = []
+
+        shuffled_indices = list(range(len(train_rows)))
+        rng.shuffle(shuffled_indices)
+
+        for m in range(micro_per_epoch):
+            batch_idx = shuffled_indices[m * bs : (m + 1) * bs]
+            if not batch_idx:
+                continue
+            batch_rows = [train_rows[i] for i in batch_idx]
+            batch = collate_pad(batch_rows, pad_id)
+            ids = batch["input_ids"].to(device)
+            mask = batch["attention_mask"].to(device)
+            lbls = batch["labels"].to(device)
+
+            # (i) Gated forward with grad
+            model.set_gate_mode("learned")
+            model.set_routing_override(None)
+            _set_ctx(model, mask, lbls)
+            out_g = model(input_ids=ids, attention_mask=mask)
+
+            shift_logits_g = out_g.logits[:, :-1, :].float()
+            shift_lbls = lbls[:, 1:]
+            valid = shift_lbls.ne(-100)
+            if not valid.any():
+                continue
+
+            loss_mat_g = F.cross_entropy(
+                shift_logits_g.transpose(1, 2), shift_lbls, ignore_index=-100, reduction="none"
+            )
+            nll_gated = loss_mat_g.sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+
+            # (ii) Ungated forward under counterfactual_mode with the same route
+            routes = model.current_route_tuples()
+            with model.counterfactual_mode():
+                model.set_gate_mode("const", scale=getattr(cfg, "steer_scale", 1.0))
+                model.set_routing_override("matrix", model.subset_matrix(routes).to(device))
+                out_u = model(input_ids=ids, attention_mask=mask)
+                shift_logits_u = out_u.logits[:, :-1, :].float()
+                loss_mat_u = F.cross_entropy(
+                    shift_logits_u.transpose(1, 2), shift_lbls, ignore_index=-100, reduction="none"
+                )
+                nll_ungated = loss_mat_u.sum(dim=1) / valid.sum(dim=1).clamp(min=1)
+                model.set_routing_override(None)
+                model.set_gate_mode("learned")
+
+            # (iii) Token BCE & L1
+            bce_tok = gate_bce_tokens(model, batch_rows, store, device)
+            mean_alpha = compute_l1_gate(model)
+
+            # (iv) Combined loss
+            total_loss, metrics = gate_total_loss(nll_gated, nll_ungated, bce_tok, mean_alpha, cfg)
+
+            if torch.isfinite(total_loss):
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(gate_params, getattr(cfg, "clip_grad", 1.0))
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+                epoch_losses.append(metrics["loss_total"])
+
+        avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+        train_loss_history.append(avg_loss)
+
+        # Validation at epoch end
+        val_sample = val_rows[: getattr(cfg, "gate_sel_n", 120)]
+        paired_eval = paired_gate_vs_ungated(model, val_sample, cfg, device, pad_id=pad_id)
+        print(
+            f"  [S3 Epoch {epoch + 1}/{cfg.gate_epochs}] "
+            f"loss={avg_loss:.4f}  "
+            f"mean_diff(gated - ungated)={paired_eval['mean_diff']:.4f} "
+            f"CI=[{paired_eval['ci_low']:.4f}, {paired_eval['ci_high']:.4f}] "
+            f"adopted={paired_eval['gate_adopted_nll']}"
+        )
+
+        if paired_eval["mean_diff"] < best_mean_diff:
+            best_mean_diff = paired_eval["mean_diff"]
+            best_gate_state = {k: v.cpu().clone() for k, v in model.gates.state_dict().items()}
+            best_paired_eval = paired_eval
+
+    # Restore best checkpoint
+    model.gates.load_state_dict(best_gate_state)
+
+    # Save gate weights
+    save_path = getattr(cfg, "gate_v5_save_path", "./checkpoints/gate_v5.pt")
+    os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+    torch.save(best_gate_state, save_path)
+    print(f"  [S3] Saved gate checkpoint to {save_path}")
+
+    # Emit manifest advisory / warning
+    manifest = _manifest()
+    gate_adopted = best_paired_eval["gate_adopted_nll"] if best_paired_eval else False
+    if not gate_adopted:
+        manifest.warn(
+            "W_GATE_NOT_ADOPTED",
+            f"Gate did not achieve negative mean NLL diff vs ungated reference (best diff: {best_mean_diff:.4f})",
+        )
+    manifest.advisory(
+        "s3_gate_paired_eval",
+        best_paired_eval,
+        "Paired gated vs ungated NLL evaluation on selection split",
+    )
+
+    return {
+        "train_loss_history": train_loss_history,
+        "best_mean_diff": best_mean_diff,
+        "paired_eval": best_paired_eval,
+        "gate_adopted_nll": gate_adopted,
+        "save_path": save_path,
+    }
