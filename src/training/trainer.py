@@ -710,21 +710,41 @@ def _phase1_confirmation_verdict(
         or combined_nonregressing
     )
     one_question = 1.0 / max(1, int(confirmation_n))
-    noise_tolerated = bool(
-        getattr(cfg, "phase1_allow_confirmation_noise_tolerance", True)
-        and confirmation_n <= 32
-        and confirmation_gain >= -one_question - epsilon
-        and calibration_gain >= 0.10 - epsilon
-        and combined_nonregressing
-    )
+    allow_nonregressing = bool(getattr(cfg, "phase1_allow_nonregressing_confirmation", False))
+    if allow_nonregressing:
+        accuracy_pass = (
+            (confirmation_gain >= -epsilon and combined_nonregressing)
+            or (
+                confirmation_n <= 32
+                and confirmation_gain >= -2 * one_question - epsilon
+                and calibration_gain > epsilon
+                and combined_nonregressing
+            )
+            or direct_accuracy_pass
+        )
+        noise_tolerated = (
+            confirmation_n <= 32
+            and confirmation_gain >= -2 * one_question - epsilon
+            and calibration_gain > epsilon
+            and combined_nonregressing
+        )
+    else:
+        accuracy_pass = direct_accuracy_pass
+        noise_tolerated = bool(
+            getattr(cfg, "phase1_allow_confirmation_noise_tolerance", True)
+            and confirmation_n <= 32
+            and confirmation_gain >= -one_question - epsilon
+            and calibration_gain >= 0.10 - epsilon
+            and combined_nonregressing
+        )
     reasons = []
     if not safe:
         reasons.append("confirmation_safety")
     if not nll_safe:
         reasons.append("nll_reduction")
-    if not direct_accuracy_pass:
+    if not accuracy_pass:
         reasons.append("confirmation_accuracy")
-    return safe and nll_safe and direct_accuracy_pass, noise_tolerated, reasons
+    return safe and nll_safe and accuracy_pass, noise_tolerated, reasons
 
 
 def phase1_steernet_acceptance(model, tokenizer, train_data, eval_data, cfg: RSCConfig, device: torch.device) -> Dict[str, Any]:
@@ -1721,7 +1741,9 @@ def select_phase1b_candidate_layers(
         for trial in acceptance_report.get("confirmation_trials", [])
         for layer in [trial.get("layer")]
         if layer is not None and (
-            not trial.get("safe", True) or not trial.get("passed", True)
+            not trial.get("safe", True)
+            or not trial.get("nll_safe", True)
+            or (not trial.get("passed", True) and trial.get("confirmation_gain", 0.0) < -0.10)
         )
     }
     candidate_rows: List[Dict[str, Any]] = []

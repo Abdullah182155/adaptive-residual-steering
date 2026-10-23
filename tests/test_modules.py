@@ -2534,3 +2534,36 @@ class TestEngineV4(unittest.TestCase):
         m2 = DummyModel()
         _restore_phase2_runtime_state(m2, state)
         self.assertEqual(m2._restored_scales, {11: 0.35, 18: 0.50})
+
+    def test_nonregressing_confirmation_promotion(self):
+        from src.training.trainer import _phase1_confirmation_verdict
+        # With phase1_allow_nonregressing_confirmation=True, a 0.0pp confirmation gain with nonregressing combined gain passes
+        cfg = RSCConfig(phase1_allow_nonregressing_confirmation=True)
+        passed, noise, reasons = _phase1_confirmation_verdict(
+            confirmation_gain=0.0,
+            calibration_gain=0.0,
+            combined_gain=0.0,
+            confirmation_n=28,
+            safe=True,
+            nll_safe=True,
+            cfg=cfg,
+        )
+        self.assertTrue(passed)
+        self.assertEqual(len(reasons), 0)
+
+    def test_noise_tolerated_confirmation_promotion(self):
+        from src.training.trainer import _phase1_confirmation_verdict
+        # With phase1_allow_nonregressing_confirmation=True, small noise (-1 question on N=28) passes when calibration is positive and combined is nonregressing
+        cfg = RSCConfig(phase1_allow_nonregressing_confirmation=True)
+        passed, noise, reasons = _phase1_confirmation_verdict(
+            confirmation_gain=-1.0 / 28.0,
+            calibration_gain=0.08,
+            combined_gain=0.01,
+            confirmation_n=28,
+            safe=True,
+            nll_safe=True,
+            cfg=cfg,
+        )
+        self.assertTrue(passed)
+        self.assertTrue(noise)
+        self.assertEqual(len(reasons), 0)

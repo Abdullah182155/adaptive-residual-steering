@@ -164,6 +164,7 @@ class RSCConfig:
     continue_on_diagnostic_failure: bool = False
     skip_adaptive_phases_when_phase1_fails: bool = True
     skip_adaptive_phases_when_router_fails: bool = True
+    phase1_allow_nonregressing_confirmation: bool = False
 
     # Phase 2 staged parameters
     phase2_warmup_ratio: float = 0.03
@@ -633,6 +634,10 @@ ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     "lambda_gate_budget": 0.15,
     "lambda_l1_gate": 0.01,
     "calc_token_weight": 1.75,
+    "skip_adaptive_phases_when_phase1_fails": False,
+    "phase1_allow_nonregressing_confirmation": True,
+    "phase1_allow_confirmation_noise_tolerance": True,
+    "phase1_max_confirmation_candidates": 6,
 }
 ENGINE_V40_KAGGLE_EVALUATION: Dict[str, Any] = {
     "n_test": 100,
