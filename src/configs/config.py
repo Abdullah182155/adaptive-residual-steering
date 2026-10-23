@@ -457,6 +457,16 @@ class RSCConfig:
     audit_n_boot: int = 2000
     audit_inflation_margin: float = 0.01
 
+    # ==== M3 ====
+    onpolicy_n_questions: int = 1500
+    onpolicy_samples: Tuple[int, int] = (2, 4)           # adaptive: 2 first, +2 for questions with 0 correct
+    onpolicy_temperature: float = 0.7
+    onpolicy_max_new_tokens: int = 320
+    onpolicy_shots_mix: Tuple[int, ...] = (0, 4)
+    onpolicy_batch_size: int = 16
+    onpolicy_max_tok_len: int = 1280
+    onpolicy_gold_mix: float = 0.4
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')
