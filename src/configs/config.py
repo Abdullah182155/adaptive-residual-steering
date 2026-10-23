@@ -495,6 +495,13 @@ class RSCConfig:
     router_catalog_save_path: str = "./checkpoints/router_catalog_v5.pt"
     router_loss_mode: str = "catalog_distill"             # "catalog_distill" | "rloo_legacy"
 
+    # ==== M6b ====
+    abstain_theta: float = 1.01                           # >1 disables threshold-based abstention
+    guards_enabled: bool = True
+    guard_rel_norm_cap: float = 0.02                      # calibrated in M8
+    guard_k_max: int = 3
+    gate_task_gradient: bool = False
+
     def __post_init__(self):
         if self.failure_policy not in ("warn", "strict"):
             raise ValueError('failure_policy must be "warn" or "strict"')

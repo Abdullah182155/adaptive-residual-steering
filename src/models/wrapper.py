@@ -1,7 +1,7 @@
 import math
 import warnings
 import weakref
-from typing import List, Optional, Tuple, Dict, Any, Set
+from typing import List, Optional, Tuple, Dict, Any, Set, Union, Sequence
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -114,6 +114,28 @@ class Phi2WithRSC(nn.Module):
         )
         self.register_buffer("routing_forwards", torch.tensor(0, dtype=torch.long, device=self.device))
 
+        # ---- M6b state ----
+        self._catalog = None
+        self._catalog_membership = None
+        self._route_is_catalog = False
+        self._last_catalog_idx = None
+        self._router_policy = None          # None -> fall back to cfg.router_policy
+        self._abstain_theta = None          # None -> fall back to cfg.abstain_theta
+        self._shot_bucket = None
+        self._gate_mode = "learned"
+        self._manifest = None
+        if not hasattr(self, "_joint_grad_mode"):
+            self._joint_grad_mode = False
+        if not hasattr(self, "_steer_scale"):
+            self._steer_scale = None
+        if not isinstance(getattr(self, "guard_state", None), dict):
+            self.guard_state = {}
+        self._guards_enabled = bool(getattr(cfg, "guards_enabled", True))
+        self._guard_rel_norm_cap = float(getattr(cfg, "guard_rel_norm_cap", 0.02))
+        self._guard_k_max = int(getattr(cfg, "guard_k_max", 3))
+        self._guard_rel_max = None
+        self._guard_nonfinite = None
+
         self._inject_rsc(n_layers)
 
         # Freeze backbone parameters strictly
@@ -162,8 +184,9 @@ class Phi2WithRSC(nn.Module):
                         if not selected.any():
                             g._alpha_for_aux, g.last_alpha, g._valid_mask = None, None, None
                             return output
-                        if wrapper._routing_override is None:
-                            wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
+                        if not wrapper._route_is_catalog:
+                            if wrapper._routing_override is None:
+                                wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
                         delta = s(h_fp, active_k=wrapper._active_k_realized if getattr(wrapper.cfg, 'steernet_k_conditioning', True) else None)
                         if wrapper._token_competitive_alpha is not None:
                             # Advance the causal gate cache using the native
@@ -181,7 +204,7 @@ class Phi2WithRSC(nn.Module):
                         # injecting a full residual on the same tokens.
                         allocation = (
                             torch.ones_like(alpha)
-                            if wrapper._token_competitive_alpha is not None
+                            if (wrapper._token_competitive_alpha is not None or wrapper._route_allocation is None)
                             else wrapper._route_allocation[:, layer_pos].to(alpha.dtype).view(-1, 1, 1)
                         )
                         alpha = alpha * allocation
@@ -256,11 +279,22 @@ class Phi2WithRSC(nn.Module):
                                 metrics["energy_max"] = max(metrics["energy_max"], float(effective_energy.max().item()))
                         if wrapper._routing_override is None:
                             g.record_diagnostics(alpha, steer_mask)
-                        if wrapper._joint_grad_mode:
-                            h_new = h_fp + route_st * alpha * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1)
-                        else:
-                            h_new = h_fp + route_st * alpha.detach() * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1)
-                        wrapper._record_envelope(layer_pos, route_st * alpha.detach() * delta * route_budget * steer_mask.to(alpha.dtype).unsqueeze(-1), h_fp, steer_mask, h_new)
+                        allow_grad = wrapper._joint_grad_mode or getattr(wrapper.cfg, "gate_task_gradient", False)
+                        scale = (
+                            wrapper._steer_scale
+                            if wrapper._steer_scale is not None
+                            else getattr(wrapper.cfg, "steer_scale", 1.0)
+                        )
+                        alpha_eff = (alpha if allow_grad else alpha.detach()) * scale
+                        delta_injected = (
+                            route_st * alpha_eff * delta * route_budget
+                            * steer_mask.to(alpha.dtype).unsqueeze(-1)
+                        )
+                        h_new = h_fp + delta_injected
+                        record = getattr(wrapper, "_record_envelope", None)
+                        if record is not None:
+                            record(layer_pos, delta_injected.detach(), h_fp, steer_mask, h_new)
+                        wrapper._update_guard(delta_injected, h_fp, steer_mask, selected)
                     h_out = h_new.to(h.dtype)
                     if orig_2d:
                         h_out = h_out.squeeze(0)
@@ -625,6 +659,13 @@ class Phi2WithRSC(nn.Module):
         if self._selected_counts is None or self._selected_counts.shape[0] != h.shape[0]:
             raise RuntimeError("RSC router state was not initialised by the model forward pre-hook")
 
+        # ---- M6b: catalog policy branch ----
+        self._route_is_catalog = False
+        self._last_catalog_idx = None
+        if self._catalog_policy_active():
+            self._prepare_routes_catalog(h, mask)
+            return
+
         router_mask = self._router_mask_for(h, mask)
         demo_mask = None
         if bool(getattr(self.cfg, "router_demo_features", False)):
@@ -801,6 +842,7 @@ class Phi2WithRSC(nn.Module):
 
     def _select_layer(self, layer_idx: int, layer_pos: int, h: torch.Tensor, mask: torch.Tensor):
         if layer_idx == self.target_layers[0]:
+            self._reset_guard(h)
             self._prepare_routes(h, mask)
             if self._collect_routing_trace:
                 self.routing_step_log.append({
@@ -810,15 +852,21 @@ class Phi2WithRSC(nn.Module):
         if self._precomputed_routes is None or self._desired_k is None:
             raise RuntimeError("RSC routes were not prepared at the first candidate layer")
         selected = self._precomputed_routes[:, layer_pos]
-        probability = self._router_probabilities[:, layer_pos]
-        margin = self._router_margins[:, layer_pos]
+        if self._route_is_catalog:
+            probability = self._catalog_layer_probs()[:, layer_pos]
+            margin = probability
+            layer_logit = torch.log(probability.clamp(min=1e-8))
+        else:
+            probability = self._router_probabilities[:, layer_pos]
+            margin = self._router_margins[:, layer_pos]
+            layer_logit = self._router_logits[:, layer_pos]
         fallback = torch.zeros_like(selected)
         if self._collect_routing_trace:
             if self.last_routing_trace is None:
                 self.last_routing_trace = {}
             self.last_routing_trace[int(layer_idx)] = {
                 "probability": probability.detach().float().cpu().tolist(),
-                "logit": self._router_logits[:, layer_pos].detach().float().cpu().tolist(),
+                "logit": layer_logit.detach().float().cpu().tolist(),
                 "selection_rate_ema": float(self.router.selection_rate_ema[layer_pos].item()),
                 "probability_ema": float(self.router.selection_rate_ema[layer_pos].item()),
                 "logit_ema": float(self.router.logit_ema[layer_pos].item()),
@@ -826,8 +874,8 @@ class Phi2WithRSC(nn.Module):
                 "selected": selected.detach().cpu().tolist(),
                 "fallback": fallback.detach().cpu().tolist(),
                 "desired_k": self._desired_k.detach().cpu().tolist(),
-                "realized_k": self._active_k_realized.detach().cpu().tolist(),
-                "route_allocation": self._route_allocation[:, layer_pos].detach().float().cpu().tolist(),
+                "realized_k": self._active_k_realized.detach().cpu().tolist() if self._active_k_realized is not None else [],
+                "route_allocation": self._route_allocation[:, layer_pos].detach().float().cpu().tolist() if self._route_allocation is not None else [],
                 "predicted_k": self.router._last_prediction.detach().cpu().tolist(),
             }
         self._selected_counts = self._selected_counts + selected.long()
@@ -836,6 +884,276 @@ class Phi2WithRSC(nn.Module):
             self.routing_k_hist.add_(torch.bincount(counts, minlength=self.cfg.max_active_layers + 1))
             self.routing_forwards.add_(counts.numel())
         return selected, probability
+
+    # ---- M6b: question-span / shot-bucket plumbing ----
+    def set_question_span_mask(self, mask=None):
+        """Alias of set_router_context_mask (pending -> active at the next model forward)."""
+        self.set_router_context_mask(mask)
+
+    def set_shot_bucket(self, b: Union[int, Sequence[int], torch.Tensor, None]):
+        if b is None:
+            self._shot_bucket = None
+        elif isinstance(b, int):
+            self._shot_bucket = int(b)
+        elif torch.is_tensor(b):
+            t = b.detach().long()
+            self._shot_bucket = int(t.item()) if t.dim() == 0 else t.reshape(-1).clone()
+        else:
+            self._shot_bucket = torch.as_tensor(list(b), dtype=torch.long)
+
+    def _shot_bucket_for(self, h: torch.Tensor):
+        sb = self._shot_bucket
+        B = h.shape[0]
+        if sb is None:
+            return None
+        if isinstance(sb, int):
+            return torch.full((B,), sb, dtype=torch.long, device=h.device)
+        t = sb.to(device=h.device, dtype=torch.long).reshape(-1)
+        if t.numel() == 1 and B > 1:
+            t = t.expand(B)
+        return t
+
+    # ---- M6b: policy / catalog / abstain setters ----
+    def set_catalog(self, catalog):
+        self._catalog = catalog
+        self._catalog_membership = None
+        if self._catalog is not None and getattr(self.router, "catalog_head", None) is None:
+            self.router.catalog_head = nn.Linear(
+                self.router.d_model, len(self._catalog.subsets)
+            ).to(self.device)
+            nn.init.zeros_(self.router.catalog_head.weight)
+            nn.init.zeros_(self.router.catalog_head.bias)
+
+    def set_abstain_threshold(self, theta: float):
+        self._abstain_theta = float(theta)
+
+    def set_router_policy(self, mode: str):
+        if mode not in {"legacy", "catalog"}:
+            raise ValueError('router policy must be "legacy" or "catalog"')
+        self._router_policy = mode
+
+    def _policy(self) -> str:
+        if self._router_policy is not None:
+            return self._router_policy
+        return getattr(self.cfg, "router_policy", "legacy")
+
+    def _catalog_policy_active(self) -> bool:
+        return (
+            self._routing_override is None
+            and not self._router_warmup
+            and self._policy() == "catalog"
+        )
+
+    def _prepare_routes_catalog(self, h: torch.Tensor, mask: torch.Tensor):
+        """Catalog policy: one argmax class per batch row, optional abstention to the empty class."""
+        if self._catalog is None:
+            from src.routing.catalog import Catalog
+            layers = getattr(self.cfg, "catalog_layers", None) or self.target_layers
+            self._catalog = Catalog.build(layers, getattr(self.cfg, "catalog_max_k", 3))
+            self._catalog_membership = None
+
+        if getattr(self.router, "catalog_head", None) is None:
+            self.router.catalog_head = nn.Linear(
+                self.router.d_model, len(self._catalog.subsets)
+            ).to(self.device)
+            nn.init.zeros_(self.router.catalog_head.weight)
+            nn.init.zeros_(self.router.catalog_head.bias)
+
+        router_mask = self._router_mask_for(h, mask)
+        with torch.no_grad():
+            logits = self.router.catalog_logits(h, router_mask, shot_bucket=self._shot_bucket_for(h))
+            p = F.softmax(logits.float(), dim=-1)
+            idx = p.argmax(dim=-1)
+            # Abstain rule: if idx != 0 and p[:, 0] >= theta: idx = 0
+            theta = self._abstain_theta
+            if theta is None:
+                theta = getattr(self.cfg, "abstain_theta", 1.01)
+            if theta <= 1.0:
+                idx = torch.where((idx != 0) & (p[:, 0] >= theta), torch.zeros_like(idx), idx)
+
+        selected_matrix = self._catalog.to_candidate_matrix(idx, self.target_layers).to(h.device).bool()
+        self._desired_k = self._catalog.sizes().to(h.device)[idx]
+        self._active_k_realized = self._desired_k.clamp(min=1)
+        self.router.seen_forwards += h.shape[0]
+        self.router.selected_forwards += selected_matrix.long().sum(dim=0).to(self.router.selected_forwards.device)
+
+        self._router_logits = logits.detach()
+        self._router_margins = logits.detach()
+        self._router_probabilities = p
+        self._last_catalog_idx = idx.detach()
+        self._route_is_catalog = True
+        self._precomputed_routes = selected_matrix
+        self._precomputed_route_tuples = [
+            tuple(sorted(self.target_layers[j] for j in range(len(self.target_layers)) if bool(selected_matrix[b, j])))
+            for b in range(h.shape[0])
+        ]
+        self.router._last_prediction = self._desired_k
+        self._last_inferred_k = self._desired_k
+
+        if h.shape[1] > 1:
+            self._cached_decode_routes = selected_matrix.detach()
+            self._cached_decode_k = self._desired_k.detach()
+            self._cached_decode_probs = self._router_probabilities.detach()
+            self._cached_decode_logits = self._router_logits.detach()
+            self._cached_decode_margins = self._router_margins.detach()
+            self._cached_decode_active_k = self._active_k_realized.detach()
+
+    def _catalog_layer_probs(self) -> torch.Tensor:
+        """(B, n_candidates) marginal probability that each candidate layer is in the sampled class."""
+        p = self._router_probabilities.float()
+        if self._catalog_membership is None or self._catalog_membership.shape[0] != p.shape[1]:
+            n = len(self._catalog.subsets)
+            self._catalog_membership = self._catalog.to_candidate_matrix(
+                torch.arange(n), self.target_layers
+            ).float()
+        return p @ self._catalog_membership.to(p.device)
+
+    # ---- M6b: steer scale / gate mode ----
+    def set_steer_scale(self, scale: Optional[float] = None):
+        self._steer_scale = None if scale is None else float(scale)
+
+    def set_manifest(self, manifest):
+        self._manifest = manifest
+
+    def set_gate_mode(self, mode: str, scale: Optional[float] = None):
+        if mode not in {"learned", "const"}:
+            raise ValueError('gate mode must be "learned" or "const"')
+        self._gate_mode = mode
+        if mode == "const":
+            self.set_gate_freeze(True, 1.0)
+            self.set_steer_scale(1.0 if scale is None else scale)
+        else:
+            self.set_gate_freeze(False)
+            self.set_steer_scale(None)
+        if self._manifest is not None:
+            self._manifest.set("gate_mode", mode)
+
+    @property
+    def gate_mode(self) -> str:
+        return self._gate_mode
+
+    # ---- M6b: guards (record only, never raise) ----
+    def set_guards(self, enabled: bool = True, rel_norm_cap: float = 0.02, k_max: int = 3):
+        self._guards_enabled = bool(enabled)
+        self._guard_rel_norm_cap = float(rel_norm_cap)
+        self._guard_k_max = int(k_max)
+        self.guard_state["enabled"] = self._guards_enabled
+        self.guard_state["cap"] = self._guard_rel_norm_cap
+        self.guard_state["k_max"] = self._guard_k_max
+
+    def _reset_guard(self, h: torch.Tensor):
+        B = h.shape[0]
+        self._guard_rel_max = torch.zeros(B, device=h.device)
+        self._guard_nonfinite = torch.zeros(B, dtype=torch.bool, device=h.device)
+        self.guard_state["tripped"] = torch.zeros(B, dtype=torch.bool, device=h.device)
+        self.guard_state["enabled"] = self._guards_enabled
+        self.guard_state["cap"] = self._guard_rel_norm_cap
+        self.guard_state["k_max"] = self._guard_k_max
+
+    def _update_guard(self, delta_injected, h_fp, steer_mask, selected):
+        """tripped = (rel_max > cap) | nonfinite | (K > k_max), per batch row. Never raises."""
+        with torch.no_grad():
+            d = delta_injected.detach().float()
+            hh = h_fp.detach().float()
+            if self._guard_rel_max is None or self._guard_rel_max.shape[0] != d.shape[0]:
+                self._reset_guard(h_fp)
+            act = selected.detach().bool().reshape(-1)
+            valid = steer_mask.bool() & act.unsqueeze(1)
+            finite = torch.isfinite(d).all(dim=-1) & torch.isfinite(hh).all(dim=-1)
+            nonfinite = ((~finite) & valid).any(dim=1)
+            rel = d.norm(dim=-1) / hh.norm(dim=-1).clamp(min=1e-6)
+            rel = torch.nan_to_num(rel, nan=0.0).masked_fill(~valid, 0.0)
+            self._guard_rel_max = torch.maximum(self._guard_rel_max, rel.max(dim=1).values)
+            self._guard_nonfinite = self._guard_nonfinite | nonfinite
+            routes = self._precomputed_routes
+            if torch.is_tensor(routes):
+                k = routes.long().sum(dim=-1).to(d.device)
+            else:
+                k = torch.tensor([len(r) for r in routes], device=d.device)
+            tripped = (
+                (self._guard_rel_max > self._guard_rel_norm_cap)
+                | self._guard_nonfinite
+                | (k > self._guard_k_max)
+            )
+            self.guard_state["tripped"] = tripped
+            self.guard_state["rel_max_tracked"] = self._guard_rel_max.clone()
+            self.guard_state["k"] = k
+
+    # ---- M6b: route prediction / canonical keys ----
+    def _clear_decode_caches(self):
+        self._cached_decode_routes = None
+        self._cached_decode_k = None
+        self._cached_decode_probs = None
+        self._cached_decode_logits = None
+        self._cached_decode_margins = None
+        self._cached_decode_active_k = None
+        self._cached_decode_allocation = None
+
+    @torch.no_grad()
+    def predict_routes(self, input_ids, attention_mask, question_span_mask=None, shot_bucket=None) -> List[dict]:
+        """Single no-grad prefill; returns [{"route", "class_idx", "p_empty"}] per batch row.
+
+        Diagnostic counters are restored and decode caches cleared, so a subsequent
+        generate() recomputes routes from scratch.
+        """
+        saved = {
+            "sel": self.router.selected_forwards.clone(),
+            "seen": self.router.seen_forwards.clone(),
+            "khist": self.routing_k_hist.clone(),
+            "kfwd": self.routing_forwards.clone(),
+        }
+        prev_bucket = self._shot_bucket
+        if shot_bucket is not None:
+            self.set_shot_bucket(shot_bucket)
+        self.set_question_span_mask(question_span_mask)
+        try:
+            with self.counterfactual_mode():
+                self.base_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
+            routes = [tuple(int(x) for x in r) for r in self.current_route_tuples()]
+            B = len(routes)
+            if self._route_is_catalog and self._last_catalog_idx is not None:
+                class_idx = [int(i) for i in self._last_catalog_idx.cpu().tolist()]
+                p_empty = [float(x) for x in self._router_probabilities[:, 0].float().cpu().tolist()]
+            else:
+                lookup = {}
+                if self._catalog is not None:
+                    lookup = {tuple(sorted(s)): i for i, s in enumerate(self._catalog.subsets)}
+                class_idx = [lookup.get(r, -1) for r in routes]
+                p_empty = [1.0 if len(r) == 0 else 0.0 for r in routes]
+            out = [
+                {"route": routes[b], "class_idx": class_idx[b], "p_empty": p_empty[b]}
+                for b in range(B)
+            ]
+        finally:
+            self.router.selected_forwards.copy_(saved["sel"])
+            self.router.seen_forwards.copy_(saved["seen"])
+            self.routing_k_hist.copy_(saved["khist"])
+            self.routing_forwards.copy_(saved["kfwd"])
+            self._shot_bucket = prev_bucket
+            self._clear_decode_caches()
+        return out
+
+    @staticmethod
+    def route_key(row) -> Tuple[Tuple[int, ...], str, Optional[float]]:
+        """Canonical (route_tuple, gate_mode, steer_scale_or_None). Empty route -> ((), "none", None).
+
+        `row` is a predict_routes() dict (optionally with "gate_mode"/"steer_scale") or a bare route sequence.
+        A learned-gate row with scale None or 1.0 canonicalises to scale None.
+        """
+        if isinstance(row, dict):
+            route = row.get("route", ())
+            gate_mode = row.get("gate_mode", "learned")
+            scale = row.get("steer_scale", None)
+        else:
+            route, gate_mode, scale = row, "learned", None
+        route = tuple(sorted(int(x) for x in route))
+        if len(route) == 0:
+            return ((), "none", None)
+        if scale is not None:
+            scale = float(scale)
+            if gate_mode == "learned" and scale == 1.0:
+                scale = None
+        return (route, str(gate_mode), scale)
 
     def reset_routing_diagnostics(self):
         self.router.selected_forwards.zero_()
