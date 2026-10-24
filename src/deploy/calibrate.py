@@ -449,7 +449,16 @@ def load_contract_weights(model, contract: dict, device=None, verify: bool = Tru
         cat_info = contract["catalog"]
         layers = tuple(int(l) for l in cat_info["layers"])
         max_k = int(cat_info.get("max_k", 3))
-        catalog = Catalog.build(layers, max_k)
+        # Use the exact subsets stored in the contract so the catalog_head
+        # output dimension matches the router checkpoint (e.g. 26 not 163).
+        # _catalog_subsets() strips the empty set () when writing the contract,
+        # so we prepend it back here to restore the original 26-entry catalog.
+        if "subsets" in cat_info:
+            non_empty = tuple(tuple(int(x) for x in s) for s in cat_info["subsets"])
+            subsets = ((),) + non_empty
+            catalog = Catalog(layers=layers, max_k=max_k, subsets=subsets)
+        else:
+            catalog = Catalog.build(layers, max_k)
         _opt(model, "set_catalog", catalog)
     seen = set()
     for key in ("steernet", "router", "gate"):
@@ -596,7 +605,7 @@ def run_deployment_calibration(
         k_scale_mode=getattr(cfg, "k_scale_mode", "sqrt"),
         steernet_k_conditioning=bool(getattr(cfg, "steernet_k_conditioning", True)),
         catalog={
-            "layers":  list(model.target_layers),
+            "layers":  list(catalog.layers),
             "max_k":   int(cfg.max_active_layers),
             "subsets": [list(s) for s in _catalog_subsets(catalog)],
         },
