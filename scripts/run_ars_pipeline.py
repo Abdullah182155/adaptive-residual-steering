@@ -33,11 +33,21 @@ def parse_args():
     p.add_argument("--secondary", action="store_true")
     p.add_argument("--report",    action="store_true", help="run make_report after bench")
     p.add_argument("--report_dir", default="report")
-    p.add_argument("--manifest",     default="")
-    p.add_argument("--n_questions",  type=int, default=None, help="Number of questions for S0b sampling")
-    p.add_argument("--batch_size",   type=int, default=None, help="Batch size override")
-    p.add_argument("--s1_epochs",    type=int, default=None, help="Epochs for S1 SteerNet training")
-    p.add_argument("--gate_epochs",  type=int, default=None, help="Epochs for S3 Gate training")
+    p.add_argument("--manifest",         default="")
+    p.add_argument("--profile",          choices=["quick", "medium", "full"], default=None,
+                   help="Scale preset: quick (~5m), medium (~20m), full (production)")
+    p.add_argument("--cf_n_audit",       type=int, default=None, help="Total train examples for S0 audit table")
+    p.add_argument("--cf_heldout_n",     type=int, default=None, help="Heldout examples for S0 audit table")
+    p.add_argument("--cf_shard_size",    type=int, default=None, help="Shard size for CF table")
+    p.add_argument("--n_questions",      type=int, default=None, help="Number of questions for S0b sampling")
+    p.add_argument("--onpolicy_samples", type=int, nargs=2, default=None, help="Onpolicy samples (round1 round2)")
+    p.add_argument("--s1_epochs",        type=int, default=None, help="Epochs for S1 SteerNet training")
+    p.add_argument("--s1_val_n",         type=int, default=None, help="Validation rows for S1")
+    p.add_argument("--gate_epochs",      type=int, default=None, help="Epochs for S3 Gate training")
+    p.add_argument("--gate_sel_n",       type=int, default=None, help="Selection rows for S3 Gate")
+    p.add_argument("--calib_sel_n",      type=int, default=None, help="Selection rows for S5 calibration")
+    p.add_argument("--batch_size",       type=int, default=None, help="Batch size override")
+    p.add_argument("--set",              action="append", default=[], help="Arbitrary config override KEY=VAL")
     return p.parse_args()
 
 
@@ -338,10 +348,90 @@ def stage_bench(model, tok, cfg, device, args):
     return out
 
 
+
+def apply_cfg_overrides(cfg, args):
+    """Apply profile presets, dedicated CLI flags, and arbitrary --set KEY=VAL overrides."""
+    profile = getattr(args, "profile", None)
+    if profile == "quick":
+        cfg.cf_audit_plan = ((0, 20), (4, 10), (8, 10))
+        cfg.cf_heldout_n = 10
+        cfg.cf_shard_size = 10
+        cfg.onpolicy_n_questions = 30
+        cfg.onpolicy_samples = (1, 1)
+        cfg.s1_epochs = 2
+        cfg.s1_val_onpolicy_n = 20
+        cfg.gate_epochs = 2
+        cfg.gate_sel_n = 30
+        cfg.calib_sel_n = 30
+        print("[profile: quick] Applied fast-execution scale preset")
+    elif profile == "medium":
+        cfg.cf_audit_plan = ((0, 100), (4, 50), (8, 50))
+        cfg.cf_heldout_n = 40
+        cfg.cf_shard_size = 20
+        cfg.onpolicy_n_questions = 100
+        cfg.onpolicy_samples = (2, 2)
+        cfg.s1_epochs = 3
+        cfg.s1_val_onpolicy_n = 60
+        cfg.gate_epochs = 3
+        cfg.gate_sel_n = 60
+        cfg.calib_sel_n = 60
+        print("[profile: medium] Applied balanced-scale preset")
+
+    if getattr(args, "cf_shard_size", None) is not None:
+        cfg.cf_shard_size = int(args.cf_shard_size)
+    if getattr(args, "cf_heldout_n", None) is not None:
+        cfg.cf_heldout_n = int(args.cf_heldout_n)
+    if getattr(args, "cf_n_audit", None) is not None:
+        total = int(args.cf_n_audit)
+        n0 = max(1, total // 2)
+        n4 = max(1, total // 4)
+        n8 = max(1, total - n0 - n4)
+        cfg.cf_audit_plan = ((0, n0), (4, n4), (8, n8))
+    if getattr(args, "n_questions", None) is not None:
+        cfg.onpolicy_n_questions = int(args.n_questions)
+    if getattr(args, "onpolicy_samples", None) is not None:
+        cfg.onpolicy_samples = tuple(int(x) for x in args.onpolicy_samples)
+    if getattr(args, "s1_epochs", None) is not None:
+        cfg.s1_epochs = int(args.s1_epochs)
+    if getattr(args, "s1_val_n", None) is not None:
+        cfg.s1_val_onpolicy_n = int(args.s1_val_n)
+    if getattr(args, "gate_epochs", None) is not None:
+        cfg.gate_epochs = int(args.gate_epochs)
+    if getattr(args, "gate_sel_n", None) is not None:
+        cfg.gate_sel_n = int(args.gate_sel_n)
+    if getattr(args, "calib_sel_n", None) is not None:
+        cfg.calib_sel_n = int(args.calib_sel_n)
+    if getattr(args, "batch_size", None) is not None:
+        cfg.batch_size = int(args.batch_size)
+        cfg.onpolicy_batch_size = int(args.batch_size)
+
+    if getattr(args, "set", None):
+        for item in args.set:
+            if "=" in item:
+                k, v = item.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if v.lower() == "true":
+                    val = True
+                elif v.lower() == "false":
+                    val = False
+                else:
+                    try:
+                        val = int(v)
+                    except ValueError:
+                        try:
+                            val = float(v)
+                        except ValueError:
+                            val = v
+                setattr(cfg, k, val)
+                print(f"[config override] {k} = {val}")
+
+
 def main():
     args      = parse_args()
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg       = RSCConfig()
+    apply_cfg_overrides(cfg, args)
     stage_map = dict(STAGE_MAP)
     if args.stage_map:
         with open(args.stage_map) as f:
