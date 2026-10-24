@@ -46,8 +46,13 @@ def parse_args():
     p.add_argument("--gate_epochs",      type=int, default=None, help="Epochs for S3 Gate training")
     p.add_argument("--gate_sel_n",       type=int, default=None, help="Selection rows for S3 Gate")
     p.add_argument("--calib_sel_n",      type=int, default=None, help="Selection rows for S5 calibration")
-    p.add_argument("--batch_size",       type=int, default=None, help="Batch size override")
-    p.add_argument("--set",              action="append", default=[], help="Arbitrary config override KEY=VAL")
+    p.add_argument("--batch_size",              type=int, default=None, help="Batch size override")
+    p.add_argument("--steer_scale",             type=float, default=None, help="Steering magnitude multiplier")
+    p.add_argument("--s1_lr",                   type=float, default=None, help="Learning rate for S1 SteerNet")
+    p.add_argument("--gate_lr",                 type=float, default=None, help="Learning rate for S3 Gate")
+    p.add_argument("--onpolicy_temperature",    type=float, default=None, help="Temperature for S0b sampling")
+    p.add_argument("--onpolicy_max_new_tokens", type=int, default=None, help="Max tokens for S0b sampling")
+    p.add_argument("--set",                     action="append", default=[], help="Arbitrary config override KEY=VAL")
     return p.parse_args()
 
 
@@ -404,6 +409,16 @@ def apply_cfg_overrides(cfg, args):
     if getattr(args, "batch_size", None) is not None:
         cfg.batch_size = int(args.batch_size)
         cfg.onpolicy_batch_size = int(args.batch_size)
+    if getattr(args, "steer_scale", None) is not None:
+        cfg.steer_scale = float(args.steer_scale)
+    if getattr(args, "s1_lr", None) is not None:
+        cfg.s1_lr = float(args.s1_lr)
+    if getattr(args, "gate_lr", None) is not None:
+        cfg.gate_lr = float(args.gate_lr)
+    if getattr(args, "onpolicy_temperature", None) is not None:
+        cfg.onpolicy_temperature = float(args.onpolicy_temperature)
+    if getattr(args, "onpolicy_max_new_tokens", None) is not None:
+        cfg.onpolicy_max_new_tokens = int(args.onpolicy_max_new_tokens)
 
     if getattr(args, "set", None):
         for item in args.set:
