@@ -294,7 +294,7 @@ class Phi2WithRSC(nn.Module):
                         record = getattr(wrapper, "_record_envelope", None)
                         if record is not None:
                             record(layer_pos, delta_injected.detach(), h_fp, steer_mask, h_new)
-                        wrapper._update_guard(delta_injected, h_fp, steer_mask, selected)
+                        wrapper._update_guard(delta_injected, h_fp, steer_mask, selected, layer_idx=layer_idx)
                     h_out = h_new.to(h.dtype)
                     if orig_2d:
                         h_out = h_out.squeeze(0)
@@ -820,7 +820,7 @@ class Phi2WithRSC(nn.Module):
             # Forced Phase-1B/audit routes are an intervention contract, not
             # a chance for the immature router logits to attenuate one member
             # of a deliberately balanced pair.
-            self._route_allocation = selected_matrix.to(dtype=self._router_logits.dtype) / self._active_k_realized.clamp_min(1).to(dtype=self._router_logits.dtype).unsqueeze(-1)
+            self._route_allocation = selected_matrix.to(dtype=self._router_logits.dtype)
         elif bool(getattr(self.cfg, "factorized_gate_allocation", True)):
             self._route_allocation = masked_route_allocation(
                 self._router_logits, selected_matrix,
@@ -926,6 +926,35 @@ class Phi2WithRSC(nn.Module):
 
     def set_abstain_threshold(self, theta: float):
         self._abstain_theta = float(theta)
+
+    def set_theta_abs(self, theta: float):
+        self.set_abstain_threshold(theta)
+
+    def set_k_scale_mode(self, mode):
+        self._k_scale_mode = mode
+        if hasattr(self, 'cfg') and self.cfg is not None:
+            self.cfg.k_scale_mode = mode
+
+    def reset_guard_state(self):
+        self._guard_rel_max = None
+        self._guard_nonfinite = None
+        if not isinstance(getattr(self, 'guard_state', None), dict):
+            self.guard_state = {}
+        self.guard_state.clear()
+        self.guard_state['enabled'] = getattr(self, '_guards_enabled', True)
+        self.guard_state['cap'] = getattr(self, '_guard_rel_norm_cap', 0.02)
+        self.guard_state['k_max'] = getattr(self, '_guard_k_max', 3)
+        self.guard_state['finite_check'] = getattr(self, '_guard_finite_check', True)
+        self.guard_state['revert_to_k0'] = getattr(self, '_guard_revert_to_k0', True)
+        self.guard_state['rel_norms'] = {}
+
+    def reset_routing_diagnostics(self):
+        if hasattr(self, 'routing_k_hist'):
+            self.routing_k_hist.zero_()
+        if hasattr(self, 'routing_forwards'):
+            self.routing_forwards.zero_()
+        if hasattr(self, '_route_tuple_counts'):
+            self._route_tuple_counts.clear()
 
     def set_router_policy(self, mode: str):
         if mode not in {"legacy", "catalog"}:
@@ -1033,13 +1062,29 @@ class Phi2WithRSC(nn.Module):
         return self._gate_mode
 
     # ---- M6b: guards (record only, never raise) ----
-    def set_guards(self, enabled: bool = True, rel_norm_cap: float = 0.02, k_max: int = 3):
+    def set_guards(
+        self,
+        enabled: bool = True,
+        rel_norm_cap: float = 0.02,
+        k_max: int = 3,
+        finite_check: bool = True,
+        revert_to_k0: bool = True,
+        **kwargs,
+    ):
         self._guards_enabled = bool(enabled)
         self._guard_rel_norm_cap = float(rel_norm_cap)
         self._guard_k_max = int(k_max)
+        self._guard_finite_check = bool(finite_check)
+        self._guard_revert_to_k0 = bool(revert_to_k0)
         self.guard_state["enabled"] = self._guards_enabled
         self.guard_state["cap"] = self._guard_rel_norm_cap
         self.guard_state["k_max"] = self._guard_k_max
+        if "rel_norms" not in self.guard_state:
+            self.guard_state["rel_norms"] = {}
+        self.guard_state["finite_check"] = self._guard_finite_check
+        self.guard_state["revert_to_k0"] = self._guard_revert_to_k0
+        if "rel_norms" not in self.guard_state:
+            self.guard_state["rel_norms"] = {}
 
     def _reset_guard(self, h: torch.Tensor):
         B = h.shape[0]
@@ -1050,7 +1095,7 @@ class Phi2WithRSC(nn.Module):
         self.guard_state["cap"] = self._guard_rel_norm_cap
         self.guard_state["k_max"] = self._guard_k_max
 
-    def _update_guard(self, delta_injected, h_fp, steer_mask, selected):
+    def _update_guard(self, delta_injected, h_fp, steer_mask, selected, layer_idx=None):
         """tripped = (rel_max > cap) | nonfinite | (K > k_max), per batch row. Never raises."""
         with torch.no_grad():
             d = delta_injected.detach().float()
@@ -1078,6 +1123,13 @@ class Phi2WithRSC(nn.Module):
             self.guard_state["tripped"] = tripped
             self.guard_state["rel_max_tracked"] = self._guard_rel_max.clone()
             self.guard_state["k"] = k
+            if layer_idx is not None:
+                rn = self.guard_state.setdefault("rel_norms", {})
+                valid_rel = rel[valid]
+                if valid_rel.numel() > 0:
+                    prev = rn.get(int(layer_idx))
+                    val_flat = valid_rel.detach().cpu()
+                    rn[int(layer_idx)] = torch.cat([prev, val_flat]) if prev is not None else val_flat
 
     # ---- M6b: route prediction / canonical keys ----
     def _clear_decode_caches(self):

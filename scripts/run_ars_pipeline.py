@@ -25,6 +25,7 @@ def parse_args():
     p = argparse.ArgumentParser(description="ARS end-to-end pipeline")
     p.add_argument("--stage",     default="all", choices=STAGE_ORDER + ["all"])
     p.add_argument("--stage_map", default=None, help="JSON overriding STAGE_MAP entrypoints")
+    p.add_argument("--ckpt",      default=None, help="Initial SteerNet checkpoint to load")
     p.add_argument("--contract",  default=None)
     p.add_argument("--record",    default="experiment_record.json")
     p.add_argument("--shots",     type=int, nargs="*", default=None)
@@ -65,15 +66,82 @@ def resolve(spec: str):
         ) from e
 
 
+
+def _slice_dataset(ds, n: int):
+    """Safely slice a dataset (HF Dataset, list, or dict of columns) into a list of row dicts."""
+    if ds is None:
+        return []
+    total = len(ds)
+    limit = min(n, total)
+    if limit <= 0:
+        return []
+    if hasattr(ds, "select"):
+        return [ds[i] for i in range(limit)]
+    elif isinstance(ds, list):
+        return ds[:limit]
+    elif isinstance(ds, dict):
+        keys = list(ds.keys())
+        first_col_len = len(ds[keys[0]]) if keys else 0
+        limit = min(limit, first_col_len)
+        return [{k: ds[k][i] for k in keys} for i in range(limit)]
+    else:
+        try:
+            return [ds[i] for i in range(limit)]
+        except Exception:
+            return list(ds)[:limit]
+
+
+def _dataset_to_rows(ds, n: int = None):
+    """Convert dataset or slice into unpadded 1D row dicts for SteerNet training."""
+    if ds is None:
+        return []
+    rows = []
+    limit = len(ds) if n is None else min(n, len(ds))
+    for i in range(limit):
+        ex = ds[i]
+        if isinstance(ex, dict) and "attention_mask" in ex:
+            keep = ex["attention_mask"].bool() if hasattr(ex["attention_mask"], "bool") else [bool(x) for x in ex["attention_mask"]]
+            inp = ex["input_ids"]
+            lbl = ex["labels"]
+            if hasattr(inp, "__getitem__") and hasattr(inp, "long"):
+                inp = inp[keep].long()
+            elif isinstance(inp, list):
+                inp = torch.tensor([inp[j] for j, m in enumerate(keep) if m], dtype=torch.long)
+            if hasattr(lbl, "__getitem__") and hasattr(lbl, "long"):
+                lbl = lbl[keep].long()
+            elif isinstance(lbl, list):
+                lbl = torch.tensor([lbl[j] for j, m in enumerate(keep) if m], dtype=torch.long)
+            rows.append({
+                "input_ids": inp,
+                "labels": lbl,
+                "is_onpolicy": False,
+                "shot": 0,
+                "qid": i,
+                "question": ex.get("question", ""),
+                "final_num": ex.get("final_num", None),
+            })
+        else:
+            rows.append(ex)
+    return rows
+
 def stage_s0(model, tok, train_data, eval_data, cfg, device, state, args):
     from src.analysis.cf_table import build_cf_table, sample_audit_examples
     from src.analysis.signal_audit import compute_signal_audit, write_audit
     from src.routing.catalog import Catalog
     from src.utils.failure_policy import get_manifest
+    from src.training.trainer import load_steer_weights
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     table_path = getattr(cfg, "cf_table_path", os.path.join(cfg.checkpoint_dir, "cf_table_s0.npz"))
     layers = getattr(cfg, "catalog_layers", None) or model.target_layers
     catalog = Catalog.build(tuple(layers), getattr(cfg, "catalog_max_k", 3))
+    if hasattr(model, "set_catalog"):
+        model.set_catalog(catalog)
+
+    # P0-5: Load initial SteerNet weights if available
+    init_ckpt = getattr(args, "ckpt", None) or os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
+    if init_ckpt and os.path.exists(init_ckpt):
+        print(f"[S0] Loading SteerNet weights from {init_ckpt} for CF table")
+        load_steer_weights(model, init_ckpt, device=device)
 
     if os.path.exists(table_path):
         print(f"[S0] Loading existing CF table from {table_path}")
@@ -112,23 +180,6 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
     ckpt_path = os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
     cfg.s1_save_path = ckpt_path
 
-    def _dataset_to_rows(ds):
-        rows = []
-        for i in range(len(ds)):
-            ex = ds[i]
-            if isinstance(ex, dict) and "attention_mask" in ex:
-                keep = ex["attention_mask"].bool()
-                rows.append({
-                    "input_ids": ex["input_ids"][keep].long(),
-                    "labels": ex["labels"][keep].long(),
-                    "is_onpolicy": False,
-                    "shot": 0,
-                    "qid": i,
-                })
-            else:
-                rows.append(ex)
-        return rows
-
     gold_rows_all = _dataset_to_rows(train_data)
     store_path = (state.get("S0b") or {}).get("store_path", os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl"))
     if os.path.exists(store_path):
@@ -136,7 +187,7 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
         train_rows, val_rows = store.build_training_rows(tok, cfg, gold_rows_all, val_fraction=0.1, seed=cfg.seed)
     else:
         train_rows = gold_rows_all
-        val_rows = _dataset_to_rows(eval_data[:min(len(eval_data), 100)])
+        val_rows = _dataset_to_rows(eval_data, n=min(len(eval_data), 100))
 
     gold_rows = [r for r in train_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))]
     onpolicy_rows = [r for r in train_rows if (isinstance(r, dict) and r.get("is_onpolicy"))]
@@ -161,7 +212,7 @@ def stage_s0b(model, tok, train_data, cfg, device, state, args):
     n = min(getattr(cfg, "onpolicy_n_questions", 100), len(train_data))
     idxs = random.Random(cfg.seed).sample(range(len(train_data)), n)
     questions = [
-        {"qid": i, "question": train_data[i]["question"], "final_num": train_data[i]["final_num"]}
+        {"qid": i, "question": train_data[i]["question"], "final_num": train_data[i].get("final_num", None)}
         for i in idxs
     ]
 
@@ -172,21 +223,18 @@ def stage_s0b(model, tok, train_data, cfg, device, state, args):
 def stage_s2(model, tok, cfg, device, state, args):
     from src.routing.distill import distill_router
     from src.analysis.cf_table import CFTable
-    from src.routing.router import JointLayerRouter
     from src.utils.failure_policy import get_manifest
     from src.training.trainer import save_steer_weights
 
     table_path = (state.get("S0") or {}).get("table_path") or getattr(cfg, "cf_table_path", os.path.join(cfg.checkpoint_dir, "cf_table_s0.npz"))
     table = CFTable.load(table_path)
 
-    layers = getattr(cfg, "catalog_layers", None) or model.target_layers
-    n_catalog = len(table.catalog.subsets) if hasattr(table.catalog, "subsets") else len(table.catalog)
-    router = JointLayerRouter(layers, int(table.pooled.shape[1]), 32, cfg.max_active_layers, n_catalog=n_catalog).to(device)
+    # P0-3: Ensure catalog is attached to model.router before distillation
+    model.set_catalog(table.catalog)
 
     manifest = get_manifest()
-    report = distill_router(router, table, cfg, device, manifest, seed=cfg.seed, verbose=True)
+    report = distill_router(model.router, table, cfg, device, manifest, seed=cfg.seed, verbose=True)
     ckpt = getattr(cfg, "router_catalog_save_path", os.path.join(cfg.checkpoint_dir, "router_catalog_v5.pt"))
-    model.router.load_state_dict(router.state_dict())
     save_steer_weights(model, ckpt, cfg=cfg, phase="s2_router", prefixes=("router.",))
     return {"ckpt": ckpt, "val_loss": report.val_loss, "top1_agreement": report.top1_agreement}
 
@@ -194,18 +242,33 @@ def stage_s2(model, tok, cfg, device, state, args):
 def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
     from src.training.trainer import train_s3_gate, load_steer_weights, save_steer_weights
     from src.analysis.cf_table import CFTable
+    from src.routing.catalog import Catalog
+
+    # P0-3 & P0-6: Load frozen SteerNet AND distilled router
+    table_path = (state.get("S0") or {}).get("table_path") or getattr(cfg, "cf_table_path", os.path.join(cfg.checkpoint_dir, "cf_table_s0.npz"))
+    table = CFTable.load(table_path) if os.path.exists(table_path) else None
+
+    if table is not None:
+        model.set_catalog(table.catalog)
+    else:
+        layers = getattr(cfg, "catalog_layers", None) or model.target_layers
+        catalog = Catalog.build(tuple(layers), getattr(cfg, "catalog_max_k", 3))
+        model.set_catalog(catalog)
 
     s1_ckpt = (state.get("S1") or {}).get("ckpt") or os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
     if os.path.exists(s1_ckpt):
         load_steer_weights(model, s1_ckpt, device=device)
 
-    table_path = (state.get("S0") or {}).get("table_path") or getattr(cfg, "cf_table_path", os.path.join(cfg.checkpoint_dir, "cf_table_s0.npz"))
-    table = CFTable.load(table_path) if os.path.exists(table_path) else None
+    router_ckpt = (state.get("S2") or {}).get("ckpt") or getattr(cfg, "router_catalog_save_path", os.path.join(cfg.checkpoint_dir, "router_catalog_v5.pt"))
+    if os.path.exists(router_ckpt):
+        print(f"[S3] Loading distilled router from {router_ckpt}")
+        load_steer_weights(model, router_ckpt, device=device)
 
     ckpt = getattr(cfg, "gate_v5_save_path", os.path.join(cfg.checkpoint_dir, "gate_v5.pt"))
     cfg.gate_v5_save_path = ckpt
-    val_rows = eval_data[:min(len(eval_data), 100)]
-    results = train_s3_gate(model, tok, train_data, val_rows, cfg, device, table=table)
+    val_rows = _slice_dataset(eval_data, min(len(eval_data), 100))
+    train_rows = _slice_dataset(train_data, len(train_data))
+    results = train_s3_gate(model, tok, train_rows, val_rows, cfg, device, table=table)
     save_steer_weights(model, ckpt, cfg=cfg, phase="s3_gate", prefixes=("gates.",))
     return {"ckpt": ckpt, "results": results}
 

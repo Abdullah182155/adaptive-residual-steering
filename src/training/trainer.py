@@ -3914,6 +3914,8 @@ def _s1_fit(
 
     for epoch in range(max(0, epochs)):
         model.train()
+        if hasattr(model, 'base_model') and model.base_model is not None:
+            model.base_model.eval()
         optimizer.zero_grad(set_to_none=True)
         accum, epoch_loss, n_loss = 0, 0.0, 0
         pbar = tqdm(range(micro_per_epoch), desc=f"{label} {epoch + 1}/{epochs}", leave=False)
@@ -4287,6 +4289,8 @@ def train_s3_gate(
 
     for epoch in range(max(1, cfg.gate_epochs)):
         model.train()
+        if hasattr(model, 'base_model') and model.base_model is not None:
+            model.base_model.eval()
         optimizer.zero_grad(set_to_none=True)
         epoch_losses = []
 
