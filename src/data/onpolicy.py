@@ -10,6 +10,7 @@ from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
 
 import torch
+from tqdm import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
 from src.evaluation.answers import cut_continuation, extract_numeric_answer
@@ -449,8 +450,17 @@ def sample_chains(
     done = {(c.qid, c.sample_idx) for c in store.chains}
 
     def run(pending: List[Tuple[Dict[str, Any], int]], round_no: int) -> None:
+        if not pending:
+            return
         pending.sort(key=lambda it: it[0]["shot"])  # stable: batch similar prompt lengths
-        for b_idx, start in enumerate(range(0, len(pending), bs)):
+        total_batches = (len(pending) + bs - 1) // bs
+        pbar = tqdm(
+            range(0, len(pending), bs),
+            desc=f"[S0b] Round {round_no}",
+            total=total_batches,
+            leave=True,
+        )
+        for b_idx, start in enumerate(pbar):
             batch = pending[start:start + bs]
             batch_seed = (seed * 1_000_003 + round_no * 10_007 + b_idx) % (2 ** 31 - 1)
             with _seeded(batch_seed):
@@ -470,6 +480,8 @@ def sample_chains(
             done.update((c.qid, c.sample_idx) for c in new)
             if out_path:
                 _append_jsonl(out_path, new)
+            n_corr = sum(1 for c in store.chains if c.correct)
+            pbar.set_postfix({"chains": len(store.chains), "correct": n_corr, "acc": f"{n_corr/max(1, len(store.chains)):.1%}"})
 
     # round 1: n0 samples per question
     run([(r, i) for r in records for i in range(n0) if (r["qid"], i) not in done], 1)

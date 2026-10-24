@@ -33,7 +33,11 @@ def parse_args():
     p.add_argument("--secondary", action="store_true")
     p.add_argument("--report",    action="store_true", help="run make_report after bench")
     p.add_argument("--report_dir", default="report")
-    p.add_argument("--manifest",  default="")
+    p.add_argument("--manifest",     default="")
+    p.add_argument("--n_questions",  type=int, default=None, help="Number of questions for S0b sampling")
+    p.add_argument("--batch_size",   type=int, default=None, help="Batch size override")
+    p.add_argument("--s1_epochs",    type=int, default=None, help="Epochs for S1 SteerNet training")
+    p.add_argument("--gate_epochs",  type=int, default=None, help="Epochs for S3 Gate training")
     return p.parse_args()
 
 
@@ -179,6 +183,10 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     ckpt_path = os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
     cfg.s1_save_path = ckpt_path
+    if getattr(args, "s1_epochs", None):
+        cfg.s1_epochs = args.s1_epochs
+    if getattr(args, "batch_size", None):
+        cfg.batch_size = args.batch_size
 
     gold_rows_all = _dataset_to_rows(train_data)
     store_path = (state.get("S0b") or {}).get("store_path", os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl"))
@@ -209,13 +217,18 @@ def stage_s0b(model, tok, train_data, cfg, device, state, args):
         load_steer_weights(model, s1_ckpt, device=device)
 
     out_path = os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl")
-    n = min(getattr(cfg, "onpolicy_n_questions", 100), len(train_data))
+    n_q = getattr(args, "n_questions", None) or getattr(cfg, "onpolicy_n_questions", 100)
+    cfg.onpolicy_n_questions = n_q
+    if getattr(args, "batch_size", None):
+        cfg.onpolicy_batch_size = args.batch_size
+    n = min(n_q, len(train_data))
     idxs = random.Random(cfg.seed).sample(range(len(train_data)), n)
     questions = [
         {"qid": i, "question": train_data[i]["question"], "final_num": train_data[i].get("final_num", None)}
         for i in idxs
     ]
 
+    print(f"[S0b] Sampling on-policy chains for {len(questions)} questions (batch_size={cfg.onpolicy_batch_size})...")
     store = sample_chains(model, tok, questions, cfg, device, seed=cfg.seed, out_path=out_path)
     return {"store_path": out_path, "n_samples": len(store)}
 
@@ -266,6 +279,10 @@ def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
 
     ckpt = getattr(cfg, "gate_v5_save_path", os.path.join(cfg.checkpoint_dir, "gate_v5.pt"))
     cfg.gate_v5_save_path = ckpt
+    if getattr(args, "gate_epochs", None):
+        cfg.gate_epochs = args.gate_epochs
+    if getattr(args, "batch_size", None):
+        cfg.batch_size = args.batch_size
     val_rows = _slice_dataset(eval_data, min(len(eval_data), 100))
     train_rows = _slice_dataset(train_data, len(train_data))
     results = train_s3_gate(model, tok, train_rows, val_rows, cfg, device, table=table)
