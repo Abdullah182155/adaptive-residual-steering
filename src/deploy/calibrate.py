@@ -500,13 +500,17 @@ def apply_contract(model, contract: dict, which: str):
 # --------------------------------------------------------------------------- model loading
 
 def build_model(cfg, device):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
     from src.models.wrapper import Phi2WithRSC
     tok = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
+    model_config = AutoConfig.from_pretrained(cfg.model_name, trust_remote_code=True)
+    if not hasattr(model_config, "pad_token_id") or model_config.pad_token_id is None:
+        model_config.pad_token_id = tok.pad_token_id or getattr(model_config, "eos_token_id", 50256)
     base = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
+        config=model_config,
         torch_dtype=torch.float32 if device.type == "cpu" else torch.float16,
         trust_remote_code=True,
     ).to(device)
