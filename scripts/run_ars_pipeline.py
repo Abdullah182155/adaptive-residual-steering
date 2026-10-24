@@ -65,10 +65,11 @@ def resolve(spec: str):
         ) from e
 
 
-def stage_s0(model, tok, eval_data, cfg, device, state, args):
+def stage_s0(model, tok, train_data, eval_data, cfg, device, state, args):
     from src.analysis.cf_table import build_cf_table, sample_audit_examples
-    from src.analysis.signal_audit import compute_signal_audit
+    from src.analysis.signal_audit import compute_signal_audit, write_audit
     from src.routing.catalog import Catalog
+    from src.utils.failure_policy import get_manifest
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     table_path = getattr(cfg, "cf_table_path", os.path.join(cfg.checkpoint_dir, "cf_table_s0.npz"))
     layers = getattr(cfg, "catalog_layers", None) or model.target_layers
@@ -80,19 +81,27 @@ def stage_s0(model, tok, eval_data, cfg, device, state, args):
         table = CFTable.load(table_path)
     else:
         print(f"[S0] Building CF table over {len(catalog)} subsets...")
-        examples = sample_audit_examples(eval_data, cfg)
-        table = build_cf_table(model, tok, examples, catalog, cfg, device)
+        examples = sample_audit_examples(train_data, eval_data, tok, cfg, seed=cfg.seed)
+        steer_scale = getattr(cfg, "steer_scale", 1.0)
+        table = build_cf_table(
+            model, tok, examples, catalog, cfg, device,
+            steer_scale=steer_scale, out_dir=cfg.checkpoint_dir, seed=cfg.seed
+        )
         table.save(table_path)
         print(f"[S0] Saved CF table to {table_path}")
 
+    manifest = get_manifest()
     audit = compute_signal_audit(table, cfg, seed=cfg.seed)
-    decision = audit.decision
-    print(f"[S0] Decision 1: {decision.recommendation}")
+    audit_json = os.path.join(cfg.checkpoint_dir, "audit_s0.json")
+    audit_md = os.path.join(cfg.checkpoint_dir, "AUDIT_REPORT_S0.md")
+    write_audit(audit, manifest, audit_json, audit_md)
+    print(f"[S0] Decision 1: {audit.decision_1}")
     return {
         "table_path": table_path,
-        "recommendation": decision.recommendation,
-        "decision": decision.as_dict() if hasattr(decision, "as_dict") else str(decision),
-        "halt": decision.recommendation == "HALT",
+        "audit_path": audit_json,
+        "decision_1": audit.decision_1,
+        "flags": audit.flags,
+        "decision_2_inputs": audit.decision_2_inputs,
     }
 
 
@@ -101,24 +110,46 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
     from src.data.onpolicy import OnPolicyStore
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     ckpt_path = os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
+    cfg.s1_save_path = ckpt_path
 
-    store_path = (state.get("S0b") or {}).get("store_path", "./checkpoints/onpolicy_store.jsonl")
+    def _dataset_to_rows(ds):
+        rows = []
+        for i in range(len(ds)):
+            ex = ds[i]
+            if isinstance(ex, dict) and "attention_mask" in ex:
+                keep = ex["attention_mask"].bool()
+                rows.append({
+                    "input_ids": ex["input_ids"][keep].long(),
+                    "labels": ex["labels"][keep].long(),
+                    "is_onpolicy": False,
+                    "shot": 0,
+                    "qid": i,
+                })
+            else:
+                rows.append(ex)
+        return rows
+
+    gold_rows_all = _dataset_to_rows(train_data)
+    store_path = (state.get("S0b") or {}).get("store_path", os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl"))
     if os.path.exists(store_path):
         store = OnPolicyStore.load(store_path)
-        train_rows, val_rows = store.build_training_rows(train_data, val_frac=0.1, seed=cfg.seed)
+        train_rows, val_rows = store.build_training_rows(tok, cfg, gold_rows_all, val_fraction=0.1, seed=cfg.seed)
     else:
-        train_rows = train_data
-        val_rows = eval_data[:min(len(eval_data), 100)]
+        train_rows = gold_rows_all
+        val_rows = _dataset_to_rows(eval_data[:min(len(eval_data), 100)])
 
     gold_rows = [r for r in train_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))]
     onpolicy_rows = [r for r in train_rows if (isinstance(r, dict) and r.get("is_onpolicy"))]
-    sel_rows = eval_data[:min(len(eval_data), getattr(cfg, "calib_sel_n", 120))]
+    val_onp = [r for r in val_rows if (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
+    val_gold = [r for r in val_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
+    sel_rows = (val_onp + val_gold) if (val_onp or val_gold) else val_rows[:min(len(val_rows), 120)]
 
     logs = train_s1_steernet(model, tok, gold_rows, onpolicy_rows, sel_rows, cfg, device)
     return {"ckpt": ckpt_path, "logs": logs}
 
 
 def stage_s0b(model, tok, train_data, cfg, device, state, args):
+    import random
     from src.data.onpolicy import sample_chains
     from src.training.trainer import load_steer_weights
 
@@ -127,11 +158,14 @@ def stage_s0b(model, tok, train_data, cfg, device, state, args):
         load_steer_weights(model, s1_ckpt, device=device)
 
     out_path = os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl")
-    n_q = getattr(cfg, "onpolicy_n_questions", 100)
-    questions = [ex["question"] if isinstance(ex, dict) else ex for ex in train_data[:n_q]]
+    n = min(getattr(cfg, "onpolicy_n_questions", 100), len(train_data))
+    idxs = random.Random(cfg.seed).sample(range(len(train_data)), n)
+    questions = [
+        {"qid": i, "question": train_data[i]["question"], "final_num": train_data[i]["final_num"]}
+        for i in idxs
+    ]
 
-    store = sample_chains(model, tok, questions, cfg, device, seed=cfg.seed)
-    store.save(out_path)
+    store = sample_chains(model, tok, questions, cfg, device, seed=cfg.seed, out_path=out_path)
     return {"store_path": out_path, "n_samples": len(store)}
 
 
@@ -140,6 +174,7 @@ def stage_s2(model, tok, cfg, device, state, args):
     from src.analysis.cf_table import CFTable
     from src.routing.router import JointLayerRouter
     from src.utils.failure_policy import get_manifest
+    from src.training.trainer import save_steer_weights
 
     table_path = (state.get("S0") or {}).get("table_path") or getattr(cfg, "cf_table_path", os.path.join(cfg.checkpoint_dir, "cf_table_s0.npz"))
     table = CFTable.load(table_path)
@@ -151,12 +186,13 @@ def stage_s2(model, tok, cfg, device, state, args):
     manifest = get_manifest()
     report = distill_router(router, table, cfg, device, manifest, seed=cfg.seed, verbose=True)
     ckpt = getattr(cfg, "router_catalog_save_path", os.path.join(cfg.checkpoint_dir, "router_catalog_v5.pt"))
-    torch.save(router.state_dict(), ckpt)
+    model.router.load_state_dict(router.state_dict())
+    save_steer_weights(model, ckpt, cfg=cfg, phase="s2_router", prefixes=("router.",))
     return {"ckpt": ckpt, "val_loss": report.val_loss, "top1_agreement": report.top1_agreement}
 
 
 def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
-    from src.training.trainer import train_s3_gate, load_steer_weights
+    from src.training.trainer import train_s3_gate, load_steer_weights, save_steer_weights
     from src.analysis.cf_table import CFTable
 
     s1_ckpt = (state.get("S1") or {}).get("ckpt") or os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
@@ -166,9 +202,11 @@ def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
     table_path = (state.get("S0") or {}).get("table_path") or getattr(cfg, "cf_table_path", os.path.join(cfg.checkpoint_dir, "cf_table_s0.npz"))
     table = CFTable.load(table_path) if os.path.exists(table_path) else None
 
+    ckpt = getattr(cfg, "gate_v5_save_path", os.path.join(cfg.checkpoint_dir, "gate_v5.pt"))
+    cfg.gate_v5_save_path = ckpt
     val_rows = eval_data[:min(len(eval_data), 100)]
     results = train_s3_gate(model, tok, train_data, val_rows, cfg, device, table=table)
-    ckpt = getattr(cfg, "gate_v5_save_path", os.path.join(cfg.checkpoint_dir, "gate_v5.pt"))
+    save_steer_weights(model, ckpt, cfg=cfg, phase="s3_gate", prefixes=("gates.",))
     return {"ckpt": ckpt, "results": results}
 
 
@@ -242,7 +280,7 @@ def main():
     for s in stages:
         print("\n" + "=" * 80 + f"\n[pipeline] stage {s}\n" + "=" * 80)
         if s == "S0":
-            result = stage_s0(model, tok, eval_data, cfg, device, state, args)
+            result = stage_s0(model, tok, train_data, eval_data, cfg, device, state, args)
         elif s == "S1":
             result = stage_s1(model, tok, train_data, eval_data, cfg, device, state, args)
         elif s == "S0b":
