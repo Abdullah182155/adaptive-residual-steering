@@ -307,6 +307,12 @@ def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
 
 def stage_s5(model, tok, eval_data, cfg, device, state, args):
     from src.deploy.calibrate import run_deployment_calibration
+    from src.routing.catalog import Catalog
+    layers = getattr(cfg, "catalog_layers", None) or model.target_layers
+    catalog = Catalog.build(tuple(layers), getattr(cfg, "catalog_max_k", 3))
+    if hasattr(model, "set_catalog"):
+        model.set_catalog(catalog)
+
     ck = {k: (state.get(s) or {}).get("ckpt") for k, s in (
         ("steernet_ckpt", "S1"),
         ("router_ckpt",   "S2"),
@@ -314,6 +320,7 @@ def stage_s5(model, tok, eval_data, cfg, device, state, args):
     )}
     contract = run_deployment_calibration(
         model, tok, eval_data, cfg, device,
+        catalog=catalog,
         manifest_path=args.manifest,
         out_path=args.contract or cfg.contract_path,
         **ck,
@@ -332,7 +339,10 @@ def stage_s5(model, tok, eval_data, cfg, device, state, args):
 def stage_bench(model, tok, cfg, device, args):
     from src.deploy.calibrate import load_contract, load_contract_weights
     from src.evaluation.benchmark import run_full_benchmark, write_record
-    contract = load_contract(args.contract or cfg.contract_path)
+    contract_path = args.contract or cfg.contract_path
+    if not os.path.exists(contract_path):
+        raise FileNotFoundError(f"Deployment contract not found: {contract_path}. Please run Stage S5 first.")
+    contract = load_contract(contract_path)
     load_contract_weights(model, contract, device=device)
     record = run_full_benchmark(
         model, tok, contract, cfg, device,

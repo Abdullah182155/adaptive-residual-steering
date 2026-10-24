@@ -170,12 +170,14 @@ def _catalog_subsets(catalog) -> List[Tuple[int, ...]]:
     return out
 
 
-def default_catalog(target_layers: Sequence[int], cfg) -> List[Tuple[int, ...]]:
-    """Use the M5 catalog builder if present; otherwise singles/pairs/triples from cfg flags."""
+def default_catalog(target_layers: Sequence[int], cfg):
+    """Use the M5 Catalog.build if present; otherwise singles/pairs/triples from cfg flags."""
     try:
-        from src.routing.catalog import build_catalog  # type: ignore
-        return _catalog_subsets(build_catalog(list(target_layers), cfg))
-    except ImportError:
+        from src.routing.catalog import Catalog
+        layers = getattr(cfg, "catalog_layers", None) or tuple(target_layers)
+        max_k = getattr(cfg, "catalog_max_k", 3)
+        return Catalog.build(tuple(layers), max_k)
+    except Exception:
         pass
     ls   = list(target_layers)
     subs = [(l,) for l in ls]
@@ -442,6 +444,13 @@ def load_contract(path: str) -> dict:
 
 def load_contract_weights(model, contract: dict, device=None, verify: bool = True):
     from src.training.trainer import load_steer_weights
+    from src.routing.catalog import Catalog
+    if "catalog" in contract:
+        cat_info = contract["catalog"]
+        layers = tuple(int(l) for l in cat_info["layers"])
+        max_k = int(cat_info.get("max_k", 3))
+        catalog = Catalog.build(layers, max_k)
+        _opt(model, "set_catalog", catalog)
     seen = set()
     for key in ("steernet", "router", "gate"):
         ent  = contract[key]
@@ -545,15 +554,16 @@ def run_deployment_calibration(
         if not os.path.exists(p):
             raise FileNotFoundError(f"checkpoint required for an immutable contract: {p}")
 
+    if catalog is None:
+        catalog = default_catalog(model.target_layers, cfg)
+    _opt(model, "set_catalog", catalog)
+
     if load_weights:
         seen = set()
         for p in (steernet_ckpt, router_ckpt, gate_ckpt):
             if p not in seen:
                 seen.add(p)
                 load_steer_weights(model, p, device=device)
-
-    if catalog is None:
-        catalog = default_catalog(model.target_layers, cfg)
 
     rows = select_rows(eval_data, cfg)
     print(f"[S5] selection split n={len(rows)}")

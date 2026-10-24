@@ -917,12 +917,14 @@ class Phi2WithRSC(nn.Module):
     def set_catalog(self, catalog):
         self._catalog = catalog
         self._catalog_membership = None
-        if self._catalog is not None and getattr(self.router, "catalog_head", None) is None:
-            self.router.catalog_head = nn.Linear(
-                self.router.d_model, len(self._catalog.subsets)
-            ).to(self.device)
-            nn.init.zeros_(self.router.catalog_head.weight)
-            nn.init.zeros_(self.router.catalog_head.bias)
+        if self._catalog is not None:
+            n_subsets = len(self._catalog.subsets) if hasattr(self._catalog, "subsets") else len(self._catalog)
+            if getattr(self.router, "catalog_head", None) is None or self.router.catalog_head.out_features != n_subsets:
+                self.router.catalog_head = nn.Linear(
+                    self.router.d_model, n_subsets
+                ).to(self.device)
+                nn.init.zeros_(self.router.catalog_head.weight)
+                nn.init.zeros_(self.router.catalog_head.bias)
 
     def set_abstain_threshold(self, theta: float):
         self._abstain_theta = float(theta)
