@@ -245,7 +245,7 @@ def stage_s0b(model, tok, train_data, cfg, device, state, args):
 
     print(f"[S0b] Sampling on-policy chains for {len(questions)} questions (batch_size={cfg.onpolicy_batch_size})...")
     store = sample_chains(model, tok, questions, cfg, device, seed=cfg.seed, out_path=out_path)
-    return {"store_path": out_path, "n_samples": len(store)}
+    return {"store_path": out_path, "n_samples": len(store.chains) if hasattr(store, "chains") else len(store)}
 
 
 def stage_s2(model, tok, cfg, device, state, args):

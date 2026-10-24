@@ -124,7 +124,11 @@ def _table_arrays(table: CFTable):
     pooled = _to_np(table.pooled).astype(np.float32)
     scalars = _to_np(table.scalars).astype(np.float32)
     n_shot = _to_np(table.n_shot).astype(np.int64)
-    qid = _to_np(table.qid).astype(np.int64)
+    raw_qid = _to_np(table.qid)
+    try:
+        qid = raw_qid.astype(np.int64)
+    except (ValueError, TypeError):
+        qid = raw_qid.astype(str)
     return rewards, pooled, scalars, n_shot, qid
 
 
@@ -155,7 +159,7 @@ def _reference_rows(qid: np.ndarray, n_shot: np.ndarray) -> np.ndarray:
     """For each row, the index of its qid-group's lowest-shot row (teacher); -1 for the teacher itself."""
     q_list = qid.tolist()
     s_list = n_shot.tolist()
-    best: Dict[int, int] = {}
+    best: Dict[Any, int] = {}
     for i, (q, s) in enumerate(zip(q_list, s_list)):
         if q not in best or s < s_list[best[q]]:
             best[q] = i
@@ -323,9 +327,9 @@ def distill_router(
     tr_t = torch.from_numpy(train_idx).to(device)
     router.fit_bucket_stats(pooled_t[tr_t], bucket_t[tr_t])
 
-    groups: Dict[int, List[int]] = {}
+    groups: Dict[Any, List[int]] = {}
     for i in train_idx.tolist():
-        groups.setdefault(int(qid_np[i]), []).append(i)
+        groups.setdefault(qid_np[i], []).append(i)
     group_rows = [np.asarray(v, dtype=np.int64) for v in groups.values()]
 
     params = [p for p in router.parameters() if p.requires_grad]

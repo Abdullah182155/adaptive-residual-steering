@@ -178,6 +178,9 @@ class OnPolicyStore:
     def __init__(self, chains: Optional[List[OnPolicyChain]] = None):
         self.chains: List[OnPolicyChain] = chains if chains is not None else []
 
+    def __len__(self) -> int:
+        return len(self.chains)
+
     def save(self, path: str) -> None:
         """Save store as JSONL to path (creates parent dir if needed)."""
         d = os.path.dirname(path)
