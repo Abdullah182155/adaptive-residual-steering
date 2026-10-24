@@ -4297,7 +4297,13 @@ def train_s3_gate(
         shuffled_indices = list(range(len(train_rows)))
         rng.shuffle(shuffled_indices)
 
-        for m in range(micro_per_epoch):
+        pbar = tqdm(
+            range(micro_per_epoch),
+            desc=f"S3 Epoch {epoch + 1}/{cfg.gate_epochs}",
+            unit="batch",
+            leave=True,
+        )
+        for m in pbar:
             batch_idx = shuffled_indices[m * bs : (m + 1) * bs]
             if not batch_idx:
                 continue
@@ -4351,6 +4357,11 @@ def train_s3_gate(
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 epoch_losses.append(metrics["loss_total"])
+                pbar.set_postfix({
+                    "loss": f"{metrics['loss_total']:.4f}",
+                    "dom": f"{metrics.get('loss_dom', 0.0):.4f}",
+                    "a": f"{metrics.get('mean_alpha', 0.0):.3f}",
+                })
 
         avg_loss = float(np.mean(epoch_losses)) if epoch_losses else 0.0
         train_loss_history.append(avg_loss)

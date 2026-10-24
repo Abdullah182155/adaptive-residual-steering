@@ -44,6 +44,7 @@ def parse_args():
     p.add_argument("--s1_epochs",        type=int, default=None, help="Epochs for S1 SteerNet training")
     p.add_argument("--s1_val_n",         type=int, default=None, help="Validation rows for S1")
     p.add_argument("--gate_epochs",      type=int, default=None, help="Epochs for S3 Gate training")
+    p.add_argument("--gate_train_n",     type=int, default=None, help="Training rows for S3 Gate training")
     p.add_argument("--gate_sel_n",       type=int, default=None, help="Selection rows for S3 Gate")
     p.add_argument("--calib_sel_n",      type=int, default=None, help="Selection rows for S5 calibration")
     p.add_argument("--batch_size",              type=int, default=None, help="Batch size override")
@@ -298,8 +299,11 @@ def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
         cfg.gate_epochs = args.gate_epochs
     if getattr(args, "batch_size", None):
         cfg.batch_size = args.batch_size
-    val_rows = _slice_dataset(eval_data, min(len(eval_data), 100))
-    train_rows = _slice_dataset(train_data, len(train_data))
+    val_n = getattr(args, "gate_sel_n", None) or getattr(cfg, "gate_sel_n", None) or 100
+    val_rows = _slice_dataset(eval_data, min(len(eval_data), val_n))
+    train_n = getattr(args, "gate_train_n", None) or getattr(cfg, "gate_train_n", None) or len(train_data)
+    train_rows = _slice_dataset(train_data, train_n)
+    print(f"[S3] Gate training on n={len(train_rows)} rows (epochs={cfg.gate_epochs}, bs={cfg.batch_size}), val on n={len(val_rows)} rows")
     results = train_s3_gate(model, tok, train_rows, val_rows, cfg, device, table=table)
     save_steer_weights(model, ckpt, cfg=cfg, phase="s3_gate", prefixes=("gates.",))
     return {"ckpt": ckpt, "results": results}
@@ -376,6 +380,7 @@ def apply_cfg_overrides(cfg, args):
         cfg.s1_epochs = 2
         cfg.s1_val_onpolicy_n = 20
         cfg.gate_epochs = 2
+        cfg.gate_train_n = 50
         cfg.gate_sel_n = 30
         cfg.calib_sel_n = 30
         print("[profile: quick] Applied fast-execution scale preset")
@@ -388,6 +393,7 @@ def apply_cfg_overrides(cfg, args):
         cfg.s1_epochs = 3
         cfg.s1_val_onpolicy_n = 60
         cfg.gate_epochs = 3
+        cfg.gate_train_n = 200
         cfg.gate_sel_n = 60
         cfg.calib_sel_n = 60
         print("[profile: medium] Applied balanced-scale preset")
@@ -412,6 +418,8 @@ def apply_cfg_overrides(cfg, args):
         cfg.s1_val_onpolicy_n = int(args.s1_val_n)
     if getattr(args, "gate_epochs", None) is not None:
         cfg.gate_epochs = int(args.gate_epochs)
+    if getattr(args, "gate_train_n", None) is not None:
+        cfg.gate_train_n = int(args.gate_train_n)
     if getattr(args, "gate_sel_n", None) is not None:
         cfg.gate_sel_n = int(args.gate_sel_n)
     if getattr(args, "calib_sel_n", None) is not None:
