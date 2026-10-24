@@ -516,6 +516,7 @@ class RSCConfig:
     gate_v5_save_path: str = "./checkpoints/gate_v5.pt"
     gate_sel_n: int = 120
     gate_train_n: Optional[int] = None
+    s1_train_n: Optional[int] = None
 
     # ==== M8 ====
     calib_theta_grid: Tuple[float, ...] = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.01)

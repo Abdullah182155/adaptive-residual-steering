@@ -42,6 +42,7 @@ def parse_args():
     p.add_argument("--n_questions",      type=int, default=None, help="Number of questions for S0b sampling")
     p.add_argument("--onpolicy_samples", type=int, nargs=2, default=None, help="Onpolicy samples (round1 round2)")
     p.add_argument("--s1_epochs",        type=int, default=None, help="Epochs for S1 SteerNet training")
+    p.add_argument("--s1_train_n",       type=int, default=None, help="Training rows for S1 SteerNet training")
     p.add_argument("--s1_val_n",         type=int, default=None, help="Validation rows for S1")
     p.add_argument("--gate_epochs",      type=int, default=None, help="Epochs for S3 Gate training")
     p.add_argument("--gate_train_n",     type=int, default=None, help="Training rows for S3 Gate training")
@@ -204,7 +205,9 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
     if getattr(args, "batch_size", None):
         cfg.batch_size = args.batch_size
 
-    gold_rows_all = _dataset_to_rows(train_data)
+    s1_train_n = getattr(args, "s1_train_n", None) or getattr(cfg, "s1_train_n", None)
+    gold_rows_all = _dataset_to_rows(train_data, n=s1_train_n)
+    print(f"[S1] SteerNet training on n={len(gold_rows_all)} gold rows")
     store_path = (state.get("S0b") or {}).get("store_path", os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl"))
     if os.path.exists(store_path):
         store = OnPolicyStore.load(store_path)
@@ -378,6 +381,7 @@ def apply_cfg_overrides(cfg, args):
         cfg.onpolicy_n_questions = 30
         cfg.onpolicy_samples = (1, 1)
         cfg.s1_epochs = 2
+        cfg.s1_train_n = 50
         cfg.s1_val_onpolicy_n = 20
         cfg.gate_epochs = 2
         cfg.gate_train_n = 50
@@ -391,6 +395,7 @@ def apply_cfg_overrides(cfg, args):
         cfg.onpolicy_n_questions = 100
         cfg.onpolicy_samples = (2, 2)
         cfg.s1_epochs = 3
+        cfg.s1_train_n = 200
         cfg.s1_val_onpolicy_n = 60
         cfg.gate_epochs = 3
         cfg.gate_train_n = 200
@@ -414,6 +419,8 @@ def apply_cfg_overrides(cfg, args):
         cfg.onpolicy_samples = tuple(int(x) for x in args.onpolicy_samples)
     if getattr(args, "s1_epochs", None) is not None:
         cfg.s1_epochs = int(args.s1_epochs)
+    if getattr(args, "s1_train_n", None) is not None:
+        cfg.s1_train_n = int(args.s1_train_n)
     if getattr(args, "s1_val_n", None) is not None:
         cfg.s1_val_onpolicy_n = int(args.s1_val_n)
     if getattr(args, "gate_epochs", None) is not None:
