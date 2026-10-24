@@ -82,7 +82,13 @@ class TinyBase(nn.Module):
             ids = torch.cat([ids, nxt.unsqueeze(1)], dim=1)
             if eos_token_id is not None:
                 finished |= nxt == eos_token_id
-            if stopping_criteria is not None and stopping_criteria(ids, None):
+            if stopping_criteria is not None:
+                stop_res = stopping_criteria(ids, None)
+                if torch.is_tensor(stop_res):
+                    if bool(stop_res.all()):
+                        break
+                elif bool(stop_res):
+                    break
                 break
             if bool(finished.all()):
                 break

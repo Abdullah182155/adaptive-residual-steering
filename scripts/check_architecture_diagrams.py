@@ -32,11 +32,13 @@ def get_repo_root() -> str:
 
 
 def compute_file_hash(filepath: str) -> str:
-    """Computes SHA-256 hash of a file."""
+    """Computes SHA-256 hash of a file, normalizing line endings so hashes are OS-independent."""
     h = hashlib.sha256()
     with open(filepath, "rb") as f:
-        while chunk := f.read(8192):
-            h.update(chunk)
+        content = f.read()
+    if filepath.endswith((".py", ".drawio", ".json", ".md", ".txt")):
+        content = content.replace(b"\r\n", b"\n")
+    h.update(content)
     return h.hexdigest()
 
 

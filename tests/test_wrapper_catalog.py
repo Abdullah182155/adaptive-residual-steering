@@ -30,14 +30,14 @@ def make_model(gate_task_gradient: bool = False, policy: str = "catalog") -> Phi
     if HAS_PHI:
         pcfg = PhiConfig(
             vocab_size=VOCAB, hidden_size=32, intermediate_size=64, num_hidden_layers=8,
-            num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=64,
+            num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=64, pad_token_id=0, bos_token_id=1, eos_token_id=1,
             partial_rotary_factor=0.5, resid_pdrop=0.0, embd_pdrop=0.0, attention_dropout=0.0,
         )
         pcfg._attn_implementation = "eager"
     else:
         pcfg = PhiConfig(
             vocab_size=VOCAB, hidden_size=32, intermediate_size=64, num_hidden_layers=8,
-            num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=64,
+            num_attention_heads=4, num_key_value_heads=4, max_position_embeddings=64, pad_token_id=0, bos_token_id=1, eos_token_id=1,
             attention_dropout=0.0,
         )
     base = PhiForCausalLM(pcfg).eval()
