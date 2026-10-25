@@ -1175,9 +1175,9 @@ class Phi2WithRSC(nn.Module):
         prev_bucket = self._shot_bucket
         if shot_bucket is not None:
             self.set_shot_bucket(shot_bucket)
-        self.set_question_span_mask(question_span_mask)
         try:
             with self.counterfactual_mode():
+                self.set_question_span_mask(question_span_mask)
                 self.base_model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
             routes = [tuple(int(x) for x in r) for r in self.current_route_tuples()]
             B = len(routes)
@@ -1200,6 +1200,9 @@ class Phi2WithRSC(nn.Module):
             self.routing_k_hist.copy_(saved["khist"])
             self.routing_forwards.copy_(saved["kfwd"])
             self._shot_bucket = prev_bucket
+            self.set_question_span_mask(None)
+            self._router_context_mask_pending = None
+            self._router_context_mask_active = None
             self._clear_decode_caches()
         return out
 
@@ -1474,6 +1477,7 @@ class Phi2WithRSC(nn.Module):
         old_scale = self._steer_scale
         old_freeze = [(g, g._freeze_gate, g._freeze_gate_value) for g in self.gates.values()]
         old_ctx_pending = self._router_context_mask_pending
+        old_ctx_active = self._router_context_mask_active
         self.eval()
         try:
             with torch.no_grad():
@@ -1486,6 +1490,7 @@ class Phi2WithRSC(nn.Module):
                 g._freeze_gate = freeze_flag
                 g._freeze_gate_value = freeze_val
             self._router_context_mask_pending = old_ctx_pending
+            self._router_context_mask_active = old_ctx_active
 
     def subset_matrix(self, subsets):
         """Convert layer-id subsets to (B, n_candidates) bool matrix.

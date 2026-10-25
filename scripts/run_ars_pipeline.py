@@ -115,12 +115,13 @@ def _slice_dataset(ds, n: int):
             return list(ds)[:limit]
 
 
-def _dataset_to_rows(ds, n: int = None):
-    """Convert dataset or slice into unpadded 1D row dicts for SteerNet training."""
+def _dataset_to_rows(ds, n: int = None, split: str = "train", qid_prefix: str = None, n_shot: int = 0):
+    """Convert dataset or slice into unpadded 1D row dicts for SteerNet and Gate training."""
     if ds is None:
         return []
     rows = []
     limit = len(ds) if n is None else min(n, len(ds))
+    prefix = qid_prefix if qid_prefix is not None else split
     for i in range(limit):
         ex = ds[i]
         if isinstance(ex, dict) and "attention_mask" in ex:
@@ -139,10 +140,10 @@ def _dataset_to_rows(ds, n: int = None):
                 "input_ids": inp,
                 "labels": lbl,
                 "is_onpolicy": False,
-                "shot": 0,
-                "n_shot": 0,
-                "split": "train",
-                "qid": f"train:{i}",
+                "shot": n_shot,
+                "n_shot": n_shot,
+                "split": split,
+                "qid": f"{prefix}:{i}",
                 "question": ex.get("question", ""),
                 "final_num": ex.get("final_num", None),
             })
@@ -187,10 +188,17 @@ def stage_s0(model, tok, train_data, eval_data, cfg, device, state, args):
         print(f"[S0] Building CF table over {len(catalog)} subsets...")
         examples = sample_audit_examples(train_data, eval_data, tok, cfg, seed=cfg.seed)
         steer_scale = getattr(cfg, "steer_scale", 1.0)
-        table = build_cf_table(
-            model, tok, examples, catalog, cfg, device,
-            steer_scale=steer_scale, out_dir=cfg.checkpoint_dir, seed=cfg.seed
-        )
+        old_mode = getattr(model, "gate_mode", None)
+        if hasattr(model, "set_gate_mode"):
+            model.set_gate_mode("const", scale=steer_scale)
+        try:
+            table = build_cf_table(
+                model, tok, examples, catalog, cfg, device,
+                steer_scale=steer_scale, out_dir=cfg.checkpoint_dir, seed=cfg.seed
+            )
+        finally:
+            if hasattr(model, "set_gate_mode") and old_mode is not None:
+                model.set_gate_mode(old_mode)
         table.save(table_path)
         print(f"[S0] Saved CF table to {table_path}")
 
@@ -318,9 +326,9 @@ def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
     if getattr(args, "batch_size", None):
         cfg.batch_size = args.batch_size
     val_n = getattr(args, "gate_sel_n", None) or getattr(cfg, "gate_sel_n", None) or 100
-    val_rows = _slice_dataset(eval_data, min(len(eval_data), val_n))
+    val_rows = _dataset_to_rows(eval_data, n=min(len(eval_data), val_n), split="eval", qid_prefix="eval", n_shot=0)
     train_n = getattr(args, "gate_train_n", None) or getattr(cfg, "gate_train_n", None) or len(train_data)
-    train_rows = _slice_dataset(train_data, train_n)
+    train_rows = _dataset_to_rows(train_data, n=train_n, split="train", qid_prefix="train", n_shot=0)
     print(f"[S3] Gate training on n={len(train_rows)} rows (epochs={cfg.gate_epochs}, bs={cfg.batch_size}), val on n={len(val_rows)} rows")
     results = train_s3_gate(model, tok, train_rows, val_rows, cfg, device, table=table)
     save_steer_weights(model, ckpt, cfg=cfg, phase="s3_gate", prefixes=("gates.",))

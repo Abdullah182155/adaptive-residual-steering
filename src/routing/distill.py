@@ -355,6 +355,8 @@ def distill_router(
         groups.setdefault(qid_np[i], []).append(i)
     group_rows = [np.asarray(v, dtype=np.int64) for v in groups.values()]
 
+    for p in router.parameters():
+        p.requires_grad = True
     params = [p for p in router.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(params, lr=float(cfg.router_distill_lr), weight_decay=float(cfg.router_distill_wd))
     lam_bal = float(cfg.router_lambda_bal)

@@ -547,12 +547,31 @@ def save_steer_weights(
 
 
 def load_steer_weights(model, path: str, device: Optional[torch.device] = None):
-    """Load RSC-specific weights into model."""
+    """Load RSC-specific weights into model and attach provenance metadata."""
     if device is None:
         device = next(model.parameters()).device
     report = load_ars_checkpoint_strict(model, path, device=device)
     phase = (report.get("manifest") or {}).get("phase", "legacy-unmanifested")
     print(f"✅ Loaded strict ARS checkpoint from {path} (phase={phase}, tensors={report['saved_ars_tensors']})")
+
+    # Compute checkpoint SHA-256 for CF table shard cache invalidation
+    sha256 = None
+    if os.path.exists(path):
+        import hashlib
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        sha256 = h.hexdigest()
+
+    is_steer_ckpt = phase in ("ars", "s1_steernet", "legacy-unmanifested") or "steernet" in path.lower()
+    if is_steer_ckpt or getattr(model, "_audit_ckpt_meta", None) is None:
+        model._audit_ckpt_meta = {
+            "sha256": sha256,
+            "path": path,
+            "phase": phase,
+            "tensors": report.get("saved_ars_tensors", 0),
+        }
 
 
 def evaluate_loss(
@@ -3878,6 +3897,8 @@ def _s1_fit(
             p.requires_grad = True
             steer_params.append(p)
     model.set_steer_scale(getattr(cfg, "steer_scale", 1.0))
+    if hasattr(model, "set_gate_mode"):
+        model.set_gate_mode("const", scale=getattr(cfg, "steer_scale", 1.0))
     if hasattr(model, "set_router_warmup"):
         model.set_router_warmup(False)
 
@@ -4337,7 +4358,11 @@ def train_s3_gate(
             )
             nll_gated = loss_mat_g.sum(dim=1) / valid.sum(dim=1).clamp(min=1)
 
-            # (ii) Ungated forward under counterfactual_mode with the same route
+            # (ii) Compute Token BCE & L1 immediately while _alpha_for_aux holds active autograd graph
+            bce_tok = gate_bce_tokens(model, batch_rows, store, device)
+            mean_alpha = compute_l1_gate(model)
+
+            # (iii) Ungated forward under counterfactual_mode with the same route
             routes = model.current_route_tuples()
             with model.counterfactual_mode():
                 model.set_gate_mode("const", scale=getattr(cfg, "steer_scale", 1.0))
@@ -4350,10 +4375,6 @@ def train_s3_gate(
                 nll_ungated = loss_mat_u.sum(dim=1) / valid.sum(dim=1).clamp(min=1)
                 model.set_routing_override(None)
                 model.set_gate_mode("learned")
-
-            # (iii) Token BCE & L1
-            bce_tok = gate_bce_tokens(model, batch_rows, store, device)
-            mean_alpha = compute_l1_gate(model)
 
             # (iv) Combined loss
             total_loss, metrics = gate_total_loss(nll_gated, nll_ungated, bce_tok, mean_alpha, cfg)
