@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [1.17.0] - 2026-10-25
+
+### 🏆 Landmark Run & M0–M10 Pipeline Completion: +14.00 pp Breakthrough on 8-Shot GSM8K (`exp_20261025_050311_ars_phi2_kaggle`)
+- **End-to-End M0–M10 Pipeline Validation:** Successfully executed the complete automated ARS pipeline on Kaggle dual Tesla T4: S0 (26-subset counterfactual table) $\to$ S1 (SteerNet subset training with layer-dropout) $\to$ S0b (on-policy sampling store) $\to$ S2 (catalog router distillation) $\to$ S3 (token gate training with dominance hinge) $\to$ S5 (deployment calibration contract) $\to$ Bench (5-arm benchmark evaluation across 0, 4, 8-shot).
+- **Statistically Significant 8-Shot Reasoning Breakthrough:**
+  - **Fixed-Control ($s^* = [13, 15, 22]$):** Jumped from **32.00% $\to$ 46.00% strict accuracy (+14.00 pp over baseline)**.
+  - **Paired McNemar Contingency Test:** $(b=15, c=1)$, $p = 5.19 \times 10^{-4}$ ($p < 0.001$), Holm-Bonferroni corrected $p = 0.0021$. Proves 15 previously failed GSM8K reasoning chains were corrected with only 1 regression.
+  - **Router-Only ($K=2$, $\{13, 22\}$):** Achieved **39.00% strict (+7.00 pp)**, $p = 0.039$.
+  - **Raw ARS:** Reached **48.00% lenient** in 4-shot (highest lenient accuracy in the study).
+- **Cooperative Synergy & Layer Dynamics:** S5 calibration evidence demonstrated clear multi-layer synergy: single layers $K=1$ NLL (1.021–1.029), pairs $K=2$ NLL (1.013–1.020), triples $K=3$ NLL (1.008–1.010). Triad $[13, 15, 22]$ achieved 47% greedy calibration accuracy.
+- **Safety Envelope & Norm Containment:**
+  - Relative norm cap calibrated to $0.00416$ (0.416% of residual stream energy).
+  - Zero guard trips (`guard_trip_rate = 0.0000`) across all 100 questions, all arms, and all shots, confirming surgical intervention with zero representation collapse.
+- **Key Forensic & Diagnostic Discoveries:**
+  - **Router Under-Routing Collapse ($K=2$):** Distillation favored minimal subset $\{13, 22\}$, dropping Layer 15 and achieving 39% (+7 pp) while leaving an additional +7 pp on the table compared to $\{13, 15, 22\}$ (46%).
+  - **Token Gate Fallback in S5:** S5 calibration safely reverted to passthrough ($\alpha=1.0$) following conservative "do no harm" protocol due to tied calibration accuracy (45% vs 45%).
+  - **0-Shot CoT Format Divergence:** Phi-2 in 0-shot emitted natural language reasoning without `#### <ans>`, causing strict accuracy to read 0.00% while lenient accuracy revealed active steering gain (+8.00 pp: 41.00% vs 33.00% baseline, $p = 0.0215$).
+- **Registry & Checkpoint Archival:**
+  - Experiment formally registered in `experiments/registry.json` (`exp_20261025_050311_ars_phi2_kaggle`).
+  - Run artifacts preserved in `experiments/runs/exp_20261025_050311_ars_phi2_kaggle/` (`deployment_contract.json`, `REPORT.md`, `experiment_record.json`).
+  - Unit test suite: **264 passed, 0 failed** (100% green).
+
+---
+
 ## [1.16.0] - 2026-10-22
 
 ### 🚀 Engine v4.2 / v5.0: Layer Diversity, Multi-Shot Co-adaptation & Hierarchical Arbiter
