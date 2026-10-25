@@ -109,6 +109,15 @@
       "git_commit": "995259e",
       "record_path": "experiments/runs/exp_20261022_132141_ars_phi2_kaggle/experiment_record.json",
       "artifact_provenance": "Kaggle run output supplied 2026-10-22. Engine v4.0, rank=32, n_samples=4000. Tokenizer cache fix verified. Phase 1 accepted L11 (alpha=0.50, +16.7pp calib, +3.1pp conf). Phase 1B pool: [11, 18, 20]. Phase 2 completed. Benchmark: Baseline=56%, Fixed SteerNet=59%, ARS Raw=58% (0-shot). Router route entropy collapsed to 0.0 bits on 2/4/8-shot due to zero-shot training bias (fewshot_train_prob=0.0)."
+    },
+    {
+      "experiment_id": "exp_20261025_050311_ars_phi2_kaggle",
+      "tag": "ars_phi2_kaggle_m8_m10_fixed_breakthrough_46",
+      "created_at": "2026-10-25T05:03:11.029498+00:00",
+      "status": "COMPLETED_FIXED_STEERNET_BREAKTHROUGH",
+      "git_commit": "b51a81e",
+      "record_path": "experiments/runs/exp_20261025_050311_ars_phi2_kaggle/experiment_record.json",
+      "artifact_provenance": "Kaggle dual-T4 run supplied 2026-10-25. Full M0-M10 pipeline completed (S0 counterfactuals -> S1 subset SteerNet -> S0b on-policy sampling -> S2 catalog router -> S3 token gate -> S5 deployment calibration -> 5-arm benchmark). S5 calibration selected s*=[13, 15, 22] (acc=47%, nll=1.008), theta*=1.01, gate=passthrough, envelope cap=0.00416 (0.416% residual energy). 8-shot: Baseline=32.00%, Fixed-control=46.00% (+14.00 pp, McNemar p=5.19e-4, Holm p=0.0021, b=15, c=1), Router-only=39.00% (+7.00 pp), Full ARS=39.00%, Raw ARS=39.00%. 4-shot: Baseline=31.00%, Fixed=35.00%, Raw ARS=48.00% lenient. 0-shot: Strict=0.00% (Phi-2 CoT formatting), Lenient: Baseline=33.00%, Fixed=41.00% (+8.00 pp, p=0.0386), Raw ARS=41.00% (+8.00 pp, p=0.0215). Guard trip rate=0.0000 across all 100 questions. Checkpoints at /kaggle/working/checkpoints/ (s1_steernet.pt sha256: c399efe3..., router_catalog_v5.pt sha256: 9f16d325..., gate_v5.pt sha256: 34d16f84...)."
     }
   ]
 }

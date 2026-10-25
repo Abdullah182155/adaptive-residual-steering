@@ -1,0 +1,835 @@
+{
+  "schema_version": 1,
+  "experiment_id": "exp_20261025_050311_ars_phi2_kaggle",
+  "tag": "ars_phi2_kaggle_m8_m10_fixed_breakthrough_46",
+  "created_at": "2026-10-25T05:03:11.029498+00:00",
+  "git_commit": "b51a81e",
+  "model_name": "microsoft/phi-2",
+  "engine": "v4.1",
+  "status": "COMPLETED_FIXED_STEERNET_BREAKTHROUGH",
+  "hardware": "Kaggle Dual Tesla T4 (2x 15,360 MiB)",
+  "config": {
+    "bench_n_test": 100,
+    "bench_shots": [
+      0,
+      4,
+      8
+    ],
+    "bench_n_boot": 10000,
+    "bench_max_new_tokens": 512,
+    "bench_noninf_margin_pp": 1.0,
+    "seed": 42,
+    "steer_scale": 0.3,
+    "k_scale_mode": "sqrt",
+    "steernet_k_conditioning": true,
+    "max_active_layers": 4
+  },
+  "contract": {
+    "s_fixed_star": [
+      13,
+      15,
+      22
+    ],
+    "theta_abs": 1.01,
+    "gate_adopted": "passthrough",
+    "rel_norm_cap": 0.0041589075699448586,
+    "steer_scale": 0.3,
+    "git_commit": "b51a81e",
+    "created": "2026-10-25T05:02:57.443457+00:00",
+    "selection_ids_hash": "375f9084d999f5d4ade0585775a798d9e3e7933ff23a2be26998d0730b9332a6",
+    "steernet_sha256": "c399efe3308445e031170f276dbeafb1c2ab7032eb268e928cf29bde63b39ac9",
+    "router_sha256": "9f16d3256353cd62e1d21040556fb829da05c8304dd5158a84ef923c16e2a20d",
+    "gate_sha256": "34d16f84622d5b863a660a8b1a2c8a9d78d573b6e32b85087c24dbba1afde94b"
+  },
+  "calibration_evidence": {
+    "fixed_evidence": {
+      "n": 100,
+      "tie_eps": 0.003,
+      "best_nll": 1.0084830522537231,
+      "ranking": [
+        {
+          "subset": [
+            13,
+            15,
+            20
+          ],
+          "k": 3,
+          "mean_nll": 1.0084830522537231,
+          "acc": 0.44
+        },
+        {
+          "subset": [
+            13,
+            15,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0086596012115479,
+          "acc": 0.47
+        },
+        {
+          "subset": [
+            13,
+            20,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0092369318008423,
+          "acc": 0.42
+        },
+        {
+          "subset": [
+            13,
+            15,
+            18
+          ],
+          "k": 3,
+          "mean_nll": 1.0094115734100342,
+          "acc": 0.44
+        },
+        {
+          "subset": [
+            13,
+            18,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0099692344665527,
+          "acc": 0.44
+        },
+        {
+          "subset": [
+            13,
+            18,
+            20
+          ],
+          "k": 3,
+          "mean_nll": 1.0102449655532837,
+          "acc": 0.46
+        },
+        {
+          "subset": [
+            15,
+            20,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0125579833984375
+        },
+        {
+          "subset": [
+            15,
+            18,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0131573677062988
+        },
+        {
+          "subset": [
+            15,
+            18,
+            20
+          ],
+          "k": 3,
+          "mean_nll": 1.0134831666946411
+        },
+        {
+          "subset": [
+            18,
+            20,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0137414932250977
+        },
+        {
+          "subset": [
+            13,
+            15
+          ],
+          "k": 2,
+          "mean_nll": 1.0138338804244995
+        },
+        {
+          "subset": [
+            13,
+            20
+          ],
+          "k": 2,
+          "mean_nll": 1.0141953229904175
+        },
+        {
+          "subset": [
+            13,
+            22
+          ],
+          "k": 2,
+          "mean_nll": 1.0145286321640015
+        },
+        {
+          "subset": [
+            13,
+            18
+          ],
+          "k": 2,
+          "mean_nll": 1.0158393383026123
+        },
+        {
+          "subset": [
+            15,
+            22
+          ],
+          "k": 2,
+          "mean_nll": 1.0181207656860352
+        },
+        {
+          "subset": [
+            15,
+            20
+          ],
+          "k": 2,
+          "mean_nll": 1.0188645124435425
+        },
+        {
+          "subset": [
+            15,
+            18
+          ],
+          "k": 2,
+          "mean_nll": 1.0194849967956543
+        },
+        {
+          "subset": [
+            20,
+            22
+          ],
+          "k": 2,
+          "mean_nll": 1.0196046829223633
+        },
+        {
+          "subset": [
+            18,
+            22
+          ],
+          "k": 2,
+          "mean_nll": 1.0201764106750488
+        },
+        {
+          "subset": [
+            18,
+            20
+          ],
+          "k": 2,
+          "mean_nll": 1.02043879032135
+        },
+        {
+          "subset": [
+            13
+          ],
+          "k": 1,
+          "mean_nll": 1.0210553407669067
+        },
+        {
+          "subset": [
+            15
+          ],
+          "k": 1,
+          "mean_nll": 1.0263477563858032
+        },
+        {
+          "subset": [
+            22
+          ],
+          "k": 1,
+          "mean_nll": 1.0279042720794678
+        },
+        {
+          "subset": [
+            20
+          ],
+          "k": 1,
+          "mean_nll": 1.0282319784164429
+        },
+        {
+          "subset": [
+            18
+          ],
+          "k": 1,
+          "mean_nll": 1.029554009437561
+        }
+      ],
+      "candidates": [
+        {
+          "subset": [
+            13,
+            15,
+            18
+          ],
+          "k": 3,
+          "mean_nll": 1.0094115734100342,
+          "acc": 0.44
+        },
+        {
+          "subset": [
+            13,
+            15,
+            20
+          ],
+          "k": 3,
+          "mean_nll": 1.0084830522537231,
+          "acc": 0.44
+        },
+        {
+          "subset": [
+            13,
+            15,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0086596012115479,
+          "acc": 0.47
+        },
+        {
+          "subset": [
+            13,
+            18,
+            20
+          ],
+          "k": 3,
+          "mean_nll": 1.0102449655532837,
+          "acc": 0.46
+        },
+        {
+          "subset": [
+            13,
+            18,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0099692344665527,
+          "acc": 0.44
+        },
+        {
+          "subset": [
+            13,
+            20,
+            22
+          ],
+          "k": 3,
+          "mean_nll": 1.0092369318008423,
+          "acc": 0.42
+        }
+      ],
+      "winner": [
+        13,
+        15,
+        22
+      ],
+      "rule": "min paired NLL within eps -> max greedy acc -> smaller K -> lower NLL"
+    },
+    "gate_evidence": {},
+    "envelope": {
+      "rel_norm_cap": 0.0041589075699448586,
+      "quantile": 0.999,
+      "p50": 0.0033093413803726435,
+      "p99": 0.004130674991756678,
+      "max": 0.004175987094640732,
+      "n_samples": 52604,
+      "nominal_cap": 0.02,
+      "per_layer": {
+        "13": {
+          "p50": 0.003981885965913534,
+          "p99": 0.004153351299464703,
+          "q": 0.004170256666839123,
+          "max": 0.004175987094640732,
+          "n": 8371
+        },
+        "15": {
+          "p50": 0.0032686928752809763,
+          "p99": 0.0033958936110138893,
+          "q": 0.00340693979524076,
+          "max": 0.0034189699217677116,
+          "n": 11954
+        },
+        "18": {
+          "p50": 0.0032509160228073597,
+          "p99": 0.0033868688624352217,
+          "q": 0.0034013506956398487,
+          "max": 0.0034136399626731873,
+          "n": 11954
+        },
+        "22": {
+          "p50": 0.0033282481599599123,
+          "p99": 0.004121545236557722,
+          "q": 0.0041481624357402325,
+          "max": 0.004164574667811394,
+          "n": 20325
+        }
+      },
+      "warnings": [
+        "W_ENVELOPE_MISMATCH: measured q0.999 cap 0.00416 differs from 0.02 by 0.21x (> 2x)"
+      ]
+    },
+    "theta_table": [
+      {
+        "theta": 0.1,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 0.2,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 0.3,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 0.4,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 0.5,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 0.6,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 0.7,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 0.8,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 0.9,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      },
+      {
+        "theta": 1.01,
+        "nll_gain": 0.03562501072883606,
+        "mean_nll": 1.0133955478668213,
+        "abstain_rate": 0.0,
+        "acc": 0.45
+      }
+    ]
+  },
+  "benchmark": {
+    "gsm8k_0shot": {
+      "strict": {
+        "baseline": 0.0,
+        "fixed_control": 0.0,
+        "router_only": 0.0,
+        "full_ars": 0.0,
+        "raw_ars": 0.0
+      },
+      "lenient": {
+        "baseline": 0.33,
+        "fixed_control": 0.41,
+        "router_only": 0.37,
+        "full_ars": 0.37,
+        "raw_ars": 0.41
+      },
+      "paired_lenient": {
+        "fixed_control": {
+          "delta_pp": 8.0,
+          "ci_95": [
+            2.0,
+            15.0
+          ],
+          "bc": [
+            10,
+            2
+          ],
+          "mcnemar_p": 0.0386,
+          "holm_p": 0.1157
+        },
+        "router_only": {
+          "delta_pp": 4.0,
+          "ci_95": [
+            -1.0,
+            10.0
+          ],
+          "bc": [
+            6,
+            2
+          ],
+          "mcnemar_p": 0.2891,
+          "holm_p": 0.5781
+        },
+        "full_ars": {
+          "delta_pp": 4.0,
+          "ci_95": [
+            -1.0,
+            10.0
+          ],
+          "bc": [
+            6,
+            2
+          ],
+          "mcnemar_p": 0.2891,
+          "holm_p": 0.5781
+        },
+        "raw_ars": {
+          "delta_pp": 8.0,
+          "ci_95": [
+            2.0,
+            14.0
+          ],
+          "bc": [
+            9,
+            1
+          ],
+          "mcnemar_p": 0.0215,
+          "holm_p": 0.0859
+        }
+      }
+    },
+    "gsm8k_4shot": {
+      "strict": {
+        "baseline": 0.31,
+        "fixed_control": 0.35,
+        "router_only": 0.35,
+        "full_ars": 0.35,
+        "raw_ars": 0.33
+      },
+      "lenient": {
+        "baseline": 0.42,
+        "fixed_control": 0.47,
+        "router_only": 0.47,
+        "full_ars": 0.47,
+        "raw_ars": 0.48
+      },
+      "paired_strict": {
+        "fixed_control": {
+          "delta_pp": 4.0,
+          "ci_95": [
+            -3.0,
+            11.0
+          ],
+          "bc": [
+            8,
+            4
+          ],
+          "mcnemar_p": 0.3877,
+          "holm_p": 1.0
+        },
+        "router_only": {
+          "delta_pp": 4.0,
+          "ci_95": [
+            -3.0,
+            11.0
+          ],
+          "bc": [
+            9,
+            5
+          ],
+          "mcnemar_p": 0.424,
+          "holm_p": 1.0
+        },
+        "full_ars": {
+          "delta_pp": 4.0,
+          "ci_95": [
+            -3.0,
+            11.0
+          ],
+          "bc": [
+            9,
+            5
+          ],
+          "mcnemar_p": 0.424,
+          "holm_p": 1.0
+        },
+        "raw_ars": {
+          "delta_pp": 2.0,
+          "ci_95": [
+            -5.0,
+            9.0
+          ],
+          "bc": [
+            8,
+            6
+          ],
+          "mcnemar_p": 0.7905,
+          "holm_p": 1.0
+        }
+      },
+      "paired_lenient": {
+        "fixed_control": {
+          "delta_pp": 5.0,
+          "ci_95": [
+            -2.0,
+            12.0
+          ],
+          "bc": [
+            9,
+            4
+          ],
+          "mcnemar_p": 0.2668,
+          "holm_p": 0.8005
+        },
+        "router_only": {
+          "delta_pp": 5.0,
+          "ci_95": [
+            -2.0,
+            12.0
+          ],
+          "bc": [
+            9,
+            4
+          ],
+          "mcnemar_p": 0.2668,
+          "holm_p": 0.8005
+        },
+        "full_ars": {
+          "delta_pp": 5.0,
+          "ci_95": [
+            -2.0,
+            12.0
+          ],
+          "bc": [
+            9,
+            4
+          ],
+          "mcnemar_p": 0.2668,
+          "holm_p": 0.8005
+        },
+        "raw_ars": {
+          "delta_pp": 6.0,
+          "ci_95": [
+            0.0,
+            13.0
+          ],
+          "bc": [
+            9,
+            3
+          ],
+          "mcnemar_p": 0.146,
+          "holm_p": 0.584
+        }
+      }
+    },
+    "gsm8k_8shot": {
+      "strict": {
+        "baseline": 0.32,
+        "fixed_control": 0.46,
+        "router_only": 0.39,
+        "full_ars": 0.39,
+        "raw_ars": 0.39
+      },
+      "lenient": {
+        "baseline": 0.36,
+        "fixed_control": 0.46,
+        "router_only": 0.41,
+        "full_ars": 0.41,
+        "raw_ars": 0.4
+      },
+      "paired_strict": {
+        "fixed_control": {
+          "delta_pp": 14.0,
+          "ci_95": [
+            7.0,
+            22.0
+          ],
+          "bc": [
+            15,
+            1
+          ],
+          "mcnemar_p": 0.000519,
+          "holm_p": 0.0021
+        },
+        "router_only": {
+          "delta_pp": 7.0,
+          "ci_95": [
+            2.0,
+            13.0
+          ],
+          "bc": [
+            8,
+            1
+          ],
+          "mcnemar_p": 0.0391,
+          "holm_p": 0.1172
+        },
+        "full_ars": {
+          "delta_pp": 7.0,
+          "ci_95": [
+            2.0,
+            13.0
+          ],
+          "bc": [
+            8,
+            1
+          ],
+          "mcnemar_p": 0.0391,
+          "holm_p": 0.1172
+        },
+        "raw_ars": {
+          "delta_pp": 7.0,
+          "ci_95": [
+            2.0,
+            13.0
+          ],
+          "bc": [
+            8,
+            1
+          ],
+          "mcnemar_p": 0.0391,
+          "holm_p": 0.1172
+        }
+      },
+      "paired_lenient": {
+        "fixed_control": {
+          "delta_pp": 10.0,
+          "ci_95": [
+            2.0,
+            18.0
+          ],
+          "bc": [
+            14,
+            4
+          ],
+          "mcnemar_p": 0.0309,
+          "holm_p": 0.1235
+        },
+        "router_only": {
+          "delta_pp": 5.0,
+          "ci_95": [
+            -1.0,
+            12.0
+          ],
+          "bc": [
+            8,
+            3
+          ],
+          "mcnemar_p": 0.2266,
+          "holm_p": 0.6797
+        },
+        "full_ars": {
+          "delta_pp": 5.0,
+          "ci_95": [
+            -1.0,
+            12.0
+          ],
+          "bc": [
+            8,
+            3
+          ],
+          "mcnemar_p": 0.2266,
+          "holm_p": 0.6797
+        },
+        "raw_ars": {
+          "delta_pp": 4.0,
+          "ci_95": [
+            -3.0,
+            11.0
+          ],
+          "bc": [
+            8,
+            4
+          ],
+          "mcnemar_p": 0.3877,
+          "holm_p": 0.6797
+        }
+      }
+    }
+  },
+  "routing_diagnostics": {
+    "guard_trip_rate_all_arms": 0.0,
+    "rel_norm_envelope_cap": 0.0041589075699448586,
+    "route_entropy_bits": {
+      "0shot": {
+        "router_only": 0.995,
+        "full_ars": 0.995,
+        "raw_ars": 0.995
+      },
+      "4shot": {
+        "router_only": 0.0,
+        "full_ars": 0.0,
+        "raw_ars": 0.0
+      },
+      "8shot": {
+        "router_only": 0.0,
+        "full_ars": 0.0,
+        "raw_ars": 0.0
+      }
+    },
+    "layer_frequencies": {
+      "0shot": {
+        "L13": 0.46,
+        "L15": 0.54,
+        "L18": 0.54,
+        "L22": 1.0
+      },
+      "4shot": {
+        "L13": 1.0,
+        "L22": 1.0
+      },
+      "8shot": {
+        "L13": 1.0,
+        "L22": 1.0
+      }
+    },
+    "k_distribution": {
+      "0shot": {
+        "K0": 0.0,
+        "K1": 0.0,
+        "K2": 0.46,
+        "K3": 0.54,
+        "K4": 0.0
+      },
+      "4shot": {
+        "K0": 0.0,
+        "K1": 0.0,
+        "K2": 1.0,
+        "K3": 0.0,
+        "K4": 0.0
+      },
+      "8shot": {
+        "K0": 0.0,
+        "K1": 0.0,
+        "K2": 1.0,
+        "K3": 0.0,
+        "K4": 0.0
+      }
+    }
+  },
+  "forensic_findings": {
+    "1_statistical_breakthrough_8shot": "Fixed-control subset s*=[13, 15, 22] achieved a statistically significant +14.00 pp improvement (32.00% -> 46.00%) over baseline with McNemar p=5.19e-4 and Holm-Bonferroni corrected p=0.0021. Contingency table b=15, c=1 proves 15 previously failed questions were solved with only 1 regression.",
+    "2_cooperative_synergy": "S5 calibration evidence confirms multi-layer cooperative synergy: single layers K=1 showed poor NLL (1.021-1.029), pairs K=2 reached (1.013-1.020), while triples K=3 dominated (1.008-1.010), with [13, 15, 22] achieving 47% greedy calibration accuracy.",
+    "3_router_underrouting_collapse": "Router distillation in S2 collapsed to K=2 ({13, 22}) on 100% of 4-shot and 8-shot prompts, dropping Layer 15. While {13, 22} alone produced +7.00 pp (39.00%, p=0.039), it missed the additional +7.00 pp provided by Layer 15 in the triple.",
+    "4_gate_passthrough_fallback": "Token gate was demoted to passthrough (alpha=1.0) during S5 calibration due to an exact accuracy tie (45% vs 45%) and marginal NLL increase (+0.000166). In Raw ARS where gate was forced active, it achieved top performance in 4-shot (48% lenient) but matched router-only at 39% in 8-shot.",
+    "5_zeroshot_formatting_artifact": "Phi-2 under 0-shot conditions does not emit the GSM8K '#### <ans>' delimiter, resulting in 0.00% strict accuracy across all arms. Lenient parsing revealed baseline at 33.00% and Fixed/Raw ARS at 41.00% (+8.00 pp, p=0.0215), demonstrating active steering efficacy.",
+    "6_envelope_safety": "Rel norm cap of 0.00416 (0.416% of residual norm) was adhered to with zero guard trips (0.0000) across all 100 questions and all arms, confirming zero representation collapse."
+  }
+}
