@@ -16,6 +16,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
+from src.data.shots import question_span_mask_from_prompts
+from src.evaluation.answers import cut_continuation
 from src.deploy.calibrate import apply_contract, git_commit
 from src.evaluation.output_cache import (
     EMPTY_ROUTE_KEY,
@@ -145,11 +147,11 @@ def batch_size_for(cfg, shots: int) -> int:
 
 _STRICT_PATTERNS = (
     re.compile(r"####\s*\$?(-?\d[\d,]*\.?\d*)"),
-    re.compile(r"[Ff]inal\s+answer(?:\s+is)?\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
+    re.compile(r"[Ff]inal\s+[Aa]nswer(?:\s+is)?\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
 )
 _TRIM_PATTERNS = (
     r"####\s*-?\d[\d,]*\.?\d*",
-    r"[Ff]inal\s+answer\s*[:\-]?\s*-?\d[\d,]*\.?\d*",
+    r"[Ff]inal\s+[Aa]nswer\s*[:\-]?\s*-?\d[\d,]*\.?\d*",
     r"[Tt]herefore[^.\n]*\.",
     r"[Tt]he answer is[^.\n]*\.",
 )
@@ -192,7 +194,7 @@ def _left_padding(tokenizer):
 
 class _AllDoneCriteria(StoppingCriteria):
     """Stop once every sequence in the batch has emitted a complete answer marker."""
-    PAT = re.compile(r"(?:####|[Ff]inal\s+answer\s*[:\-]?)\s*\$?-?\d[\d,]*\.?\d*[^\d,.]")
+    PAT = re.compile(r"(?:####|[Ff]inal\s+[Aa]nswer\s*[:\-]?)\s*\$?-?\d[\d,]*\.?\d*[^\d,.]")
 
     def __init__(self, tokenizer, prompt_len: int, every: int = 4):
         self.tok, self.prompt_len, self.every = tokenizer, prompt_len, every
@@ -240,22 +242,48 @@ def _generate_batch_full(
             plen = enc["input_ids"].shape[1]
             _opt(model, "reset_guard_state")
             stop = StoppingCriteriaList([_AllDoneCriteria(tokenizer, plen)])
-            with torch.no_grad():
-                out = model.generate(
-                    **enc,
-                    max_new_tokens=max_new_tokens,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    stopping_criteria=stop,
-                    do_sample=False,
-                    repetition_penalty=1.1,
-                    no_repeat_ngram_size=6,
-                    use_cache=True,
-                )
+            # Multi-shot prompt shielding: protect few-shot demonstrations from steering representation drift
+            if hasattr(model, "set_prompt_shield_mask"):
+                q_toks = tokenizer.encode("Question:", add_special_tokens=False)
+                B, T_prompt = enc["input_ids"].shape
+                shield_mask = torch.zeros((B, T_prompt), dtype=torch.bool, device=device)
+                has_shield = False
+                for b_i in range(B):
+                    inp_list = enc["input_ids"][b_i].tolist()
+                    last_match = -1
+                    for k in range(len(inp_list) - len(q_toks) + 1):
+                        if inp_list[k : k + len(q_toks)] == q_toks:
+                            last_match = k
+                    if last_match > 0:
+                        shield_mask[b_i, :last_match] = True
+                        has_shield = True
+                if has_shield:
+                    model.set_prompt_shield_mask(shield_mask)
+                else:
+                    model.set_prompt_shield_mask(None)
+
+            try:
+                with torch.no_grad():
+                    out = model.generate(
+                        **enc,
+                        max_new_tokens=max_new_tokens,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        stopping_criteria=stop,
+                        do_sample=False,
+                        repetition_penalty=1.1,
+                        no_repeat_ngram_size=6,
+                        use_cache=True,
+                    )
+            finally:
+                if hasattr(model, "set_prompt_shield_mask"):
+                    model.set_prompt_shield_mask(None)
+
             trip = _read_tripped(model, len(idx))
             for j, i in enumerate(idx):
                 raw       = tokenizer.decode(out[j][plen:], skip_special_tokens=True).strip()
-                texts[i]   = _trim_response(raw)
+                cleaned   = cut_continuation(raw)
+                texts[i]   = _trim_response(cleaned)
                 tripped[i] = trip[j]
     return texts, tripped
 
@@ -278,6 +306,7 @@ def predict_routes(
     prompts: List[str],
     device,
     bs: int,
+    n_shot: int = 0,
 ) -> List[Tuple[int, ...]]:
     """Prefill-time route prediction per prompt under the model's current arm state."""
     fn = getattr(model, "predict_routes", None)
@@ -288,15 +317,36 @@ def predict_routes(
     out: List[Any] = [None] * len(prompts)
     order = sorted(range(len(prompts)), key=lambda i: len(prompts[i]))
     model.eval()
+
+    # Pass shot-bucket if supported
+    shot_bucket = None
+    if hasattr(model, "shot_to_bucket"):
+        shot_bucket = model.shot_to_bucket(n_shot)
+    elif hasattr(model, "_shot_bucket"):
+        shot_bucket = getattr(model, "shot_to_bucket", lambda s: "0shot" if s == 0 else "fewshot")(n_shot)
+
     with _left_padding(tokenizer):
         for s in range(0, len(order), bs):
             idx   = order[s:s + bs]
+            sub_prompts = [prompts[i] for i in idx]
             enc   = tokenizer(
-                [prompts[i] for i in idx],
+                sub_prompts,
                 return_tensors="pt", padding=True,
                 truncation=True, max_length=2048,
             ).to(device)
-            preds = fn(enc["input_ids"], enc["attention_mask"])
+
+            # Build question-span mask for router feature pooling
+            q_mask = None
+            try:
+                q_mask = question_span_mask_from_prompts(tokenizer, sub_prompts, padding_side="left", max_len=2048).to(device)
+            except Exception:
+                q_mask = None
+
+            try:
+                preds = fn(enc["input_ids"], enc["attention_mask"], question_span_mask=q_mask, shot_bucket=shot_bucket)
+            except TypeError:
+                preds = fn(enc["input_ids"], enc["attention_mask"])
+
             for i, p in zip(idx, preds):
                 route = p["route"] if isinstance(p, dict) and "route" in p else p
                 out[i] = tuple(sorted(int(x) for x in route))
@@ -335,7 +385,7 @@ def run_arm(
         if which == "fixed":
             routes = [tuple(sorted(int(l) for l in contract["s_fixed_star"]))] * n
         else:
-            routes = predict_routes(model, tokenizer, prompts, device, bs)
+            routes = predict_routes(model, tokenizer, prompts, device, bs, n_shot=shots)
 
     gate_mode, scale = _arm_gate(contract, which)
     kfn  = route_key_fn or canonical_route_key

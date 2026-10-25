@@ -131,9 +131,11 @@ class AnswerStoppingCriteria(StoppingCriteria):
         if hasattr(tokenizer, "encode"):
             hash_ids = tokenizer.encode("####", add_special_tokens=False)
             final_ids = tokenizer.encode("\nFinal answer:", add_special_tokens=False)
+            final_ids_cap = tokenizer.encode("\nFinal Answer:", add_special_tokens=False)
+            self.stop_sequences = [torch.tensor(hash_ids), torch.tensor(final_ids), torch.tensor(final_ids_cap)]
         else:
-            hash_ids, final_ids = [1001], [1002]
-        self.stop_sequences = [torch.tensor(hash_ids), torch.tensor(final_ids)]
+            hash_ids, final_ids, final_ids_cap = [1001], [1002], [1003]
+            self.stop_sequences = [torch.tensor(hash_ids), torch.tensor(final_ids), torch.tensor(final_ids_cap)]
         self._marker_seen_at = None
 
     def __call__(self, input_ids: torch.Tensor, scores, **kwargs) -> bool:
