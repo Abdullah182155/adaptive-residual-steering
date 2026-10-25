@@ -321,8 +321,10 @@ def predict_routes(
     shot_bucket = None
     if hasattr(model, "shot_to_bucket"):
         shot_bucket = model.shot_to_bucket(n_shot)
-    elif hasattr(model, "_shot_bucket"):
-        shot_bucket = getattr(model, "shot_to_bucket", lambda s: "0shot" if s == 0 else "fewshot")(n_shot)
+    elif hasattr(model, "router") and hasattr(model.router, "shot_to_bucket"):
+        shot_bucket = model.router.shot_to_bucket(n_shot)
+    elif n_shot is not None:
+        shot_bucket = 0 if n_shot == 0 else (2 if n_shot == 4 else 3)
 
     with _left_padding(tokenizer):
         for s in range(0, len(order), bs):

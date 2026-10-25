@@ -336,6 +336,8 @@ class JointLayerRouter(nn.Module):
         """Map raw shot counts (array / tensor) to indices into self.shot_buckets (nearest bucket)."""
         if torch.is_tensor(n_shot):
             shots = n_shot.detach().cpu().long()
+        elif isinstance(n_shot, int):
+            shots = torch.tensor([n_shot], dtype=torch.long)
         else:
             shots = torch.as_tensor(list(n_shot) if not hasattr(n_shot, "shape") else n_shot).long()
         buckets = torch.tensor(self.shot_buckets, dtype=torch.long)

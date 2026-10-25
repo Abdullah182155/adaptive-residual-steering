@@ -890,6 +890,16 @@ class Phi2WithRSC(nn.Module):
         """Alias of set_router_context_mask (pending -> active at the next model forward)."""
         self.set_router_context_mask(mask)
 
+    def shot_to_bucket(self, n_shot) -> torch.Tensor:
+        """Map raw shot counts to bucket index."""
+        if hasattr(self, "router") and hasattr(self.router, "shot_to_bucket"):
+            return self.router.shot_to_bucket(n_shot)
+        buckets = [0, 2, 4, 8]
+        if isinstance(n_shot, int):
+            diffs = [abs(n_shot - b) for b in buckets]
+            return torch.tensor([diffs.index(min(diffs))], dtype=torch.long)
+        return torch.tensor([0], dtype=torch.long)
+
     def set_shot_bucket(self, b: Union[int, Sequence[int], torch.Tensor, None]):
         if b is None:
             self._shot_bucket = None
@@ -898,6 +908,8 @@ class Phi2WithRSC(nn.Module):
         elif torch.is_tensor(b):
             t = b.detach().long()
             self._shot_bucket = int(t.item()) if t.dim() == 0 else t.reshape(-1).clone()
+        elif isinstance(b, str):
+            self._shot_bucket = 0 if "0" in b else 2
         else:
             self._shot_bucket = torch.as_tensor(list(b), dtype=torch.long)
 
