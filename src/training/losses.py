@@ -812,16 +812,32 @@ def dominance_hinge(nll_gated: torch.Tensor, nll_ungated: torch.Tensor, margin: 
 
 
 class TokenLabelStore:
-    """Keyed (split, qid, n_shot) -> (labels: torch.BoolTensor[T_ans], weights: torch.Tensor)."""
+    """Keyed canonical_token_key or (split, qid, n_shot) -> (labels: torch.BoolTensor[T_ans], weights: torch.Tensor)."""
 
-    def __init__(self, data: Optional[Dict[Tuple[str, str, int], Tuple[torch.Tensor, torch.Tensor]]] = None):
-        self._data = data if data is not None else {}
+    def __init__(self, data: Optional[Dict[Any, Tuple[torch.Tensor, torch.Tensor]]] = None):
+        from src.utils.keys import canonical_token_key
+        self._data = {}
+        if data is not None:
+            for k, v in data.items():
+                if isinstance(k, tuple):
+                    ck = canonical_token_key(*k)
+                else:
+                    ck = canonical_token_key("train", k, 0)
+                self._data[ck] = v
+                self._data[k] = v  # preserve raw key for backward compatibility
 
-    def get(self, key: Tuple[str, str, int]) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        return self._data.get(key)
+    def get(self, key: Any) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        from src.utils.keys import canonical_token_key
+        if key in self._data:
+            return self._data[key]
+        if isinstance(key, tuple):
+            ck = canonical_token_key(*key)
+        else:
+            ck = canonical_token_key("train", key, 0)
+        return self._data.get(ck)
 
-    def __contains__(self, key: Tuple[str, str, int]) -> bool:
-        return key in self._data
+    def __contains__(self, key: Any) -> bool:
+        return self.get(key) is not None
 
     def __len__(self) -> int:
         return len(self._data)
@@ -834,6 +850,8 @@ def counterfactual_token_labels(table, router_choice: np.ndarray, tau_u: float =
     label = 1[u_t > tau_u]. Rows with c_n == 0 have no label (empty / abstain class).
     Weights balance positive and negative tokens on valid positions.
     """
+    from src.utils.keys import canonical_token_key
+
     store_dict = {}
     N = len(table.qid) if hasattr(table, "qid") else len(table)
     choices = np.asarray(router_choice)
@@ -860,7 +878,7 @@ def counterfactual_token_labels(table, router_choice: np.ndarray, tau_u: float =
             )
         else:
             weights = torch.ones(n_tot, dtype=torch.float32)
-        key = (str(table.split[i]), str(table.qid[i]), int(table.n_shot[i]))
+        key = canonical_token_key(table.split[i], table.qid[i], table.n_shot[i])
         store_dict[key] = (lbls_bool, weights)
     return TokenLabelStore(store_dict)
 
@@ -879,7 +897,7 @@ def gate_bce_tokens(
     weight_terms = []
 
     for b, r in enumerate(rows):
-        key = (str(r.get("split", "")), str(r.get("qid", "")), int(r.get("n_shot", 0)))
+        key = (str(r.get("split", "train")), str(r.get("qid", "")), int(r.get("n_shot", r.get("shot", 0))))
         item = store.get(key)
         if item is None:
             continue
@@ -964,7 +982,7 @@ def gate_label_auc(
     all_preds, all_tgts = [], []
     with torch.no_grad():
         for r in rows:
-            key = (str(r.get("split", "")), str(r.get("qid", "")), int(r.get("n_shot", 0)))
+            key = (str(r.get("split", "train")), str(r.get("qid", "")), int(r.get("n_shot", r.get("shot", 0))))
             item = store.get(key)
             if item is None:
                 continue

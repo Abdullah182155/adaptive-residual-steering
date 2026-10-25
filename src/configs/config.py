@@ -504,15 +504,15 @@ class RSCConfig:
     gate_task_gradient: bool = False
 
     # ==== M7 ====
-    gate_init_logit: float = 2.0                          # alpha_init = sigmoid(2) = 0.8808
+    gate_init_logit: float = 0.0                          # alpha_init = sigmoid(0) = 0.5 (neutral, max gradient)
     gate_loss_mode: str = "v5"                            # "v5" | "legacy"
     lambda_dom: float = 1.0
-    lambda_tok: float = 0.3
+    lambda_tok: float = 1.0                               # raised from 0.3 for decisive token BCE supervision
     lambda_l1_gate_v5: float = 0.005
     gate_tau_u: float = 0.005
-    gate_dom_margin: float = 0.0
+    gate_dom_margin: float = 0.01                         # slight margin to strictly enforce dominance
     gate_epochs: int = 3
-    gate_lr: float = 1e-3
+    gate_lr: float = 2e-3                                 # raised from 1e-3 for faster convergence
     gate_label_row_frac: float = 0.5
     gate_v5_save_path: str = "./checkpoints/gate_v5.pt"
     gate_sel_n: int = 120

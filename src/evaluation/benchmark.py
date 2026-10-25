@@ -249,11 +249,13 @@ def _generate_batch_full(
                 has_shield = False
                 for b_i in range(B):
                     inp_list = enc["input_ids"][b_i].tolist()
-                    last_match = -1
+                    matches = []
                     for k in range(len(inp_list) - len(q_toks) + 1):
                         if inp_list[k : k + len(q_toks)] == q_toks:
-                            last_match = k
-                    if last_match > 0:
+                            matches.append(k)
+                    # Only shield if there are few-shot demonstrations (more than 1 Question: occurrence)
+                    if len(matches) > 1:
+                        last_match = matches[-1]
                         shield_mask[b_i, :last_match] = True
                         has_shield = True
                 if has_shield:

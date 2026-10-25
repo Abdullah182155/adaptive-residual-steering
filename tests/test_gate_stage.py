@@ -162,6 +162,9 @@ class TestGateStage(unittest.TestCase):
         # u > 0.05 -> [True, False, True]
         item1 = store.get(("train", "q1", 0))
         self.assertIsNotNone(item1)
+        # Test canonical string key and prefixed tuple key lookups
+        self.assertIsNotNone(store.get("train:q1:0"))
+        self.assertIsNotNone(store.get(("train", "train:q1", 0)))
         lbls1, w1 = item1
         self.assertEqual(lbls1.tolist(), [True, False, True])
         self.assertEqual(len(w1), 3)

@@ -17,7 +17,7 @@ import numpy as np
 
 from src.configs.config import RSCConfig
 
-STAGE_ORDER = ["S0", "S1", "S0b", "S2", "S3", "S5", "bench"]
+STAGE_ORDER = ["S1", "S0b", "S0", "S2", "S3", "S5", "bench"]
 STAGE_MAP = {}
 
 
@@ -140,7 +140,9 @@ def _dataset_to_rows(ds, n: int = None):
                 "labels": lbl,
                 "is_onpolicy": False,
                 "shot": 0,
-                "qid": i,
+                "n_shot": 0,
+                "split": "train",
+                "qid": f"train:{i}",
                 "question": ex.get("question", ""),
                 "final_num": ex.get("final_num", None),
             })
@@ -163,11 +165,21 @@ def stage_s0(model, tok, train_data, eval_data, cfg, device, state, args):
 
     # P0-5: Load initial SteerNet weights if available
     init_ckpt = getattr(args, "ckpt", None) or os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
+    has_steer = False
     if init_ckpt and os.path.exists(init_ckpt):
         print(f"[S0] Loading SteerNet weights from {init_ckpt} for CF table")
         load_steer_weights(model, init_ckpt, device=device)
+        has_steer = True
+    else:
+        print(f"[S0] Notice: No SteerNet checkpoint found at {init_ckpt}; evaluating unsteered baseline.")
 
-    if os.path.exists(table_path):
+    rebuild = False
+    if os.path.exists(table_path) and has_steer and init_ckpt and os.path.exists(init_ckpt):
+        if os.path.getmtime(init_ckpt) > os.path.getmtime(table_path):
+            print(f"[S0] SteerNet checkpoint is newer than existing CF table. Rebuilding CF table.")
+            rebuild = True
+
+    if os.path.exists(table_path) and not rebuild:
         print(f"[S0] Loading existing CF table from {table_path}")
         from src.analysis.cf_table import CFTable
         table = CFTable.load(table_path)
