@@ -298,7 +298,8 @@ def predict_routes(
             ).to(device)
             preds = fn(enc["input_ids"], enc["attention_mask"])
             for i, p in zip(idx, preds):
-                out[i] = tuple(sorted(int(x) for x in p))
+                route = p["route"] if isinstance(p, dict) and "route" in p else p
+                out[i] = tuple(sorted(int(x) for x in route))
     return out
 
 # ----------------------------------------------------------------------------- one arm
