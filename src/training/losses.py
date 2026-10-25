@@ -893,7 +893,21 @@ def gate_bce_tokens(
         tgt = target_labels[-t_m:].to(device).float()
         w = target_weights[-t_m:].to(device).float()
 
-        for gate in model.gates.values():
+        # Retrieve active layer selection for row b if available
+        active_layers = None
+        if hasattr(model, "current_route_tuples"):
+            routes = model.current_route_tuples()
+            if b < len(routes):
+                active_layers = set(routes[b])
+
+        for layer_idx, gate in model.gates.items():
+            # If active route exists for this sample, only supervise active layer gates
+            if active_layers is not None and len(active_layers) > 0:
+                try:
+                    if int(layer_idx) not in active_layers:
+                        continue
+                except (ValueError, TypeError):
+                    pass
             alpha = getattr(gate, "_alpha_for_aux", None)
             if alpha is None or alpha.shape[0] <= b:
                 continue

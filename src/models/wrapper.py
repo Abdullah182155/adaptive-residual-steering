@@ -995,12 +995,16 @@ class Phi2WithRSC(nn.Module):
             logits = self.router.catalog_logits(h, router_mask, shot_bucket=self._shot_bucket_for(h))
             p = F.softmax(logits.float(), dim=-1)
             idx = p.argmax(dim=-1)
-            # Abstain rule: if idx != 0 and p[:, 0] >= theta: idx = 0
+            # Abstain rule:
+            # 1. Primary confidence margin check: if top1_prob < theta, abstain to k=0 (idx=0)
+            # 2. Legacy/empty-set fallback: if p[:, 0] >= theta
             theta = self._abstain_theta
             if theta is None:
                 theta = getattr(self.cfg, "abstain_theta", 1.01)
             if theta <= 1.0:
-                idx = torch.where((idx != 0) & (p[:, 0] >= theta), torch.zeros_like(idx), idx)
+                top1_prob = p.max(dim=-1).values
+                abstain_cond = (top1_prob < theta) | (p[:, 0] >= theta)
+                idx = torch.where((idx != 0) & abstain_cond, torch.zeros_like(idx), idx)
 
         selected_matrix = self._catalog.to_candidate_matrix(idx, self.target_layers).to(h.device).bool()
         self._desired_k = self._catalog.sizes().to(h.device)[idx]

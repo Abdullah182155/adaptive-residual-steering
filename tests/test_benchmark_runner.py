@@ -245,6 +245,9 @@ class TestAssemble(unittest.TestCase):
         self.assertEqual((st["b"], st["c"]), (1, 0))
         self.assertAlmostEqual(blk["arms"]["full_ars"]["summary"]["abstain_rate"], 0.25)
         self.assertEqual(B.extract_strict("so Final answer: 1,234."), 1234.0)
+        self.assertEqual(B.extract_strict("Therefore, Final Answer: 56."), 56.0)
+        self.assertEqual(B.extract_strict("The final answer is: 78."), 78.0)
+        self.assertEqual(B.extract_strict("So the Final Answer is 90."), 90.0)
         self.assertIsNone(B.extract_strict("it is 5 maybe"))
 
 

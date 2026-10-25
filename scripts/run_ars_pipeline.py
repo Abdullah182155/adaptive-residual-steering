@@ -54,6 +54,9 @@ def parse_args():
     p.add_argument("--gate_lr",                 type=float, default=None, help="Learning rate for S3 Gate")
     p.add_argument("--onpolicy_temperature",    type=float, default=None, help="Temperature for S0b sampling")
     p.add_argument("--onpolicy_max_new_tokens", type=int, default=None, help="Max tokens for S0b sampling")
+    p.add_argument("--router_tau",              type=float, default=None, help="Softmax temperature for router target distribution")
+    p.add_argument("--router_k_free",           type=int, default=None, help="Number of layers exempt from size penalty (K<=k_free free)")
+    p.add_argument("--router_c_size",           type=float, default=None, help="Penalty per excess layer beyond k_free in router distillation")
     p.add_argument("--set",                     action="append", default=[], help="Arbitrary config override KEY=VAL")
     return p.parse_args()
 
@@ -444,6 +447,12 @@ def apply_cfg_overrides(cfg, args):
         cfg.onpolicy_temperature = float(args.onpolicy_temperature)
     if getattr(args, "onpolicy_max_new_tokens", None) is not None:
         cfg.onpolicy_max_new_tokens = int(args.onpolicy_max_new_tokens)
+    if getattr(args, "router_tau", None) is not None:
+        cfg.router_tau = float(args.router_tau)
+    if getattr(args, "router_k_free", None) is not None:
+        cfg.router_k_free = int(args.router_k_free)
+    if getattr(args, "router_c_size", None) is not None:
+        cfg.router_c_size = float(args.router_c_size)
 
     if getattr(args, "set", None):
         for item in args.set:

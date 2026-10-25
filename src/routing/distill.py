@@ -20,22 +20,32 @@ _TIE_TOL = 1e-6      # float tolerance for the near-optimal set
 
 
 # --------------------------------------------------------------------------- targets & losses
-def build_soft_targets(rewards: torch.Tensor, eps: float = 0.01, tau: float = 0.01) -> Tuple[torch.Tensor, torch.Tensor]:
+def build_soft_targets(
+    rewards: torch.Tensor,
+    eps: float = 0.01,
+    tau: float = 0.01,
+    sizes: Optional[torch.Tensor] = None,
+    k_free: int = 2,
+    c_size: float = 0.0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute soft distillation target distribution q and near-optimal mask.
 
     rewards: (N, C) float tensor (e.g. NLL gains from CFTable); -inf entries are never near-optimal.
     eps: near-tie threshold
     tau: temperature for softmax over near-optimal set E_n
-
-    R*_n = max_c rewards[n, c]
-    E_n = {c : rewards[n, c] >= R*_n - eps} (near-optimal set)
-    q_n(c) = exp(rewards[n, c] / tau) for c in E_n, 0 otherwise, normalized to sum to 1.
+    sizes: (C,) integer or float tensor of subset sizes |S| for each class
+    k_free: number of layers exempt from size penalty (default 2: K<=2 free)
+    c_size: penalty per layer exceeding k_free
 
     Returns:
         q: (N, C) target probabilities
         near_opt: (N, C) bool mask of E_n
     """
     rewards = rewards.float()
+    if sizes is not None and c_size > 0.0:
+        sizes_t = sizes.to(rewards.device).float()
+        excess_k = torch.clamp(sizes_t - float(k_free), min=0.0)
+        rewards = rewards - float(c_size) * excess_k.unsqueeze(0)
     best = rewards.max(dim=1, keepdim=True).values
     near_opt = rewards >= (best - eps - _TIE_TOL)
     logits = (rewards - best) / tau                       # <= 0, numerically stable
@@ -319,7 +329,20 @@ def distill_router(
     rewards_t = torch.from_numpy(rewards_np).to(device)
     rewards_t = rewards_t.masked_fill(~allowed.unsqueeze(0), float("-inf"))
 
-    q_all, near_all = build_soft_targets(rewards_t, float(cfg.router_eps_tie), float(cfg.router_tau))
+    sizes_t = None
+    if hasattr(table, "catalog") and table.catalog is not None and hasattr(table.catalog, "sizes"):
+        sizes_t = table.catalog.sizes().to(device)
+
+    c_size = float(getattr(cfg, "router_c_size", 0.0))
+    k_free = int(getattr(cfg, "router_k_free", 2))
+    q_all, near_all = build_soft_targets(
+        rewards_t,
+        eps=float(cfg.router_eps_tie),
+        tau=float(cfg.router_tau),
+        sizes=sizes_t,
+        k_free=k_free,
+        c_size=c_size,
+    )
     multi_all = near_all.sum(dim=1) >= 2
     ref_np = _reference_rows(qid_np, n_shot_np)
 

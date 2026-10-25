@@ -16,7 +16,6 @@ from datasets import load_dataset
 from tqdm import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
-from src.data.shots import question_span_mask_from_prompts
 from src.evaluation.answers import cut_continuation
 from src.deploy.calibrate import apply_contract, git_commit
 from src.evaluation.output_cache import (
@@ -338,6 +337,7 @@ def predict_routes(
             # Build question-span mask for router feature pooling
             q_mask = None
             try:
+                from src.data.shots import question_span_mask_from_prompts
                 q_mask = question_span_mask_from_prompts(tokenizer, sub_prompts, padding_side="left", max_len=2048).to(device)
             except Exception:
                 q_mask = None

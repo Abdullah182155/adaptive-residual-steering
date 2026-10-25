@@ -85,6 +85,21 @@ class TestDistill(unittest.TestCase):
         self.assertTrue(torch.allclose(q.sum(dim=1), torch.ones(2), atol=1e-6))
         self.assertEqual(near.sum(dim=1).tolist(), [2, 1])
 
+    def test_build_soft_targets_k_free_tariff(self):
+        # Rewards equal for classes 0, 1, 2, 3
+        rewards = torch.tensor([[1.0, 1.0, 1.0, 1.0]])
+        sizes = torch.tensor([0, 1, 2, 3])
+        # With k_free=2, c_size=0.1:
+        # Penalties: [0.0, 0.0, 0.0, 0.1]
+        # Net rewards: [1.0, 1.0, 1.0, 0.9]
+        # With eps=0.01: class 3 is excluded from near_opt, classes 0, 1, 2 tie
+        q, near = build_soft_targets(rewards, eps=0.01, tau=0.01, sizes=sizes, k_free=2, c_size=0.1)
+        self.assertEqual(near.squeeze(0).tolist(), [True, True, True, False])
+        self.assertAlmostEqual(float(q[0, 3]), 0.0, places=6)
+        self.assertAlmostEqual(float(q[0, 0]), 1.0 / 3.0, places=5)
+        self.assertAlmostEqual(float(q[0, 1]), 1.0 / 3.0, places=5)
+        self.assertAlmostEqual(float(q[0, 2]), 1.0 / 3.0, places=5)
+
     def test_balance_loss(self):
         p = torch.softmax(torch.randn(8, 5), dim=-1)
         none_tied = torch.zeros(8, dtype=torch.bool)
