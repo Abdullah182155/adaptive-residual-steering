@@ -114,10 +114,10 @@ def _forward_chunk(model, chunk, device):
     lbl  = _stack(chunk, "labels", device)
     model._attn_mask_cache = mask
     if any("question_span_mask" in r for r in chunk):
-        qm = _stack([r["question_span_mask"] for r in chunk], device)
+        qm = _stack(chunk, "question_span_mask", device)
         _opt(model, "set_router_context_mask", qm.bool())
     elif any("prompt_shield_mask" in r for r in chunk):
-        sh = _stack([r["prompt_shield_mask"] for r in chunk], device)
+        sh = _stack(chunk, "prompt_shield_mask", device)
         _opt(model, "set_router_context_mask", mask.bool() & (~sh.bool()))
     else:
         _opt(model, "set_router_context_mask", mask.bool() & lbl.eq(-100))
