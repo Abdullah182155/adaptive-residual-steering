@@ -113,7 +113,17 @@ def _forward_chunk(model, chunk, device):
     mask = _stack(chunk, "attention_mask", device)
     lbl  = _stack(chunk, "labels", device)
     model._attn_mask_cache = mask
-    _opt(model, "set_router_context_mask", mask.bool() & lbl.eq(-100))
+    if any("question_span_mask" in r for r in chunk):
+        qm = _stack([r["question_span_mask"] for r in chunk], device)
+        _opt(model, "set_router_context_mask", qm.bool())
+    elif any("prompt_shield_mask" in r for r in chunk):
+        sh = _stack([r["prompt_shield_mask"] for r in chunk], device)
+        _opt(model, "set_router_context_mask", mask.bool() & (~sh.bool()))
+    else:
+        _opt(model, "set_router_context_mask", mask.bool() & lbl.eq(-100))
+    if any("n_shot" in r or "shot" in r for r in chunk):
+        shots = [r.get("n_shot", r.get("shot", 0)) for r in chunk]
+        _opt(model, "set_shot_bucket", _opt(model, "shot_to_bucket", shots))
     with torch.amp.autocast("cuda", enabled=(torch.device(device).type == "cuda")):
         out = model(input_ids=ids, attention_mask=mask)
     return out.logits, lbl

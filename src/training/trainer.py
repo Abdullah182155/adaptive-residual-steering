@@ -4283,7 +4283,10 @@ def train_s3_gate(
             with torch.no_grad():
                 pooled_t = torch.as_tensor(table.pooled, dtype=torch.float32, device=device)
                 scalars_t = torch.as_tensor(table.scalars, dtype=torch.float32, device=device)
-                cat_logits = model.router.catalog_logits_from_features(pooled_t, scalars_t)
+                shot_buckets_t = None
+                if hasattr(table, "n_shot") and hasattr(model.router, "shot_to_bucket"):
+                    shot_buckets_t = model.router.shot_to_bucket(table.n_shot).to(device)
+                cat_logits = model.router.catalog_logits_from_features(pooled_t, scalars_t, shot_bucket=shot_buckets_t)
                 choices = cat_logits.argmax(dim=-1).cpu().numpy()
             tau_u = getattr(cfg, "gate_tau_u", 0.005)
             store = counterfactual_token_labels(table, choices, tau_u=tau_u)
