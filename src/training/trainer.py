@@ -4249,6 +4249,7 @@ def train_s3_gate(
         TokenLabelStore,
         counterfactual_token_labels,
         gate_bce_tokens,
+        gate_bce_tokens_with_live_fallback,
         gate_total_loss,
         compute_l1_gate,
         paired_gate_vs_ungated,
@@ -4361,8 +4362,7 @@ def train_s3_gate(
             )
             nll_gated = loss_mat_g.sum(dim=1) / valid.sum(dim=1).clamp(min=1)
 
-            # (ii) Compute Token BCE & L1 immediately while _alpha_for_aux holds active autograd graph
-            bce_tok = gate_bce_tokens(model, batch_rows, store, device)
+            # (ii) Compute L1 immediately while _alpha_for_aux holds active autograd graph
             mean_alpha = compute_l1_gate(model)
 
             # (iii) Ungated forward under counterfactual_mode with the same route
@@ -4378,6 +4378,18 @@ def train_s3_gate(
                 nll_ungated = loss_mat_u.sum(dim=1) / valid.sum(dim=1).clamp(min=1)
                 model.set_routing_override(None)
                 model.set_gate_mode("learned")
+
+            # (ii-b) Token BCE: prefer CF store entries when available; fall back to live
+            # per-token NLL-diff labels derived from the current batch.
+            # Live labels: token is "beneficial" (label=1) when ungated_nll > gated_nll,
+            # i.e. the gate improves this token.  This dense signal replaces the sparse
+            # CF store which covers only ~1-3% of training rows due to index mismatch.
+            tau_u = float(getattr(cfg, "gate_tau_u", 0.005))
+            bce_tok = gate_bce_tokens_with_live_fallback(
+                model, batch_rows, store, device,
+                loss_mat_g=loss_mat_g.detach(), loss_mat_u=loss_mat_u.detach(),
+                valid_mask=valid, tau_u=tau_u,
+            )
 
             # (iv) Combined loss
             total_loss, metrics = gate_total_loss(nll_gated, nll_ungated, bce_tok, mean_alpha, cfg)

@@ -483,13 +483,13 @@ class RSCConfig:
 
     # ==== M5 ====
     router_policy: str = "catalog"                        # "legacy" | "catalog"
-    router_c_size: float = 5e-3                           # K>=3 tariff to encourage K<=2 diversity
+    router_c_size: float = 2.0e-2                          # K>=3 tariff to encourage K<=2 diversity (raised from 5e-3: prior value was insufficient to overcome K=3 gain gap of ~3-5e-3 NLL units)
     router_k_free: int = 2                                # K<=2 free tariff; only K>=3 taxed
     router_eps_tie: float = 0.01
     router_tau: float = 0.05                              # raised from 0.01 to prevent probability saturation
     router_lambda_bal: float = 0.02
     router_lambda_cons: float = 0.1
-    router_distill_epochs: int = 60
+    router_distill_epochs: int = 100                     # raised from 60: more epochs for router to escape K=3 local minimum under increased c_size tariff
     router_distill_lr: float = 1e-3
     router_distill_wd: float = 1e-2
     router_distill_val_frac: float = 0.2
@@ -509,6 +509,7 @@ class RSCConfig:
     lambda_dom: float = 1.0
     lambda_tok: float = 1.0                               # raised from 0.3 for decisive token BCE supervision
     lambda_l1_gate_v5: float = 0.005
+    lambda_nll_diff: float = 1.0                         # direct NLL-diff minimisation: drives gate to reduce nll_gated below nll_ungated (complements dominance hinge which only penalises positive gaps)
     gate_tau_u: float = 0.005
     gate_dom_margin: float = 0.01                         # slight margin to strictly enforce dominance
     gate_epochs: int = 3

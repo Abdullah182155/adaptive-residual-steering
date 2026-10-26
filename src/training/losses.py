@@ -943,6 +943,119 @@ def gate_bce_tokens(
     return total_bce / total_w.clamp(min=1e-6)
 
 
+def gate_bce_tokens_with_live_fallback(
+    model,
+    rows: Sequence[dict],
+    store: Optional["TokenLabelStore"],
+    device: torch.device,
+    loss_mat_g: Optional[torch.Tensor] = None,
+    loss_mat_u: Optional[torch.Tensor] = None,
+    valid_mask: Optional[torch.Tensor] = None,
+    tau_u: float = 0.005,
+) -> torch.Tensor:
+    """Token BCE using CF store when available; live per-token NLL-diff labels as fallback.
+
+    For rows with a CF store hit, uses the pre-computed counterfactual labels (higher
+    quality, but sparse — typically only ~1-3% of training rows).  For all other rows,
+    derives token-level binary labels on-the-fly from the current batch's gated vs
+    ungated per-token NLL matrices:
+
+        live_label[b, t] = 1  if  loss_mat_u[b, t] - loss_mat_g[b, t] > tau_u
+                             0  otherwise
+
+    i.e. a token is labelled "beneficial" when steering lowers its NLL by more than
+    tau_u.  This provides a dense, always-available supervision signal that replaces
+    the sparse CF store.
+
+    Args:
+        model: Phi2WithRSC with gate._alpha_for_aux populated from the gated forward pass.
+        rows: list of row dicts (current batch).
+        store: TokenLabelStore built from CF table (may be None or sparse).
+        device: torch device.
+        loss_mat_g: (B, T) per-token NLL from gated forward (detached, no grad).
+        loss_mat_u: (B, T) per-token NLL from ungated forward (detached, no grad).
+        valid_mask: (B, T) bool mask of non-padding answer tokens.
+        tau_u: minimum NLL improvement to label a token as beneficial.
+    """
+    # Try CF store first
+    cf_result = gate_bce_tokens(model, rows, store, device)
+    if loss_mat_g is None or loss_mat_u is None or valid_mask is None:
+        return cf_result
+
+    # Build live labels for rows not covered by the CF store
+    live_bce_terms = []
+    live_weight_terms = []
+
+    for b, r in enumerate(rows):
+        # Skip if CF store already covered this row
+        if store is not None and len(store) > 0:
+            key = (str(r.get("split", "train")), str(r.get("qid", "")), int(r.get("n_shot", r.get("shot", 0))))
+            if store.get(key) is not None:
+                continue  # CF store hit: already included in cf_result
+
+        # Derive live labels from the NLL difference at valid (answer) positions
+        row_valid = valid_mask[b]  # (T,) bool
+        if not row_valid.any():
+            continue
+
+        # NLL improvement per token: positive means gated is better.
+        # loss_mat has shape (T-1,) because it's derived from shifted logits.
+        # Clamp valid positions to the loss matrix length to avoid out-of-bounds.
+        nll_diff_tok = (loss_mat_u[b] - loss_mat_g[b])  # (T-1,) — positive = gated is better
+        L_loss = nll_diff_tok.shape[0]
+        # Restrict to positions within the loss matrix bounds
+        valid_positions = row_valid.nonzero(as_tuple=True)[0]
+        valid_positions = valid_positions[valid_positions < L_loss]
+        if len(valid_positions) == 0:
+            continue
+        diff_valid = nll_diff_tok[valid_positions]  # (V,)
+        live_labels = (diff_valid > tau_u).float().to(device)
+        n_pos = int((live_labels > 0.5).sum().item())
+        n_neg = int((live_labels <= 0.5).sum().item())
+        n_tot = len(live_labels)
+        if n_tot == 0:
+            continue
+        if n_pos > 0 and n_neg > 0:
+            w_pos = n_tot / (2.0 * n_pos)
+            w_neg = n_tot / (2.0 * n_neg)
+            live_weights = torch.where(live_labels > 0.5,
+                torch.full((n_tot,), w_pos, dtype=torch.float32, device=device),
+                torch.full((n_tot,), w_neg, dtype=torch.float32, device=device),
+            )
+        else:
+            live_weights = torch.ones(n_tot, dtype=torch.float32, device=device)
+
+        # Collect gate alpha values at valid positions across active layers
+        for layer_idx, gate in model.gates.items():
+            alpha = getattr(gate, "_alpha_for_aux", None)
+            if alpha is None or alpha.shape[0] <= b:
+                continue
+            pred = alpha[b, valid_positions, 0].float().clamp(1e-7, 1.0 - 1e-7)
+            if pred.shape[0] != n_tot:
+                # Lengths may differ if seq is shorter; align to minimum
+                m = min(pred.shape[0], n_tot)
+                pred = pred[-m:]
+                tgt = live_labels[-m:]
+                w = live_weights[-m:]
+            else:
+                tgt = live_labels
+                w = live_weights
+            term = F.binary_cross_entropy(pred, tgt, weight=w, reduction="sum")
+            live_bce_terms.append(term)
+            live_weight_terms.append(w.sum())
+
+    if not live_bce_terms:
+        return cf_result
+
+    live_total = sum(live_bce_terms) / sum(live_weight_terms).clamp(min=1e-6)
+    # Combine: if cf_result is non-zero (some CF store hits), average both signals;
+    # otherwise return only the live signal.
+    cf_val = cf_result.detach().item() if torch.is_tensor(cf_result) else float(cf_result)
+    if abs(cf_val) > 1e-9:
+        return (cf_result + live_total) * 0.5
+    return live_total
+
+
 def gate_total_loss(
     nll_gated: torch.Tensor,
     nll_ungated: torch.Tensor,
@@ -950,22 +1063,37 @@ def gate_total_loss(
     mean_alpha: torch.Tensor,
     cfg,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Compute combined V5 gate loss: NLL_gated + lambda_dom*L_dom + lambda_tok*BCE + lambda_l1*mean_alpha."""
+    """Compute combined V5 gate loss.
+
+    Loss = NLL_gated + lambda_dom*L_dom + lambda_nll_diff*(NLL_gated - NLL_ungated).mean()
+           + lambda_tok*BCE + lambda_l1*mean_alpha
+
+    The lambda_nll_diff term directly minimises the mean per-example NLL gap
+    (gated - ungated), providing an explicit reward signal when the gate suppresses
+    steering on harmful tokens.  Without it, the dominance hinge only penalises
+    positive gaps but never rewards negative ones, leaving the gate unable to learn
+    selective suppression when most training examples are harmful.
+    """
     margin = float(getattr(cfg, "gate_dom_margin", 0.0))
     l_dom = dominance_hinge(nll_gated, nll_ungated, margin=margin)
     lambda_dom = float(getattr(cfg, "lambda_dom", 1.0))
     lambda_tok = float(getattr(cfg, "lambda_tok", 0.3))
     lambda_l1 = float(getattr(cfg, "lambda_l1_gate_v5", 0.005))
+    # Direct NLL-diff minimisation: drives gate to reduce nll_gated below nll_ungated.
+    # Default 1.0 — same scale as lambda_dom, but this term is always active (no relu).
+    lambda_nll_diff = float(getattr(cfg, "lambda_nll_diff", 1.0))
 
     bce_val = bce_tok if torch.is_tensor(bce_tok) else torch.tensor(float(bce_tok), device=nll_gated.device)
     alpha_val = mean_alpha if torch.is_tensor(mean_alpha) else torch.tensor(float(mean_alpha), device=nll_gated.device)
 
-    total = nll_gated.mean() + lambda_dom * l_dom + lambda_tok * bce_val + lambda_l1 * alpha_val
+    nll_diff = (nll_gated - nll_ungated.detach()).mean()
+    total = nll_gated.mean() + lambda_dom * l_dom + lambda_nll_diff * nll_diff + lambda_tok * bce_val + lambda_l1 * alpha_val
     metrics = {
         "loss_total": float(total.detach().item()),
         "nll_gated": float(nll_gated.mean().detach().item()),
         "nll_ungated": float(nll_ungated.mean().detach().item()),
         "loss_dom": float(l_dom.detach().item()),
+        "loss_nll_diff": float(nll_diff.detach().item()),
         "loss_bce_tok": float(bce_val.detach().item()),
         "mean_alpha": float(alpha_val.detach().item()),
     }

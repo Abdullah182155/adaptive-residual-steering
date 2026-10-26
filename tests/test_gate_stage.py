@@ -25,6 +25,7 @@ from src.training.losses import (
     TokenLabelStore,
     gate_total_loss,
     gate_bce_tokens,
+    gate_bce_tokens_with_live_fallback,
 )
 from src.training.trainer import train_s3_gate
 
@@ -182,6 +183,7 @@ class TestGateStage(unittest.TestCase):
         cfg.lambda_tok = 0.5
         cfg.lambda_l1_gate_v5 = 0.1
         cfg.gate_dom_margin = 0.0
+        cfg.lambda_nll_diff = 1.0
 
         nll_gated = torch.tensor([1.5], requires_grad=True)
         nll_ungated = torch.tensor([1.0])
@@ -189,12 +191,48 @@ class TestGateStage(unittest.TestCase):
         mean_alpha = torch.tensor(0.8, requires_grad=True)
 
         tot, metrics = gate_total_loss(nll_gated, nll_ungated, bce_tok, mean_alpha, cfg)
-        expected = 1.5 + 1.0 * (1.5 - 1.0) + 0.5 * 0.4 + 0.1 * 0.8
+        # Formula: nll_gated.mean() + lambda_dom * hinge + lambda_nll_diff * (nll_gated - nll_ungated).mean()
+        #          + lambda_tok * bce + lambda_l1 * mean_alpha
+        # hinge = relu(1.5 - 1.0 + 0.0) = 0.5
+        # nll_diff = (1.5 - 1.0) = 0.5
+        expected = 1.5 + 1.0 * 0.5 + 1.0 * 0.5 + 0.5 * 0.4 + 0.1 * 0.8
         self.assertAlmostEqual(float(tot.item()), expected, places=5)
         self.assertIn("loss_total", metrics)
         self.assertIn("loss_dom", metrics)
+        self.assertIn("loss_nll_diff", metrics)
         self.assertIn("loss_bce_tok", metrics)
         self.assertIn("mean_alpha", metrics)
+
+    def test_gate_bce_live_fallback_no_crash(self):
+        """gate_bce_tokens_with_live_fallback returns a finite tensor with no CF store entries."""
+        model = make_tiny_model(gate_task_gradient=True)
+        device = torch.device("cpu")
+        B, T = 2, 10
+        rows = [
+            {"split": "train", "qid": "train:9999", "n_shot": 0,
+             "input_ids": torch.zeros(T, dtype=torch.long),
+             "labels": torch.cat([torch.full((5,), -100, dtype=torch.long), torch.zeros(5, dtype=torch.long)])},
+            {"split": "train", "qid": "train:9998", "n_shot": 0,
+             "input_ids": torch.zeros(T, dtype=torch.long),
+             "labels": torch.cat([torch.full((5,), -100, dtype=torch.long), torch.zeros(5, dtype=torch.long)])},
+        ]
+        # Populate gate._alpha_for_aux with dummy tensors
+        for gate in model.gates.values():
+            gate._alpha_for_aux = torch.full((B, T, 1), 0.7, requires_grad=True)
+        empty_store = TokenLabelStore()
+        loss_mat_g = torch.rand(B, T - 1)
+        loss_mat_u = loss_mat_g + 0.05  # ungated is always slightly worse
+        # valid_mask has shape (B, T-1) matching shift_lbls in the trainer
+        valid_mask = torch.cat([
+            torch.zeros(B, 5, dtype=torch.bool),
+            torch.ones(B, 4, dtype=torch.bool),
+        ], dim=1)
+        result = gate_bce_tokens_with_live_fallback(
+            model, rows, empty_store, device,
+            loss_mat_g=loss_mat_g, loss_mat_u=loss_mat_u,
+            valid_mask=valid_mask, tau_u=0.005,
+        )
+        self.assertTrue(torch.isfinite(result))
 
     def test_tiny_model_gate_training_smoke(self):
         model = make_tiny_model(gate_task_gradient=True)

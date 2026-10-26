@@ -7,7 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [1.17.0] - 2026-10-25
+## [1.18.0] - 2026-10-26
+
+### Fix: Three Root-Cause Bugs Diagnosed from `exp_20261026` Kaggle Run
+
+Analysis of the October 26 medium-profile run revealed three independent failures causing (a) the token gate to diverge in the wrong direction, (b) the router to collapse entirely to K=3, and (c) the Full ARS arm to be identical to Router-only in every shot condition.
+
+#### Bug Fix 1 — S3 Gate NLL-Diff Loss Term Missing (`src/training/losses.py`, `src/configs/config.py`)
+- **Root cause:** `gate_total_loss` minimized `nll_gated.mean() + lambda_dom * hinge(...)`. The dominance hinge term penalizes rows where `nll_gated > nll_ungated`, but provides zero reward gradient when gating actively helps (`nll_gated < nll_ungated`). With ~90% of training rows having `nll_gated > nll_ungated` (K=3 constant routing + 2-epoch training), the gate could not learn selective suppression — only global alpha depression.
+- **Fix:** Added a direct NLL-diff minimization term `lambda_nll_diff * (nll_gated - nll_ungated).mean()` to `gate_total_loss`. This term is always active (no `relu`), providing explicit gradient signal that rewards the gate for reducing NLL relative to passthrough. New config field `lambda_nll_diff = 1.0`.
+- **Test updated:** `test_gate_total_loss_composition` in `tests/test_gate_stage.py` updated to reflect new formula.
+
+#### Bug Fix 2 — S3 Gate BCE Token Labels Always Zero (`src/training/losses.py`, `src/training/trainer.py`)
+- **Root cause:** The CF token label store is built from CF table entries keyed by shuffled dataset indices (e.g., `"train:3241"`). S3 training rows use sequential indices (`"train:0"`, `"train:1"`, ...). With `CF_N_AUDIT=200` drawing ~100 random indices from 7000 total, only ~1.4% of the 2000 S3 training rows overlap — effectively zero BCE signal in every batch.
+- **Fix:** Added `gate_bce_tokens_with_live_fallback()` in `losses.py`. When a row has no CF store hit, derives per-token binary labels on-the-fly from the current batch's `loss_mat_g` vs `loss_mat_u`: `label[t] = 1` if `loss_u[t] - loss_g[t] > tau_u` (gate improves that token). This provides a dense, always-available supervision signal. Updated `train_s3_gate` in `trainer.py` to use this function.
+- **New test:** `test_gate_bce_live_fallback_no_crash` in `tests/test_gate_stage.py`.
+
+#### Bug Fix 3 — Router K=3 Collapse: `router_c_size` Insufficient (`src/configs/config.py`)
+- **Root cause:** The K=3 tariff `router_c_size = 5e-3` was too small relative to the actual K=3 vs K=2 NLL gain gap (~3–5 × 10⁻³ per the calibration table). After applying the tariff, K=3 remained in the near-optimal set for most examples (`router_eps_tie = 0.01`), keeping the target distribution heavily K=3. The router never escaped this local minimum in 60 epochs.
+- **Fix:** Increased `router_c_size = 2.0e-2` (4× increase). At this level the K=3 subset pays a tariff of 0.020 per excess layer — larger than the typical K=3 vs K=2 gain gap of 0.003–0.005, reliably pushing K=3 out of the near-optimal set for most questions. Also increased `router_distill_epochs = 100` (from 60) to give the router sufficient time to converge to a K-diverse policy.
+
+
 
 ### 🏆 Landmark Run & M0–M10 Pipeline Completion: +14.00 pp Breakthrough on 8-Shot GSM8K (`exp_20261025_050311_ars_phi2_kaggle`)
 - **End-to-End M0–M10 Pipeline Validation:** Successfully executed the complete automated ARS pipeline on Kaggle dual Tesla T4: S0 (26-subset counterfactual table) $\to$ S1 (SteerNet subset training with layer-dropout) $\to$ S0b (on-policy sampling store) $\to$ S2 (catalog router distillation) $\to$ S3 (token gate training with dominance hinge) $\to$ S5 (deployment calibration contract) $\to$ Bench (5-arm benchmark evaluation across 0, 4, 8-shot).
