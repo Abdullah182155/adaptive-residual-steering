@@ -18,6 +18,13 @@ from src.utils.failure_policy import FatalContractError, get_manifest
 class Phi2WithRSC(nn.Module):
     """Wraps Phi-2 backbone with RSC forward hooks for steering, gating, and routing."""
 
+    def train(self, mode: bool = True):
+        base_training = getattr(self.base_model, "training", False) if hasattr(self, "base_model") and self.base_model is not None else None
+        super().train(mode)
+        if base_training is False and hasattr(self, "base_model") and self.base_model is not None:
+            self.base_model.eval()
+        return self
+
     def __init__(self, base_model, cfg: RSCConfig, device: Optional[torch.device] = None):
         super().__init__()
         self.base_model = base_model
@@ -1473,6 +1480,7 @@ class Phi2WithRSC(nn.Module):
         """eval(), no_grad context; saves/restores training flag, routing override,
         steer_scale, gate_freeze, router context mask. Used by table builder and RLOO."""
         was_training = self.training
+        base_was_training = getattr(self.base_model, "training", False) if hasattr(self, "base_model") and self.base_model is not None else False
         old_override = self._routing_override
         old_scale = self._steer_scale
         old_freeze = [(g, g._freeze_gate, g._freeze_gate_value) for g in self.gates.values()]
@@ -1484,6 +1492,8 @@ class Phi2WithRSC(nn.Module):
                 yield
         finally:
             self.train(was_training)
+            if hasattr(self, "base_model") and self.base_model is not None and not base_was_training:
+                self.base_model.eval()
             self._routing_override = old_override
             self._steer_scale = old_scale
             for g, freeze_flag, freeze_val in old_freeze:

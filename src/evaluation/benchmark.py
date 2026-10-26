@@ -146,7 +146,9 @@ def batch_size_for(cfg, shots: int) -> int:
 
 _STRICT_PATTERNS = (
     re.compile(r"####\s*\$?(-?\d[\d,]*\.?\d*)"),
+    re.compile(r"\\+boxed\{\s*\$?(-?\d[\d,]*\.?\d*)\s*\}"),
     re.compile(r"[Ff]inal\s+[Aa]nswer(?:\s+is)?\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
+    re.compile(r"[Tt]he\s+answer\s+is\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
 )
 _TRIM_PATTERNS = (
     r"####\s*-?\d[\d,]*\.?\d*",
