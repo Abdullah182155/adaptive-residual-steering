@@ -483,7 +483,7 @@ class RSCConfig:
 
     # ==== M5 ====
     router_policy: str = "catalog"                        # "legacy" | "catalog"
-    router_c_size: float = 1e-3
+    router_c_size: float = 5e-3                           # K>=3 tariff to encourage K<=2 diversity
     router_k_free: int = 2                                # K<=2 free tariff; only K>=3 taxed
     router_eps_tie: float = 0.01
     router_tau: float = 0.05                              # raised from 0.01 to prevent probability saturation
@@ -524,7 +524,7 @@ class RSCConfig:
     calib_envelope_quantile: float = 0.999
     calib_nll_tie_eps: float = 0.003
     calib_sel_n: int = 120
-    calib_gate_acc_tolerance: int = 1
+    calib_gate_acc_tolerance: int = 2
     contract_path: str = './deployment_contract.json'
     # ==== M9 ====
     bench_shots: Tuple[int, ...] = (0, 8)

@@ -50,7 +50,10 @@ def build_prompt(question: str, n_shot: int = 0) -> str:
     for i in range(min(n_shot, len(GSM8K_8SHOT_EXEMPLARS))):
         ex = GSM8K_8SHOT_EXEMPLARS[i]
         prompt += f"Question: {ex['q']}\nAnswer: Let's think step by step.\n{ex['a']}\n\n"
-    prompt += f"Question: {question}\nAnswer: Let's think step by step.\n"
+    if n_shot == 0:
+        prompt += f"Question: {question}\nAnswer: Let's think step by step and end with 'Final answer: [number]'.\n"
+    else:
+        prompt += f"Question: {question}\nAnswer: Let's think step by step.\n"
     return prompt
 
 def extract_and_verify_equations(text: str) -> Tuple[int, int, List[Tuple[str, bool]]]:

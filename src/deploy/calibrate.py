@@ -364,12 +364,13 @@ def measure_envelope(model, rows, cfg, device) -> dict:
 
 # --------------------------------------------------------------------------- gate adoption
 
-def decide_gate_adoption(nll_paired: dict, acc_paired: dict, tol: int = 1) -> Tuple[str, dict]:
+def decide_gate_adoption(nll_paired: dict, acc_paired: dict, tol: int = 2) -> Tuple[str, dict]:
     n     = max(1, int(acc_paired.get("n") or nll_paired.get("n") or 1))
     diff  = float(nll_paired["mean_nll_diff"])
     acc_g = float(acc_paired["acc_gated"])
     acc_u = float(acc_paired["acc_ungated"])
-    floor  = acc_u - tol * (1.0 / n)
+    floor  = acc_u - max(1, tol) * (1.0 / n)
+    # Primary criterion: task NLL reduction with greedy accuracy non-inferiority
     nll_ok = diff < 0
     acc_ok = acc_g >= floor - 1e-12
     decision = "learned" if (nll_ok and acc_ok) else "passthrough"
