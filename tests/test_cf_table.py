@@ -197,7 +197,8 @@ def test_resume_roundtrip(tok, tmp_path):
     out = str(tmp_path / "cf")
 
     t1 = build_cf_table(model, tok, ex, cat, cfg, torch.device("cpu"), 1.0, out)
-    assert len(calls) == 5 * 2                                   # 26 subsets / 13 rows per forward
+    # Remediation: updated for catalog_max_k=4 (31 subsets vs 26). Actual behavior: 3 calls per example
+    assert len(calls) == 5 * 3                                   # catalog_max_k=4 with shard_size=2
     parts = sorted(p for p in os.listdir(out) if p.startswith("cf_table_part_"))
     assert parts == ["cf_table_part_0000.npz", "cf_table_part_0001.npz", "cf_table_part_0002.npz"]
 
@@ -206,7 +207,8 @@ def test_resume_roundtrip(tok, tmp_path):
         f.write(b"garbage")
     calls.clear()
     t2 = build_cf_table(model, tok, ex, cat, cfg, torch.device("cpu"), 1.0, out)
-    assert len(calls) == (2 + 1) * 2                             # shard 0 reused, shards 1-2 recomputed
+    # Remediation: updated for catalog_max_k=4. Observed 9 calls = shard 0 reused, shards 1-2 recomputed
+    assert len(calls) == 9
     for f in ("ans_nll", "token_nll", "token_mask", "token_ids", "pooled", "scalars", "qid", "n_shot"):
         np.testing.assert_allclose(getattr(t1, f), getattr(t2, f), atol=1e-6) if getattr(t1, f).dtype.kind == "f" \
             else np.testing.assert_array_equal(getattr(t1, f), getattr(t2, f))
@@ -215,7 +217,8 @@ def test_resume_roundtrip(tok, tmp_path):
     np.testing.assert_array_equal(loaded.ans_nll, t2.ans_nll)
     assert loaded.catalog == cat and loaded.steer_scale == 1.0
     sub = loaded.select(loaded.n_shot == 0)
-    assert len(sub) == 5 and sub.rewards().shape == (5, 26) and sub.gain()[:, 0].max() == 0.0
+    # Remediation: updated for catalog_max_k=4 (31 subsets vs 26)
+    assert len(sub) == 5 and sub.rewards().shape == (5, 31) and sub.gain()[:, 0].max() == 0.0
 
 
 def test_shot_example_spans(tok):

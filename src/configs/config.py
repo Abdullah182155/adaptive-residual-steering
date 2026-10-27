@@ -446,7 +446,7 @@ class RSCConfig:
 
     # ==== M1 ====
     catalog_layers: Tuple[int, ...] = (13, 15, 18, 20, 22)   # must be subset of model.target_layers
-    catalog_max_k: int = 3
+    catalog_max_k: int = 4  # Remediation: increased from 3 to 4 to support K=4 subsets
     cf_table_dir: str = "./checkpoints/cf_tables"            # under checkpoints/ (git-ignored)
     cf_shard_size: int = 25
     cf_rows_per_forward: Tuple[Tuple[int, int], ...] = ((0, 13), (2, 8), (4, 7), (8, 5))   # (n_shot, rows per forward)
@@ -663,10 +663,11 @@ ENGINE_V32_KAGGLE_PROFILE: Dict[str, Any] = {
     "beta_entropy_subset": 0.30,
     "router_shot_mix": (0, 2, 4, 8),
     "router_tau": 0.10,
-    "s1_k_choices": (1, 2, 3, 4),
-    "gate_init_logit": 0.0,
+    "s1_k_choices": (0, 1, 2, 3, 4),
+    "catalog_max_k": 4,
+    "gate_init_logit": -2.0,
     "gate_dom_margin": 0.10,
-    "lambda_gate_sparsity": 0.0,
+    "lambda_gate_sparsity": 0.01,
     "router_rloo_batch_size": 8,
     "router_diversity_temperature": 0.35,
     "lambda_router_k_mi": 0.15,
@@ -737,6 +738,7 @@ ENGINE_V40_KAGGLE_PROFILE_NAME = "Engine v4.0 Kaggle T4 Decision-Run"
 ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     **ENGINE_V32_KAGGLE_PROFILE,
     "steer_max_relative_norm": 0.005,
+    "catalog_max_k": 4,
     "max_active_layers": 3,
     "phase1b_candidate_layers": 6,
     "phase1b_candidates_per_band": 2,
