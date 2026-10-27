@@ -326,10 +326,24 @@ def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
     if getattr(args, "batch_size", None):
         cfg.batch_size = args.batch_size
     val_n = getattr(args, "gate_sel_n", None) or getattr(cfg, "gate_sel_n", None) or 100
-    val_rows = _dataset_to_rows(eval_data, n=min(len(eval_data), val_n), split="eval", qid_prefix="eval", n_shot=0)
+    # Mixed-shot val split: half 0-shot, half 4-shot so gate adoption reflects multi-shot quality.
+    # A 0-shot-only val split adopted a gate that regressed at 8-shot (Full ARS < Fixed, exp_20261026).
+    val_n_per_shot = max(1, min(len(eval_data), val_n) // 2)
+    val_rows_0 = _dataset_to_rows(eval_data, n=val_n_per_shot, split="eval", qid_prefix="eval", n_shot=0)
+    val_rows_4 = _dataset_to_rows(eval_data, n=val_n_per_shot, split="eval", qid_prefix="eval", n_shot=4)
+    val_rows = val_rows_0 + val_rows_4
+
     train_n = getattr(args, "gate_train_n", None) or getattr(cfg, "gate_train_n", None) or len(train_data)
-    train_rows = _dataset_to_rows(train_data, n=train_n, split="train", qid_prefix="train", n_shot=0)
-    print(f"[S3] Gate training on n={len(train_rows)} rows (epochs={cfg.gate_epochs}, bs={cfg.batch_size}), val on n={len(val_rows)} rows")
+    # Mixed-shot training: equal 0-shot and 4-shot rows.
+    # Gate trained only on 0-shot learned suppression patterns that backfired at 8-shot
+    # (Full ARS -2pp vs Router-only at 8-shot in exp_20261026).
+    train_n_per_shot = max(1, train_n // 2)
+    train_rows_0 = _dataset_to_rows(train_data, n=train_n_per_shot, split="train", qid_prefix="train", n_shot=0)
+    train_rows_4 = _dataset_to_rows(train_data, n=train_n_per_shot, split="train", qid_prefix="train", n_shot=4)
+    import random as _stdlib_random
+    train_rows = train_rows_0 + train_rows_4
+    _stdlib_random.Random(cfg.seed + 13).shuffle(train_rows)
+    print(f"[S3] Gate training on n={len(train_rows)} rows (0-shot:{len(train_rows_0)} + 4-shot:{len(train_rows_4)}, epochs={cfg.gate_epochs}, bs={cfg.batch_size}), val on n={len(val_rows)} rows (0+4-shot mixed)")
     results = train_s3_gate(model, tok, train_rows, val_rows, cfg, device, table=table)
     save_steer_weights(model, ckpt, cfg=cfg, phase="s3_gate", prefixes=("gates.",))
     return {"ckpt": ckpt, "results": results}

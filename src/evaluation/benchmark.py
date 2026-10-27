@@ -274,8 +274,10 @@ def _generate_batch_full(
                         eos_token_id=tokenizer.eos_token_id,
                         stopping_criteria=stop,
                         do_sample=False,
-                        repetition_penalty=1.1,
-                        no_repeat_ngram_size=6,
+                        # ISSUE-12 fix: removed repetition_penalty=1.1 and no_repeat_ngram_size=6.
+                        # These flags penalised recurring arithmetic tokens and could ban 6-token
+                        # spans including "Final answer:" — an asymmetric confound vs verifier.py
+                        # which already has the fix. Applies symmetrically across all benchmark arms.
                         use_cache=True,
                     )
             finally:
@@ -541,7 +543,7 @@ def cache_fingerprint(contract: dict, cfg) -> str:
         contract.get("k_scale_mode"),
         cfg.model_name,
         int(cfg.bench_max_new_tokens),
-        "rp1.1-nr6",
+        "rp-removed-issue12",
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
