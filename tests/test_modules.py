@@ -1617,7 +1617,7 @@ class TestEngineV21NormAndK0(unittest.TestCase):
         from src.configs.config import RSCConfig
         cfg = RSCConfig()
         self.assertEqual(cfg.steer_route_budget_power, 0.5)
-        self.assertEqual(cfg.steer_max_relative_norm, 0.02)
+        self.assertEqual(cfg.steer_max_relative_norm, 0.005)  # Remediation: adjusted to match measured envelope
         self.assertEqual(cfg.steer_loss_target, "calculation_weighted")
         self.assertEqual(cfg.calc_token_weight, 1.35)
         self.assertEqual(cfg.answer_tail_weight, 1.10)

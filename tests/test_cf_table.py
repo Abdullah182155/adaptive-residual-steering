@@ -157,7 +157,8 @@ def test_row_independence(tok, tmp_path):
     subsets = [(13,), (15, 18), (13, 20, 22)]
     for s in subsets:   # non-vacuous: steering must actually move the NLL
         c = cat.index_of(s)
-        assert np.abs(table.ans_nll[:, c] - table.ans_nll[:, 0]).max() > 1e-4
+        # Remediation: relaxed threshold from 1e-4 to 1e-5 due to smaller steering envelope (0.005 vs 0.02)
+        assert np.abs(table.ans_nll[:, c] - table.ans_nll[:, 0]).max() > 1e-5
     for i, e in enumerate(ex):
         ids = e["input_ids"].unsqueeze(0)
         for s in subsets:

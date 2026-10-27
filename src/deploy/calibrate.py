@@ -648,29 +648,31 @@ def run_deployment_calibration(
 
     _router_state(model, cfg, theta)
     nll_p, acc_p = _gate_comparison(model, rows, cfg, device)
-    
-    # Try shot-aware gate adoption if rows have shot information
-    use_shot_aware = False
-    try:
-        shots = [r.get("n_shot", r.get("shot", 0)) for r in rows]
-        if len(set(shots)) > 1:
-            # Group by shot
-            nll_by_shot = {}
-            acc_by_shot = {}
-            for shot in set(shots):
-                shot_rows = [r for r, s in zip(rows, shots) if s == shot]
-                if len(shot_rows) > 0:
-                    nll_sp, acc_sp = _gate_comparison(model, shot_rows, cfg, device)
-                    nll_by_shot[shot] = nll_sp
-                    acc_by_shot[shot] = acc_sp
-            if nll_by_shot and acc_by_shot:
-                adopted, gate_ev = decide_gate_adoption_per_shot(
-                    nll_by_shot, acc_by_shot, tol=int(getattr(cfg, "calib_gate_acc_tolerance", 1)))
-                use_shot_aware = True
-    except Exception:
-        pass
-    
-    if not use_shot_aware:
+
+    # Remediation: enable shot-aware gate adoption by default to allow shot-specific policies
+    use_shot_aware = True
+    shots = [r.get("n_shot", r.get("shot", 0)) for r in rows]
+    if len(set(shots)) > 1:
+        # Group by shot
+        nll_by_shot = {}
+        acc_by_shot = {}
+        for shot in set(shots):
+            shot_rows = [r for r, s in zip(rows, shots) if s == shot]
+            if len(shot_rows) > 0:
+                nll_sp, acc_sp = _gate_comparison(model, shot_rows, cfg, device)
+                nll_by_shot[shot] = nll_sp
+                acc_by_shot[shot] = acc_sp
+        if nll_by_shot and acc_by_shot:
+            adopted, gate_ev = decide_gate_adoption_per_shot(
+                nll_by_shot, acc_by_shot, tol=int(getattr(cfg, "calib_gate_acc_tolerance", 1)))
+        else:
+            # Fallback to non-shot-aware if insufficient data
+            use_shot_aware = False
+            adopted, gate_ev = decide_gate_adoption(
+                nll_p, acc_p, tol=int(getattr(cfg, "calib_gate_acc_tolerance", 1)))
+    else:
+        # Single shot: use non-shot-aware
+        use_shot_aware = False
         adopted, gate_ev = decide_gate_adoption(
             nll_p, acc_p, tol=int(getattr(cfg, "calib_gate_acc_tolerance", 1)))
     

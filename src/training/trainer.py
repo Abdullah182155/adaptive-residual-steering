@@ -4335,11 +4335,18 @@ def train_s3_gate(
             batch_rows = [train_rows[i] for i in batch_idx]
             if epoch == 0 and m == 0 and store is not None:
                 from src.utils.keys import canonical_token_key
-                matched_cnt = sum(
-                    1 for r in batch_rows
-                    if canonical_token_key(r.get("split", "train"), r.get("qid", ""), r.get("n_shot", r.get("shot", 0))) in store
-                )
+                matched_cnt = 0
+                sample_keys = []
+                for r in batch_rows:
+                    key = canonical_token_key(r.get("split", "train"), r.get("qid", ""), r.get("n_shot", r.get("shot", 0)))
+                    if key in store:
+                        matched_cnt += 1
+                    if len(sample_keys) < 3:
+                        sample_keys.append(key)
                 print(f"\n  [S3 Diagnostics] First batch token label matches: {matched_cnt}/{len(batch_rows)} rows (store size={len(store)})")
+                if matched_cnt == 0:
+                    print(f"  [S3 Diagnostics] Sample row keys: {sample_keys}")
+                    print(f"  [S3 Diagnostics] Sample store keys: {list(store.keys())[:3]}")
             batch = collate_pad(batch_rows, pad_id)
             ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)

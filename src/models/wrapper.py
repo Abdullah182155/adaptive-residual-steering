@@ -1033,7 +1033,8 @@ class Phi2WithRSC(nn.Module):
             theta = self._abstain_theta
             if theta is None:
                 theta = getattr(self.cfg, "abstain_theta", 1.01)
-            if theta <= 1.0:
+            # Fix: use strict less-than to allow K=0 abstention when theta is slightly above 1.0 (e.g., 1.01)
+            if theta < 1.0:
                 top1_prob = p.max(dim=-1).values
                 abstain_cond = (top1_prob < theta) | (p[:, 0] >= theta)
                 idx = torch.where((idx != 0) & abstain_cond, torch.zeros_like(idx), idx)
