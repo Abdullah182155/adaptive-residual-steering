@@ -70,6 +70,7 @@ class Phi2WithRSC(nn.Module):
         self._prompt_level_selected_count = [0] * len(self.target_layers)
         self._prompt_level_total = 0
         self._routing_override = None
+        self._steering_cosine = None  # Steering vector geometry diagnostic
         # Set after Phase 1B.  A router may only learn/deploy routes composed
         # of layers that survived the Phase-1 safety contract and received
         # co-adaptation updates.  ``None`` preserves the complete catalog for
@@ -303,6 +304,12 @@ class Phi2WithRSC(nn.Module):
                             * steer_mask.to(alpha.dtype).unsqueeze(-1)
                         )
                         h_new = h_fp + delta_injected
+                        
+                        # Steering vector geometry: track cosine similarity for diagnostic
+                        if valid.any():
+                            cosine = F.cosine_similarity(h_fp[valid], delta[valid], dim=-1, eps=1e-6)
+                            self._steering_cosine = cosine.mean()
+                        
                         record = getattr(wrapper, "_record_envelope", None)
                         if record is not None:
                             record(layer_pos, delta_injected.detach(), h_fp, steer_mask, h_new)
@@ -1160,6 +1167,13 @@ class Phi2WithRSC(nn.Module):
                     prev = rn.get(int(layer_idx))
                     val_flat = valid_rel.detach().cpu()
                     rn[int(layer_idx)] = torch.cat([prev, val_flat]) if prev is not None else val_flat
+                
+                # Steering vector geometry: cosine similarity with base hidden state
+                if valid_rel.numel() > 0 and hasattr(self, '_steering_cosine') and self._steering_cosine is not None:
+                    cn = self.guard_state.setdefault("cosine_sim", {})
+                    prev_cos = cn.get(int(layer_idx))
+                    cos_val = self._steering_cosine.detach().cpu().unsqueeze(0) if self._steering_cosine.dim() == 0 else self._steering_cosine.detach().cpu()
+                    cn[int(layer_idx)] = torch.cat([prev_cos, cos_val]) if prev_cos is not None else cos_val
 
     # ---- M6b: route prediction / canonical keys ----
     def _clear_decode_caches(self):

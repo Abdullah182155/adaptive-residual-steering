@@ -199,11 +199,34 @@ def default_catalog(target_layers: Sequence[int], cfg):
 
 
 def select_rows(eval_data, cfg) -> list:
-    """Deterministic dedicated selection split (n = cfg.calib_sel_n) drawn from eval_data."""
+    """Stratified difficulty selection split (n = cfg.calib_sel_n) drawn from eval_data.
+    
+    Samples balanced across difficulty levels (2-step, 3-step, 5+ step reasoning)
+    to make gate adoption decisions statistically robust.
+    """
     n   = min(int(cfg.calib_sel_n), len(eval_data))
     rng = random.Random(int(cfg.seed) + 8080)
-    idx = sorted(rng.sample(range(len(eval_data)), n))
-    return [eval_data[i] for i in idx]
+    
+    # Categorize by number of reasoning steps
+    buckets = {"easy": [], "medium": [], "hard": []}
+    for idx, ex in enumerate(eval_data):
+        steps = len(ex.get("steps_list", [])) if isinstance(ex, dict) else 0
+        bucket = "easy" if steps <= 2 else "medium" if steps <= 4 else "hard"
+        buckets[bucket].append(idx)
+    
+    # Sample proportionally from each bucket (at least 1 each)
+    per_bucket = max(1, n // max(1, len(buckets)))
+    idxs = []
+    for values in buckets.values():
+        idxs.extend(rng.sample(values, min(per_bucket, len(values))))
+    
+    # Fill remainder from remaining examples
+    if len(idxs) < n:
+        remaining = sorted(set(range(len(eval_data))) - set(idxs))
+        rng.shuffle(remaining)
+        idxs.extend(remaining[: n - len(idxs)])
+    
+    return [eval_data[i] for i in sorted(idxs[:n])]
 
 
 def _ids_hash(rows) -> str:
