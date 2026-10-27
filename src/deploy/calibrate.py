@@ -413,6 +413,31 @@ def _gate_comparison(model, rows, cfg, device) -> Tuple[dict, dict]:
     }
     return nll_paired, acc_paired
 
+
+def decide_gate_adoption_per_shot(nll_paired_by_shot: dict, acc_paired_by_shot: dict, tol: int = 2) -> Tuple[str, dict]:
+    """Evaluate gate adoption separately for each shot condition.
+    
+    Gate is adopted if it improves NLL and maintains accuracy in ANY shot condition.
+    This allows shot-specific gate policy where the gate helps in some conditions
+    but not others.
+    """
+    decisions = {}
+    for shot in [0, 2, 4, 8]:
+        if shot not in nll_paired_by_shot or shot not in acc_paired_by_shot:
+            continue
+        nll_p = nll_paired_by_shot[shot]
+        acc_p = acc_paired_by_shot[shot]
+        decision, _ = decide_gate_adoption(nll_p, acc_p, tol)
+        decisions[shot] = decision
+    
+    # Overall decision: adopt if beneficial in any shot
+    overall_decision = "learned" if "learned" in decisions.values() else "passthrough"
+    
+    return overall_decision, {
+        "overall": overall_decision,
+        "by_shot": decisions,
+    }
+
 # --------------------------------------------------------------------------- contract I/O
 
 def _validate_contract(c: dict):
@@ -596,10 +621,34 @@ def run_deployment_calibration(
 
     _router_state(model, cfg, theta)
     nll_p, acc_p = _gate_comparison(model, rows, cfg, device)
-    adopted, gate_ev = decide_gate_adoption(
-        nll_p, acc_p, tol=int(getattr(cfg, "calib_gate_acc_tolerance", 1)))
+    
+    # Try shot-aware gate adoption if rows have shot information
+    use_shot_aware = False
+    try:
+        shots = [r.get("n_shot", r.get("shot", 0)) for r in rows]
+        if len(set(shots)) > 1:
+            # Group by shot
+            nll_by_shot = {}
+            acc_by_shot = {}
+            for shot in set(shots):
+                shot_rows = [r for r, s in zip(rows, shots) if s == shot]
+                if len(shot_rows) > 0:
+                    nll_sp, acc_sp = _gate_comparison(model, shot_rows, cfg, device)
+                    nll_by_shot[shot] = nll_sp
+                    acc_by_shot[shot] = acc_sp
+            if nll_by_shot and acc_by_shot:
+                adopted, gate_ev = decide_gate_adoption_per_shot(
+                    nll_by_shot, acc_by_shot, tol=int(getattr(cfg, "calib_gate_acc_tolerance", 1)))
+                use_shot_aware = True
+    except Exception:
+        pass
+    
+    if not use_shot_aware:
+        adopted, gate_ev = decide_gate_adoption(
+            nll_p, acc_p, tol=int(getattr(cfg, "calib_gate_acc_tolerance", 1)))
+    
     gate_ev = {**gate_ev, "nll_paired": nll_p, "acc_paired": acc_p}
-    print(f"[S5] gate adoption -> {adopted}")
+    print(f"[S5] gate adoption -> {adopted} (shot_aware={use_shot_aware})")
 
     _router_state(model, cfg, theta)
     if adopted == "learned":

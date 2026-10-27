@@ -27,6 +27,7 @@ def build_soft_targets(
     sizes: Optional[torch.Tensor] = None,
     k_free: int = 2,
     c_size: float = 0.0,
+    shots: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute soft distillation target distribution q and near-optimal mask.
 
@@ -36,6 +37,7 @@ def build_soft_targets(
     sizes: (C,) integer or float tensor of subset sizes |S| for each class
     k_free: number of layers exempt from size penalty (default 2: K<=2 free)
     c_size: penalty per layer exceeding k_free
+    shots: (N,) integer tensor of shot counts for shot-aware tariff (optional)
 
     Returns:
         q: (N, C) target probabilities
@@ -45,7 +47,25 @@ def build_soft_targets(
     if sizes is not None and c_size > 0.0:
         sizes_t = sizes.to(rewards.device).float()
         excess_k = torch.clamp(sizes_t - float(k_free), min=0.0)
-        rewards = rewards - float(c_size) * excess_k.unsqueeze(0)
+        
+        # Shot-aware tariff: 0-shot needs stronger K=1/2 incentive
+        if shots is not None:
+            shots_t = shots.to(rewards.device).float()
+            # 0-shot: 3.0e-2, 2-shot: 2.0e-2, 4-shot: 1.5e-2, 8-shot: 1.0e-2
+            shot_multiplier = torch.where(
+                shots_t == 0, 3.0,
+                torch.where(
+                    shots_t == 2, 2.0,
+                    torch.where(
+                        shots_t == 4, 1.5,
+                        1.0  # 8-shot or other
+                    )
+                )
+            )
+            c_size_per_row = float(c_size) * shot_multiplier
+            rewards = rewards - c_size_per_row.unsqueeze(1) * excess_k.unsqueeze(0)
+        else:
+            rewards = rewards - float(c_size) * excess_k.unsqueeze(0)
     best = rewards.max(dim=1, keepdim=True).values
     near_opt = rewards >= (best - eps - _TIE_TOL)
     logits = (rewards - best) / tau                       # <= 0, numerically stable
@@ -303,6 +323,8 @@ def distill_router(
     manifest = _resolve_manifest(manifest)
     if getattr(router, "catalog_head", None) is None:
         raise ValueError("router has no catalog_head; construct JointLayerRouter(..., n_catalog=C)")
+    # Allow config to override the patience kwarg so it is checkpoint-visible.
+    patience = int(getattr(cfg, "router_distill_patience", patience))
 
     rewards_np, pooled_np, scalars_np, n_shot_np, qid_np = _table_arrays(table)
     N, C = rewards_np.shape
@@ -335,6 +357,8 @@ def distill_router(
 
     c_size = float(getattr(cfg, "router_c_size", 0.0))
     k_free = int(getattr(cfg, "router_k_free", 2))
+    # Pass shot information for shot-aware tariff
+    shots_t = torch.from_numpy(n_shot_np).to(device)
     q_all, near_all = build_soft_targets(
         rewards_t,
         eps=float(cfg.router_eps_tie),
@@ -342,6 +366,7 @@ def distill_router(
         sizes=sizes_t,
         k_free=k_free,
         c_size=c_size,
+        shots=shots_t,
     )
     multi_all = near_all.sum(dim=1) >= 2
     ref_np = _reference_rows(qid_np, n_shot_np)

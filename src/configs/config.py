@@ -307,8 +307,9 @@ class RSCConfig:
     router_tariff_max_positive_gain_fraction: float = 0.50
     # RC-2 fix: beta_entropy_k 0.03->0.10, beta_entropy_subset 0.02->0.05
     # The entropy bonus must be large enough to overcome k_cost under genuine reward noise.
-    beta_entropy_k: float = 0.10
-    beta_entropy_subset: float = 0.05
+    # Further increased to 0.20/0.10 to strengthen K diversity incentive
+    beta_entropy_k: float = 0.20
+    beta_entropy_subset: float = 0.10
     router_balance_weight: float = 0.01  # was 0.10 — layer_dropout already prevents monopoly
     router_tariff_k1_free: bool = True   # Engine v4.2: K=1 is free capacity (zero tariff)
     router_min_active_k_fraction: float = 0.75 # Engine v4.2: at least 75% reasoning tokens steer
@@ -475,7 +476,7 @@ class RSCConfig:
     s1_unl_every_n_steps: int = 4
     s1_calc_token_weight: float = 1.75
     s1_val_onpolicy_n: int = 120
-    s1_k_choices: Tuple[int, ...] = (1, 2, 3)
+    s1_k_choices: Tuple[int, ...] = (2, 3)  # Focus on K=2/K=3 to improve complementarity
     s1_save_path: str = "./checkpoints/s1_steernet.pt"
     s1_final_gen_n: int = 240
     s1_ablation_epochs: int = 1
@@ -486,12 +487,13 @@ class RSCConfig:
     router_c_size: float = 2.0e-2                          # K>=3 tariff to encourage K<=2 diversity (raised from 5e-3: prior value was insufficient to overcome K=3 gain gap of ~3-5e-3 NLL units)
     router_k_free: int = 2                                # K<=2 free tariff; only K>=3 taxed
     router_eps_tie: float = 0.01
-    router_tau: float = 0.05                              # raised from 0.01 to prevent probability saturation
+    router_tau: float = 0.02                              # lowered from 0.05: sharper target distribution for cleaner supervision signal
     router_lambda_bal: float = 0.02
     router_lambda_cons: float = 0.1
     router_distill_epochs: int = 100                     # raised from 60: more epochs for router to escape K=3 local minimum under increased c_size tariff
-    router_distill_lr: float = 1e-3
+    router_distill_lr: float = 3e-4                      # lowered from 1e-3: reduces val_kl oscillation that was triggering early stopping at epoch 40
     router_distill_wd: float = 1e-2
+    router_distill_patience: int = 20                    # raised from hardcoded 12: gives router more time to escape KL plateaus
     router_distill_val_frac: float = 0.2
     router_catalog_save_path: str = "./checkpoints/router_catalog_v5.pt"
     router_loss_mode: str = "catalog_distill"             # "catalog_distill" | "rloo_legacy"
@@ -507,11 +509,11 @@ class RSCConfig:
     gate_init_logit: float = 0.0                          # alpha_init = sigmoid(0) = 0.5 (neutral, max gradient)
     gate_loss_mode: str = "v5"                            # "v5" | "legacy"
     lambda_dom: float = 1.0
-    lambda_tok: float = 1.0                               # raised from 0.3 for decisive token BCE supervision
+    lambda_tok: float = 0.1                               # lowered from 1.0: at 1.0 live BCE term (~7.9) overwhelmed nll_gated (~1.1) by 8x, drowning the NLL-diff signal; 0.1 brings BCE (~0.8) to NLL scale
     lambda_l1_gate_v5: float = 0.005
-    lambda_nll_diff: float = 1.0                         # direct NLL-diff minimisation: drives gate to reduce nll_gated below nll_ungated (complements dominance hinge which only penalises positive gaps)
+    lambda_nll_diff: float = 10.0                        # direct NLL-diff minimisation: drives gate to reduce nll_gated below nll_ungated (complements dominance hinge which only penalises positive gaps) - increased from 1.0 to 10.0 to strengthen gate learning signal
     gate_tau_u: float = 0.005
-    gate_dom_margin: float = 0.01                         # slight margin to strictly enforce dominance
+    gate_dom_margin: float = 0.05                         # increased from 0.01 to 0.05 to enforce meaningful dominance
     gate_epochs: int = 3
     gate_lr: float = 2e-3                                 # raised from 1e-3 for faster convergence
     gate_label_row_frac: float = 0.5
