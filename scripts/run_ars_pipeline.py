@@ -115,14 +115,20 @@ def _slice_dataset(ds, n: int):
             return list(ds)[:limit]
 
 
-def _dataset_to_rows(ds, n: int = None, split: str = "train", qid_prefix: str = None, n_shot: int = 0):
+def _dataset_to_rows(ds, n: int = None, split: str = "train", qid_prefix: str = None, n_shot: int = 0, indices: list = None):
     """Convert dataset or slice into unpadded 1D row dicts for SteerNet and Gate training."""
     if ds is None:
         return []
     rows = []
-    limit = len(ds) if n is None else min(n, len(ds))
     prefix = qid_prefix if qid_prefix is not None else split
-    for i in range(limit):
+    if indices is not None:
+        idx_list = [i for i in indices if 0 <= i < len(ds)]
+        if n is not None:
+            idx_list = idx_list[:n]
+    else:
+        limit = len(ds) if n is None else min(n, len(ds))
+        idx_list = range(limit)
+    for i in idx_list:
         ex = ds[i]
         if isinstance(ex, dict) and "attention_mask" in ex:
             keep = ex["attention_mask"].bool() if hasattr(ex["attention_mask"], "bool") else [bool(x) for x in ex["attention_mask"]]
@@ -334,12 +340,30 @@ def stage_s3(model, tok, train_data, eval_data, cfg, device, state, args):
     val_rows = val_rows_0 + val_rows_4
 
     train_n = getattr(args, "gate_train_n", None) or getattr(cfg, "gate_train_n", None) or len(train_data)
-    # Mixed-shot training: equal 0-shot and 4-shot rows.
-    # Gate trained only on 0-shot learned suppression patterns that backfired at 8-shot
-    # (Full ARS -2pp vs Router-only at 8-shot in exp_20261026).
     train_n_per_shot = max(1, train_n // 2)
-    train_rows_0 = _dataset_to_rows(train_data, n=train_n_per_shot, split="train", qid_prefix="train", n_shot=0)
-    train_rows_4 = _dataset_to_rows(train_data, n=train_n_per_shot, split="train", qid_prefix="train", n_shot=4)
+
+    # Prioritize table indices so S3 gate trains with ground-truth CF token supervision
+    table_train_indices = []
+    if table is not None and hasattr(table, "qid"):
+        for q in table.qid:
+            q_str = str(q)
+            if q_str.startswith("train:"):
+                try:
+                    idx_val = int(q_str.split(":")[-1])
+                    if idx_val not in table_train_indices:
+                        table_train_indices.append(idx_val)
+                except ValueError:
+                    pass
+
+    if table_train_indices:
+        table_set = set(table_train_indices)
+        remaining = [i for i in range(len(train_data)) if i not in table_set]
+        target_indices = table_train_indices + remaining[:max(0, train_n_per_shot - len(table_train_indices))]
+        train_rows_0 = _dataset_to_rows(train_data, n=train_n_per_shot, split="train", qid_prefix="train", n_shot=0, indices=target_indices)
+        train_rows_4 = _dataset_to_rows(train_data, n=train_n_per_shot, split="train", qid_prefix="train", n_shot=4, indices=target_indices)
+    else:
+        train_rows_0 = _dataset_to_rows(train_data, n=train_n_per_shot, split="train", qid_prefix="train", n_shot=0)
+        train_rows_4 = _dataset_to_rows(train_data, n=train_n_per_shot, split="train", qid_prefix="train", n_shot=4)
     import random as _stdlib_random
     train_rows = train_rows_0 + train_rows_4
     _stdlib_random.Random(cfg.seed + 13).shuffle(train_rows)

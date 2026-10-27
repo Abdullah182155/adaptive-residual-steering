@@ -821,10 +821,15 @@ class TokenLabelStore:
             for k, v in data.items():
                 if isinstance(k, tuple):
                     ck = canonical_token_key(*k)
+                elif isinstance(k, str) and ":" in k:
+                    ck = k
                 else:
                     ck = canonical_token_key("train", k, 0)
                 self._data[ck] = v
                 self._data[k] = v  # preserve raw key for backward compatibility
+
+    def keys(self):
+        return self._data.keys()
 
     def get(self, key: Any) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         from src.utils.keys import canonical_token_key
@@ -832,6 +837,8 @@ class TokenLabelStore:
             return self._data[key]
         if isinstance(key, tuple):
             ck = canonical_token_key(*key)
+        elif isinstance(key, str) and ":" in key:
+            ck = key
         else:
             ck = canonical_token_key("train", key, 0)
         return self._data.get(ck)

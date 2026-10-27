@@ -509,7 +509,7 @@ class RSCConfig:
     gate_task_gradient: bool = False
 
     # ==== M7 ====
-    gate_init_logit: float = -2.0                         # alpha_init = sigmoid(-2) ≈ 0.12 (sparse init to encourage gate suppression)
+    gate_init_logit: float = 0.0                         # alpha_init = sigmoid(-2) ≈ 0.12 (sparse init to encourage gate suppression)
     gate_loss_mode: str = "v5"                            # "v5" | "legacy"
     lambda_dom: float = 1.0
     lambda_tok: float = 0.1                               # lowered from 1.0: at 1.0 live BCE term (~7.9) overwhelmed nll_gated (~1.1) by 8x, drowning the NLL-diff signal; 0.1 brings BCE (~0.8) to NLL scale
@@ -664,9 +664,9 @@ ENGINE_V32_KAGGLE_PROFILE: Dict[str, Any] = {
     "router_shot_mix": (0, 2, 4, 8),
     "router_tau": 0.10,
     "s1_k_choices": (0, 1, 2, 3, 4),
-    "gate_init_logit": -2.0,
+    "gate_init_logit": 0.0,
     "gate_dom_margin": 0.10,
-    "lambda_gate_sparsity": 0.01,
+    "lambda_gate_sparsity": 0.0,
     "router_rloo_batch_size": 8,
     "router_diversity_temperature": 0.35,
     "lambda_router_k_mi": 0.15,
@@ -767,8 +767,8 @@ ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     "gate_target_sparsity": 0.25,
     "lambda_gate_budget": 0.15,
     "lambda_l1_gate": 0.01,
-    "lambda_gate_sparsity": 0.01,
-    "gate_init_logit": -2.0,
+    "lambda_gate_sparsity": 0.0,
+    "gate_init_logit": 0.0,
     "gate_dom_margin": 0.10,
     "calc_token_weight": 1.75,
     "skip_adaptive_phases_when_phase1_fails": False,
