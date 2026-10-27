@@ -169,7 +169,8 @@ class TestRunArm(unittest.TestCase):
             on      = bool(model.guards.get("enabled"))
             texts   = [("base:" if is_base else "steered:") + p for p in prompts]
             trip    = [(not is_base) and on and p == "p1" for p in prompts]
-            return texts, trip
+            timings = [0.5] * len(prompts)
+            return texts, trip, timings
 
         self.p_gen   = mock.patch.object(B, "_generate_batch_full", side_effect=fake_gen)
         self.p_route = mock.patch.object(B, "predict_routes", return_value=[(), (10,), (12,)])

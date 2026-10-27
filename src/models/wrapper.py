@@ -188,7 +188,12 @@ class Phi2WithRSC(nn.Module):
                         h_fp = h.float()
                         mask = wrapper._valid_mask_for(h_fp)
                         selected, route_prob = wrapper._select_layer(layer_idx, layer_pos, h_fp, mask)
+                        # K=0 short-circuit: if no layers selected, skip all steering computation
                         if not selected.any():
+                            g._alpha_for_aux, g.last_alpha, g._valid_mask = None, None, None
+                            return output
+                        # K=0 route short-circuit: if total K=0 for the entire route, skip steering
+                        if wrapper._active_k_realized is not None and wrapper._active_k_realized.max() == 0:
                             g._alpha_for_aux, g.last_alpha, g._valid_mask = None, None, None
                             return output
                         if not wrapper._route_is_catalog:

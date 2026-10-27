@@ -11,6 +11,7 @@ class RSCConfig:
     model_name: str = "microsoft/phi-2"
     # Layer positions are intentionally discovered from the backbone depth.
     # The router decides which candidates to use for each forward pass and selects at most max_active_layers.
+    # K=0 (identity/no-op) is always available via the empty subset; max_active_layers=4 allows K in {0,1,2,3,4}.
     max_active_layers: int = 4
     # Canonical Phi-2 candidate blocks.  Earlier code derived a percentage
     # range and silently substituted L9 for the specified L17.  Candidate

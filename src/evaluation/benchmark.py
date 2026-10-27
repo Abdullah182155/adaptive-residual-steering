@@ -149,6 +149,9 @@ _STRICT_PATTERNS = (
     re.compile(r"\\+boxed\{\s*\$?(-?\d[\d,]*\.?\d*)\s*\}"),
     re.compile(r"[Ff]inal\s+[Aa]nswer(?:\s+is)?\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
     re.compile(r"[Tt]he\s+answer\s+is\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
+    re.compile(r"[Aa]nswer\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
+    re.compile(r"[Rr]esult\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
+    re.compile(r"[Ss]olution\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
 )
 _TRIM_PATTERNS = (
     r"####\s*-?\d[\d,]*\.?\d*",
@@ -227,9 +230,9 @@ def _generate_batch_full(
     max_new_tokens: int = 512,
     batch_size: int = 8,
     desc: str = "gen",
-) -> Tuple[List[str], List[bool]]:
+) -> Tuple[List[str], List[bool], List[float]]:
     n = len(prompts)
-    texts, tripped = [""] * n, [False] * n
+    texts, tripped, timings = [""] * n, [False] * n, [0.0] * n
     order = sorted(range(n), key=lambda i: len(prompts[i]))
     model.eval()
     with _left_padding(tokenizer):
@@ -266,6 +269,8 @@ def _generate_batch_full(
                     model.set_prompt_shield_mask(None)
 
             try:
+                torch.cuda.synchronize() if device.type == "cuda" else None
+                t0 = time.time()
                 with torch.no_grad():
                     out = model.generate(
                         **enc,
@@ -280,6 +285,8 @@ def _generate_batch_full(
                         # which already has the fix. Applies symmetrically across all benchmark arms.
                         use_cache=True,
                     )
+                torch.cuda.synchronize() if device.type == "cuda" else None
+                elapsed = time.time() - t0
             finally:
                 if hasattr(model, "set_prompt_shield_mask"):
                     model.set_prompt_shield_mask(None)
@@ -290,7 +297,8 @@ def _generate_batch_full(
                 cleaned   = cut_continuation(raw)
                 texts[i]   = _trim_response(cleaned)
                 tripped[i] = trip[j]
-    return texts, tripped
+                timings[i] = elapsed
+    return texts, tripped, timings
 
 
 def generate_batch(
@@ -301,7 +309,11 @@ def generate_batch(
     max_new_tokens: int = 512,
     batch_size: int = 8,
 ) -> List[str]:
-    return _generate_batch_full(model, tokenizer, prompts, device, max_new_tokens, batch_size)[0]
+    result = _generate_batch_full(model, tokenizer, prompts, device, max_new_tokens, batch_size)
+    # Backward compatibility: handle both 2-tuple (old) and 3-tuple (new) returns
+    if len(result) == 2:
+        return result[0]
+    return result[0]
 
 
 @torch.no_grad()
@@ -403,12 +415,12 @@ def run_arm(
     entries: List[Optional[dict]] = [cache.get(prompts[i], keys[i], ns) for i in range(n)]
     miss = [i for i, e in enumerate(entries) if e is None]
     if miss:
-        texts, trip = _generate_batch_full(
+        texts, trip, timings = _generate_batch_full(
             model, tokenizer, [prompts[i] for i in miss],
             device, max_new, bs, desc=f"{which or 'baseline'} {shots}-shot",
         )
         for j, i in enumerate(miss):
-            e = {"text": texts[j], "tripped": bool(trip[j])}
+            e = {"text": texts[j], "tripped": bool(trip[j]), "time_sec": timings[j]}
             cache.put(prompts[i], keys[i], ns, e)
             entries[i] = e
 
@@ -427,13 +439,13 @@ def run_arm(
                     base_text[i] = b["text"]
         if pending:
             apply_baseline(model)
-            texts, _ = _generate_batch_full(
+            texts_base, _, _ = _generate_batch_full(
                 model, tokenizer, [prompts[i] for i in pending],
                 device, max_new, bs, desc="k0-revert",
             )
             for j, i in enumerate(pending):
-                cache.put(prompts[i], EMPTY_ROUTE_KEY, ns, {"text": texts[j], "tripped": False})
-                base_text[i] = texts[j]
+                cache.put(prompts[i], EMPTY_ROUTE_KEY, ns, {"text": texts_base[j], "tripped": False, "time_sec": 0.0})
+                base_text[i] = texts_base[j]
 
     final, reverted = [], []
     for i in range(n):
@@ -449,6 +461,7 @@ def run_arm(
         "routes":   [list(r) for r in routes],
         "tripped":  tripped,
         "reverted": reverted,
+        "timings":  [e.get("time_sec", 0.0) for e in entries],  # type: ignore[index]
     }
 
 # ----------------------------------------------------------------------------- summaries
@@ -466,6 +479,7 @@ def route_summary(routes: Sequence[Sequence[int]], max_k: int) -> Dict[str, Any]
         "k_dist":             k_dist,
         "layer_freq":         {str(l): c / n for l, c in sorted(lf.items())},
         "n_distinct_routes":  len(counts),
+        "max_k_used":         top_k,
     }
 
 
@@ -493,6 +507,8 @@ def assemble_shot_block(
         summ = route_summary(res["routes"], max_k)
         summ["guard_trip_rate"] = sum(res["tripped"]) / n
         summ["reverted_rate"]   = sum(res["reverted"]) / n
+        timings = res.get("timings", [0.0] * n)
+        summ["avg_time_sec"] = sum(timings) / n if timings else 0.0
         meta = arm_meta[key]
         arms[key] = {
             "label":             meta["label"],
@@ -508,6 +524,7 @@ def assemble_shot_block(
             "reverted":          [int(x) for x in res["reverted"]],
             "responses":         res["texts"],
             "extracted":         extracted,
+            "timings":           timings,
         }
 
     stats: Dict[str, Any] = {}
