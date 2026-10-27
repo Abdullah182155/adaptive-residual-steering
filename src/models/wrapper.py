@@ -1160,20 +1160,23 @@ class Phi2WithRSC(nn.Module):
             self.guard_state["tripped"] = tripped
             self.guard_state["rel_max_tracked"] = self._guard_rel_max.clone()
             self.guard_state["k"] = k
-            if layer_idx is not None:
-                rn = self.guard_state.setdefault("rel_norms", {})
-                valid_rel = rel[valid]
-                if valid_rel.numel() > 0:
-                    prev = rn.get(int(layer_idx))
-                    val_flat = valid_rel.detach().cpu()
-                    rn[int(layer_idx)] = torch.cat([prev, val_flat]) if prev is not None else val_flat
-                
-                # Steering vector geometry: cosine similarity with base hidden state
-                if valid_rel.numel() > 0 and hasattr(self, '_steering_cosine') and self._steering_cosine is not None:
-                    cn = self.guard_state.setdefault("cosine_sim", {})
-                    prev_cos = cn.get(int(layer_idx))
-                    cos_val = self._steering_cosine.detach().cpu().unsqueeze(0) if self._steering_cosine.dim() == 0 else self._steering_cosine.detach().cpu()
-                    cn[int(layer_idx)] = torch.cat([prev_cos, cos_val]) if prev_cos is not None else cos_val
+            # Only accumulate guard telemetry during calibration (measure_envelope mode)
+            # to avoid GPU-CPU sync bomb in benchmark generation (seq_len=1 decode hot path)
+            if getattr(self, "_record_envelope", None) is not None:
+                if layer_idx is not None:
+                    rn = self.guard_state.setdefault("rel_norms", {})
+                    valid_rel = rel[valid]
+                    if valid_rel.numel() > 0:
+                        prev = rn.get(int(layer_idx))
+                        val_flat = valid_rel.detach().cpu()
+                        rn[int(layer_idx)] = torch.cat([prev, val_flat]) if prev is not None else val_flat
+                    
+                    # Steering vector geometry: cosine similarity with base hidden state
+                    if valid_rel.numel() > 0 and hasattr(self, '_steering_cosine') and self._steering_cosine is not None:
+                        cn = self.guard_state.setdefault("cosine_sim", {})
+                        prev_cos = cn.get(int(layer_idx))
+                        cos_val = self._steering_cosine.detach().cpu().unsqueeze(0) if self._steering_cosine.dim() == 0 else self._steering_cosine.detach().cpu()
+                        cn[int(layer_idx)] = torch.cat([prev_cos, cos_val]) if prev_cos is not None else cos_val
 
     # ---- M6b: route prediction / canonical keys ----
     def _clear_decode_caches(self):

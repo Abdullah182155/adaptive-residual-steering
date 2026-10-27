@@ -415,10 +415,13 @@ def run_arm(
     entries: List[Optional[dict]] = [cache.get(prompts[i], keys[i], ns) for i in range(n)]
     miss = [i for i, e in enumerate(entries) if e is None]
     if miss:
+        # Set shot bucket to ensure executed route matches predicted route
+        _opt(model, "set_shot_bucket", shots)
         texts, trip, timings = _generate_batch_full(
             model, tokenizer, [prompts[i] for i in miss],
             device, max_new, bs, desc=f"{which or 'baseline'} {shots}-shot",
         )
+        _opt(model, "set_shot_bucket", None)
         for j, i in enumerate(miss):
             e = {"text": texts[j], "tripped": bool(trip[j]), "time_sec": timings[j]}
             cache.put(prompts[i], keys[i], ns, e)

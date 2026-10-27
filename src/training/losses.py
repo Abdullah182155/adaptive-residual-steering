@@ -930,7 +930,10 @@ def gate_bce_tokens(
             if alpha is None or alpha.shape[0] <= b:
                 continue
             # alpha: (B, T, 1)
-            pred = alpha[b, ans_idx, 0].float().clamp(1e-7, 1.0 - 1e-7)
+            # FIX: Align causal next-token index - next-token prediction at position p
+            # is driven by the hidden state and gate at position p-1
+            ans_idx_shifted = torch.clamp(ans_idx - 1, min=0)
+            pred = alpha[b, ans_idx_shifted, 0].float().clamp(1e-7, 1.0 - 1e-7)
             term = F.binary_cross_entropy(pred, tgt, weight=w, reduction="sum")
             bce_terms.append(term)
             weight_terms.append(w.sum())
@@ -1009,7 +1012,11 @@ def gate_bce_tokens_with_live_fallback(
         if len(valid_positions) == 0:
             continue
         diff_valid = nll_diff_tok[valid_positions]  # (V,)
-        live_labels = (diff_valid > tau_u).float().to(device)
+        # INVERTED LOGIC FIX: When constant steering (out_u) is worse than gated steering (loss_u > loss_g),
+        # we want to train the gate toward LOWER alpha (0.0), not higher (1.0).
+        # Positive diff means gated is better, so label = 1.0 (train toward more steering).
+        # Negative diff means gated is worse, so label = 0.0 (train toward less steering).
+        live_labels = (diff_valid > 0).float().to(device)
         n_pos = int((live_labels > 0.5).sum().item())
         n_neg = int((live_labels <= 0.5).sum().item())
         n_tot = len(live_labels)
