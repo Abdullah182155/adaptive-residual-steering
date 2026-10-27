@@ -71,6 +71,7 @@ class Phi2WithRSC(nn.Module):
         self._prompt_level_total = 0
         self._routing_override = None
         self._steering_cosine = None  # Steering vector geometry diagnostic
+        self._collect_guard_rel_norms = False  # Only enabled during calibration to avoid GPU-CPU sync in hot path
         # Set after Phase 1B.  A router may only learn/deploy routes composed
         # of layers that survived the Phase-1 safety contract and received
         # co-adaptation updates.  ``None`` preserves the complete catalog for
@@ -1162,7 +1163,7 @@ class Phi2WithRSC(nn.Module):
             self.guard_state["k"] = k
             # Only accumulate guard telemetry during calibration (measure_envelope mode)
             # to avoid GPU-CPU sync bomb in benchmark generation (seq_len=1 decode hot path)
-            if getattr(self, "_record_envelope", None) is not None:
+            if bool(getattr(self, "_collect_guard_rel_norms", False)):
                 if layer_idx is not None:
                     rn = self.guard_state.setdefault("rel_norms", {})
                     valid_rel = rel[valid]

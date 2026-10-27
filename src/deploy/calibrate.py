@@ -342,7 +342,9 @@ def measure_envelope(model, rows, cfg, device) -> dict:
     bs = _calib_bs(cfg)
     per_layer: Dict[int, List[np.ndarray]] = {}
     _opt(model, "reset_guard_state")
-    with model.counterfactual_mode():
+    model._collect_guard_rel_norms = True
+    try:
+      with model.counterfactual_mode():
         for s in range(0, len(rows), bs):
             _forward_chunk(model, rows[s:s + bs], device)
             gs = getattr(model, "guard_state", None) or {}
@@ -353,6 +355,8 @@ def measure_envelope(model, rows, cfg, device) -> dict:
                     else np.asarray(vals, dtype=float)
                 ).ravel()
                 per_layer.setdefault(int(layer), []).append(arr[np.isfinite(arr)])
+    finally:
+      model._collect_guard_rel_norms = False
     _opt(model, "reset_guard_state")
     layer_arrays = {l: (np.concatenate(v) if v else np.zeros(0)) for l, v in per_layer.items()}
     allv = np.concatenate(list(layer_arrays.values())) if layer_arrays else np.zeros(0)

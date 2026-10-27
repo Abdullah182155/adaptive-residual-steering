@@ -1012,11 +1012,14 @@ def gate_bce_tokens_with_live_fallback(
         if len(valid_positions) == 0:
             continue
         diff_valid = nll_diff_tok[valid_positions]  # (V,)
-        # INVERTED LOGIC FIX: When constant steering (out_u) is worse than gated steering (loss_u > loss_g),
-        # we want to train the gate toward LOWER alpha (0.0), not higher (1.0).
-        # Positive diff means gated is better, so label = 1.0 (train toward more steering).
-        # Negative diff means gated is worse, so label = 0.0 (train toward less steering).
-        live_labels = (diff_valid > 0).float().to(device)
+        # PHYSICAL LOGIC: out_u is computed with gate_mode="const", scale=steer_scale (full steering alpha=1.0).
+        # out_g is computed with gate_mode="learned" (attenuated/gated alpha in [0, 1]).
+        # diff_valid = loss_mat_u - loss_mat_g.
+        # If loss_u > loss_g (diff_valid > 0): constant full steering caused higher loss than gated steering.
+        # This proves full steering is harmful here; the token needs less steering (target alpha -> 0.0).
+        # If loss_u < loss_g (diff_valid < 0): constant full steering caused lower loss than gated steering.
+        # This proves full steering is helpful here; the token needs more steering (target alpha -> 1.0).
+        live_labels = (diff_valid < 0).float().to(device)
         n_pos = int((live_labels > 0.5).sum().item())
         n_neg = int((live_labels <= 0.5).sum().item())
         n_tot = len(live_labels)
