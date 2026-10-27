@@ -479,7 +479,7 @@ class RSCConfig:
     s1_unl_every_n_steps: int = 4
     s1_calc_token_weight: float = 1.75
     s1_val_onpolicy_n: int = 120
-    s1_k_choices: Tuple[int, ...] = (0, 1, 2, 3, 4)  # Full K coverage to enable router to learn K=0/1/4 selection
+    s1_k_choices: Tuple[int, ...] = (1, 2, 3, 4)  # Full K coverage to enable router to learn K=0/1/4 selection
     s1_save_path: str = "./checkpoints/s1_steernet.pt"
     s1_final_gen_n: int = 240
     s1_ablation_epochs: int = 1
@@ -663,7 +663,7 @@ ENGINE_V32_KAGGLE_PROFILE: Dict[str, Any] = {
     "beta_entropy_subset": 0.30,
     "router_shot_mix": (0, 2, 4, 8),
     "router_tau": 0.10,
-    "s1_k_choices": (0, 1, 2, 3, 4),
+    "s1_k_choices": (1, 2, 3, 4),
     "gate_init_logit": 0.0,
     "gate_dom_margin": 0.10,
     "lambda_gate_sparsity": 0.0,

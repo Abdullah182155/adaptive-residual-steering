@@ -3746,7 +3746,10 @@ from src.training.losses import (
 
 def sample_training_subset(catalog: "Catalog", rng: random.Random, k_choices: Tuple[int, ...] = (1, 2, 3)) -> Tuple[int, ...]:
     """Draw a random non-empty subset. K ~ Uniform(k_choices), subset ~ Uniform(C(5,K))."""
-    k = rng.choice(list(k_choices))
+    valid_k = [k for k in k_choices if k > 0]
+    if not valid_k:
+        valid_k = [1, 2, 3]
+    k = rng.choice(valid_k)
     candidates = [s for s in catalog.subsets if len(s) == k]
     if not candidates:
         raise ValueError(f"No catalog subsets of size {k}")
@@ -3985,7 +3988,7 @@ def _s1_fit(
                         total = total + cfg.s1_lambda_unl * ul
 
             loss = total / cfg.grad_accum
-            if not torch.isfinite(loss):
+            if not torch.isfinite(loss) or not loss.requires_grad:
                 continue
             scaler.scale(loss).backward()
             accum += 1

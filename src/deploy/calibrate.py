@@ -618,9 +618,9 @@ def run_deployment_calibration(
     from src.training.trainer import load_steer_weights
     model.tokenizer = tokenizer
 
-    steernet_ckpt = steernet_ckpt or cfg.lora_save_path
-    router_ckpt   = router_ckpt   or cfg.router_bootstrap_save_path
-    gate_ckpt     = gate_ckpt     or cfg.phase2_save_path
+    steernet_ckpt = steernet_ckpt or getattr(cfg, "s1_save_path", None) or getattr(cfg, "lora_save_path", None) or os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
+    router_ckpt   = router_ckpt   or getattr(cfg, "router_catalog_save_path", None) or getattr(cfg, "router_bootstrap_save_path", None) or os.path.join(cfg.checkpoint_dir, "router_catalog_v5.pt")
+    gate_ckpt     = gate_ckpt     or getattr(cfg, "gate_v5_save_path", None) or getattr(cfg, "phase2_save_path", None) or os.path.join(cfg.checkpoint_dir, "gate_v5.pt")
 
     for p in (steernet_ckpt, router_ckpt, gate_ckpt):
         if not os.path.exists(p):

@@ -381,11 +381,11 @@ def stage_s5(model, tok, eval_data, cfg, device, state, args):
     if hasattr(model, "set_catalog"):
         model.set_catalog(catalog)
 
-    ck = {k: (state.get(s) or {}).get("ckpt") for k, s in (
-        ("steernet_ckpt", "S1"),
-        ("router_ckpt",   "S2"),
-        ("gate_ckpt",     "S3"),
-    )}
+    ck = {
+        "steernet_ckpt": (state.get("S1") or {}).get("ckpt") or getattr(cfg, "s1_save_path", os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")),
+        "router_ckpt":   (state.get("S2") or {}).get("ckpt") or getattr(cfg, "router_catalog_save_path", os.path.join(cfg.checkpoint_dir, "router_catalog_v5.pt")),
+        "gate_ckpt":     (state.get("S3") or {}).get("ckpt") or getattr(cfg, "gate_v5_save_path", os.path.join(cfg.checkpoint_dir, "gate_v5.pt")),
+    }
     contract = run_deployment_calibration(
         model, tok, eval_data, cfg, device,
         catalog=catalog,
