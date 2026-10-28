@@ -134,6 +134,13 @@ def build_prompt_unified(
     return prompt
 
 
+def build_prompt_from_config(question: str, n_shot: int, cfg) -> str:
+    """Build prompt using config settings."""
+    exemplar_set = getattr(cfg, 'exemplar_set', 'legacy')
+    include_preface = exemplar_set == 'v5'
+    return build_prompt_unified(question, n_shot=n_shot, exemplar_set=exemplar_set, include_preface=include_preface)
+
+
 def get_harness_hash() -> str:
     """Get the current harness hash for validation."""
     return _get_harness_hash()

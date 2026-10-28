@@ -28,6 +28,9 @@ class RSCConfig:
     catalog_consecutive_triples: bool = True
     router_max_tok_len: int = 512
     router_shot_mix: Tuple[int, ...] = (0, 2, 4, 8)
+    
+    # Phase 2.1: Exemplar set selection
+    exemplar_set: str = "legacy"  # "legacy" for GSM8K_8SHOT_EXEMPLARS, "v5" for new handcrafted exemplars
 
     # SteerNet
     lora_rank: int = 16
