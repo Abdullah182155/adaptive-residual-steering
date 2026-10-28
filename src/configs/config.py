@@ -31,6 +31,9 @@ class RSCConfig:
     
     # Phase 2.1: Exemplar set selection
     exemplar_set: str = "legacy"  # "legacy" for GSM8K_8SHOT_EXEMPLARS, "v5" for new handcrafted exemplars
+    
+    # Phase 2.3: Target style for training
+    train_target_style: str = "auto"  # "auto" (hash for 0-shot, final_answer for n>0), "hash", "final_answer"
 
     # SteerNet
     lora_rank: int = 16

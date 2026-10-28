@@ -23,14 +23,22 @@ def from_dataset_row(row: Mapping) -> dict:
 
 
 def build_shot_example(tokenizer, question: str, steps: List[str], final_num: str, n_shot: int,
-                       max_len: int = 1536, final_style: str = "auto") -> dict:
+                       max_len: int = 1536, final_style: str = "auto", cfg=None) -> dict:
     """Construct prompt + target CoT. Target tokens have offset >= target start.
     Question span tokens have char start in [last 'Question:' char index, target_char_start).
     Returns dict(input_ids, attention_mask, labels, question_span_mask, n_shot) as 1D tensors, unpadded.
 
-    final_style: "auto" -> "#### x" for 0-shot, "Final answer: x" otherwise; or force "hash" / "final_answer".
+    final_style: "auto" -> "#### x" for 0-shot (legacy), "Final answer: x" otherwise; or force "hash" / "final_answer".
+              Phase 2.3: If cfg.train_target_style="final_answer", use "Final answer: x" for all shots.
     max_len is advisory (callers filter on length); sequences are never truncated here because
     truncating would silently cut the target."""
+    # Phase 2.3: Check config for target style override
+    if cfg is not None and hasattr(cfg, 'train_target_style'):
+        if cfg.train_target_style == "final_answer":
+            final_style = "final_answer"
+        elif cfg.train_target_style == "hash":
+            final_style = "hash"
+    
     prompt_prefix = build_prompt_unified(question, n_shot=n_shot, exemplar_set="legacy", include_preface=False)
 
     # Target rendering
