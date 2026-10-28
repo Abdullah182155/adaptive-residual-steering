@@ -182,7 +182,6 @@ class TestGateStage(unittest.TestCase):
         cfg.lambda_dom = 1.0
         cfg.lambda_tok = 0.5
         cfg.lambda_l1_gate_v5 = 0.1
-        cfg.lambda_gate_sparsity = 0.01  # Remediation: sparsity prior added
         cfg.gate_dom_margin = 0.0
         cfg.lambda_nll_diff = 1.0
 
@@ -193,16 +192,15 @@ class TestGateStage(unittest.TestCase):
 
         tot, metrics = gate_total_loss(nll_gated, nll_ungated, bce_tok, mean_alpha, cfg)
         # Formula: nll_gated.mean() + lambda_dom * hinge + lambda_nll_diff * (nll_gated - nll_ungated).mean()
-        #          + lambda_tok * bce + lambda_l1 * mean_alpha + lambda_sparsity * mean_alpha
+        #          + lambda_tok * bce + lambda_l1 * mean_alpha
         # hinge = relu(1.5 - 1.0 + 0.0) = 0.5
         # nll_diff = (1.5 - 1.0) = 0.5
-        expected = 1.5 + 1.0 * 0.5 + 1.0 * 0.5 + 0.5 * 0.4 + 0.1 * 0.8 + 0.01 * 0.8
+        expected = 1.5 + 1.0 * 0.5 + 1.0 * 0.5 + 0.5 * 0.4 + 0.1 * 0.8
         self.assertAlmostEqual(float(tot.item()), expected, places=5)
         self.assertIn("loss_total", metrics)
         self.assertIn("loss_dom", metrics)
         self.assertIn("loss_nll_diff", metrics)
         self.assertIn("loss_bce_tok", metrics)
-        self.assertIn("loss_sparsity", metrics)
         self.assertIn("mean_alpha", metrics)
 
     def test_gate_bce_live_fallback_no_crash(self):

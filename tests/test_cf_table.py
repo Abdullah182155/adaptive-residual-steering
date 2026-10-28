@@ -157,8 +157,7 @@ def test_row_independence(tok, tmp_path):
     subsets = [(13,), (15, 18), (13, 20, 22)]
     for s in subsets:   # non-vacuous: steering must actually move the NLL
         c = cat.index_of(s)
-        # Remediation: relaxed threshold from 1e-4 to 1e-5 due to smaller steering envelope (0.005 vs 0.02)
-        assert np.abs(table.ans_nll[:, c] - table.ans_nll[:, 0]).max() > 1e-5
+        assert np.abs(table.ans_nll[:, c] - table.ans_nll[:, 0]).max() > 1e-4
     for i, e in enumerate(ex):
         ids = e["input_ids"].unsqueeze(0)
         for s in subsets:
@@ -197,8 +196,8 @@ def test_resume_roundtrip(tok, tmp_path):
     out = str(tmp_path / "cf")
 
     t1 = build_cf_table(model, tok, ex, cat, cfg, torch.device("cpu"), 1.0, out)
-    # Remediation: updated for catalog_max_k=4 (31 subsets vs 26). Actual behavior: 3 calls per example
-    assert len(calls) == 5 * 3                                   # catalog_max_k=4 with shard_size=2
+    # catalog_max_k=3 with shard_size=2: actual observed 2 calls per example
+    assert len(calls) == 5 * 2
     parts = sorted(p for p in os.listdir(out) if p.startswith("cf_table_part_"))
     assert parts == ["cf_table_part_0000.npz", "cf_table_part_0001.npz", "cf_table_part_0002.npz"]
 
@@ -207,8 +206,8 @@ def test_resume_roundtrip(tok, tmp_path):
         f.write(b"garbage")
     calls.clear()
     t2 = build_cf_table(model, tok, ex, cat, cfg, torch.device("cpu"), 1.0, out)
-    # Remediation: updated for catalog_max_k=4. Observed 9 calls = shard 0 reused, shards 1-2 recomputed
-    assert len(calls) == 9
+    # shard 0 reused, shards 1-2 recomputed: 6 calls
+    assert len(calls) == 6
     for f in ("ans_nll", "token_nll", "token_mask", "token_ids", "pooled", "scalars", "qid", "n_shot"):
         np.testing.assert_allclose(getattr(t1, f), getattr(t2, f), atol=1e-6) if getattr(t1, f).dtype.kind == "f" \
             else np.testing.assert_array_equal(getattr(t1, f), getattr(t2, f))
@@ -217,8 +216,7 @@ def test_resume_roundtrip(tok, tmp_path):
     np.testing.assert_array_equal(loaded.ans_nll, t2.ans_nll)
     assert loaded.catalog == cat and loaded.steer_scale == 1.0
     sub = loaded.select(loaded.n_shot == 0)
-    # Remediation: updated for catalog_max_k=4 (31 subsets vs 26)
-    assert len(sub) == 5 and sub.rewards().shape == (5, 31) and sub.gain()[:, 0].max() == 0.0
+    assert len(sub) == 5 and sub.rewards().shape == (5, 26) and sub.gain()[:, 0].max() == 0.0
 
 
 def test_shot_example_spans(tok):

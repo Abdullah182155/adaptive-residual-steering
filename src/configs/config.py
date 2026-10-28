@@ -40,7 +40,7 @@ class RSCConfig:
     # magnitude head in 'direct' mode handles magnitude control instead.
     # Engine v2.1: envelope tightened from 0.04 to 0.02 once norm regularisation is active.
     # Remediation: adjusted to 0.005 to match measured envelope cap (0.00418 from S5)
-    steer_max_relative_norm: float = 0.005
+    steer_max_relative_norm: float = 0.02
     steer_orthogonal_projection: bool = False  # ISSUE-6: disabled (was True)
     # A route has one shared intervention budget.  Each selected layer receives
     # K**(-power) of its own bounded delta.  A square-root route budget keeps
@@ -311,8 +311,8 @@ class RSCConfig:
     # The entropy bonus must be large enough to overcome k_cost under genuine reward noise.
     # Further increased to 0.20/0.10 to strengthen K diversity incentive
     # Remediation: increased to 0.50/0.30 to prevent K-collapse and encourage diverse subset selection
-    beta_entropy_k: float = 0.50
-    beta_entropy_subset: float = 0.30
+    beta_entropy_k: float = 0.20
+    beta_entropy_subset: float = 0.10
     router_balance_weight: float = 0.01  # was 0.10 — layer_dropout already prevents monopoly
     router_tariff_k1_free: bool = True   # Engine v4.2: K=1 is free capacity (zero tariff)
     router_min_active_k_fraction: float = 0.75 # Engine v4.2: at least 75% reasoning tokens steer
@@ -446,7 +446,7 @@ class RSCConfig:
 
     # ==== M1 ====
     catalog_layers: Tuple[int, ...] = (13, 15, 18, 20, 22)   # must be subset of model.target_layers
-    catalog_max_k: int = 4  # Remediation: increased from 3 to 4 to support K=4 subsets
+    catalog_max_k: int = 3
     cf_table_dir: str = "./checkpoints/cf_tables"            # under checkpoints/ (git-ignored)
     cf_shard_size: int = 25
     cf_rows_per_forward: Tuple[Tuple[int, int], ...] = ((0, 13), (2, 8), (4, 7), (8, 5))   # (n_shot, rows per forward)
@@ -479,7 +479,7 @@ class RSCConfig:
     s1_unl_every_n_steps: int = 4
     s1_calc_token_weight: float = 1.75
     s1_val_onpolicy_n: int = 120
-    s1_k_choices: Tuple[int, ...] = (1, 2, 3, 4)  # Full K coverage to enable router to learn K=0/1/4 selection
+    s1_k_choices: Tuple[int, ...] = (2, 3)
     s1_save_path: str = "./checkpoints/s1_steernet.pt"
     s1_final_gen_n: int = 240
     s1_ablation_epochs: int = 1
@@ -490,7 +490,7 @@ class RSCConfig:
     router_c_size: float = 2.0e-2                          # K>=3 tariff to encourage K<=2 diversity (raised from 5e-3: prior value was insufficient to overcome K=3 gain gap of ~3-5e-3 NLL units)
     router_k_free: int = 2                                # K<=2 free tariff; only K>=3 taxed
     router_eps_tie: float = 0.01
-    router_tau: float = 0.10                              # increased from 0.02 to encourage router exploration of diverse subsets
+    router_tau: float = 0.02
     router_lambda_bal: float = 0.02
     router_lambda_cons: float = 0.1
     router_distill_epochs: int = 100                     # raised from 60: more epochs for router to escape K=3 local minimum under increased c_size tariff
@@ -509,15 +509,14 @@ class RSCConfig:
     gate_task_gradient: bool = False
 
     # ==== M7 ====
-    gate_init_logit: float = 0.0                         # alpha_init = sigmoid(-2) ≈ 0.12 (sparse init to encourage gate suppression)
+    gate_init_logit: float = 0.0
     gate_loss_mode: str = "v5"                            # "v5" | "legacy"
     lambda_dom: float = 1.0
     lambda_tok: float = 0.1                               # lowered from 1.0: at 1.0 live BCE term (~7.9) overwhelmed nll_gated (~1.1) by 8x, drowning the NLL-diff signal; 0.1 brings BCE (~0.8) to NLL scale
     lambda_l1_gate_v5: float = 0.01
-    lambda_gate_sparsity: float = 0.01                     # Remediation: sparsity prior to encourage gate toward 0
     lambda_nll_diff: float = 10.0                        # direct NLL-diff minimisation: drives gate to reduce nll_gated below nll_ungated (complements dominance hinge which only penalises positive gaps) - increased from 1.0 to 10.0 to strengthen gate learning signal
     gate_tau_u: float = 0.005
-    gate_dom_margin: float = 0.10                         # Remediation: increased from 0.05 to 0.10 to enforce stronger dominance
+    gate_dom_margin: float = 0.05
     gate_epochs: int = 3
     gate_lr: float = 2e-3                                 # raised from 1e-3 for faster convergence
     gate_label_row_frac: float = 0.5
@@ -618,7 +617,7 @@ ENGINE_V32_KAGGLE_PROFILE: Dict[str, Any] = {
     "lora_rank": 16,
     "lora_alpha": 32.0,
     "steer_magnitude_mode": "direct",
-    "steer_max_relative_norm": 0.005,
+    "steer_max_relative_norm": 0.02,
     "steer_orthogonal_projection": False,
     "n_samples": 3000,
     "max_tok_len": 512,
@@ -657,17 +656,17 @@ ENGINE_V32_KAGGLE_PROFILE: Dict[str, Any] = {
     "router_relative_k_cost": 0.03,
     "router_tariff_warmup_epochs": 1,
     "router_tariff_max_positive_gain_fraction": 0.50,
-    "beta_entropy_k": 0.50,
+    "beta_entropy_k": 0.20,
     "lambda_synergy": 0.25,
     "lambda_synergy_prior": 0.01,
-    "beta_entropy_subset": 0.30,
+    "beta_entropy_subset": 0.10,
     "router_shot_mix": (0, 2, 4, 8),
-    "router_tau": 0.10,
-    "s1_k_choices": (0, 1, 2, 3, 4),
-    "catalog_max_k": 4,
-    "gate_init_logit": -2.0,
-    "gate_dom_margin": 0.10,
-    "lambda_gate_sparsity": 0.01,
+    "router_tau": 0.02,
+    "s1_k_choices": (2, 3),
+    "catalog_max_k": 3,
+    "gate_init_logit": 0.0,
+    "gate_dom_margin": 0.05,
+    "lambda_gate_sparsity": 0.0,
     "router_rloo_batch_size": 8,
     "router_diversity_temperature": 0.35,
     "lambda_router_k_mi": 0.15,
@@ -737,8 +736,8 @@ def assert_engine_v32_kaggle_profile(cfg: RSCConfig, strict: bool = False) -> st
 ENGINE_V40_KAGGLE_PROFILE_NAME = "Engine v4.0 Kaggle T4 Decision-Run"
 ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     **ENGINE_V32_KAGGLE_PROFILE,
-    "steer_max_relative_norm": 0.005,
-    "catalog_max_k": 4,
+    "steer_max_relative_norm": 0.02,
+    "catalog_max_k": 3,
     "max_active_layers": 3,
     "phase1b_candidate_layers": 6,
     "phase1b_candidates_per_band": 2,
@@ -771,7 +770,7 @@ ENGINE_V40_KAGGLE_PROFILE: Dict[str, Any] = {
     "lambda_l1_gate": 0.01,
     "lambda_gate_sparsity": 0.0,
     "gate_init_logit": 0.0,
-    "gate_dom_margin": 0.10,
+    "gate_dom_margin": 0.05,
     "calc_token_weight": 1.75,
     "skip_adaptive_phases_when_phase1_fails": False,
     "skip_adaptive_phases_when_router_fails": False,

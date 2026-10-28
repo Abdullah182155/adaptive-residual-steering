@@ -1096,7 +1096,6 @@ def gate_total_loss(
     lambda_dom = float(getattr(cfg, "lambda_dom", 1.0))
     lambda_tok = float(getattr(cfg, "lambda_tok", 0.3))
     lambda_l1 = float(getattr(cfg, "lambda_l1_gate_v5", 0.005))
-    lambda_sparsity = float(getattr(cfg, "lambda_gate_sparsity", 0.0))  # Remediation: sparsity prior
     # Direct NLL-diff minimisation: drives gate to reduce nll_gated below nll_ungated.
     # Default 1.0 — same scale as lambda_dom, but this term is always active (no relu).
     lambda_nll_diff = float(getattr(cfg, "lambda_nll_diff", 1.0))
@@ -1105,8 +1104,7 @@ def gate_total_loss(
     alpha_val = mean_alpha if torch.is_tensor(mean_alpha) else torch.tensor(float(mean_alpha), device=nll_gated.device)
 
     nll_diff = (nll_gated - nll_ungated.detach()).mean()
-    sparsity_loss = alpha_val  # Encourage alpha toward 0
-    total = nll_gated.mean() + lambda_dom * l_dom + lambda_nll_diff * nll_diff + lambda_tok * bce_val + lambda_l1 * alpha_val + lambda_sparsity * sparsity_loss
+    total = nll_gated.mean() + lambda_dom * l_dom + lambda_nll_diff * nll_diff + lambda_tok * bce_val + lambda_l1 * alpha_val
     metrics = {
         "loss_total": float(total.detach().item()),
         "nll_gated": float(nll_gated.mean().detach().item()),
@@ -1114,7 +1112,6 @@ def gate_total_loss(
         "loss_dom": float(l_dom.detach().item()),
         "loss_nll_diff": float(nll_diff.detach().item()),
         "loss_bce_tok": float(bce_val.detach().item()),
-        "loss_sparsity": float(sparsity_loss.detach().item()),
         "mean_alpha": float(alpha_val.detach().item()),
     }
     return total, metrics
