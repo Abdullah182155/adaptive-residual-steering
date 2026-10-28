@@ -9,6 +9,7 @@ import torch
 import numpy as np
 from transformers import StoppingCriteria, StoppingCriteriaList
 from tqdm.auto import tqdm
+from src.data.prompts import build_prompt_unified
 
 GSM8K_8SHOT_EXEMPLARS = [
     {
@@ -46,15 +47,8 @@ GSM8K_8SHOT_EXEMPLARS = [
 ]
 
 def build_prompt(question: str, n_shot: int = 0) -> str:
-    prompt = ""
-    for i in range(min(n_shot, len(GSM8K_8SHOT_EXEMPLARS))):
-        ex = GSM8K_8SHOT_EXEMPLARS[i]
-        prompt += f"Question: {ex['q']}\nAnswer: Let's think step by step.\n{ex['a']}\n\n"
-    if n_shot == 0:
-        prompt += f"Question: {question}\nAnswer: Let's think step by step and end with 'Final answer: [number]'.\n"
-    else:
-        prompt += f"Question: {question}\nAnswer: Let's think step by step.\n"
-    return prompt
+    """Legacy wrapper for unified prompt builder. Use build_prompt_unified directly for new code."""
+    return build_prompt_unified(question, n_shot=n_shot, exemplar_set="legacy")
 
 def extract_and_verify_equations(text: str) -> Tuple[int, int, List[Tuple[str, bool]]]:
     """Enhanced equation verifier: handles standard and reversed equations."""
