@@ -522,6 +522,16 @@ def apply_cfg_overrides(cfg, args):
                     val = True
                 elif v.lower() == "false":
                     val = False
+                elif v.startswith("(") and v.endswith(")"):
+                    # Parse tuple: (0,1,2,3) -> (0, 1, 2, 3)
+                    try:
+                        inner = v[1:-1].strip()
+                        if inner:
+                            val = tuple(int(x.strip()) for x in inner.split(","))
+                        else:
+                            val = ()
+                    except (ValueError, AttributeError):
+                        val = v
                 else:
                     try:
                         val = int(v)
