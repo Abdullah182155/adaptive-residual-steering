@@ -97,6 +97,7 @@ def build_prompt_unified(
     exemplars: Optional[List[Dict[str, str]]] = None,
     preface: Optional[str] = None,
     exemplar_set: str = "v5",
+    include_preface: bool = True,
 ) -> str:
     """
     Unified prompt builder for training, evaluation, and sampling.
@@ -107,6 +108,7 @@ def build_prompt_unified(
         exemplars: Optional custom exemplar list (uses default if None)
         preface: Optional custom preface (uses default if None)
         exemplar_set: "legacy" or "v5" (default "v5")
+        include_preface: Whether to include preface (True for v5, False for legacy compatibility)
     
     Returns:
         Complete prompt string
@@ -117,7 +119,9 @@ def build_prompt_unified(
     if preface is None:
         preface = PREFACE
     
-    prompt = f"{preface}\n\n"
+    prompt = ""
+    if include_preface:
+        prompt = f"{preface}\n\n"
     
     # Add exemplars (shielded tokens - not counted in steering)
     for i in range(min(n_shot, len(exemplars))):

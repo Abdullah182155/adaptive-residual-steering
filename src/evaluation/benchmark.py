@@ -26,11 +26,11 @@ from src.evaluation.output_cache import (
 )
 from src.evaluation.stats import compare_to_control
 from src.evaluation.verifier import (
-    build_prompt,
     evaluate_response,
     extract_final_answer,
     generate_response,
 )
+from src.data.prompts import build_prompt_unified
 
 # ----------------------------------------------------------------------------- legacy
 
@@ -52,7 +52,7 @@ def eval_gsm8k_benchmark(
         q    = ex["question"]
         gp   = ex["answer"].split("####")
         gold = float(gp[1].replace(",", "").strip()) if len(gp) > 1 else None
-        prompt = build_prompt(q, n_shot=n_shot)
+        prompt = build_prompt_unified(q, n_shot=n_shot, exemplar_set="legacy", include_preface=False)
         t0     = time.time()
         resp   = generate_response(model, tokenizer, prompt, device, max_new_tokens=512)
         elapsed = time.time() - t0

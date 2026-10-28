@@ -9,7 +9,7 @@ from transformers import StoppingCriteriaList
 
 from src.data.onpolicy import BatchAnswerStopping
 from src.evaluation.answers import cut_continuation, extract_numeric_answer  # noqa: F401
-from src.evaluation.verifier import build_prompt
+from src.data.prompts import build_prompt_unified
 
 _TRIM_PATTERNS = [
     r"####\s*-?\d[\d,]*\.?\d*",
@@ -129,7 +129,7 @@ def paired_greedy_eval(
     questions = list(questions)
     golds = list(golds)
     n = len(questions)
-    prompts = [build_prompt(q, n_shot=0) for q in questions]
+    prompts = [build_prompt_unified(q, n_shot=0, exemplar_set="legacy", include_preface=False) for q in questions]
 
     old_override = getattr(model, "_routing_override", None)
     ctx = model.counterfactual_mode() if hasattr(model, "counterfactual_mode") else nullcontext()

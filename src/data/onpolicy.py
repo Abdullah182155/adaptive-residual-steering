@@ -14,7 +14,8 @@ from tqdm import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
 from src.evaluation.answers import cut_continuation, extract_numeric_answer
-from src.evaluation.verifier import build_prompt, extract_and_verify_equations
+from src.evaluation.verifier import extract_and_verify_equations
+from src.data.prompts import build_prompt_unified
 
 # Marker whose number has at least begun (used for stopping; grace tokens finish the number).
 _ANSWER_START_RE = re.compile(r"####\s*\$?-?\d|[Ff]inal\s+answer\s*[:\-]?\s*\$?-?\d")
@@ -444,7 +445,7 @@ def sample_chains(
         shot = int(shots[qid % len(shots)])
         records.append({
             "qid": qid, "shot": shot, "gold": _gold_of(q),
-            "prompt": build_prompt(str(q["question"]), n_shot=shot),
+            "prompt": build_prompt_unified(str(q["question"]), n_shot=shot, exemplar_set="legacy", include_preface=False),
         })
 
     store = OnPolicyStore()

@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 import torch
-from src.evaluation.verifier import build_prompt
+from src.data.prompts import build_prompt_unified
 
 
 def from_dataset_row(row: Mapping) -> dict:
@@ -31,7 +31,7 @@ def build_shot_example(tokenizer, question: str, steps: List[str], final_num: st
     final_style: "auto" -> "#### x" for 0-shot, "Final answer: x" otherwise; or force "hash" / "final_answer".
     max_len is advisory (callers filter on length); sequences are never truncated here because
     truncating would silently cut the target."""
-    prompt_prefix = build_prompt(question, n_shot=n_shot)
+    prompt_prefix = build_prompt_unified(question, n_shot=n_shot, exemplar_set="legacy", include_preface=False)
 
     # Target rendering
     cot_body = "\n".join(f"Step {i+1}: {step}" for i, step in enumerate(steps))

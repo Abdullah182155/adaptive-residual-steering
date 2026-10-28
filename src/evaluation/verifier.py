@@ -48,7 +48,7 @@ GSM8K_8SHOT_EXEMPLARS = [
 
 def build_prompt(question: str, n_shot: int = 0) -> str:
     """Legacy wrapper for unified prompt builder. Use build_prompt_unified directly for new code."""
-    return build_prompt_unified(question, n_shot=n_shot, exemplar_set="legacy")
+    return build_prompt_unified(question, n_shot=n_shot, exemplar_set="legacy", include_preface=False)
 
 def extract_and_verify_equations(text: str) -> Tuple[int, int, List[Tuple[str, bool]]]:
     """Enhanced equation verifier: handles standard and reversed equations."""
