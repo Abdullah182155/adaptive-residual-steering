@@ -153,12 +153,6 @@ _STRICT_PATTERNS = (
     re.compile(r"[Rr]esult\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
     re.compile(r"[Ss]olution\s*[:\-]?\s*\$?(-?\d[\d,]*\.?\d*)"),
 )
-_TRIM_PATTERNS = (
-    r"####\s*-?\d[\d,]*\.?\d*",
-    r"[Ff]inal\s+[Aa]nswer\s*[:\-]?\s*-?\d[\d,]*\.?\d*",
-    r"[Tt]herefore[^.\n]*\.",
-    r"[Tt]he answer is[^.\n]*\.",
-)
 
 
 def extract_strict(text: str) -> Optional[float]:
@@ -171,14 +165,6 @@ def extract_strict(text: str) -> Optional[float]:
             except ValueError:
                 return None
     return None
-
-
-def _trim_response(raw: str) -> str:
-    for pat in _TRIM_PATTERNS:
-        m = re.search(pat, raw)
-        if m:
-            return raw[: m.end()].strip()
-    return raw
 
 
 def _is_correct(pred: Optional[float], gold: Optional[float]) -> bool:
@@ -194,21 +180,6 @@ def _left_padding(tokenizer):
         yield
     finally:
         tokenizer.padding_side = old
-
-
-class _AllDoneCriteria(StoppingCriteria):
-    """Stop once every sequence in the batch has emitted a complete answer marker."""
-    PAT = re.compile(r"(?:####|[Ff]inal\s+[Aa]nswer\s*[:\-]?)\s*\$?-?\d[\d,]*\.?\d*[^\d,.]")
-
-    def __init__(self, tokenizer, prompt_len: int, every: int = 4):
-        self.tok, self.prompt_len, self.every = tokenizer, prompt_len, every
-
-    def __call__(self, input_ids, scores, **kwargs):
-        n = input_ids.shape[1] - self.prompt_len
-        if n <= 0 or n % self.every:
-            return False
-        texts = self.tok.batch_decode(input_ids[:, self.prompt_len:], skip_special_tokens=True)
-        return all(self.PAT.search(t) is not None for t in texts)
 
 
 def _read_tripped(model, n: int) -> List[bool]:
@@ -245,7 +216,8 @@ def _generate_batch_full(
             ).to(device)
             plen = enc["input_ids"].shape[1]
             _opt(model, "reset_guard_state")
-            stop = StoppingCriteriaList([_AllDoneCriteria(tokenizer, plen)])
+            # Phase 0.3: Use per-row BatchAnswerStopping instead of batch-wide _AllDoneCriteria
+            stop = StoppingCriteriaList([BatchAnswerStopping(tokenizer, plen)])
             # Multi-shot prompt shielding: protect few-shot demonstrations from steering representation drift
             if hasattr(model, "set_prompt_shield_mask"):
                 q_toks = tokenizer.encode("Question:", add_special_tokens=False)
@@ -295,7 +267,9 @@ def _generate_batch_full(
             for j, i in enumerate(idx):
                 raw       = tokenizer.decode(out[j][plen:], skip_special_tokens=True).strip()
                 cleaned   = cut_continuation(raw)
-                texts[i]   = _trim_response(cleaned)
+                # Phase 0.3: Remove _TRIM_PATTERNS, use T1-based truncation instead
+                # Keep full text up to stop, or truncate at first T1 marker + 6-token grace
+                texts[i]   = cleaned
                 tripped[i] = trip[j]
                 timings[i] = elapsed
     return texts, tripped, timings

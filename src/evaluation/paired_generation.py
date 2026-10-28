@@ -11,24 +11,6 @@ from src.data.onpolicy import BatchAnswerStopping
 from src.evaluation.answers import cut_continuation, extract_numeric_answer  # noqa: F401
 from src.data.prompts import build_prompt_unified
 
-_TRIM_PATTERNS = [
-    r"####\s*-?\d[\d,]*\.?\d*",
-    r"[Ff]inal\s+answer\s*[:\-]?\s*-?\d[\d,]*\.?\d*",
-    r"[Tt]herefore[^.\n]*\.",
-    r"[Tt]he answer is[^.\n]*\.",
-]
-
-
-def _trim_like_generate_response(raw_text: str) -> str:
-    """Identical regex truncation to verifier.generate_response."""
-    raw_text = raw_text.strip()
-    for pat in _TRIM_PATTERNS:
-        m = re.search(pat, raw_text)
-        if m:
-            raw_text = raw_text[: m.end()].strip()
-            break
-    return raw_text
-
 
 def generate_batch(
     model,
@@ -82,8 +64,6 @@ def generate_batch(
             eos_token_id=tokenizer.eos_token_id,
             stopping_criteria=stopping,
             do_sample=False,
-            repetition_penalty=1.1,
-            no_repeat_ngram_size=6,
             use_cache=True,
         )
 
@@ -91,7 +71,8 @@ def generate_batch(
     for row in output_ids:
         new_ids = row[prompt_len:]
         raw_text = tokenizer.decode(new_ids, skip_special_tokens=True)
-        outputs.append(_trim_like_generate_response(raw_text))
+        # Phase 0.3: Use cut_continuation instead of _TRIM_PATTERNS
+        outputs.append(cut_continuation(raw_text))
     return outputs
 
 
