@@ -309,11 +309,18 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
 
 def stage_s0b(model, tok, train_data, cfg, device, state, args):
     import random
+    import torch
     from src.data.onpolicy import sample_chains
     from src.training.trainer import load_steer_weights
 
     s1_ckpt = (state.get("S1") or {}).get("ckpt") or os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
     if os.path.exists(s1_ckpt):
+        # Auto-detect architecture from checkpoint
+        ckpt_state = torch.load(s1_ckpt, map_location="cpu")
+        has_v5_keys = any("conv.weight" in k or "conv.bias" in k for k in ckpt_state.keys())
+        if has_v5_keys and cfg.steernet_arch != "v5":
+            print(f"[S0b] Auto-detected v5 architecture from checkpoint, setting steernet_arch=v5")
+            cfg.steernet_arch = "v5"
         load_steer_weights(model, s1_ckpt, device=device)
 
     out_path = os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl")
@@ -612,6 +619,17 @@ def main():
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg       = RSCConfig()
     apply_cfg_overrides(cfg, args)
+    
+    # Auto-detect architecture from existing checkpoint before building model
+    s1_ckpt = os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
+    if os.path.exists(s1_ckpt):
+        import torch
+        ckpt_state = torch.load(s1_ckpt, map_location="cpu")
+        has_v5_keys = any("conv.weight" in k or "conv.bias" in k for k in ckpt_state.keys())
+        if has_v5_keys and cfg.steernet_arch != "v5":
+            print(f"[main] Auto-detected v5 architecture from checkpoint, setting steernet_arch=v5")
+            cfg.steernet_arch = "v5"
+    
     stage_map = dict(STAGE_MAP)
     if args.stage_map:
         with open(args.stage_map) as f:
