@@ -5,6 +5,7 @@ from .verifier import (
     evaluate_response,
     build_prompt,
     AnswerStoppingCriteria,
+    BatchAnswerStopping,
     epoch_end_accuracy,
     generate_response,
     GSM8K_8SHOT_EXEMPLARS,

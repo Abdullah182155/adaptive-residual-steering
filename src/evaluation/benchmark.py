@@ -29,10 +29,10 @@ from src.evaluation.verifier import (
     evaluate_response,
     extract_final_answer,
     generate_response,
+    BatchAnswerStopping,
 )
 from src.evaluation.extract_v2 import extract_canonical
 from src.data.prompts import build_prompt_unified
-from src.data.onpolicy import BatchAnswerStopping
 
 # ----------------------------------------------------------------------------- legacy
 

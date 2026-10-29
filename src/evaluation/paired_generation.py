@@ -7,7 +7,7 @@ import torch
 from torch import Tensor
 from transformers import StoppingCriteriaList
 
-from src.data.onpolicy import BatchAnswerStopping
+from src.evaluation.verifier import BatchAnswerStopping
 from src.evaluation.answers import cut_continuation, extract_numeric_answer  # noqa: F401
 from src.data.prompts import build_prompt_unified
 

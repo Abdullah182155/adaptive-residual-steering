@@ -14,12 +14,11 @@ from tqdm import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
 from src.evaluation.answers import cut_continuation, extract_numeric_answer
-from src.evaluation.verifier import extract_and_verify_equations
+from src.evaluation.verifier import extract_and_verify_equations, BatchAnswerStopping
 from src.data.prompts import build_prompt_unified
 
-# Marker whose number has at least begun (used for stopping; grace tokens finish the number).
+# Marker for AnswerStopping
 _ANSWER_START_RE = re.compile(r"####\s*\$?-?\d|[Ff]inal\s+answer\s*[:\-]?\s*\$?-?\d")
-# Marker with the complete number (used for truncation).
 _ANSWER_FULL_RE = re.compile(r"(?:####|[Ff]inal\s+answer\s*[:\-]?)\s*\$?-?\d[\d,]*(?:\.\d+)?")
 _RUNAWAY = "\nQuestion:"
 _TOL = 0.01
@@ -38,55 +37,6 @@ class OnPolicyChain:
     correct: bool
     n_tokens: int
     div_line: Optional[int]  # index of first line that differs from a correct sibling (pairs only)
-
-
-class BatchAnswerStopping(StoppingCriteria):
-    """Per-row batch stopping criteria for HuggingFace generate.
-
-    Tracks each row independently: a row is finished on EOS, on an answer marker
-    ('#### <num>', 'Final answer: <num>') once `grace_tokens` more tokens have been
-    produced (so the number can complete), or immediately on runaway continuation
-    ('\\nQuestion:'). Returns True only when every row in the batch is finished.
-    """
-
-    def __init__(self, tokenizer, prompt_len: int, grace_tokens: int = 12, window: int = 32):
-        self.tokenizer = tokenizer
-        self.prompt_len = int(prompt_len)
-        self.grace_tokens = int(grace_tokens)
-        self.window = int(window)
-        self.eos_id = getattr(tokenizer, "eos_token_id", None)
-        self.row_done: List[bool] = []
-        self._marker_at: List[Optional[int]] = []
-
-    def _init_rows(self, n: int) -> None:
-        if len(self.row_done) != n:
-            self.row_done = [False] * n
-            self._marker_at = [None] * n
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        n = input_ids.shape[0]
-        self._init_rows(n)
-        cur_len = input_ids.shape[1] - self.prompt_len
-        if cur_len <= 0:
-            return False
-        new_ids = input_ids[:, self.prompt_len:]
-        for b in range(n):
-            if self.row_done[b]:
-                continue
-            row = new_ids[b]
-            if self.eos_id is not None and bool((row == self.eos_id).any()):
-                self.row_done[b] = True
-                continue
-            if self._marker_at[b] is None:
-                text = self.tokenizer.decode(row[-self.window:], skip_special_tokens=True)
-                if _RUNAWAY in text:
-                    self.row_done[b] = True
-                    continue
-                if _ANSWER_START_RE.search(text):
-                    self._marker_at[b] = cur_len
-            if self._marker_at[b] is not None and cur_len >= self._marker_at[b] + self.grace_tokens:
-                self.row_done[b] = True
-        return all(self.row_done)
 
 
 # --------------------------------------------------------------------------- helpers

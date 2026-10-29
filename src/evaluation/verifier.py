@@ -11,6 +11,59 @@ from transformers import StoppingCriteria, StoppingCriteriaList
 from tqdm.auto import tqdm
 from src.data.prompts import build_prompt_unified
 
+# Marker for BatchAnswerStopping
+_ANSWER_START_RE = re.compile(r"####\s*\$?-?\d|[Ff]inal\s+answer\s*[:\-]?\s*\$?-?\d")
+_RUNAWAY = "\nQuestion:"
+
+
+class BatchAnswerStopping(StoppingCriteria):
+    """Per-row batch stopping criteria for HuggingFace generate.
+
+    Tracks each row independently: a row is finished on EOS, on an answer marker
+    ('#### <num>', 'Final answer: <num>') once `grace_tokens` more tokens have been
+    produced (so the number can complete), or immediately on runaway continuation
+    ('\\nQuestion:'). Returns True only when every row in the batch is finished.
+    """
+
+    def __init__(self, tokenizer, prompt_len: int, grace_tokens: int = 12, window: int = 32):
+        self.tokenizer = tokenizer
+        self.prompt_len = int(prompt_len)
+        self.grace_tokens = int(grace_tokens)
+        self.window = int(window)
+        self.eos_id = getattr(tokenizer, "eos_token_id", None)
+        self.row_done: List[bool] = []
+        self._marker_at: List[Optional[int]] = []
+
+    def _init_rows(self, n: int) -> None:
+        if len(self.row_done) != n:
+            self.row_done = [False] * n
+            self._marker_at = [None] * n
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        n = input_ids.shape[0]
+        self._init_rows(n)
+        cur_len = input_ids.shape[1] - self.prompt_len
+        if cur_len <= 0:
+            return False
+        new_ids = input_ids[:, self.prompt_len:]
+        for b in range(n):
+            if self.row_done[b]:
+                continue
+            row = new_ids[b]
+            if self.eos_id is not None and bool((row == self.eos_id).any()):
+                self.row_done[b] = True
+                continue
+            if self._marker_at[b] is None:
+                text = self.tokenizer.decode(row[-self.window:], skip_special_tokens=True)
+                if _RUNAWAY in text:
+                    self.row_done[b] = True
+                    continue
+                if _ANSWER_START_RE.search(text):
+                    self._marker_at[b] = cur_len
+            if self._marker_at[b] is not None and cur_len >= self._marker_at[b] + self.grace_tokens:
+                self.row_done[b] = True
+        return all(self.row_done)
+
 GSM8K_8SHOT_EXEMPLARS = [
     {
         "q": "There are 15 trees in the grove. Grove workers will plant trees in the grove today. After they are done, there will be 21 trees. How many trees did the grove workers plant today?",
