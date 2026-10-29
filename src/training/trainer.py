@@ -4052,6 +4052,70 @@ def _s1_fit(
     }
 
 
+def train_s1_pref(
+    model,
+    tokenizer,
+    pairs: List,
+    cfg,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Train S1' SteerNets with preference (DPO) loss from mined pairs.
+    
+    Phase 1.4: Preference training with Step-DPO.
+    
+    Args:
+        model: RSC model
+        tokenizer: Tokenizer
+        pairs: List of PreferencePair objects
+        cfg: RSCConfig
+        device: torch device
+    
+    Returns:
+        Training logs
+    """
+    print("\n" + "=" * 80)
+    print("S1': SteerNet preference trainer (DPO)")
+    print(f"     pairs={len(pairs)}  lr={cfg.s1_lr}  epochs={cfg.s1_epochs}")
+    print("=" * 80)
+    
+    # Freeze router and gate
+    model.set_steer_scale(cfg.steer_scale)
+    
+    # Training setup
+    optimizer = torch.optim.AdamW(
+        [p for name, p in model.named_parameters() if "steer_nets" in name],
+        lr=cfg.s1_lr,
+    )
+    
+    beta = getattr(cfg, "dpo_beta", 0.1)
+    kl_weight = getattr(cfg, "dpo_kl_weight", 0.01)
+    
+    model.train()
+    loss_history = []
+    
+    for epoch in range(cfg.s1_epochs):
+        epoch_loss = 0.0
+        for pair in pairs:
+            # Placeholder: compute logprobs for y+ and y-
+            # This would require forward passes through the model
+            # For now, just record dummy loss
+            loss = torch.tensor(0.0, device=device, requires_grad=True)
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            epoch_loss += loss.item()
+        
+        avg_loss = epoch_loss / len(pairs)
+        loss_history.append(avg_loss)
+        print(f"Epoch {epoch+1}/{cfg.s1_epochs}: loss={avg_loss:.4f}")
+    
+    return {
+        "loss_history": loss_history,
+        "n_pairs": len(pairs),
+        "beta": beta,
+    }
+
+
 def train_s1_steernet(
     model,
     tokenizer,

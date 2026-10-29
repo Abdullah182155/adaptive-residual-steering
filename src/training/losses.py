@@ -9,6 +9,67 @@ import numpy as np
 from src.data.dataset import PromptTemplateBank
 from src.evaluation.verifier import extract_final_answer
 
+# Phase 1.4: Preference (DPO) loss
+def preference_dpo_loss(
+    logp_y_plus: torch.Tensor,
+    logp_y_minus: torch.Tensor,
+    beta: float = 0.1,
+    label_smoothing: float = 0.0,
+) -> torch.Tensor:
+    """
+    Direct Preference Optimization (DPO) loss.
+    
+    L = -beta * log(sigmoid(beta * (logp_y_plus - logp_y_minus)))
+    
+    Args:
+        logp_y_plus: Log probabilities for preferred chains (B,)
+        logp_y_minus: Log probabilities for dispreferred chains (B,)
+        beta: DPO temperature
+        label_smoothing: Label smoothing (0 = hard labels)
+    
+    Returns:
+        Scalar loss
+    """
+    log_ratio = logp_y_plus - logp_y_minus
+    if label_smoothing > 0:
+        # Smooth labels: mix with uniform distribution
+        log_ratio = log_ratio * (1 - label_smoothing) + label_smoothing * torch.zeros_like(log_ratio)
+    
+    loss = -beta * F.logsigmoid(beta * log_ratio)
+    return loss.mean()
+
+
+def preference_loss_with_kl(
+    logp_y_plus: torch.Tensor,
+    logp_y_minus: torch.Tensor,
+    logp_ref_y_plus: torch.Tensor,
+    logp_ref_y_minus: torch.Tensor,
+    beta: float = 0.1,
+    kl_weight: float = 0.01,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    DPO loss with KL divergence constraint against reference policy.
+    
+    Args:
+        logp_y_plus, logp_y_minus: Policy logprobs
+        logp_ref_y_plus, logp_ref_y_minus: Reference (baseline) logprobs
+        beta: DPO temperature
+        kl_weight: KL penalty weight
+    
+    Returns:
+        (dpo_loss, kl_loss)
+    """
+    # DPO loss
+    dpo_loss = preference_dpo_loss(logp_y_plus, logp_y_minus, beta)
+    
+    # KL divergence: E[log(pi/pi_ref)]
+    kl_y_plus = (logp_y_plus - logp_ref_y_plus).mean()
+    kl_y_minus = (logp_y_minus - logp_ref_y_minus).mean()
+    kl_loss = 0.5 * (kl_y_plus + kl_y_minus)
+    
+    total_loss = dpo_loss + kl_weight * kl_loss
+    return total_loss, kl_loss
+
 class LRReducer:
     """Cosine LR schedule with linear warmup and plateau-triggered peak reduction.
 
