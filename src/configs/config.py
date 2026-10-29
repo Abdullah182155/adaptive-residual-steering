@@ -36,7 +36,15 @@ class RSCConfig:
     train_target_style: str = "auto"  # "auto" (hash for 0-shot, final_answer for n>0), "hash", "final_answer"
     
     # Phase 1.2: SteerNet architecture selection
-    steernet_arch: str = "v4"  # "v4" for current architecture, "v5" for rank-64 with per-layer caps
+    steernet_arch: str = "v5"  # "v4" for current architecture, "v5" for rank-64 with per-layer caps (default v5)
+    
+    # Phase 1.2: V5-specific parameters
+    steer_kappa: float = 0.04  # Cap multiplier for v5: C_l = kappa * N_l
+    layer_norms_calibration: Optional[str] = None  # Path to calibration JSON for per-layer norms
+    
+    # Phase 1.4: Preference training parameters
+    dpo_beta: float = 0.1  # DPO temperature
+    dpo_kl_weight: float = 0.01  # KL penalty weight for DPO
 
     # SteerNet
     lora_rank: int = 16
@@ -798,10 +806,38 @@ ENGINE_V40_KAGGLE_EVALUATION: Dict[str, Any] = {
 }
 
 
+# Phase 1.0: V5 Kaggle profile with preference training
+ENGINE_V50_KAGGLE_PROFILE_NAME = "Engine v5.0 Kaggle T4 Decision-Run"
+ENGINE_V50_KAGGLE_PROFILE: Dict[str, Any] = {
+    **ENGINE_V40_KAGGLE_PROFILE,
+    "steernet_arch": "v5",
+    "steer_kappa": 0.04,
+    "exemplar_set": "v5",
+    "train_target_style": "final_answer",
+    "dpo_beta": 0.1,
+    "dpo_kl_weight": 0.01,
+}
+ENGINE_V50_KAGGLE_EVALUATION: Dict[str, Any] = {
+    "n_test": 100,
+    "shots": (0, 2, 4, 8),
+    "max_new_tokens": 512,
+}
+
+
 def make_engine_v40_kaggle_config(**overrides) -> RSCConfig:
     """Return the committed Engine v4.0 T4 decision-run profile."""
     cfg = RSCConfig()
     for field, value in ENGINE_V40_KAGGLE_PROFILE.items():
+        setattr(cfg, field, value)
+    for field, value in overrides.items():
+        setattr(cfg, field, value)
+    return cfg
+
+
+def make_engine_v50_kaggle_config(**overrides) -> RSCConfig:
+    """Return the committed Engine v5.0 T4 decision-run profile with preference training."""
+    cfg = RSCConfig()
+    for field, value in ENGINE_V50_KAGGLE_PROFILE.items():
         setattr(cfg, field, value)
     for field, value in overrides.items():
         setattr(cfg, field, value)
