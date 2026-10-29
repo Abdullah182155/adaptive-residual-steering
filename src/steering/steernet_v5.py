@@ -99,7 +99,7 @@ class RSCSteerNetV5(nn.Module):
         rank: int = 64,
         lora_alpha: float = 32.0,
         dropout: float = 0.1,
-        kappa: float = 0.04,  # Multiplier for cap: C_l = κ * N_l
+        kappa: float = 0.08,  # Multiplier for cap: C_l = κ * N_l (increased from 0.04 to 0.08 for stronger steering)
         layer_norms: Optional[Dict[int, float]] = None,  # N_l per layer
         layer_idx: int = 0,  # Which layer this steernet is for
         max_magnitude: float = 2.0,
@@ -124,6 +124,10 @@ class RSCSteerNetV5(nn.Module):
         # Smooth cap C_l = κ * N_l
         self.C_l = self.kappa * self.N_l
         
+        # Log the cap for debugging
+        if layer_idx % 5 == 0:  # Log every 5th layer to avoid spam
+            print(f"[SteerNetV5 L{layer_idx}] N_l={self.N_l:.3f}, kappa={self.kappa}, C_l={self.C_l:.3f}")
+        
         # Telemetry (same as v4)
         self._pre_cap_sum = 0.0
         self._pre_cap_n = 0
@@ -139,7 +143,8 @@ class RSCSteerNetV5(nn.Module):
         # Network layers
         self.norm = nn.LayerNorm(hidden_dim)
         self.down = nn.Linear(hidden_dim, rank, bias=False)
-        nn.init.xavier_uniform_(self.down.weight, gain=0.02)
+        # Use standard initialization (gain=1.0) instead of tiny 0.02
+        nn.init.xavier_uniform_(self.down.weight, gain=1.0)
         
         # Causal convolution for sequence mixing
         if self.use_causal_conv:
@@ -148,9 +153,9 @@ class RSCSteerNetV5(nn.Module):
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
         
-        # Zero-init up projection for identity
+        # Small init up projection (not zero) to allow steering to develop
         self.up = nn.Linear(rank, hidden_dim, bias=False)
-        nn.init.zeros_(self.up.weight)
+        nn.init.xavier_uniform_(self.up.weight, gain=0.1)  # Small but non-zero
         
         # Per-token magnitude head
         self.mag_head = nn.Linear(rank, 1)
