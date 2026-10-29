@@ -105,6 +105,7 @@ class RSCConfig:
     # conservative adapter learning rate; generation validation owns model
     # selection below.
     phase1_lr: float = 3e-4
+    phase1_lr_v5: float = 1e-3  # Higher LR for v5 (rank 64 + conv needs faster learning)
     phase1_epochs: int = 2  # Engine v3 Stage A: capacity before pair co-adaptation
     phase1_warmup_ratio: float = 0.06
     phase1_patience: int = 4

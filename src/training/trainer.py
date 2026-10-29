@@ -1559,7 +1559,9 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
     print("\n" + "=" * 80)
     print("PHASE 1: Pure SteerNet Training (Hidden States)")
     print("         Gates FIXED at 1.0; deterministic K=1 rotation")
-    print(f"         lr={cfg.phase1_lr}, epochs={cfg.phase1_epochs}")
+    # Use v5-specific learning rate if v5 architecture is active
+    phase1_lr = getattr(cfg, "phase1_lr_v5", cfg.phase1_lr) if getattr(cfg, "steernet_arch", "v4") == "v5" else cfg.phase1_lr
+    print(f"         lr={phase1_lr}, epochs={cfg.phase1_epochs}")
     print("=" * 80)
 
     model.set_gate_freeze(True, 1.0)
@@ -1577,7 +1579,7 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
 
     optimizer_p1 = torch.optim.AdamW(
         steer_params,
-        lr=cfg.phase1_lr,
+        lr=phase1_lr,
         weight_decay=cfg.weight_decay,
         betas=(0.9, 0.98),
         eps=1e-6,
