@@ -1651,7 +1651,11 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
                     q_hi=getattr(cfg, "steer_norm_q_hi", 0.75),
                     huber_delta=getattr(cfg, "steer_norm_huber_delta", 0.10),
                 )
-                lambda_norm = float(getattr(cfg, "lambda_steer_norm", 0.15))
+                # Use v5-specific regularization if v5 architecture is active
+                if getattr(cfg, "steernet_arch", "v4") == "v5":
+                    lambda_norm = float(getattr(cfg, "lambda_steer_norm_v5", 0.30))
+                else:
+                    lambda_norm = float(getattr(cfg, "lambda_steer_norm", 0.60))
                 loss = (loss_task + lambda_norm * loss_norm) / cfg.grad_accum
 
             if not torch.isfinite(loss):

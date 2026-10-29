@@ -39,7 +39,10 @@ class RSCConfig:
     steernet_arch: str = "v4"  # "v4" for current architecture (default), "v5" for rank-64 with per-layer caps
     
     # Phase 1.2: V5-specific parameters
-    steer_kappa: float = 0.04  # Cap multiplier for v5: C_l = kappa * N_l
+    steer_kappa: float = 0.08  # Cap multiplier for v5: C_l = kappa * N_l (increased from 0.04 to 0.08 for stronger steering)
+    # V5-specific regularization (less aggressive than v4 due to larger rank and convolution)
+    lambda_steer_norm_v5: float = 0.30  # Reduced from 0.60 for v5 (stronger architecture needs less regularization)
+    steer_norm_q_hi_v5: float = 0.75  # Increased from 0.50 for v5 (allow larger residuals in linear regime)
     layer_norms_calibration: Optional[str] = None  # Path to calibration JSON for per-layer norms
     
     # Phase 1.4: Preference training parameters
