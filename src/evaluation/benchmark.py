@@ -30,7 +30,9 @@ from src.evaluation.verifier import (
     extract_final_answer,
     generate_response,
 )
+from src.evaluation.extract_v2 import extract_canonical
 from src.data.prompts import build_prompt_unified
+from src.data.onpolicy import BatchAnswerStopping
 
 # ----------------------------------------------------------------------------- legacy
 
@@ -58,25 +60,49 @@ def eval_gsm8k_benchmark(
         elapsed = time.time() - t0
         total_time += elapsed
         er      = evaluate_response(resp, gold, min_steps=1)
+        # Phase 1.0: Use canonical extractor for v5 metrics
+        can_result = extract_canonical(resp, q)  # Pass question for exemplar boundary
         correct += int(er["correct"])
         n_tok   = len(tokenizer.encode(resp, add_special_tokens=False))
         total_tokens += n_tok
+        # Determine which tier fired
+        tier_fired = "none"
+        if can_result["strict"] is not None:
+            tier_fired = "T1"
+        elif can_result["canonical"] is not None:
+            tier_fired = "T2"
+        elif can_result["lenient"] is not None:
+            tier_fired = "T3"
         results.append({
             "idx": idx, "question": q, "gold": gold, "response": resp,
             "extracted": er["extracted"], "correct": er["correct"],
             "steps": er["steps"], "has_answer": er["has_answer"],
             "time_sec": elapsed, "tokens": n_tok,
+            # Phase 1.0: Add v5 metrics
+            "canonical_correct": can_result["canonical"] is not None and abs(can_result["canonical"] - gold) < 0.01,
+            "tier": tier_fired,
         })
         if idx < display_examples:
             icon = "✅" if er["correct"] else "❌"
             print(f"[{idx + 1}/{len(ds)}] {icon} Expected: {gold} | Got: {er['extracted']} ({elapsed:.2f}s)")
     acc     = 100.0 * correct / max(1, len(results))
+    # Phase 1.0: Calculate canonical accuracy and tier histogram
+    canonical_correct = sum(r["canonical_correct"] for r in results)
+    canonical_acc = 100.0 * canonical_correct / max(1, len(results))
+    tier_counts = Counter(r["tier"] for r in results)
+    marker_rate = 100.0 * (tier_counts.get("T1", 0) + tier_counts.get("T2", 0) + tier_counts.get("T3", 0)) / max(1, len(results))
+    
     summary = {
         "stage":          stage_name,
         "n_examples":     len(results),
         "n_shot":         n_shot,
         "correct":        correct,
         "accuracy":       acc,
+        # Phase 1.0: Add v5 metrics
+        "canonical_correct": canonical_correct,
+        "canonical_accuracy": canonical_acc,
+        "marker_rate": marker_rate,
+        "tier_histogram": dict(tier_counts),
         "answer_present": 100.0 * sum(r["has_answer"] for r in results) / max(1, len(results)),
         "step_coverage":  100.0 * sum(r["steps"] > 0 for r in results) / max(1, len(results)),
         "avg_time_sec":   total_time / max(1, len(results)),
@@ -471,15 +497,31 @@ def assemble_shot_block(
     max_k:            int   = 4,
 ) -> Dict[str, Any]:
     arms: Dict[str, Any] = {}
-    bits: Dict[str, Dict[str, List[bool]]] = {"strict": {}, "lenient": {}}
+    bits: Dict[str, Dict[str, List[bool]]] = {"strict": {}, "lenient": {}, "canonical": {}}
+    tier_histograms: Dict[str, Counter] = {}
 
     for key, res in arm_results.items():
-        strict, lenient, extracted = [], [], []
+        strict, lenient, canonical, extracted = [], [], [], []
+        tier_counts = Counter()
         for t, g in zip(res["texts"], golds):
             strict.append(_is_correct(extract_strict(t), g))
             lenient.append(bool(evaluate_response(t, g, min_steps=1)["correct"]))
+            # Phase 1.0: Use canonical extractor
+            can_result = extract_canonical(t, "")  # No question for batch mode
+            canonical.append(can_result["canonical"] is not None and abs(can_result["canonical"] - g) < 0.01)
+            # Extract tier from histogram
+            tier_hist = can_result["tier_histogram"]
+            if tier_hist.get("T1", 0) > 0:
+                tier_counts["T1"] += 1
+            elif tier_hist.get("T2", 0) > 0:
+                tier_counts["T2"] += 1
+            elif tier_hist.get("T3", 0) > 0:
+                tier_counts["T3"] += 1
+            else:
+                tier_counts["none"] += 1
             extracted.append(extract_final_answer(t))
-        bits["strict"][key], bits["lenient"][key] = strict, lenient
+        bits["strict"][key], bits["lenient"][key], bits["canonical"][key] = strict, lenient, canonical
+        tier_histograms[key] = tier_counts
         n    = max(1, len(strict))
         summ = route_summary(res["routes"], max_k)
         summ["guard_trip_rate"] = sum(res["tripped"]) / n
@@ -487,15 +529,22 @@ def assemble_shot_block(
         timings = res.get("timings", [0.0] * n)
         summ["avg_time_sec"] = sum(timings) / n if timings else 0.0
         meta = arm_meta[key]
+        # Phase 1.0: Calculate marker rate
+        marker_rate = 100.0 * (tier_counts.get("T1", 0) + tier_counts.get("T2", 0) + tier_counts.get("T3", 0)) / n
         arms[key] = {
             "label":             meta["label"],
             "gate_mode":         meta["gate_mode"],
             "guards":            meta["guards"],
             "accuracy_strict":   100.0 * sum(strict) / n,
             "accuracy_lenient":  100.0 * sum(lenient) / n,
+            # Phase 1.0: Add canonical metrics
+            "accuracy_canonical": 100.0 * sum(canonical) / n,
+            "marker_rate": marker_rate,
+            "tier_histogram": dict(tier_counts),
             "summary":           summ,
             "correct_strict":    [int(x) for x in strict],
             "correct_lenient":   [int(x) for x in lenient],
+            "correct_canonical": [int(x) for x in canonical],
             "routes":            res["routes"],
             "tripped":           [int(x) for x in res["tripped"]],
             "reverted":          [int(x) for x in res["reverted"]],
@@ -506,7 +555,7 @@ def assemble_shot_block(
 
     stats: Dict[str, Any] = {}
     if "baseline" in arm_results:
-        for metric in ("strict", "lenient"):
+        for metric in ("strict", "lenient", "canonical"):
             treat = {k: v for k, v in bits[metric].items() if k != "baseline"}
             stats[metric] = compare_to_control(
                 bits[metric]["baseline"], treat,

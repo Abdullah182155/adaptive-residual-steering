@@ -245,6 +245,11 @@ class TestAssemble(unittest.TestCase):
         st = blk["stats"]["strict"]["full_ars"]
         self.assertEqual((st["b"], st["c"]), (1, 0))
         self.assertAlmostEqual(blk["arms"]["full_ars"]["summary"]["abstain_rate"], 0.25)
+        # Phase 1.0: Check canonical metrics are present
+        self.assertIn("accuracy_canonical", blk["arms"]["baseline"])
+        self.assertIn("marker_rate", blk["arms"]["baseline"])
+        self.assertIn("tier_histogram", blk["arms"]["baseline"])
+        self.assertIn("canonical", blk["stats"])
         self.assertEqual(B.extract_strict("so Final answer: 1,234."), 1234.0)
         self.assertEqual(B.extract_strict("Therefore, Final Answer: 56."), 56.0)
         self.assertEqual(B.extract_strict("The final answer is: 78."), 78.0)

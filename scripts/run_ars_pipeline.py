@@ -57,6 +57,11 @@ def parse_args():
     p.add_argument("--router_tau",              type=float, default=None, help="Softmax temperature for router target distribution")
     p.add_argument("--router_k_free",           type=int, default=None, help="Number of layers exempt from size penalty (K<=k_free free)")
     p.add_argument("--router_c_size",           type=float, default=None, help="Penalty per excess layer beyond k_free in router distillation")
+    # Phase 1.0: Add v5 and preference training flags
+    p.add_argument("--steernet_arch",          choices=["v4", "v5"], default="v4", help="SteerNet architecture version")
+    p.add_argument("--objective",              choices=["nll", "pref"], default=None, help="S1 training objective (auto: pref for v5, nll for v4)")
+    p.add_argument("--dpo_beta",               type=float, default=0.1, help="DPO beta temperature")
+    p.add_argument("--dpo_kl_weight",          type=float, default=0.01, help="KL penalty weight for DPO")
     p.add_argument("--set",                     action="append", default=[], help="Arbitrary config override KEY=VAL")
     return p.parse_args()
 
@@ -224,8 +229,9 @@ def stage_s0(model, tok, train_data, eval_data, cfg, device, state, args):
 
 
 def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
-    from src.training.trainer import train_s1_steernet
+    from src.training.trainer import train_s1_steernet, train_s1_pref
     from src.data.onpolicy import OnPolicyStore
+    from src.data.pairs import mine_preference_pairs, save_pairs, load_pairs
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     ckpt_path = os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
     cfg.s1_save_path = ckpt_path
@@ -233,26 +239,72 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
         cfg.s1_epochs = args.s1_epochs
     if getattr(args, "batch_size", None):
         cfg.batch_size = args.batch_size
+    
+    # Phase 1.0: Set steernet_arch from args
+    if hasattr(args, "steernet_arch"):
+        cfg.steernet_arch = args.steernet_arch
+    
+    # Phase 1.0: Auto-select objective based on architecture
+    objective = getattr(args, "objective", None)
+    if objective is None:
+        objective = "pref" if cfg.steernet_arch == "v5" else "nll"
+    
+    # Set DPO parameters
+    if hasattr(args, "dpo_beta"):
+        cfg.dpo_beta = args.dpo_beta
+    if hasattr(args, "dpo_kl_weight"):
+        cfg.dpo_kl_weight = args.dpo_kl_weight
 
     s1_train_n = getattr(args, "s1_train_n", None) or getattr(cfg, "s1_train_n", None)
     gold_rows_all = _dataset_to_rows(train_data, n=s1_train_n)
     print(f"[S1] SteerNet training on n={len(gold_rows_all)} gold rows")
     store_path = (state.get("S0b") or {}).get("store_path", os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl"))
-    if os.path.exists(store_path):
-        store = OnPolicyStore.load(store_path)
-        train_rows, val_rows = store.build_training_rows(tok, cfg, gold_rows_all, val_fraction=0.1, seed=cfg.seed)
-    else:
-        train_rows = gold_rows_all
-        val_rows = _dataset_to_rows(eval_data, n=min(len(eval_data), 100))
+    
+    if objective == "pref":
+        # Phase 1.0: Preference training path
+        print(f"[S1] Using preference training (objective=pref)")
+        if os.path.exists(store_path):
+            store = OnPolicyStore.load(store_path)
+            chains = store.chains
+            pairs_path = os.path.join(cfg.checkpoint_dir, "preference_pairs.json")
+            if os.path.exists(pairs_path):
+                pairs = load_pairs(pairs_path)
+                print(f"[S1] Loaded {len(pairs)} existing preference pairs")
+            else:
+                # Mine preference pairs
+                pairs = mine_preference_pairs(
+                    chains,
+                    k_samples=8,
+                    temperature=getattr(cfg, "onpolicy_temperature", 0.8),
+                    max_pairs_per_question=10,
+                )
+                save_pairs(pairs, pairs_path)
+                print(f"[S1] Mined {len(pairs)} preference pairs")
+            
+            logs = train_s1_pref(model, tok, pairs, cfg, device)
+        else:
+            print(f"[S1] Warning: No onpolicy store found for preference training, falling back to NLL")
+            objective = "nll"
+    
+    if objective == "nll":
+        # Legacy NLL training path
+        print(f"[S1] Using NLL training (objective=nll)")
+        if os.path.exists(store_path):
+            store = OnPolicyStore.load(store_path)
+            train_rows, val_rows = store.build_training_rows(tok, cfg, gold_rows_all, val_fraction=0.1, seed=cfg.seed)
+        else:
+            train_rows = gold_rows_all
+            val_rows = _dataset_to_rows(eval_data, n=min(len(eval_data), 100))
 
-    gold_rows = [r for r in train_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))]
-    onpolicy_rows = [r for r in train_rows if (isinstance(r, dict) and r.get("is_onpolicy"))]
-    val_onp = [r for r in val_rows if (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
-    val_gold = [r for r in val_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
-    sel_rows = (val_onp + val_gold) if (val_onp or val_gold) else val_rows[:min(len(val_rows), 120)]
+        gold_rows = [r for r in train_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))]
+        onpolicy_rows = [r for r in train_rows if (isinstance(r, dict) and r.get("is_onpolicy"))]
+        val_onp = [r for r in val_rows if (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
+        val_gold = [r for r in val_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
+        sel_rows = (val_onp + val_gold) if (val_onp or val_gold) else val_rows[:min(len(val_rows), 120)]
 
-    logs = train_s1_steernet(model, tok, gold_rows, onpolicy_rows, sel_rows, cfg, device)
-    return {"ckpt": ckpt_path, "logs": logs}
+        logs = train_s1_steernet(model, tok, gold_rows, onpolicy_rows, sel_rows, cfg, device)
+    
+    return {"ckpt": ckpt_path, "logs": logs, "objective": objective}
 
 
 def stage_s0b(model, tok, train_data, cfg, device, state, args):
