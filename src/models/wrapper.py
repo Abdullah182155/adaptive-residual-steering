@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from src.configs.config import RSCConfig
 from src.steering.steernet import RSCSteerNet
+from src.steering.steernet_v5 import RSCSteerNetV5
 from src.gating.gate import RSCUsefulnessGate, masked_route_allocation, token_competitive_allocation
 from src.routing.router import JointLayerRouter
 from src.routing.rloo import sample_k, sample_subset_plackett_luce
@@ -154,21 +155,46 @@ class Phi2WithRSC(nn.Module):
     def _inject_rsc(self, n_layers: int):
         layers = self.base_model.model.layers
         self_ref = weakref.ref(self)
+        
+        # Phase 1.2: Load layer norms calibration if using v5
+        layer_norms = None
+        if getattr(self.cfg, "steernet_arch", "v4") == "v5":
+            calibration_path = getattr(self.cfg, "layer_norms_calibration", None)
+            if calibration_path:
+                from src.steering.steernet_v5 import load_layer_norms
+                layer_norms = load_layer_norms(calibration_path)
 
         for idx in self.target_layers:
             gate = RSCUsefulnessGate(self.hidden_dim, self.cfg).to(self.device)
-            steer = RSCSteerNet(
-                self.hidden_dim,
-                self.cfg.lora_rank,
-                self.cfg.lora_alpha,
-                self.cfg.lora_dropout,
-                magnitude_mode=getattr(self.cfg, "steer_magnitude_mode", "direct"),
-                max_magnitude=getattr(self.cfg, "steer_max_magnitude", 2.0),
-                max_relative_norm=getattr(self.cfg, "steer_max_relative_norm", 0.04),     # BUG-C3 fix: 0.15→0.04
-                orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", False),
-                k_max=getattr(self.cfg, "max_active_layers", 4),
-                telemetry_reservoir_size=getattr(self.cfg, "pre_cap_telemetry_reservoir_size", 8192),
-            ).to(self.device)
+            
+            # Phase 1.2: Choose SteerNet architecture based on config
+            if getattr(self.cfg, "steernet_arch", "v4") == "v5":
+                steer = RSCSteerNetV5(
+                    self.hidden_dim,
+                    rank=64,  # Fixed rank for v5
+                    lora_alpha=getattr(self.cfg, "lora_alpha", 32.0),
+                    dropout=getattr(self.cfg, "lora_dropout", 0.1),
+                    kappa=getattr(self.cfg, "steer_kappa", 0.04),
+                    layer_norms=layer_norms,
+                    layer_idx=idx,
+                    max_magnitude=getattr(self.cfg, "steer_max_magnitude", 2.0),
+                    orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", False),
+                    telemetry_reservoir_size=getattr(self.cfg, "pre_cap_telemetry_reservoir_size", 8192),
+                ).to(self.device)
+            else:
+                steer = RSCSteerNet(
+                    self.hidden_dim,
+                    self.cfg.lora_rank,
+                    self.cfg.lora_alpha,
+                    self.cfg.lora_dropout,
+                    magnitude_mode=getattr(self.cfg, "steer_magnitude_mode", "direct"),
+                    max_magnitude=getattr(self.cfg, "steer_max_magnitude", 2.0),
+                    max_relative_norm=getattr(self.cfg, "steer_max_relative_norm", 0.04),
+                    orthogonal_projection=getattr(self.cfg, "steer_orthogonal_projection", False),
+                    k_max=getattr(self.cfg, "max_active_layers", 4),
+                    telemetry_reservoir_size=getattr(self.cfg, "pre_cap_telemetry_reservoir_size", 8192),
+                ).to(self.device)
+            
             self.gates[str(idx)] = gate
             self.steer_nets[str(idx)] = steer
             layer_pos = self.target_layers.index(idx)

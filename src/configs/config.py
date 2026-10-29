@@ -34,6 +34,9 @@ class RSCConfig:
     
     # Phase 2.3: Target style for training
     train_target_style: str = "auto"  # "auto" (hash for 0-shot, final_answer for n>0), "hash", "final_answer"
+    
+    # Phase 1.2: SteerNet architecture selection
+    steernet_arch: str = "v4"  # "v4" for current architecture, "v5" for rank-64 with per-layer caps
 
     # SteerNet
     lora_rank: int = 16
