@@ -58,7 +58,7 @@ def parse_args():
     p.add_argument("--router_k_free",           type=int, default=None, help="Number of layers exempt from size penalty (K<=k_free free)")
     p.add_argument("--router_c_size",           type=float, default=None, help="Penalty per excess layer beyond k_free in router distillation")
     # Phase 1.0: Add v5 and preference training flags
-    p.add_argument("--steernet_arch",          choices=["v4", "v5"], default="v5", help="SteerNet architecture version (default v5)")
+    p.add_argument("--steernet_arch",          choices=["v4", "v5"], default="v4", help="SteerNet architecture version (default v4)")
     p.add_argument("--objective",              choices=["nll", "pref"], default=None, help="S1 training objective (auto: pref for v5, nll for v4)")
     p.add_argument("--dpo_beta",               type=float, default=0.1, help="DPO beta temperature")
     p.add_argument("--dpo_kl_weight",          type=float, default=0.01, help="KL penalty weight for DPO")

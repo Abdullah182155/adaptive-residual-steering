@@ -36,7 +36,7 @@ class RSCConfig:
     train_target_style: str = "auto"  # "auto" (hash for 0-shot, final_answer for n>0), "hash", "final_answer"
     
     # Phase 1.2: SteerNet architecture selection
-    steernet_arch: str = "v5"  # "v4" for current architecture, "v5" for rank-64 with per-layer caps (default v5)
+    steernet_arch: str = "v4"  # "v4" for current architecture (default), "v5" for rank-64 with per-layer caps
     
     # Phase 1.2: V5-specific parameters
     steer_kappa: float = 0.04  # Cap multiplier for v5: C_l = kappa * N_l

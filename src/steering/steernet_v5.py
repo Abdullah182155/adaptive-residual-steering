@@ -2,17 +2,81 @@
 RSCSteerNetV5: Steering engine with rank 64 and per-layer cap basis.
 
 Phase 1.1: Build RSCSteerNetV5 with:
-- Rank 64 (fixed)
-- Per-layer cap basis N_l (from calibration)
-- Smooth cap C_l = κ * N_l with κ ∈ {0.02, 0.04, 0.08}
-- Position-0 shielding
-- Zero-init W_u
+|- Rank 64 (fixed)
+|- Per-layer cap basis N_l (from calibration)
+|- Smooth cap C_l = κ * N_l with κ ∈ {0.02, 0.04, 0.08}
+|- Position-0 shielding
+|- Zero-init W_u
+|- 1D causal depthwise convolution with k=4 (streaming cache for decode)
 """
 
 import math
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Optional, Dict
+
+
+class CausalDWConv1d(nn.Module):
+    """Causal depthwise 1D convolution with streaming cache for auto-regressive decode.
+    
+    - Prefill mode: full causal convolution with left padding
+    - Decode mode: streaming O(1) memory using rolling buffer of last k-1 activations
+    """
+    
+    def __init__(self, channels: int, kernel_size: int = 4):
+        super().__init__()
+        self.channels = channels
+        self.kernel_size = kernel_size
+        # Depthwise conv: each channel has its own filter
+        self.weight = nn.Parameter(torch.randn(channels, 1, kernel_size) * 0.02)
+        self.bias = nn.Parameter(torch.zeros(channels))
+        
+        # Streaming cache for decode mode
+        self._cache = None  # Rolling buffer of shape (B, C, k-1)
+        self._cache_initialized = False
+    
+    def reset_cache(self):
+        """Reset streaming cache (call at start of each decode sequence)."""
+        self._cache = None
+        self._cache_initialized = False
+    
+    def forward(self, x: torch.Tensor, is_decode: bool = False) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, C) input hidden states
+            is_decode: True for streaming decode, False for prefill
+        
+        Returns:
+            (B, T, C) output after causal conv
+        """
+        B, T, C = x.shape
+        x_1d = x.transpose(1, 2)  # (B, C, T)
+        
+        if not is_decode:
+            # Prefill mode: full causal convolution with left padding
+            # Pad left with (k-1) zeros to ensure causality
+            padding = self.kernel_size - 1
+            x_padded = F.pad(x_1d, (padding, 0), mode='constant', value=0)
+            out = F.conv1d(x_padded, self.weight, self.bias, groups=self.channels)
+            out = out.transpose(1, 2)  # (B, T, C)
+        else:
+            # Decode mode: streaming with rolling buffer
+            if not self._cache_initialized or self._cache is None or self._cache.shape[0] != B:
+                # Initialize cache with zeros
+                self._cache = torch.zeros(B, C, self.kernel_size - 1, device=x.device, dtype=x.dtype)
+                self._cache_initialized = True
+            
+            # Append new tokens to cache and keep last k-1
+            self._cache = torch.cat([self._cache, x_1d], dim=2)[:, :, -(self.kernel_size - 1):]
+            
+            # Convolve: pad with cache on left
+            x_with_cache = torch.cat([self._cache, x_1d], dim=2)  # (B, C, k-1 + T)
+            out = F.conv1d(x_with_cache, self.weight, self.bias, groups=self.channels)
+            out = out[:, :, -(T):]  # Take only the T outputs for new tokens
+            out = out.transpose(1, 2)  # (B, T, C)
+        
+        return out
 
 
 class RSCSteerNetV5(nn.Module):
@@ -24,6 +88,7 @@ class RSCSteerNetV5(nn.Module):
     - Smooth cap C_l = κ * N_l
     - Position-0 shielding (no steering on first token)
     - Zero-init W_u for identity initialization
+    - Causal 1D depthwise convolution (k=4) with streaming cache
     """
     
     def __init__(
@@ -38,6 +103,8 @@ class RSCSteerNetV5(nn.Module):
         max_magnitude: float = 2.0,
         orthogonal_projection: bool = False,
         telemetry_reservoir_size: int = 8192,
+        use_causal_conv: bool = True,  # Use causal convolution
+        conv_kernel_size: int = 4,  # Kernel size for causal conv
     ):
         super().__init__()
         self.rank = rank
@@ -46,6 +113,8 @@ class RSCSteerNetV5(nn.Module):
         self.layer_norms = layer_norms or {}
         self.max_magnitude = max_magnitude
         self.orthogonal_projection = orthogonal_projection
+        self.use_causal_conv = use_causal_conv
+        self.conv_kernel_size = conv_kernel_size
         
         # Per-layer cap basis N_l
         self.N_l = self.layer_norms.get(layer_idx, 10.0)  # Default if not calibrated
@@ -65,10 +134,14 @@ class RSCSteerNetV5(nn.Module):
         self.last_pre_cap_q = None
         self._clip_stats = 0.0
         
-        # Network layers (same structure as v4, but fixed rank 64)
+        # Network layers
         self.norm = nn.LayerNorm(hidden_dim)
         self.down = nn.Linear(hidden_dim, rank, bias=False)
         nn.init.xavier_uniform_(self.down.weight, gain=0.02)
+        
+        # Causal convolution for sequence mixing
+        if self.use_causal_conv:
+            self.conv = CausalDWConv1d(rank, kernel_size=conv_kernel_size)
         
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
@@ -85,17 +158,24 @@ class RSCSteerNetV5(nn.Module):
         scaling_factor = lora_alpha / rank
         self.register_buffer("scale", torch.tensor(scaling_factor, dtype=torch.float32))
     
+    def reset_cache(self):
+        """Reset streaming cache for causal conv (call at start of decode)."""
+        if self.use_causal_conv:
+            self.conv.reset_cache()
+    
     def forward(
         self, 
         h: torch.Tensor, 
         position_ids: Optional[torch.Tensor] = None,
         active_k: Optional[torch.Tensor] = None,
+        is_decode: bool = False,
     ) -> torch.Tensor:
         """
         Args:
             h: (B, T, hidden_dim) hidden states
             position_ids: (B, T) position indices for shielding
             active_k: (B,) active K count (for compatibility with v4 interface)
+            is_decode: True for streaming decode mode
         
         Returns:
             delta: (B, T, hidden_dim) steering correction
@@ -115,6 +195,10 @@ class RSCSteerNetV5(nn.Module):
         # Process through network
         x = self.norm(h_flt)
         x = self.drop(self.act(self.down(x)))
+        
+        # Apply causal convolution if enabled
+        if self.use_causal_conv:
+            x = self.conv(x, is_decode=is_decode)
         
         # Magnitude gating
         mag = torch.sigmoid(self.mag_head(x))

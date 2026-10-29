@@ -1,12 +1,12 @@
 """
 Tests for RSCSteerNetV5.
 
-Phase 1.1: Test rank 64, per-layer cap, and position shielding.
+Phase 1.1: Test rank 64, per-layer cap, position shielding, and causal convolution.
 """
 
 import pytest
 import torch
-from src.steering.steernet_v5 import RSCSteerNetV5
+from src.steering.steernet_v5 import RSCSteerNetV5, CausalDWConv1d
 
 
 def test_steernet_v5_forward_shape():
@@ -143,3 +143,89 @@ def test_steernet_v5_rank_fixed():
     assert model.rank == 64
     assert model.down.out_features == 64
     assert model.up.in_features == 64
+
+
+def test_causal_dwconv_prefill_mode():
+    """Test causal depthwise conv in prefill mode."""
+    conv = CausalDWConv1d(channels=64, kernel_size=4)
+    
+    x = torch.randn(2, 10, 64)
+    out = conv(x, is_decode=False)
+    
+    assert out.shape == x.shape
+    # Output should differ from input (convolution applied)
+    assert not torch.allclose(out, x, atol=1e-6)
+
+
+def test_causal_dwconv_decode_mode():
+    """Test causal depthwise conv in streaming decode mode."""
+    conv = CausalDWConv1d(channels=64, kernel_size=4)
+    
+    # Simulate streaming decode: process one token at a time
+    conv.reset_cache()
+    
+    x_full = torch.randn(1, 10, 64)
+    
+    # Stream tokens
+    out_streamed = []
+    for t in range(10):
+        x_t = x_full[:, t:t+1, :]
+        out_t = conv(x_t, is_decode=True)
+        out_streamed.append(out_t)
+    
+    out_streamed = torch.cat(out_streamed, dim=1)
+    
+    # Check shape is preserved
+    assert out_streamed.shape == x_full.shape
+    # Check outputs are not all zeros (convolution applied)
+    assert out_streamed.abs().max() > 0.01
+
+
+def test_causal_dwconv_causality():
+    """Test that convolution is causal (no future information)."""
+    conv = CausalDWConv1d(channels=64, kernel_size=4)
+    
+    # Create a signal with a step at position 5
+    x = torch.zeros(1, 10, 64)
+    x[:, 5:, :] = 1.0
+    
+    out = conv(x, is_decode=False)
+    
+    # Output at position 4 should not see the step (causality)
+    assert out[0, 4, :].abs().max() < 0.1, "Output at t=4 should not see step at t=5"
+    
+    # Output at later positions should eventually see the step (within kernel window)
+    # With kernel size 4, position 8 should definitely see the step
+    assert out[0, 8, :].abs().max() > 0.1, "Output at t=8 should see step"
+
+
+def test_steernet_v5_with_causal_conv():
+    """Test RSCSteerNetV5 with causal convolution enabled."""
+    model = RSCSteerNetV5(
+        hidden_dim=2560,
+        rank=64,
+        use_causal_conv=True,
+        conv_kernel_size=4,
+        layer_idx=13,
+    )
+    
+    x = torch.randn(2, 10, 2560)
+    delta = model(x, is_decode=False)
+    
+    assert delta.shape == x.shape
+
+
+def test_steernet_v5_without_causal_conv():
+    """Test RSCSteerNetV5 with causal convolution disabled."""
+    model = RSCSteerNetV5(
+        hidden_dim=2560,
+        rank=64,
+        use_causal_conv=False,
+        layer_idx=13,
+    )
+    
+    x = torch.randn(2, 10, 2560)
+    delta = model(x)
+    
+    assert delta.shape == x.shape
+    assert not hasattr(model, 'conv') or model.conv is None
