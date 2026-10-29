@@ -179,6 +179,16 @@ def stage_s0(model, tok, train_data, eval_data, cfg, device, state, args):
     init_ckpt = getattr(args, "ckpt", None) or os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")
     has_steer = False
     if init_ckpt and os.path.exists(init_ckpt):
+        # Auto-detect architecture from checkpoint before loading
+        import torch
+        ckpt_state = torch.load(init_ckpt, map_location="cpu")
+        has_v5_keys = any("conv.weight" in k or "conv.bias" in k for k in ckpt_state.keys())
+        if has_v5_keys and cfg.steernet_arch != "v5":
+            print(f"[S0] Auto-detected v5 architecture from checkpoint, setting steernet_arch=v5")
+            # Cannot change architecture after model is built, so we need to warn user
+            print(f"[S0] WARNING: Model was built with {cfg.steernet_arch}, but checkpoint is v5.")
+            print(f"[S0] WARNING: Please re-run with --steernet_arch v5")
+            print(f"[S0] WARNING: Attempting to load anyway (may fail)...")
         print(f"[S0] Loading SteerNet weights from {init_ckpt} for CF table")
         load_steer_weights(model, init_ckpt, device=device)
         has_steer = True
