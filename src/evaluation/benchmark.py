@@ -603,7 +603,7 @@ def run_shot(
     arms: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
     qs, golds = _load_gsm8k_test(n_test, seed=42)
-    prompts   = [build_prompt(q, n_shot=shots) for q in qs]
+    prompts   = [build_prompt_unified(q, n_shot=shots, exemplar_set="legacy", include_preface=False) for q in qs]
     wanted    = set(arms) if arms else {k for k, _, _ in ARM_SPEC}
     wanted.add("baseline")  # needed as control and as the K=0 revert source
 
