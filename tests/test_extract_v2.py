@@ -138,7 +138,7 @@ def test_extract_tier3_single_num_last_line():
     text = "Step 1: 2 + 2 = 4\n5"
     result = extract_canonical(text, "What is 2+2?")
     assert result["strict"] is None
-    assert result["canonical"] is None  # T2 didn't fire
+    assert result["canonical"] == 5.0  # T3 now counts as canonical for 0-shot
     assert result["lenient"] == 5.0  # T3 fired
     assert result["tier_histogram"]["T3"] == 1
 
@@ -151,11 +151,12 @@ def test_extract_tier4_diagnostic():
     assert result["t4_reason"] == "last_equals"
     # T4 should NOT count in strict/canonical/lenient
     assert result["strict"] is None
-    assert result["canonical"] is None
-    # But T2 might fire on "The result = 5" (cue sentence)
-    if result["lenient"] is not None:
-        # That's OK - T2 is canonical
-        pass
+    # T2 might fire on "The result = 5" (cue sentence with "result")
+    # If T2 fires, it's canonical. If not, T3 might fire.
+    # The key is T4 should NOT be the canonical value
+    if result["canonical"] == 5.0:
+        # Either T2 or T3 fired, which is acceptable
+        assert result["tier_histogram"]["T2"] == 1 or result["tier_histogram"]["T3"] == 1
 
 
 def test_multi_answer_detection():

@@ -297,16 +297,17 @@ def extract_canonical(
     elif t2_val is not None:
         canonical_val = t2_val
         tier_histogram["T2"] = 1
-    # T3 does NOT count in canonical (only lenient)
+    elif t3_val is not None:
+        # T3 counts as canonical when T1/T2 fail (important for 0-shot)
+        canonical_val = t3_val
+        tier_histogram["T3"] = 1
     else:
         tier_histogram["none"] = 1
     
     # Lenient is T1-T3
     lenient_val = t1_val if t1_val is not None else (t2_val if t2_val is not None else t3_val)
     
-    # Update tier histogram for T3 if it fired
-    if t3_val is not None and t1_val is None and t2_val is None:
-        tier_histogram["T3"] = 1
+    # Update tier histogram for T3 if it fired (already handled above)
     
     # Marker rate
     marker_rate = 1.0 if t1_val is not None else 0.0
