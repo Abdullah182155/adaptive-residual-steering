@@ -227,7 +227,12 @@ class Phi2WithRSC(nn.Module):
                         if not wrapper._route_is_catalog:
                             if wrapper._routing_override is None:
                                 wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
-                        delta = s(h_fp, active_k=wrapper._active_k_realized if getattr(wrapper.cfg, 'steernet_k_conditioning', True) else None)
+                        # Pass decode mode for v5 causal conv (only if v5)
+                        if hasattr(s, 'use_causal_conv') and s.use_causal_conv:
+                            delta = s(h_fp, active_k=wrapper._active_k_realized if getattr(wrapper.cfg, 'steernet_k_conditioning', True) else None,
+                                      is_decode=wrapper._trace_cached_decode)
+                        else:
+                            delta = s(h_fp, active_k=wrapper._active_k_realized if getattr(wrapper.cfg, 'steernet_k_conditioning', True) else None)
                         if wrapper._token_competitive_alpha is not None:
                             # Advance the causal gate cache using the native
                             # layer state, then substitute the shared
@@ -1600,4 +1605,12 @@ class Phi2WithRSC(nn.Module):
         return self.base_model(*args, **kwargs)
 
     def generate(self, *args, **kwargs):
+        # Reset steernet caches before generation for decode mode
+        self.reset_steernet_cache()
         return self.base_model.generate(*args, **kwargs)
+    
+    def reset_steernet_cache(self):
+        """Reset streaming cache for all v5 SteerNet modules (decode mode)."""
+        for steer_net in self.steer_nets.values():
+            if hasattr(steer_net, 'reset_cache'):
+                steer_net.reset_cache()

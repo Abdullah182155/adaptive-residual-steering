@@ -67,11 +67,13 @@ class CausalDWConv1d(nn.Module):
                 self._cache = torch.zeros(B, C, self.kernel_size - 1, device=x.device, dtype=x.dtype)
                 self._cache_initialized = True
             
-            # Append new tokens to cache and keep last k-1
-            self._cache = torch.cat([self._cache, x_1d], dim=2)[:, :, -(self.kernel_size - 1):]
-            
-            # Convolve: pad with cache on left
+            # Pad left with previous cache
             x_with_cache = torch.cat([self._cache, x_1d], dim=2)  # (B, C, k-1 + T)
+            
+            # Update cache to hold the last (kernel_size - 1) tokens for next step
+            self._cache = x_with_cache[:, :, -(self.kernel_size - 1):]
+            
+            # Convolve
             out = F.conv1d(x_with_cache, self.weight, self.bias, groups=self.channels)
             out = out[:, :, -(T):]  # Take only the T outputs for new tokens
             out = out.transpose(1, 2)  # (B, T, C)

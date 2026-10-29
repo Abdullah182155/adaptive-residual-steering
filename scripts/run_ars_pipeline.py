@@ -563,6 +563,17 @@ def apply_cfg_overrides(cfg, args):
         cfg.router_k_free = int(args.router_k_free)
     if getattr(args, "router_c_size", None) is not None:
         cfg.router_c_size = float(args.router_c_size)
+    # Phase 1.0: Apply steernet_arch globally across all stages
+    if getattr(args, "steernet_arch", None) is not None:
+        cfg.steernet_arch = args.steernet_arch
+    # Phase 1.0: Apply objective flag globally
+    if getattr(args, "objective", None) is not None:
+        cfg.objective = args.objective
+    # Phase 1.0: Apply DPO parameters globally
+    if getattr(args, "dpo_beta", None) is not None:
+        cfg.dpo_beta = args.dpo_beta
+    if getattr(args, "dpo_kl_weight", None) is not None:
+        cfg.dpo_kl_weight = args.dpo_kl_weight
 
     if getattr(args, "set", None):
         for item in args.set:

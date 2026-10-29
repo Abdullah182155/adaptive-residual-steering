@@ -159,6 +159,7 @@ def test_causal_dwconv_prefill_mode():
 
 def test_causal_dwconv_decode_mode():
     """Test causal depthwise conv in streaming decode mode."""
+    torch.manual_seed(42)  # Deterministic seed
     conv = CausalDWConv1d(channels=64, kernel_size=4)
     
     # Simulate streaming decode: process one token at a time
@@ -181,8 +182,34 @@ def test_causal_dwconv_decode_mode():
     assert out_streamed.abs().max() > 0.01
 
 
+def test_causal_dwconv_prefill_decode_equivalence():
+    """Test that prefill and decode modes produce equivalent outputs."""
+    torch.manual_seed(42)  # Deterministic seed
+    conv = CausalDWConv1d(channels=64, kernel_size=4)
+    
+    x_full = torch.randn(1, 10, 64)
+    
+    # Prefill mode
+    out_prefill = conv(x_full, is_decode=False)
+    
+    # Decode mode: stream token by token
+    conv.reset_cache()
+    out_streamed = []
+    for t in range(10):
+        x_t = x_full[:, t:t+1, :]
+        out_t = conv(x_t, is_decode=True)
+        out_streamed.append(out_t)
+    
+    out_streamed = torch.cat(out_streamed, dim=1)
+    
+    # Prefill and decode should be equivalent within numerical tolerance
+    assert torch.allclose(out_prefill, out_streamed, atol=1e-5), \
+        f"Prefill and decode modes differ: max diff {(out_prefill - out_streamed).abs().max()}"
+
+
 def test_causal_dwconv_causality():
     """Test that convolution is causal (no future information)."""
+    torch.manual_seed(42)  # Deterministic seed for reproducibility
     conv = CausalDWConv1d(channels=64, kernel_size=4)
     
     # Create a signal with a step at position 5
