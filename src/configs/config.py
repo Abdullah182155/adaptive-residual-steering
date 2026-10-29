@@ -59,8 +59,8 @@ class RSCConfig:
     # feature.  Orthogonal projection is disabled (ISSUE-6/7) — the per-token
     # magnitude head in 'direct' mode handles magnitude control instead.
     # Engine v2.1: envelope tightened from 0.04 to 0.02 once norm regularisation is active.
-    # Remediation: adjusted to 0.005 to match measured envelope cap (0.00418 from S5)
-    steer_max_relative_norm: float = 0.02
+    # V5: increased to 0.03 to allow stronger steering with kappa=0.08
+    steer_max_relative_norm: float = 0.03
     steer_orthogonal_projection: bool = False  # ISSUE-6: disabled (was True)
     # A route has one shared intervention budget.  Each selected layer receives
     # K**(-power) of its own bounded delta.  A square-root route budget keeps

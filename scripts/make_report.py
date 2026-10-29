@@ -62,7 +62,7 @@ def build_tables(block: Dict[str, Any], n_boot: int = 10000, seed: int = 42) -> 
     tables["accuracy"] = {
         "columns": ["Arm", "Strict acc (%)", "Lenient acc (%)"],
         "rows": [
-            [arms[a]["label"], f"{arms[a]['accuracy_strict']:.2f}", f"{arms[a]['accuracy_lenient']:.2f}"]
+            [arms[a]["label"], f"{arms[a].get('accuracy_canonical', arms[a]['accuracy_strict']):.2f}", f"{arms[a]['accuracy_lenient']:.2f}"]
             for a in order
         ],
     }
