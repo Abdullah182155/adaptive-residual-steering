@@ -36,7 +36,7 @@ def collect_layer_norms(
     sink_tokens: List[int],
 ) -> Dict[int, List[float]]:
     """
-    Collect hidden state norms for each candidate layer.
+    Collect hidden state norms for each candidate layer using output_hidden_states.
     
     Returns:
         Dict mapping layer -> list of norms (excluding sink tokens)
@@ -44,56 +44,49 @@ def collect_layer_norms(
     model.eval()
     layer_norms = {layer: [] for layer in candidate_layers}
     
-    # Hook to capture hidden states
-    hooks = {}
-    hidden_states = {}
+    print(f"Using output_hidden_states to collect norms")
     
-    def make_hook(layer_idx):
-        def hook(module, input, output):
-            # output is tuple (hidden_state, present, ...)
-            hidden_states[layer_idx] = output[0].detach()
-        return hook
-    
-    # Register hooks for candidate layers
-    for i, layer in enumerate(model.model.layers):
-        if i in candidate_layers:
-            hooks[i] = layer.register_forward_hook(make_hook(i))
-    
-    try:
-        for prompt in tqdm(prompts, desc="Collecting norms"):
-            enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
-            input_ids = enc["input_ids"]
-            attention_mask = enc["attention_mask"]
+    for prompt in tqdm(prompts, desc="Collecting norms"):
+        enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+        input_ids = enc["input_ids"]
+        attention_mask = enc["attention_mask"]
+        
+        with torch.no_grad():
+            outputs = model(
+                input_ids=input_ids, 
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True
+            )
+        
+        # outputs.hidden_states is a tuple of (embeddings + all layer outputs)
+        # Index 0 is embeddings, index 1 is layer 0, etc.
+        if outputs.hidden_states is None:
+            print("Warning: model returned no hidden_states")
+            continue
             
-            with torch.no_grad():
-                _ = model(input_ids=input_ids, attention_mask=attention_mask)
+        seq_len = input_ids.shape[1]
+        
+        for layer in candidate_layers:
+            # layer + 1 because hidden_states[0] is embeddings
+            if layer + 1 >= len(outputs.hidden_states):
+                continue
+                
+            hs = outputs.hidden_states[layer + 1]  # (1, seq_len, hidden_dim)
+            if hs is None or len(hs.shape) < 2 or hs.shape[0] == 0:
+                continue
+            norms = torch.norm(hs, dim=-1).cpu()  # (seq_len,)
+            if not isinstance(norms, torch.Tensor) or len(norms.shape) == 0:
+                continue
             
-            # Extract norms for each layer
-            seq_len = input_ids.shape[1]
-            for layer in candidate_layers:
-                if layer not in hidden_states:
+            # Exclude sink tokens (first token and padding)
+            norms_len = norms.shape[0] if len(norms.shape) > 0 else 0
+            for pos in range(1, seq_len):
+                if pos >= norms_len:
                     continue
-                
-                hs = hidden_states[layer][0]  # (1, seq_len, hidden_dim)
-                if hs is None or len(hs.shape) < 2 or hs.shape[0] == 0:
-                    continue
-                norms = torch.norm(hs, dim=-1).cpu()  # (seq_len,)
-                if not isinstance(norms, torch.Tensor) or len(norms.shape) == 0:
-                    continue
-                
-                # Exclude sink tokens (first token and padding)
-                norms_len = norms.shape[0] if len(norms.shape) > 0 else 0
-                for pos in range(1, seq_len):
-                    if pos >= norms_len:
-                        continue
-                    token_id = input_ids[0, pos].item()
-                    if token_id not in sink_tokens and attention_mask[0, pos] == 1:
-                        layer_norms[layer].append(norms[pos].item())
-    
-    finally:
-        # Remove hooks
-        for hook in hooks.values():
-            hook.remove()
+                token_id = input_ids[0, pos].item()
+                if token_id not in sink_tokens and attention_mask[0, pos] == 1:
+                    layer_norms[layer].append(norms[pos].item())
     
     return layer_norms
 
