@@ -75,13 +75,16 @@ def collect_layer_norms(
                     continue
                 
                 hs = hidden_states[layer][0]  # (1, seq_len, hidden_dim)
-                if hs.shape[0] == 0:
+                if hs is None or len(hs.shape) < 2 or hs.shape[0] == 0:
                     continue
                 norms = torch.norm(hs, dim=-1).cpu()  # (seq_len,)
+                if not isinstance(norms, torch.Tensor) or len(norms.shape) == 0:
+                    continue
                 
                 # Exclude sink tokens (first token and padding)
+                norms_len = norms.shape[0] if len(norms.shape) > 0 else 0
                 for pos in range(1, seq_len):
-                    if pos >= norms.shape[0]:
+                    if pos >= norms_len:
                         continue
                     token_id = input_ids[0, pos].item()
                     if token_id not in sink_tokens and attention_mask[0, pos] == 1:
