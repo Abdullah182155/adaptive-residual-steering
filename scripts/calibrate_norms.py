@@ -140,7 +140,7 @@ def main():
     sink_tokens = set()
     sink_tokens.add(tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
     sink_tokens.add(tokenizer.eos_token_id if tokenizer.eos_token_id is not None else 0)
-    sink_tokens.update([tokenizer.encode("\n", add_special_tokens=False)])
+    sink_tokens.update(tokenizer.encode("\n", add_special_tokens=False))
     sink_tokens = list(sink_tokens)
     
     print(f"Sink tokens: {sink_tokens}")
