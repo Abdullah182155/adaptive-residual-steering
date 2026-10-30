@@ -45,8 +45,9 @@ def collect_layer_norms(
     layer_norms = {layer: [] for layer in candidate_layers}
     
     print(f"Using output_hidden_states to collect norms")
+    print(f"Sink tokens: {sink_tokens}")
     
-    for prompt in tqdm(prompts, desc="Collecting norms"):
+    for prompt_idx, prompt in enumerate(tqdm(prompts, desc="Collecting norms")):
         enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
         input_ids = enc["input_ids"]
         attention_mask = enc["attention_mask"]
@@ -70,15 +71,19 @@ def collect_layer_norms(
         for layer in candidate_layers:
             # layer + 1 because hidden_states[0] is embeddings
             if layer + 1 >= len(outputs.hidden_states):
+                print(f"Warning: layer {layer} + 1 >= len(hidden_states) {len(outputs.hidden_states)}")
                 continue
                 
             hs = outputs.hidden_states[layer + 1]  # (1, seq_len, hidden_dim)
             if hs is None or len(hs.shape) < 2 or hs.shape[0] == 0:
+                print(f"Warning: layer {layer} hs shape issue: {hs.shape if hs is not None else 'None'}")
                 continue
             norms = torch.norm(hs, dim=-1).cpu()  # (seq_len,)
             if not isinstance(norms, torch.Tensor) or len(norms.shape) == 0:
                 continue
             
+            # Count valid positions
+            valid_count = 0
             # Exclude sink tokens (first token and padding)
             norms_len = norms.shape[0] if len(norms.shape) > 0 else 0
             for pos in range(1, seq_len):
@@ -87,6 +92,13 @@ def collect_layer_norms(
                 token_id = input_ids[0, pos].item()
                 if token_id not in sink_tokens and attention_mask[0, pos] == 1:
                     layer_norms[layer].append(norms[pos].item())
+                    valid_count += 1
+            
+            if prompt_idx == 0 and valid_count == 0:
+                print(f"Warning: First prompt collected 0 valid tokens for layer {layer}")
+                print(f"  seq_len={seq_len}, norms_len={norms_len}")
+                print(f"  Sample tokens: {input_ids[0, :10].tolist()}")
+                print(f"  Sample attention: {attention_mask[0, :10].tolist()}")
     
     return layer_norms
 
