@@ -530,6 +530,10 @@ def load_contract_weights(model, contract: dict, device=None, verify: bool = Tru
         if path in seen:
             continue
         seen.add(path)
+        # Skip missing checkpoints (Phase 1: SteerNet-only has no router/gate)
+        if not os.path.exists(path):
+            print(f"[load_contract_weights] Skipping {key} checkpoint (not found): {path}")
+            continue
         if verify:
             actual = sha256_file(path)
             if actual != ent["sha256"]:
@@ -622,9 +626,16 @@ def run_deployment_calibration(
     router_ckpt   = router_ckpt   or getattr(cfg, "router_catalog_save_path", None) or getattr(cfg, "router_bootstrap_save_path", None) or os.path.join(cfg.checkpoint_dir, "router_catalog_v5.pt")
     gate_ckpt     = gate_ckpt     or getattr(cfg, "gate_v5_save_path", None) or getattr(cfg, "phase2_save_path", None) or os.path.join(cfg.checkpoint_dir, "gate_v5.pt")
 
-    for p in (steernet_ckpt, router_ckpt, gate_ckpt):
-        if not os.path.exists(p):
-            raise FileNotFoundError(f"checkpoint required for an immutable contract: {p}")
+    # SteerNet is always required; router and gate are optional for phased deployment.
+    # Phase 1 (SteerNet-only) skips router/gate; Phase 2 adds router; Phase 3 adds gate.
+    has_router = os.path.exists(router_ckpt)
+    has_gate   = os.path.exists(gate_ckpt)
+    if not os.path.exists(steernet_ckpt):
+        raise FileNotFoundError(f"SteerNet checkpoint required for deployment contract: {steernet_ckpt}")
+    if not has_router:
+        print(f"[S5] Router checkpoint not found ({router_ckpt}); running SteerNet-only (Phase 1)")
+    if not has_gate:
+        print(f"[S5] Gate checkpoint not found ({gate_ckpt}); gate will be passthrough")
 
     if catalog is None:
         catalog = default_catalog(model.target_layers, cfg)
@@ -632,8 +643,12 @@ def run_deployment_calibration(
 
     if load_weights:
         seen = set()
-        for p in (steernet_ckpt, router_ckpt, gate_ckpt):
-            if p not in seen:
+        # Always load SteerNet
+        load_steer_weights(model, steernet_ckpt, device=device)
+        seen.add(steernet_ckpt)
+        # Load router and gate only if they exist
+        for p in (router_ckpt, gate_ckpt):
+            if p not in seen and os.path.exists(p):
                 seen.add(p)
                 load_steer_weights(model, p, device=device)
 
@@ -647,17 +662,19 @@ def run_deployment_calibration(
     print(f"[S5] theta*_abs = {theta}")
 
     _router_state(model, cfg, theta)
-    nll_p, acc_p = _gate_comparison(model, rows, cfg, device)
+    # Skip gate comparison if no gate checkpoint exists (Phase 1: SteerNet-only)
+    if has_gate:
+        nll_p, acc_p = _gate_comparison(model, rows, cfg, device)
 
-    # Remediation: enable shot-aware gate adoption by default to allow shot-specific policies
-    use_shot_aware = True
-    shots = [r.get("n_shot", r.get("shot", 0)) for r in rows]
-    if len(set(shots)) > 1:
-        # Group by shot
-        nll_by_shot = {}
-        acc_by_shot = {}
-        for shot in set(shots):
-            shot_rows = [r for r, s in zip(rows, shots) if s == shot]
+        # Remediation: enable shot-aware gate adoption by default to allow shot-specific policies
+        use_shot_aware = True
+        shots = [r.get("n_shot", r.get("shot", 0)) for r in rows]
+        if len(set(shots)) > 1:
+            # Group by shot
+            nll_by_shot = {}
+            acc_by_shot = {}
+            for shot in set(shots):
+                shot_rows = [r for r, s in zip(rows, shots) if s == shot]
             if len(shot_rows) > 0:
                 nll_sp, acc_sp = _gate_comparison(model, shot_rows, cfg, device)
                 nll_by_shot[shot] = nll_sp
@@ -675,6 +692,16 @@ def run_deployment_calibration(
         use_shot_aware = False
         adopted, gate_ev = decide_gate_adoption(
             nll_p, acc_p, tol=int(getattr(cfg, "calib_gate_acc_tolerance", 1)))
+    else:
+        # Phase 1: no gate checkpoint — skip gate comparison, adopt passthrough
+        use_shot_aware = False
+        adopted = "passthrough"
+        nll_p = {"mean_nll_diff": 0.0, "n": len(rows)}
+        acc_p = {"acc_gated": 0.0, "acc_ungated": 0.0, "n": len(rows)}
+        gate_ev = {
+            "mean_nll_diff": 0.0, "acc_gated": 0.0, "acc_ungated": 0.0,
+            "n": len(rows), "decision": "passthrough", "reason": "no_gate_checkpoint",
+        }
     
     gate_ev = {**gate_ev, "nll_paired": nll_p, "acc_paired": acc_p}
     print(f"[S5] gate adoption -> {adopted} (shot_aware={use_shot_aware})")
@@ -705,15 +732,15 @@ def run_deployment_calibration(
         router={
             "policy":         "catalog",
             "inference_mode": "argmax",
-            "ckpt":           router_ckpt,
-            "sha256":         sha256_file(router_ckpt),
+            "ckpt":           router_ckpt if has_router else "",
+            "sha256":         sha256_file(router_ckpt) if has_router else "",
         },
         gate={
             "mode":     "learned",
             "adopted":  adopted,
             "evidence": gate_ev,
-            "ckpt":     gate_ckpt,
-            "sha256":   sha256_file(gate_ckpt),
+            "ckpt":     gate_ckpt if has_gate else "",
+            "sha256":   sha256_file(gate_ckpt) if has_gate else "",
         },
         envelope=envelope,
         guards={

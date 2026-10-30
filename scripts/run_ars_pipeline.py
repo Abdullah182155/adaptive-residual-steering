@@ -62,6 +62,7 @@ def parse_args():
     p.add_argument("--objective",              choices=["nll", "pref"], default=None, help="S1 training objective (auto: pref for v5, nll for v4)")
     p.add_argument("--dpo_beta",               type=float, default=0.1, help="DPO beta temperature")
     p.add_argument("--dpo_kl_weight",          type=float, default=0.01, help="KL penalty weight for DPO")
+    p.add_argument("--arms",                    type=str, default=None, help="Comma-separated arms to run in benchmark (e.g. 'baseline,fixed')")
     p.add_argument("--set",                     action="append", default=[], help="Arbitrary config override KEY=VAL")
     return p.parse_args()
 
@@ -479,9 +480,15 @@ def stage_bench(model, tok, cfg, device, args):
         raise FileNotFoundError(f"Deployment contract not found: {contract_path}. Please run Stage S5 first.")
     contract = load_contract(contract_path)
     load_contract_weights(model, contract, device=device)
+    # Parse arms filter (e.g. "baseline,fixed" for Phase 1 SteerNet-only)
+    arms_filter = None
+    if getattr(args, "arms", None):
+        arms_filter = [a.strip() for a in args.arms.split(",")]
+        print(f"[bench] Running arms: {arms_filter}")
     record = run_full_benchmark(
         model, tok, contract, cfg, device,
         shots=args.shots, secondary=args.secondary, n_test=args.n_test,
+        arms=arms_filter,
     )
     write_record(record, args.record)
     out = {
