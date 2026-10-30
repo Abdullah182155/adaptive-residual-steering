@@ -40,6 +40,7 @@ class RSCConfig:
     
     # Phase 1.2: V5-specific parameters
     steer_kappa: float = 0.08  # Cap multiplier for v5: C_l = kappa * N_l (increased from 0.04 to 0.08 for stronger steering)
+    layer_norms_calibration: Optional[str] = "norms_calibration.json"  # Path to calibration JSON for per-layer norms (Phase 8 fix)
     # V5-specific regularization (less aggressive than v4 due to larger rank and convolution)
     lambda_steer_norm_v5: float = 0.30  # Reduced from 0.60 for v5 (stronger architecture needs less regularization)
     steer_norm_q_hi_v5: float = 0.75  # Increased from 0.50 for v5 (allow larger residuals in linear regime)
@@ -66,7 +67,8 @@ class RSCConfig:
     # K**(-power) of its own bounded delta.  A square-root route budget keeps
     # K=2 corrections viable while still preventing linear growth in aggregate
     # intervention energy.
-    steer_route_budget_power: float = 0.5
+    # Phase 6: Reduced from 0.5 to 0.25 for less aggressive scaling
+    steer_route_budget_power: float = 0.25
     # Cap-aware constrained SteerNet norm regularisation (Engine v2.1)
     lambda_steer_norm: float = 0.60         # Strongly penalise raw pre-cap ratio excess above q_hi
     steer_norm_q_hi: float = 0.50           # Keep Phase-1 residuals in the linear operating regime

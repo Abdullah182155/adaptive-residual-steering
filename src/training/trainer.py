@@ -1669,6 +1669,16 @@ def train_phase1_steernet(model, train_data, eval_data, cfg: RSCConfig, device: 
             is_last_p1 = start + cfg.batch_size >= len(indices)
             if accum_count_p1 == cfg.grad_accum or is_last_p1:
                 scaler_p1.unscale_(optimizer_p1)
+                # Phase 4: Log gradient norms for v5 diagnostics
+                total_grad_norm = 0.0
+                layer_grad_norms = {}
+                for p in steer_params:
+                    if p.grad is not None:
+                        grad_norm = p.grad.norm().item()
+                        total_grad_norm += grad_norm * grad_norm
+                total_grad_norm = total_grad_norm ** 0.5
+                if n_optimizer_steps % 10 == 0:  # Log every 10 steps
+                    print(f"    Gradient norm: {total_grad_norm:.6f}")
                 for p in steer_params:
                     if p.grad is not None and not torch.isfinite(p.grad).all():
                         p.grad.zero_()
@@ -4411,7 +4421,9 @@ def train_s3_gate(
                 matched_cnt = 0
                 sample_keys = []
                 for r in batch_rows:
-                    key = canonical_token_key(r.get("split", "train"), r.get("qid", ""), r.get("n_shot", r.get("shot", 0)))
+                    # Phase 3 fix: Ensure consistent key generation
+                    n_shot = r.get("n_shot", r.get("shot", 0))
+                    key = canonical_token_key(r.get("split", "train"), r.get("qid", ""), n_shot)
                     if key in store:
                         matched_cnt += 1
                     if len(sample_keys) < 3:

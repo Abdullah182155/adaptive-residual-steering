@@ -1613,10 +1613,10 @@ class TestEngineV21NormAndK0(unittest.TestCase):
         self.assertTrue(torch.allclose(k_logits.grad, torch.zeros_like(k_logits.grad), atol=1e-6))
 
     def test_balanced_route_budget_power(self):
-        """Engine v2.2 keeps multi-layer residuals viable with K**(-0.5)."""
+        """Engine v2.2 keeps multi-layer residuals viable with K**(-p)."""
         from src.configs.config import RSCConfig
         cfg = RSCConfig()
-        self.assertEqual(cfg.steer_route_budget_power, 0.5)
+        self.assertEqual(cfg.steer_route_budget_power, 0.25)  # Phase 6: reduced from 0.5 to 0.25
         self.assertEqual(cfg.steer_max_relative_norm, 0.03)  # V5: increased from 0.02 to 0.03
         self.assertEqual(cfg.steer_loss_target, "calculation_weighted")
         self.assertEqual(cfg.calc_token_weight, 1.35)

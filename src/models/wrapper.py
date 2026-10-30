@@ -341,6 +341,19 @@ class Phi2WithRSC(nn.Module):
                         if valid.any():
                             cosine = F.cosine_similarity(h_fp[valid], delta[valid], dim=-1, eps=1e-6)
                             self._steering_cosine = cosine.mean()
+                            # Phase 5: Log cosine similarity for diagnostics
+                            if wrapper._routing_override is None:
+                                metrics = wrapper._steering_telemetry.setdefault(
+                                    int(layer_idx), {
+                                        "count": 0, "raw_sum": 0.0, "effective_sum": 0.0,
+                                        "raw_max": 0.0, "effective_max": 0.0,
+                                        "energy_sum": 0.0, "energy_max": 0.0,
+                                        "cosine_sum": 0.0, "cosine_count": 0,
+                                    }
+                                )
+                                if "cosine_sum" in metrics:
+                                    metrics["cosine_sum"] += float(cosine.mean().item())
+                                    metrics["cosine_count"] += 1
                         
                         record = getattr(wrapper, "_record_envelope", None)
                         if record is not None:
@@ -377,6 +390,9 @@ class Phi2WithRSC(nn.Module):
             for sn in self.steer_nets.values():
                 sn.last_pre_cap_q = None
                 sn._last_valid_mask = None
+                # Reset v5 streaming cache at sequence start (Phase 2 fix)
+                if hasattr(sn, 'reset_cache'):
+                    sn.reset_cache()
             for gate in self.gates.values():
                 gate.last_alpha = None
                 gate._alpha_for_aux = None
