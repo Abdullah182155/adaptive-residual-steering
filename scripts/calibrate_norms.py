@@ -11,6 +11,8 @@ Usage:
 import argparse
 import json
 import time
+import sys
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 import torch
@@ -18,6 +20,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from tqdm.auto import tqdm
 import numpy as np
 from datasets import load_dataset
+
+# Add repo root to path for imports
+script_dir = Path(__file__).parent
+repo_root = script_dir.parent
+sys.path.insert(0, str(repo_root))
 
 
 def collect_layer_norms(
