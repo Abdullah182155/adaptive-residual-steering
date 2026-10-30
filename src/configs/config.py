@@ -44,7 +44,6 @@ class RSCConfig:
     # V5-specific regularization (less aggressive than v4 due to larger rank and convolution)
     lambda_steer_norm_v5: float = 0.30  # Reduced from 0.60 for v5 (stronger architecture needs less regularization)
     steer_norm_q_hi_v5: float = 0.75  # Increased from 0.50 for v5 (allow larger residuals in linear regime)
-    layer_norms_calibration: Optional[str] = None  # Path to calibration JSON for per-layer norms
     
     # Phase 1.4: Preference training parameters
     dpo_beta: float = 0.1  # DPO temperature
