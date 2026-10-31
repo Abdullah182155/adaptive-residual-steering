@@ -63,6 +63,8 @@ def parse_args():
     p.add_argument("--dpo_beta",               type=float, default=0.1, help="DPO beta temperature")
     p.add_argument("--dpo_kl_weight",          type=float, default=0.01, help="KL penalty weight for DPO")
     p.add_argument("--arms",                    type=str, default=None, help="Comma-separated arms to run in benchmark (e.g. 'baseline,fixed')")
+    p.add_argument("--revert_to_k0",            action="store_true", default=None, help="Revert to baseline text when guard trips (default False)")
+    p.add_argument("--no_revert",               action="store_true", default=False, help="Explicitly disable reverting to baseline on guard trip")
     p.add_argument("--set",                     action="append", default=[], help="Arbitrary config override KEY=VAL")
     return p.parse_args()
 
@@ -596,6 +598,10 @@ def apply_cfg_overrides(cfg, args):
         cfg.dpo_beta = args.dpo_beta
     if getattr(args, "dpo_kl_weight", None) is not None:
         cfg.dpo_kl_weight = args.dpo_kl_weight
+    if getattr(args, "no_revert", False):
+        cfg.guard_revert_to_k0 = False
+    elif getattr(args, "revert_to_k0", None) is not None:
+        cfg.guard_revert_to_k0 = bool(args.revert_to_k0)
 
     if getattr(args, "set", None):
         for item in args.set:

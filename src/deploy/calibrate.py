@@ -363,12 +363,15 @@ def measure_envelope(model, rows, cfg, device) -> dict:
     g    = _summ(allv, q)
     warns: List[str] = []
     cap = g["q"]
+    min_cap = float(getattr(cfg, "guard_rel_norm_cap_floor", 0.0))
     if not np.isfinite(cap) or allv.size == 0:
-        cap = NOMINAL_REL_NORM_CAP
-        msg = "W_ENVELOPE_MISMATCH: no injected-norm samples were recorded; using nominal cap 0.02"
+        cap = max(NOMINAL_REL_NORM_CAP, min_cap) if min_cap > 0 else NOMINAL_REL_NORM_CAP
+        msg = f"W_ENVELOPE_MISMATCH: no injected-norm samples were recorded; using nominal cap {cap:.5f}"
         warns.append(msg)
         warnings.warn(msg)
     else:
+        if min_cap > 0:
+            cap = max(float(cap), min_cap)
         ratio = cap / NOMINAL_REL_NORM_CAP
         if ratio > 2.0 or ratio < 0.5:
             msg = (
@@ -741,7 +744,7 @@ def run_deployment_calibration(
         guards={
             "k_max":        int(getattr(cfg, "guard_k_max", cfg.max_active_layers)),
             "finite_check": True,
-            "revert_to_k0": True,
+            "revert_to_k0": bool(getattr(cfg, "guard_revert_to_k0", False)),
         },
         steernet={
             "ckpt":   steernet_ckpt,

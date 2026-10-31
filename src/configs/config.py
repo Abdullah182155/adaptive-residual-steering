@@ -527,6 +527,8 @@ class RSCConfig:
     abstain_theta: float = 1.01                           # >1 disables threshold-based abstention
     guards_enabled: bool = True
     guard_rel_norm_cap: float = 0.02                      # calibrated in M8
+    guard_rel_norm_cap_floor: float = 0.03
+    guard_revert_to_k0: bool = False
     guard_k_max: int = 3
     gate_task_gradient: bool = False
 
