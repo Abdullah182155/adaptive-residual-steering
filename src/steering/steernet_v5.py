@@ -190,12 +190,15 @@ class RSCSteerNetV5(nn.Module):
         B, T, hidden_dim = h.shape
         h_flt = h.float()
         
-        # Position-0 shielding: no steering on first token
+        # Position-0 shielding: no steering on first prompt token (attention sink)
         if position_ids is not None:
             shield_mask = (position_ids > 0).float().unsqueeze(-1)  # (B, T, 1)
+        elif is_decode:
+            # Auto-regressive decode: all tokens are continuation tokens (position >= 1)
+            shield_mask = torch.ones(B, T, 1, device=h.device, dtype=h.dtype)
         else:
-            # Default: shield first position
-            shield_mask = torch.ones(B, T, 1, device=h.device)
+            # Prompt prefill: shield position 0
+            shield_mask = torch.ones(B, T, 1, device=h.device, dtype=h.dtype)
             if T > 0:
                 shield_mask[:, 0, :] = 0.0
         

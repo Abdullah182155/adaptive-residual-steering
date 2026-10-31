@@ -4109,22 +4109,103 @@ def train_s1_pref(
     model.train()
     loss_history = []
     
+    grad_accum = max(1, getattr(cfg, "grad_accum", 4))
+    nll_reg = getattr(cfg, "pref_nll_reg", 0.1)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+
+    def _get_chain_tokens(prompt: str, completion: str):
+        p_ids = tokenizer.encode(prompt, add_special_tokens=False)
+        sep = "\n" if not prompt.endswith("\n") else ""
+        full_text = prompt + sep + completion
+        full_ids = tokenizer.encode(full_text, add_special_tokens=False)
+        p_len = len(p_ids)
+        if len(full_ids) <= p_len:
+            full_ids = p_ids + tokenizer.encode(completion, add_special_tokens=False)
+        input_ids = torch.tensor([full_ids], dtype=torch.long, device=device)
+        attn_mask = torch.ones_like(input_ids)
+        labels = input_ids.clone()
+        labels[:, :p_len] = -100
+        return input_ids, attn_mask, labels
+
+    def _eval_logprob(inp_ids, mask, lbls, is_steered=True):
+        if not is_steered:
+            with torch.no_grad():
+                model.set_routing_override("none", ())
+                out = model(input_ids=inp_ids, attention_mask=mask)
+                model.set_routing_override(None)
+        else:
+            out = model(input_ids=inp_ids, attention_mask=mask)
+        shift_logits = out.logits[:, :-1, :].contiguous()
+        shift_labels = lbls[:, 1:].contiguous()
+        valid = (shift_labels != -100)
+        n_tokens = valid.sum().clamp(min=1).float()
+        token_loss = torch.nn.functional.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+            reduction="sum",
+        )
+        return -token_loss / n_tokens, token_loss / n_tokens
+
     for epoch in range(cfg.s1_epochs):
         epoch_loss = 0.0
-        for pair in pairs:
-            # Placeholder: compute logprobs for y+ and y-
-            # This would require forward passes through the model
-            # For now, just record dummy loss
-            loss = torch.tensor(0.0, device=device, requires_grad=True)
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-            epoch_loss += loss.item()
-        
-        avg_loss = epoch_loss / len(pairs)
+        optimizer.zero_grad(set_to_none=True)
+        accum = 0
+        n_pairs = max(1, len(pairs))
+        pbar = tqdm(pairs, desc=f"S1' Pref Epoch {epoch+1}/{cfg.s1_epochs}", leave=False)
+
+        for pair in pbar:
+            prompt = pair.y_plus.prompt
+            text_pos = pair.y_plus.text
+            text_neg = pair.y_minus.text
+
+            inp_pos, mask_pos, lbl_pos = _get_chain_tokens(prompt, text_pos)
+            inp_neg, mask_neg, lbl_neg = _get_chain_tokens(prompt, text_neg)
+
+            # Compute reference logprobs (frozen unsteered base model)
+            with torch.no_grad():
+                ref_lp_pos, _ = _eval_logprob(inp_pos, mask_pos, lbl_pos, is_steered=False)
+                ref_lp_neg, _ = _eval_logprob(inp_neg, mask_neg, lbl_neg, is_steered=False)
+
+            # Compute steered logprobs under active SteerNet
+            steer_lp_pos, nll_pos = _eval_logprob(inp_pos, mask_pos, lbl_pos, is_steered=True)
+            steer_lp_neg, _ = _eval_logprob(inp_neg, mask_neg, lbl_neg, is_steered=True)
+
+            delta_pos = steer_lp_pos - ref_lp_pos
+            delta_neg = steer_lp_neg - ref_lp_neg
+            margin = delta_pos - delta_neg
+
+            # DPO preference loss: -log(sigmoid(beta * margin))
+            dpo_loss = -torch.nn.functional.logsigmoid(beta * margin)
+            total_loss = (dpo_loss + nll_reg * nll_pos) / grad_accum
+
+            if not torch.isfinite(total_loss) or not total_loss.requires_grad:
+                continue
+
+            scaler.scale(total_loss).backward()
+            accum += 1
+            epoch_loss += float((dpo_loss + nll_reg * nll_pos).detach().item())
+
+            if accum == grad_accum:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                accum = 0
+                pbar.set_postfix(margin=f"{float(margin.item()):.3f}", loss=f"{float(dpo_loss.item()):.3f}")
+
+        if accum > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        avg_loss = epoch_loss / n_pairs
         loss_history.append(avg_loss)
         print(f"Epoch {epoch+1}/{cfg.s1_epochs}: loss={avg_loss:.4f}")
-    
+
     return {
         "loss_history": loss_history,
         "n_pairs": len(pairs),

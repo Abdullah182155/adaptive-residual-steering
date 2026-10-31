@@ -227,8 +227,8 @@ class Phi2WithRSC(nn.Module):
                         if not wrapper._route_is_catalog:
                             if wrapper._routing_override is None:
                                 wrapper.router.selected_forwards[layer_pos] += selected.long().sum()
-                        # Pass decode mode for v5 causal conv (only if v5)
-                        if hasattr(s, 'use_causal_conv') and s.use_causal_conv:
+                        # Pass decode mode for v5 architecture
+                        if hasattr(s, 'C_l') or hasattr(s, 'use_causal_conv'):
                             delta = s(h_fp, active_k=wrapper._active_k_realized if getattr(wrapper.cfg, 'steernet_k_conditioning', True) else None,
                                       is_decode=wrapper._trace_cached_decode)
                         else:
@@ -280,7 +280,16 @@ class Phi2WithRSC(nn.Module):
                         # generation, so a multi-layer route is never evaluated
                         # in a larger norm regime than it was trained in.
                         active_k = wrapper._active_k_realized.to(dtype=alpha.dtype).clamp(min=1)
-                        budget_power = float(getattr(wrapper.cfg, "steer_route_budget_power", 0.0))
+                        # Apply k_scale_mode from contract / config to prevent multi-layer noise explosion
+                        k_mode = getattr(wrapper, "_k_scale_mode", None) or getattr(wrapper.cfg, "k_scale_mode", "sqrt")
+                        if k_mode == "sqrt":
+                            budget_power = 0.5
+                        elif k_mode == "linear":
+                            budget_power = 1.0
+                        elif k_mode == "none":
+                            budget_power = 0.0
+                        else:
+                            budget_power = float(getattr(wrapper.cfg, "steer_route_budget_power", 0.5))
                         route_budget = active_k.pow(-budget_power).view(-1, 1, 1)
                         steer_mask = mask
                         if wrapper.prompt_shielding and wrapper._prompt_shield_mask_active is not None:
@@ -387,12 +396,13 @@ class Phi2WithRSC(nn.Module):
                 self.last_gate_trace = {int(layer): [] for layer in self.target_layers}
             self._selected_counts = torch.zeros(batch, dtype=torch.long, device=next(self.gates.parameters()).device)
             self._active_pre_cap_records = []
-            for sn in self.steer_nets.values():
-                sn.last_pre_cap_q = None
-                sn._last_valid_mask = None
-                # Reset v5 streaming cache at sequence start (Phase 2 fix)
-                if hasattr(sn, 'reset_cache'):
-                    sn.reset_cache()
+            if not is_cached_decode:
+                for sn in self.steer_nets.values():
+                    sn.last_pre_cap_q = None
+                    sn._last_valid_mask = None
+                    # Reset v5 streaming cache at sequence start (Phase 2 fix)
+                    if hasattr(sn, 'reset_cache'):
+                        sn.reset_cache()
             for gate in self.gates.values():
                 gate.last_alpha = None
                 gate._alpha_for_aux = None

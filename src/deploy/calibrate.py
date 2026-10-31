@@ -144,6 +144,7 @@ def _row_nll(model, rows, cfg, device) -> np.ndarray:
 def paired_greedy_eval(model, rows, cfg, device) -> List[bool]:
     """Greedy-decode every selection row under the current state; per-row correctness."""
     from src.evaluation.benchmark import generate_batch
+    from src.evaluation.extract_v2 import extract_canonical
     from src.evaluation.verifier import extract_final_number
     tok = getattr(model, "tokenizer", None)
     if tok is None:
@@ -153,7 +154,9 @@ def paired_greedy_eval(model, rows, cfg, device) -> List[bool]:
         ids, lbl = torch.as_tensor(r["input_ids"]), torch.as_tensor(r["labels"])
         qm = (lbl == -100) & (ids != tok.pad_token_id)
         prompts.append(tok.decode(ids[qm], skip_special_tokens=True))
-        golds.append(extract_final_number(tok.decode(ids[lbl != -100], skip_special_tokens=True)))
+        gold_text = tok.decode(ids[lbl != -100], skip_special_tokens=True)
+        can_gold = extract_canonical(gold_text, "").get("canonical")
+        golds.append(can_gold if can_gold is not None else extract_final_number(gold_text))
     texts = generate_batch(
         model, tok, prompts, device,
         max_new_tokens=int(getattr(cfg, "calib_max_new_tokens", 256)),
@@ -161,7 +164,10 @@ def paired_greedy_eval(model, rows, cfg, device) -> List[bool]:
     )
     ok = []
     for t, g in zip(texts, golds):
-        p = extract_final_number(t)
+        can_res = extract_canonical(t, "")
+        p = can_res.get("canonical")
+        if p is None:
+            p = extract_final_number(t)
         ok.append(bool(g is not None and p is not None and abs(p - g) < 0.01))
     return ok
 
