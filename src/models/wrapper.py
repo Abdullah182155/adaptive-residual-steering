@@ -365,11 +365,11 @@ class Phi2WithRSC(nn.Module):
                         # nudge (0.80 / 0.65) avoids over-steering collisions with in-context
                         # attention heads.  Only active when _shot_aware_scale is set.
                         if wrapper._shot_aware_scale is not None and wrapper._current_n_shot is not None:
-                            shot_scale = wrapper._shot_aware_scale.get(
+                            shot_mult = wrapper._shot_aware_scale.get(
                                 wrapper._current_n_shot,
-                                wrapper._shot_aware_scale.get(-1, scale),
+                                wrapper._shot_aware_scale.get(-1, 1.0),
                             )
-                            scale = float(shot_scale)
+                            scale = scale * float(shot_mult)
                         alpha_eff = (alpha if allow_grad else alpha.detach()) * scale
                         delta_injected = (
                             route_st * alpha_eff * delta * route_budget

@@ -453,7 +453,7 @@ def stage_s5(model, tok, eval_data, cfg, device, state, args):
     if hasattr(model, "set_catalog"):
         model.set_catalog(catalog)
 
-    if getattr(args, "s_fixed", None):
+    if getattr(args, "s_fixed", None) and str(args.s_fixed).strip().lower() not in ("auto", "none", ""):
         cfg.s_fixed_override = [int(x.strip()) for x in args.s_fixed.split(",") if x.strip()]
         print(f"[S5] Overriding s_fixed_star from --s_fixed: {cfg.s_fixed_override}")
     if getattr(args, "prefer_k", None):
@@ -489,7 +489,7 @@ def stage_bench(model, tok, cfg, device, args):
     if not os.path.exists(contract_path):
         raise FileNotFoundError(f"Deployment contract not found: {contract_path}. Please run Stage S5 first.")
     contract = load_contract(contract_path)
-    if getattr(args, "s_fixed", None):
+    if getattr(args, "s_fixed", None) and str(args.s_fixed).strip().lower() not in ("auto", "none", ""):
         contract["s_fixed_star"] = [int(x.strip()) for x in args.s_fixed.split(",") if x.strip()]
         print(f"[bench] Overriding s_fixed_star from --s_fixed: {contract['s_fixed_star']}")
     load_contract_weights(model, contract, device=device)
