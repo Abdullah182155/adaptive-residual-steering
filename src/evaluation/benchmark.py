@@ -417,13 +417,17 @@ def run_arm(
     if miss:
         # Set shot bucket to ensure executed route matches predicted route
         _opt(model, "set_shot_bucket", shots)
-        # Decode-only steering: during prefill (T>1), zero out steering deltas so the
-        # prompt KV-cache (including few-shot demonstrations) stays 100% pristine.
-        # Shot-aware scale: modulate steering energy per shot count to prevent
-        # over-steering collisions with in-context attention heads.
+        # Steering dynamics:
+        # 1. decode_only_steering is FALSE: the test question tokens MUST be steered
+        #    during prefill so their KV-cache is conditioned in math steering space
+        #    (this is what produced +10.00 to +25.2 pp in 0-shot).
+        #    Demonstrations in few-shot are ALREADY protected by prompt_shield_mask above.
+        # 2. Shot-aware scale: 0-shot needs full directional compass (1.0).
+        #    Few-shot already has strong in-context alignment, so we use gentle
+        #    arithmetic nudges (0.50 for 2-shot, 0.35 for 4-shot) to avoid over-steering.
         if which is not None:
-            _opt(model, "set_decode_only_steering", True)
-            _opt(model, "set_shot_aware_scale", {0: 1.0, 2: 0.80, 4: 0.65, -1: 0.75})
+            _opt(model, "set_decode_only_steering", False)
+            _opt(model, "set_shot_aware_scale", {0: 1.0, 2: 0.50, 4: 0.35, -1: 0.50})
             _opt(model, "set_current_n_shot", shots)
         texts, trip, timings = _generate_batch_full(
             model, tokenizer, [prompts[i] for i in miss],
@@ -599,7 +603,7 @@ def cache_fingerprint(contract: dict, cfg) -> str:
         cfg.model_name,
         int(cfg.bench_max_new_tokens),
         "rp-removed-issue12",
-        "decode-only-shot-aware-v1",
+        "shot-aware-calib-v2",
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 

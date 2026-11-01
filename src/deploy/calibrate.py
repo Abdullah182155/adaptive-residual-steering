@@ -731,13 +731,17 @@ def run_deployment_calibration(
     gate_ev = {**gate_ev, "nll_paired": nll_p, "acc_paired": acc_p}
     print(f"[S5] gate adoption -> {adopted} (shot_aware={use_shot_aware})")
 
-    _router_state(model, cfg, theta)
+    if has_router:
+        _router_state(model, cfg, theta)
+    else:
+        model.set_routing_override("only", tuple(int(l) for l in s_fixed))
     if adopted == "learned":
         model.set_gate_mode("learned")
     else:
         _gate_const(model, cfg)
 
     envelope = measure_envelope(model, rows, cfg, device)
+    model.set_routing_override(None)
     print(f"[S5] envelope cap={envelope['rel_norm_cap']:.5f} p99={envelope['p99']:.5f}")
 
     contract = write_contract(
