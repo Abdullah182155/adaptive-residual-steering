@@ -28,8 +28,12 @@ class CausalDWConv1d(nn.Module):
         super().__init__()
         self.channels = channels
         self.kernel_size = kernel_size
-        # Depthwise conv: each channel has its own filter
-        self.weight = nn.Parameter(torch.randn(channels, 1, kernel_size) * 0.02)
+        # Depthwise conv: Dirac-centered initialization
+        # Tap on current token (index -1) = 1.0, history taps have small perturbation (0.01)
+        # Preserves signal flow (gain ~1.0) while enabling temporal mixing from step 0
+        w = torch.randn(channels, 1, kernel_size) * 0.01
+        w[:, :, -1] = 1.0
+        self.weight = nn.Parameter(w)
         self.bias = nn.Parameter(torch.zeros(channels))
         
         # Streaming cache for decode mode
@@ -60,6 +64,14 @@ class CausalDWConv1d(nn.Module):
             x_padded = F.pad(x_1d, (padding, 0), mode='constant', value=0)
             out = F.conv1d(x_padded, self.weight, self.bias, groups=self.channels)
             out = out.transpose(1, 2)  # (B, T, C)
+            # Prime cache with the last (kernel_size - 1) tokens so streaming decode starts with real context
+            if T >= padding:
+                self._cache = x_1d[:, :, -padding:].detach()
+                self._cache_initialized = True
+            elif T > 0:
+                pad_needed = padding - T
+                self._cache = F.pad(x_1d, (pad_needed, 0), mode='constant', value=0).detach()
+                self._cache_initialized = True
         else:
             # Decode mode: streaming with rolling buffer
             if not self._cache_initialized or self._cache is None or self._cache.shape[0] != B:

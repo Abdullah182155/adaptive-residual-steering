@@ -262,6 +262,20 @@ def _router_state(model, cfg, theta: float):
 # --------------------------------------------------------------------------- (a)/(b) fixed subset
 
 def choose_fixed_subset(model, sel_rows, catalog, cfg, device) -> Tuple[Tuple[int, ...], dict]:
+    s_override = getattr(cfg, "s_fixed_override", None)
+    if s_override:
+        override_tuple = tuple(sorted(int(x) for x in s_override))
+        evidence = {
+            "n": len(sel_rows),
+            "tie_eps": float(getattr(cfg, "calib_nll_tie_eps", 0.003)),
+            "best_nll": 0.0,
+            "ranking": [{"subset": list(override_tuple), "k": len(override_tuple), "mean_nll": 0.0}],
+            "candidates": [{"subset": list(override_tuple), "k": len(override_tuple), "mean_nll": 0.0}],
+            "winner": list(override_tuple),
+            "rule": "user override via s_fixed_override",
+        }
+        return override_tuple, evidence
+
     subsets = _catalog_subsets(catalog)
     if not subsets:
         raise ValueError("catalog has no non-empty subsets")
@@ -280,7 +294,14 @@ def choose_fixed_subset(model, sel_rows, catalog, cfg, device) -> Tuple[Tuple[in
             ok      = paired_greedy_eval(model, sel_rows, cfg, device)
             e["acc"] = float(np.mean(ok)) if ok else 0.0
         model.set_routing_override(None)
-    winner = sorted(cands, key=lambda e: (-e["acc"], e["k"], e["mean_nll"], e["subset"]))[0]
+    prefer_k = getattr(cfg, "calib_prefer_k", "min")
+    k_sign = -1 if prefer_k == "max" else 1
+    winner = sorted(cands, key=lambda e: (-e["acc"], k_sign * e["k"], e["mean_nll"], e["subset"]))[0]
+    rule_str = (
+        "min paired NLL within eps -> max greedy acc -> larger K -> lower NLL"
+        if prefer_k == "max"
+        else "min paired NLL within eps -> max greedy acc -> smaller K -> lower NLL"
+    )
     evidence = {
         "n":         len(sel_rows),
         "tie_eps":   eps,
@@ -288,7 +309,7 @@ def choose_fixed_subset(model, sel_rows, catalog, cfg, device) -> Tuple[Tuple[in
         "ranking":   sorted(table, key=lambda e: (e["mean_nll"], e["subset"])),
         "candidates": cands,
         "winner":    winner["subset"],
-        "rule":      "min paired NLL within eps -> max greedy acc -> smaller K -> lower NLL",
+        "rule":      rule_str,
     }
     return tuple(winner["subset"]), evidence
 

@@ -62,6 +62,8 @@ def parse_args():
     p.add_argument("--objective",              choices=["nll", "pref"], default=None, help="S1 training objective (auto: pref for v5, nll for v4)")
     p.add_argument("--dpo_beta",               type=float, default=0.1, help="DPO beta temperature")
     p.add_argument("--dpo_kl_weight",          type=float, default=0.01, help="KL penalty weight for DPO")
+    p.add_argument("--s_fixed",                type=str, default=None, help="Comma-separated fixed subset override (e.g. '13,15,22')")
+    p.add_argument("--prefer_k",               choices=["max", "min"], default="max", help="Preference when accuracy ties in S5: max (synergy) or min")
     p.add_argument("--arms",                    type=str, default=None, help="Comma-separated arms to run in benchmark (e.g. 'baseline,fixed')")
     p.add_argument("--revert_to_k0",            action="store_true", default=None, help="Revert to baseline text when guard trips (default False)")
     p.add_argument("--no_revert",               action="store_true", default=False, help="Explicitly disable reverting to baseline on guard trip")
@@ -451,6 +453,12 @@ def stage_s5(model, tok, eval_data, cfg, device, state, args):
     if hasattr(model, "set_catalog"):
         model.set_catalog(catalog)
 
+    if getattr(args, "s_fixed", None):
+        cfg.s_fixed_override = [int(x.strip()) for x in args.s_fixed.split(",") if x.strip()]
+        print(f"[S5] Overriding s_fixed_star from --s_fixed: {cfg.s_fixed_override}")
+    if getattr(args, "prefer_k", None):
+        cfg.calib_prefer_k = args.prefer_k
+
     ck = {
         "steernet_ckpt": (state.get("S1") or {}).get("ckpt") or getattr(cfg, "s1_save_path", os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")),
         "router_ckpt":   (state.get("S2") or {}).get("ckpt") or getattr(cfg, "router_catalog_save_path", os.path.join(cfg.checkpoint_dir, "router_catalog_v5.pt")),
@@ -481,6 +489,9 @@ def stage_bench(model, tok, cfg, device, args):
     if not os.path.exists(contract_path):
         raise FileNotFoundError(f"Deployment contract not found: {contract_path}. Please run Stage S5 first.")
     contract = load_contract(contract_path)
+    if getattr(args, "s_fixed", None):
+        contract["s_fixed_star"] = [int(x.strip()) for x in args.s_fixed.split(",") if x.strip()]
+        print(f"[bench] Overriding s_fixed_star from --s_fixed: {contract['s_fixed_star']}")
     load_contract_weights(model, contract, device=device)
     # Parse arms filter (e.g. "baseline,fixed" for Phase 1 SteerNet-only)
     arms_filter = None
