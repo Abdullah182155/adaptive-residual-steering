@@ -3895,7 +3895,16 @@ def _rows_to_questions_golds(tokenizer, rows: List[dict], n_max: int):
         gold = extract_numeric_answer(tokenizer.decode(ids[ans_mask], skip_special_tokens=True))
         if gold is None:
             continue
-        questions.append(tokenizer.decode(ids[prompt_mask], skip_special_tokens=True))
+        q = r.get("question") if isinstance(r, dict) else None
+        if not q:
+            decoded = tokenizer.decode(ids[prompt_mask], skip_special_tokens=True).strip()
+            if decoded.startswith("Question:"):
+                decoded = decoded[len("Question:"):].strip()
+            split_idx = decoded.find("\nAnswer:")
+            if split_idx != -1:
+                decoded = decoded[:split_idx].strip()
+            q = decoded
+        questions.append(q)
         golds.append(float(gold))
     return questions, golds
 

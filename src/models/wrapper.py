@@ -975,7 +975,8 @@ class Phi2WithRSC(nn.Module):
 
     def _select_layer(self, layer_idx: int, layer_pos: int, h: torch.Tensor, mask: torch.Tensor):
         if layer_idx == self.target_layers[0]:
-            self._reset_guard(h)
+            if not self._trace_cached_decode:
+                self._reset_guard(h)
             self._prepare_routes(h, mask)
             if self._collect_routing_trace:
                 self.routing_step_log.append({
