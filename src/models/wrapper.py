@@ -146,6 +146,19 @@ class Phi2WithRSC(nn.Module):
         self._guard_rel_max = None
         self._guard_nonfinite = None
 
+        # Decode-only steering: when True, no residual delta is injected during
+        # prefill (T > 1 forward pass).  Only auto-regressive decode steps (T=1,
+        # is_cached_decode=True) receive steering.  This keeps the prompt KV-cache
+        # 100% pristine for few-shot demonstrations.
+        self._decode_only_steering: bool = getattr(cfg, "decode_only_steering", False)
+
+        # Shot-aware scale: when not None, overrides _steer_scale per number of
+        # in-context shots.  Format: {n_shot: scale}.  Populated by the benchmark
+        # runner or set explicitly via set_shot_aware_scale().
+        self._shot_aware_scale: Optional[Dict[int, float]] = None
+        # Current number of in-context shots being generated (set per arm).
+        self._current_n_shot: Optional[int] = None
+
         self._inject_rsc(n_layers)
 
         # Freeze backbone parameters strictly
@@ -297,6 +310,13 @@ class Phi2WithRSC(nn.Module):
                             if sh.ndim == 2 and sh.shape[0] == h_fp.shape[0] and sh.shape[1] >= h_fp.shape[1]:
                                 sh_aligned = sh[:, -h_fp.shape[1]:].to(device=h_fp.device, dtype=torch.bool)
                                 steer_mask = steer_mask & (~sh_aligned)
+                        # Decode-only steering: zero out the entire steering contribution
+                        # during prefill (T > 1).  This keeps the prompt KV-cache completely
+                        # pristine — critical for few-shot demonstrations where the base model
+                        # must attend back to exemplars without RSC-induced drift.
+                        # Steering activates only during auto-regressive decode (T=1).
+                        if wrapper._decode_only_steering and not wrapper._trace_cached_decode:
+                            steer_mask = torch.zeros_like(steer_mask)
                         # Gate regularisers and telemetry must operate on
                         # positions that receive an injected residual.  Using
                         # the padding-only mask included shielded few-shot
@@ -339,6 +359,17 @@ class Phi2WithRSC(nn.Module):
                             if wrapper._steer_scale is not None
                             else getattr(wrapper.cfg, "steer_scale", 1.0)
                         )
+                        # Shot-aware scale: modulate steering energy based on the number of
+                        # in-context demonstrations.  0-shot needs strong guidance (1.0);
+                        # few-shot already has exemplars that push accuracy up, so a weaker
+                        # nudge (0.80 / 0.65) avoids over-steering collisions with in-context
+                        # attention heads.  Only active when _shot_aware_scale is set.
+                        if wrapper._shot_aware_scale is not None and wrapper._current_n_shot is not None:
+                            shot_scale = wrapper._shot_aware_scale.get(
+                                wrapper._current_n_shot,
+                                wrapper._shot_aware_scale.get(-1, scale),
+                            )
+                            scale = float(shot_scale)
                         alpha_eff = (alpha if allow_grad else alpha.detach()) * scale
                         delta_injected = (
                             route_st * alpha_eff * delta * route_budget
@@ -455,6 +486,31 @@ class Phi2WithRSC(nn.Module):
         """Set a boolean mask (B, T) where True indicates tokens that should be shielded
         (i.e. zero residual steering perturbation and excluded from router pooling)."""
         self._prompt_shield_mask_pending = mask
+
+    def set_decode_only_steering(self, enabled: bool) -> None:
+        """When enabled, steering deltas are injected only during auto-regressive decode
+        (T=1 cached steps).  The prefill pass (T>1) receives zero delta, keeping the prompt
+        KV-cache 100% pristine — essential for preserving few-shot demonstration alignment.
+        """
+        self._decode_only_steering = bool(enabled)
+
+    def set_shot_aware_scale(self, scale_map: Optional[Dict[int, float]]) -> None:
+        """Configure per-shot steering scale.
+
+        Args:
+            scale_map: dict mapping n_shot (int) -> scale (float).  Use -1 as a wildcard
+                       fallback for unspecified shot counts.
+                       Pass None to disable shot-aware scaling.
+        Example:
+            model.set_shot_aware_scale({0: 1.0, 2: 0.80, 4: 0.65, -1: 0.75})
+        """
+        self._shot_aware_scale = scale_map
+
+    def set_current_n_shot(self, n_shot: Optional[int]) -> None:
+        """Set the number of in-context shots for the current generation call.
+        Used jointly with set_shot_aware_scale() to modulate steering energy.
+        """
+        self._current_n_shot = None if n_shot is None else int(n_shot)
 
     def set_prompt_shielding(self, enabled: bool):
         """Enable or disable prompt shielding."""
