@@ -100,3 +100,7 @@ secrets.json
 # Kaggle / Cloud specific temporary dirs
 kaggle/
 working/
+
+# Local Project Instructions (private instructions — kept locally, excluded from repo)
+GEMINI.md
+AGENTS.md
