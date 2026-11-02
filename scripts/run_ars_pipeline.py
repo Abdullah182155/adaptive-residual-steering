@@ -107,6 +107,16 @@ def load_benchmark_rows(limit):
     return rows
 
 
+def prepare_dataset_split(dataset, limit: int | None = None):
+    """Materialize a dataset split into a list of row dicts."""
+    total = len(dataset)
+    n = min(limit, total) if limit is not None else total
+    if hasattr(dataset, "select"):
+        selected = dataset.select(range(n))
+        return [selected[i] for i in range(n)]
+    return list(dataset[:n])
+
+
 def run(args) -> int:
     cfg = build_config(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -119,12 +129,13 @@ def run(args) -> int:
                 f"S1 checkpoint is required for {args.stage}: {checkpoint}"
             )
         load_steer_weights(model, str(checkpoint), cfg, device)
-    train_data, validation_data = gsm8k_to_cot(tokenizer, cfg)
-    train_data = train_data[: args.s1_train_n] if args.s1_train_n else train_data
-    validation_data = (
-        validation_data[: args.s1_val_n] if args.s1_val_n else validation_data
-    )
     stage = {"train": "S1", "calibrate": "S5"}.get(args.stage, args.stage)
+
+    train_data = validation_data = []
+    if stage in {"S1", "S5", "all"}:
+        raw_train, raw_val = gsm8k_to_cot(tokenizer, cfg)
+        train_data = prepare_dataset_split(raw_train, args.s1_train_n)
+        validation_data = prepare_dataset_split(raw_val, args.s1_val_n)
 
     if stage in {"S1", "all"}:
         print("Running S1 fixed-route SteerNet training")

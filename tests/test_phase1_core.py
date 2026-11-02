@@ -125,3 +125,26 @@ def test_pipeline_cli_smoke_configuration():
     assert cfg.phase1_epochs == 3
     assert cfg.phase1_lr == 0.002
     assert cfg.shot_aware_deploy is False
+
+
+def test_dataset_split_preparation_and_batching():
+    from datasets import Dataset
+    from scripts.run_ars_pipeline import prepare_dataset_split
+    from src.training.trainer import _extract_batch_rows
+
+    ds = Dataset.from_dict(
+        {
+            "input_ids": torch.randint(0, 100, (10, 8)),
+            "attention_mask": torch.ones((10, 8)),
+            "labels": torch.randint(0, 100, (10, 8)),
+        }
+    )
+    ds.set_format("torch")
+    split = prepare_dataset_split(ds, limit=6)
+    assert isinstance(split, list)
+    assert len(split) == 6
+    assert isinstance(split[0], dict)
+
+    batch = _extract_batch_rows(split, offset=0, batch_size=4)
+    assert isinstance(batch, list)
+    assert len(batch) == 4

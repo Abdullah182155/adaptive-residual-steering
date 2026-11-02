@@ -19,6 +19,14 @@ def _stack_batch(rows: List[dict], device: torch.device) -> Dict[str, torch.Tens
     }
 
 
+def _extract_batch_rows(data, offset: int, batch_size: int) -> List[dict]:
+    """Extract a batch of sample dicts from either a list or a dataset object."""
+    if isinstance(data, list):
+        return data[offset : offset + batch_size]
+    end = min(offset + batch_size, len(data))
+    return [data[i] for i in range(offset, end)]
+
+
 def _set_prompt_shield(model, rows: List[dict], device: torch.device) -> None:
     if "prompt_shield_mask" not in rows[0]:
         model.set_prompt_shield_mask(None)
@@ -30,12 +38,15 @@ def _set_prompt_shield(model, rows: List[dict], device: torch.device) -> None:
 @torch.no_grad()
 def evaluate_loss(model, rows: Iterable[dict], device: torch.device) -> float:
     """Return mean teacher-forced NLL using the same fixed route as training."""
-    rows = list(rows)
-    if not rows:
+    if not isinstance(rows, (list, tuple)) and hasattr(rows, "select"):
+        row_list = [rows[i] for i in range(len(rows))]
+    else:
+        row_list = list(rows)
+    if not row_list:
         return 0.0
     model.eval()
     losses = []
-    for row in rows:
+    for row in row_list:
         batch = _stack_batch([row], device)
         _set_prompt_shield(model, [row], device)
         output = model(**batch)
@@ -97,7 +108,7 @@ def train_phase1_steernet(
         running_loss = 0.0
         batch_count = 0
         for offset in range(0, len(train_data), cfg.batch_size):
-            rows = train_data[offset : offset + cfg.batch_size]
+            rows = _extract_batch_rows(train_data, offset, cfg.batch_size)
             if not rows:
                 continue
             batch = _stack_batch(rows, device)

@@ -13,7 +13,12 @@ def measure_envelope(
     model.eval()
     model.set_routing_override("only", cfg.fixed_layers)
     maximum, nonfinite_count, sample_count = 0.0, 0, 0
-    for row in rows:
+    row_items = (
+        [rows[i] for i in range(len(rows))]
+        if (not isinstance(rows, (list, tuple)) and hasattr(rows, "select"))
+        else rows
+    )
+    for row in row_items:
         if hasattr(model, "set_prompt_shield_mask"):
             shield = row.get("prompt_shield_mask")
             model.set_prompt_shield_mask(
