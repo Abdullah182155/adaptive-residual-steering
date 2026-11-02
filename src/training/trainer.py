@@ -3805,6 +3805,22 @@ def sample_training_subset(catalog: "Catalog", rng: random.Random, k_choices: Tu
     return rng.choice(candidates)
 
 
+def locked_s1_subset(cfg) -> Optional[Tuple[int, ...]]:
+    """Return the deployed s*_fixed route when S1 is locked, else None."""
+    raw = getattr(cfg, "s_fixed_override", None)
+    if not raw:
+        return None
+    return tuple(sorted(int(x) for x in raw))
+
+
+def s1_batch_subset(cfg, catalog: "Catalog", rng: random.Random) -> Tuple[int, ...]:
+    """Training route for one S1 batch. Locked s*_fixed bypasses catalog sampling."""
+    locked = locked_s1_subset(cfg)
+    if locked is not None:
+        return locked
+    return sample_training_subset(catalog, rng, getattr(cfg, "s1_k_choices", (2, 3)))
+
+
 def _autocast(device: torch.device):
     return torch.amp.autocast("cuda", enabled=device.type == "cuda")
 
@@ -4054,8 +4070,11 @@ def _s1_fit(
     init_state = {k: v.detach().clone() for k, v in model.steer_nets.state_dict().items()}
     use_greedy = int(getattr(cfg, "s1_greedy_sel_n", 0)) > 0
     best_state = dict(init_state) if use_greedy else None
-    best_subset = None
+    locked = locked_s1_subset(cfg)
+    best_subset = locked
     best_subset_gain = None
+    if locked is not None:
+        print(f"  {label} locked training route s*_fixed={locked} (no catalog sampling)")
     best_greedy_delta = 0.0
     greedy_scored = False
     patience_ctr = 0
@@ -4078,7 +4097,7 @@ def _s1_fit(
             lbls = batch["labels"].to(device)
             bsz = ids.size(0)
 
-            subset = sample_training_subset(catalog, rng, cfg.s1_k_choices)
+            subset = s1_batch_subset(cfg, catalog, rng)
             model.set_routing_override("matrix", model.subset_matrix([subset] * bsz).to(device))
             
             # Apply prompt shield mask for few-shot demonstrations
@@ -4187,7 +4206,7 @@ def _s1_fit(
                 best_greedy_delta = delta
                 patience_ctr = 0
                 best_state = {k: v.detach().clone() for k, v in model.steer_nets.state_dict().items()}
-                if nll_best is not None:
+                if locked is None and nll_best is not None:
                     best_subset = nll_best
                     best_subset_gain = float(per_subset[int(np.argmax(per_subset))])
             else:
@@ -4203,7 +4222,7 @@ def _s1_fit(
                 best_gain = gain
                 patience_ctr = 0
                 best_state = {k: v.detach().clone() for k, v in model.steer_nets.state_dict().items()}
-                if nll_best is not None:
+                if locked is None and nll_best is not None:
                     best_subset = nll_best
                     best_subset_gain = float(per_subset[int(np.argmax(per_subset))])
             else:
@@ -4439,6 +4458,12 @@ def train_s1_steernet(
                 f"  Final gen check: baseline={res['acc_a']:.3f}  best_subset={res['acc_b']:.3f}  "
                 f"b={res['b']} c={res['c']}"
             )
+            delta = float(final_gen.get("delta", 0.0))
+            if delta <= 0.0:
+                print(
+                    f"  [S1 Gatekeeper] WARNING: Final generation check delta ({delta:+.4f}) "
+                    f"is non-positive on n={final_gen.get('n')}. Checkpoint marked verified_gain=False."
+                )
 
     metadata = {
         "steer_scale": getattr(cfg, "steer_scale", 1.0),
@@ -4448,6 +4473,8 @@ def train_s1_steernet(
         ),
         "best_subset": list(best_subset) if best_subset is not None else None,
         "catalog_layers": list(catalog.layers),
+        "verified_gain": bool(final_gen is None or final_gen.get("delta", 0.0) > 0.0),
+        "final_gen_delta": float(final_gen.get("delta", 0.0)) if final_gen else None,
     }
     save_steer_weights(model, cfg.s1_save_path, metadata=metadata)
     model.set_routing_override(None)

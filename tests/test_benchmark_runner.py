@@ -178,11 +178,13 @@ class TestRunArm(unittest.TestCase):
         self.generated: list = []
         self.seen_scale: list = []
         self.seen_n_shot: list = []
+        self.seen_decode_only: list = []
 
         def fake_gen(model, tok, prompts, device, max_new, bs, desc=""):
             self.generated.append(list(prompts))
             self.seen_scale.append(getattr(model, "shot_aware_scale", None))
             self.seen_n_shot.append(getattr(model, "current_n_shot", None))
+            self.seen_decode_only.append(getattr(model, "decode_only", False))
             is_base = model.override is not None and model.override[0] == "none"
             on      = bool(model.guards.get("enabled"))
             texts   = [("base:" if is_base else "steered:") + p for p in prompts]
@@ -253,6 +255,28 @@ class TestRunArm(unittest.TestCase):
         self.cfg.shot_aware_deploy = False
         self._run("fixed", shots=2)
         self.assertIn(None, self.seen_scale)
+
+    def test_fewshot_arms_use_decode_only_steering(self):
+        # 0-shot steers question prefill: decode_only is never True
+        self._run("fixed", shots=0)
+        self.assertNotIn(True, self.seen_decode_only)
+
+        # 2-shot uses decode-only steering during the steered pass
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache = OutputCache(self.tmp.name, "t")
+        self.seen_decode_only.clear()
+        self._run("fixed", shots=2)
+        self.assertIn(True, self.seen_decode_only)
+
+        # 4-shot uses decode-only steering during the steered pass
+        self.tmp.cleanup()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache = OutputCache(self.tmp.name, "t")
+        self.seen_decode_only.clear()
+        self._run("fixed", shots=4)
+        self.assertIn(True, self.seen_decode_only)
+        self.assertFalse(self.model.decode_only)
 
 
 # --------------------------------------------------------------------------- assemble

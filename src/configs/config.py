@@ -509,7 +509,8 @@ class RSCConfig:
     s1_calc_token_weight: float = 4.0
     s1_format_token_weight: float = 0.25
     # 0-shot greedy lenient owns the checkpoint. 0 disables generation selection (unit tests).
-    s1_greedy_sel_n: int = 40
+    # n>=80 is the minimum that can overturn a 40-item noise spike (Kaggle e381fd3).
+    s1_greedy_sel_n: int = 80
     s1_greedy_max_new_tokens: int = 256
     fewshot_decode_only: bool = True
     s1_val_onpolicy_n: int = 120
@@ -540,7 +541,9 @@ class RSCConfig:
     guards_enabled: bool = True
     guard_rel_norm_cap: float = 0.02                      # calibrated in M8
     guard_rel_norm_cap_floor: float = 0.03
-    guard_revert_to_k0: bool = False
+    # Revert tripped generations to the cached K=0 (baseline) text. Full-blast
+    # e381fd3 kept out-of-envelope samples in the score (--no_revert).
+    guard_revert_to_k0: bool = True
     guard_k_max: int = 3
     gate_task_gradient: bool = False
 

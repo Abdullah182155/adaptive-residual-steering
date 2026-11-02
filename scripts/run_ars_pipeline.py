@@ -254,6 +254,10 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
     if getattr(args, "batch_size", None):
         cfg.batch_size = args.batch_size
     
+    if getattr(args, "s_fixed", None) and str(args.s_fixed).strip().lower() not in ("auto", "none", ""):
+        cfg.s_fixed_override = [int(x.strip()) for x in args.s_fixed.split(",") if x.strip()]
+        print(f"[S1] Overriding training route to s_fixed: {cfg.s_fixed_override}")
+
     # Phase 1.0: Set steernet_arch from args
     if hasattr(args, "steernet_arch"):
         cfg.steernet_arch = args.steernet_arch
@@ -681,6 +685,9 @@ def main():
     device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     cfg       = RSCConfig()
     apply_cfg_overrides(cfg, args)
+    if getattr(args, "s_fixed", None) and str(args.s_fixed).strip().lower() not in ("auto", "none", ""):
+        cfg.s_fixed_override = [int(x.strip()) for x in args.s_fixed.split(",") if x.strip()]
+        print(f"[main] Global s_fixed_override from --s_fixed: {cfg.s_fixed_override}")
     
     # Auto-detect architecture from existing checkpoint before building model
     s1_ckpt = os.path.join(cfg.checkpoint_dir, "s1_steernet.pt")

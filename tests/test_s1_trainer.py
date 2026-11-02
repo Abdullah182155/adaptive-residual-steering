@@ -306,6 +306,23 @@ class TestS1Trainer(unittest.TestCase):
         self.assertEqual(len(batched), 2)
         self.assertEqual(batched, single)
 
+    def test_locked_s1_subset_bypasses_catalog_sampling(self):
+        from src.training.trainer import locked_s1_subset, s1_batch_subset
+        catalog = Catalog.build([13, 15, 18, 20, 22], max_k=3)
+        rng = random.Random(42)
+
+        # Unlocked: draws from catalog
+        cfg_unlocked = SimpleNamespace(s_fixed_override=None, s1_k_choices=(3, 3))
+        self.assertIsNone(locked_s1_subset(cfg_unlocked))
+        draws = {s1_batch_subset(cfg_unlocked, catalog, rng) for _ in range(50)}
+        self.assertGreater(len(draws), 1)
+
+        # Locked: always returns exact s_fixed_override tuple
+        cfg_locked = SimpleNamespace(s_fixed_override=[22, 13, 20])
+        self.assertEqual(locked_s1_subset(cfg_locked), (13, 20, 22))
+        locked_draws = {s1_batch_subset(cfg_locked, catalog, rng) for _ in range(50)}
+        self.assertEqual(locked_draws, {(13, 20, 22)})
+
 
 if __name__ == "__main__":
     unittest.main()

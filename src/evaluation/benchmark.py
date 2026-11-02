@@ -419,14 +419,13 @@ def run_arm(
         # Set shot bucket to ensure executed route matches predicted route
         _opt(model, "set_shot_bucket", shots)
         # Steering dynamics:
-        # 1. decode_only_steering is FALSE: the test question tokens MUST be steered
-        #    during prefill so their KV-cache is conditioned in math steering space.
-        #    Demonstrations in few-shot are ALREADY protected by prompt_shield_mask above.
+        # 1. 0-shot: decode_only=False so question tokens are steered during
+        #    prefill (prime math KV). 2/4-shot: decode_only=True so ICL demos
+        #    AND the test question stay pristine; residual is decode-only.
         # 2. Shot-aware scale is DEPLOYMENT-ONLY. Training learns unit-amplitude
-        #    cooperation; evaluation multiplies that residual by 1.0 / 0.50 / 0.35
-        #    so few-shot ICL is not overwritten by a full-strength residual.
+        #    cooperation; evaluation multiplies that residual by 1.0 / 0.50 / 0.35.
         if which is not None:
-            _opt(model, "set_decode_only_steering", False)
+            _opt(model, "set_decode_only_steering", decode_only_for_shot(shots, cfg))
             scale_map = shot_aware_scale_map(cfg)
             _opt(model, "set_shot_aware_scale", scale_map)
             _opt(model, "set_current_n_shot", None if scale_map is None else int(shots))
@@ -597,6 +596,9 @@ def _load_gsm8k_test(n: Optional[int], seed: int = 42):
 def cache_fingerprint(contract: dict, cfg) -> str:
     # Include κ and the deployment shot-aware map so stale generations are not reused.
     scale_map = shot_aware_scale_map(cfg) or {}
+    decode_only_by_shot = {
+        str(k): bool(decode_only_for_shot(int(k), cfg)) for k in (0, 2, 4)
+    }
     raw = json.dumps([
         contract["steernet"]["sha256"],
         contract["router"]["sha256"],
@@ -609,6 +611,8 @@ def cache_fingerprint(contract: dict, cfg) -> str:
         "rp-removed-issue12",
         "shot-aware-deploy-v2",
         {str(k): float(v) for k, v in sorted(scale_map.items())},
+        "fewshot-decode-only-v1",
+        decode_only_by_shot,
         "kappa-in-fingerprint-v1",
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
