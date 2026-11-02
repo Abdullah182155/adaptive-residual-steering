@@ -126,6 +126,10 @@ class TinyModel(nn.Module):
     def set_routing_override(self, mode=None, layers=None):
         self._routing_override = None if mode is None else (mode, layers)
 
+    def set_prompt_shield_mask(self, mask):
+        """Mock prompt shield mask setter (TinyModel ignores shielding)."""
+        pass
+
     def subset_matrix(self, subsets):
         return torch.tensor(
             [[l in s for l in self.target_layers] for s in subsets], dtype=torch.bool
