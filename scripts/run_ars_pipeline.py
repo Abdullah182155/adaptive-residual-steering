@@ -271,7 +271,12 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
 
     s1_train_n = getattr(args, "s1_train_n", None) or getattr(cfg, "s1_train_n", None)
     gold_rows_all = _dataset_to_rows(train_data, n=s1_train_n)
-    print(f"[S1] SteerNet training on n={len(gold_rows_all)} gold rows")
+    gold_only = float(getattr(cfg, "s1_onpolicy_fraction", 0.0)) <= 0.0
+    print(
+        f"[S1] SteerNet training on n={len(gold_rows_all)} gold rows "
+        f"(pool={len(train_data) if train_data is not None else 0}, "
+        f"s1_train_n={s1_train_n}, gold_only={gold_only})"
+    )
     store_path = (state.get("S0b") or {}).get("store_path", os.path.join(cfg.checkpoint_dir, "onpolicy_store.jsonl"))
     
     if objective == "pref":
@@ -301,20 +306,29 @@ def stage_s1(model, tok, train_data, eval_data, cfg, device, state, args):
             objective = "nll"
     
     if objective == "nll":
-        # Legacy NLL training path
-        print(f"[S1] Using NLL training (objective=nll)")
-        if os.path.exists(store_path):
+        # Gold-supervised NLL. On-policy mix is off in Phase 1 (s1_onpolicy_fraction=0).
+        print(f"[S1] Using NLL training (objective=nll, gold_only={gold_only})")
+        if (not gold_only) and os.path.exists(store_path):
             store = OnPolicyStore.load(store_path)
             train_rows, val_rows = store.build_training_rows(tok, cfg, gold_rows_all, val_fraction=0.1, seed=cfg.seed)
         else:
+            if gold_only and os.path.exists(store_path):
+                print("[S1] Ignoring on-policy store because s1_onpolicy_fraction<=0")
             train_rows = gold_rows_all
-            val_rows = _dataset_to_rows(eval_data, n=min(len(eval_data), 100))
+            val_cap = getattr(args, "s1_val_n", None) or getattr(cfg, "s1_val_onpolicy_n", 100)
+            val_rows = _dataset_to_rows(
+                eval_data, n=min(len(eval_data), int(val_cap)), split="eval", qid_prefix="eval"
+            )
 
         gold_rows = [r for r in train_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))]
-        onpolicy_rows = [r for r in train_rows if (isinstance(r, dict) and r.get("is_onpolicy"))]
-        val_onp = [r for r in val_rows if (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
+        onpolicy_rows = [] if gold_only else [r for r in train_rows if (isinstance(r, dict) and r.get("is_onpolicy"))]
+        val_onp = [] if gold_only else [r for r in val_rows if (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
         val_gold = [r for r in val_rows if not (isinstance(r, dict) and r.get("is_onpolicy"))][: getattr(cfg, "s1_val_onpolicy_n", 60)]
         sel_rows = (val_onp + val_gold) if (val_onp or val_gold) else val_rows[:min(len(val_rows), 120)]
+        print(
+            f"[S1] mix: gold={len(gold_rows)} onpolicy={len(onpolicy_rows)} "
+            f"val_gold={len(val_gold)} val_onpolicy={len(val_onp)} sel={len(sel_rows)}"
+        )
 
         logs = train_s1_steernet(model, tok, gold_rows, onpolicy_rows, sel_rows, cfg, device)
     
@@ -642,6 +656,12 @@ def apply_cfg_overrides(cfg, args):
                             val = tuple(int(x.strip()) for x in inner.split(","))
                         else:
                             val = ()
+                    except (ValueError, AttributeError):
+                        val = v
+                elif "," in v:
+                    # Parse comma-separated list/tuple without parentheses: 3,3 -> (3, 3)
+                    try:
+                        val = tuple(int(x.strip()) for x in v.split(","))
                     except (ValueError, AttributeError):
                         val = v
                 else:

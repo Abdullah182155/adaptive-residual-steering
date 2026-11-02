@@ -17,6 +17,7 @@ from tqdm import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
 from src.evaluation.answers import cut_continuation
+from src.configs.config import decode_only_for_shot, shot_aware_scale_map
 from src.deploy.calibrate import apply_contract, git_commit
 from src.evaluation.output_cache import (
     EMPTY_ROUTE_KEY,
@@ -419,18 +420,16 @@ def run_arm(
         _opt(model, "set_shot_bucket", shots)
         # Steering dynamics:
         # 1. decode_only_steering is FALSE: the test question tokens MUST be steered
-        #    during prefill so their KV-cache is conditioned in math steering space
-        #    (this is what produced +10.00 to +25.2 pp in 0-shot).
+        #    during prefill so their KV-cache is conditioned in math steering space.
         #    Demonstrations in few-shot are ALREADY protected by prompt_shield_mask above.
-        # 2. Shot-aware scale: 0-shot needs full directional compass (1.0).
-        #    Few-shot already has strong in-context alignment, so we use gentle
-        #    arithmetic nudges (0.50 for 2-shot, 0.35 for 4-shot) to avoid over-steering.
+        # 2. Shot-aware scale is DEPLOYMENT-ONLY. Training learns unit-amplitude
+        #    cooperation; evaluation multiplies that residual by 1.0 / 0.50 / 0.35
+        #    so few-shot ICL is not overwritten by a full-strength residual.
         if which is not None:
             _opt(model, "set_decode_only_steering", False)
-            # BUG-6 fix: Remove shot-aware scaling to eliminate train/eval mismatch.
-            # Use single amplitude knob (steer_scale=1.0, kappa from contract) instead.
-            _opt(model, "set_shot_aware_scale", None)
-            _opt(model, "set_current_n_shot", None)
+            scale_map = shot_aware_scale_map(cfg)
+            _opt(model, "set_shot_aware_scale", scale_map)
+            _opt(model, "set_current_n_shot", None if scale_map is None else int(shots))
         texts, trip, timings = _generate_batch_full(
             model, tokenizer, [prompts[i] for i in miss],
             device, max_new, bs, desc=f"{which or 'baseline'} {shots}-shot",
@@ -596,7 +595,8 @@ def _load_gsm8k_test(n: Optional[int], seed: int = 42):
 
 
 def cache_fingerprint(contract: dict, cfg) -> str:
-    # BUG-6 fix: Include κ (rel_norm_cap) in fingerprint to prevent stale cache reuse
+    # Include κ and the deployment shot-aware map so stale generations are not reused.
+    scale_map = shot_aware_scale_map(cfg) or {}
     raw = json.dumps([
         contract["steernet"]["sha256"],
         contract["router"]["sha256"],
@@ -607,7 +607,8 @@ def cache_fingerprint(contract: dict, cfg) -> str:
         cfg.model_name,
         int(cfg.bench_max_new_tokens),
         "rp-removed-issue12",
-        "shot-aware-removed-bug6",  # Increment cache version
+        "shot-aware-deploy-v2",
+        {str(k): float(v) for k, v in sorted(scale_map.items())},
         "kappa-in-fingerprint-v1",
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]

@@ -32,6 +32,19 @@ def test_shot_aware_scale_default(tiny_model):
     assert tiny_model._current_n_shot is None
 
 
+def test_default_shot_aware_map_matches_deploy_physics():
+    from src.configs.config import DEFAULT_SHOT_AWARE_SCALE, RSCConfig, shot_aware_scale_map
+
+    assert DEFAULT_SHOT_AWARE_SCALE[0] == 1.0
+    assert DEFAULT_SHOT_AWARE_SCALE[2] == 0.50
+    assert DEFAULT_SHOT_AWARE_SCALE[4] == 0.35
+    cfg = RSCConfig()
+    assert cfg.s1_onpolicy_fraction == 0.0
+    assert shot_aware_scale_map(cfg)[4] == 0.35
+    cfg.shot_aware_deploy = False
+    assert shot_aware_scale_map(cfg) is None
+
+
 def test_set_shot_aware_scale(tiny_model):
     """set_shot_aware_scale stores the dict and set_current_n_shot stores int."""
     scale_map = {0: 1.0, 2: 0.80, 4: 0.65, -1: 0.75}

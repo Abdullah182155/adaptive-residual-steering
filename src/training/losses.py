@@ -752,22 +752,92 @@ def run_pg_loss(
 from typing import Sequence
 
 
-def compute_calc_token_weights(tokenizer, labels: torch.Tensor, ids: torch.Tensor, w: float = 1.75) -> torch.Tensor:
+_FORMAT_PHRASES = (
+    "####",
+    "Final answer:",
+    "Final answer",
+    "Step",
+    "Step 1:",
+    "Step 2:",
+    "Step 3:",
+    "Step 4:",
+    "Step 5:",
+    "Step 6:",
+    "Step 7:",
+    "Step 8:",
+    "Step 9:",
+    "1:",
+    "2:",
+    "3:",
+    "4:",
+    "5:",
+    "6:",
+    "7:",
+    "8:",
+    "9:",
+)
+_FORMAT_TOKEN_CACHE: Dict[Tuple[str, int], Tuple[int, ...]] = {}
+
+
+def collect_format_token_ids(tokenizer) -> Tuple[int, ...]:
+    """Token ids that realize CoT boilerplate / answer markers for this tokenizer."""
+    if tokenizer is None or not hasattr(tokenizer, "encode"):
+        return ()
+    try:
+        vocab = int(len(tokenizer))
+    except Exception:
+        vocab = int(getattr(tokenizer, "vocab_size", 0) or 0)
+    key = (tokenizer.__class__.__name__, vocab)
+    cached = _FORMAT_TOKEN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    ids = set()
+    for phrase in _FORMAT_PHRASES:
+        try:
+            enc = tokenizer.encode(phrase, add_special_tokens=False)
+        except TypeError:
+            enc = tokenizer.encode(phrase)
+        if isinstance(enc, dict):
+            enc = enc.get("input_ids", [])
+        for tok_id in enc:
+            ids.add(int(tok_id))
+    pad_id = getattr(tokenizer, "pad_token_id", None)
+    eos_id = getattr(tokenizer, "eos_token_id", None)
+    unk_id = getattr(tokenizer, "unk_token_id", None)
+    for drop in (pad_id, eos_id, unk_id):
+        if drop is not None:
+            ids.discard(int(drop))
+    cached = tuple(sorted(ids))
+    _FORMAT_TOKEN_CACHE[key] = cached
+    return cached
+
+
+def compute_calc_token_weights(
+    tokenizer,
+    labels: torch.Tensor,
+    ids: torch.Tensor,
+    w: float = 4.0,
+    format_w: float = 0.25,
+) -> torch.Tensor:
     """Return per-token weight tensor (same shape as labels).
 
-    Weight = w for supervised tokens whose id is in contrastive._CONTRAST_MATH_IDS
-             (digits, operators, =, $, %, .).
-    Weight = 1.0 for all other non-masked tokens.
     Weight = 0.0 where labels == -100.
+    Weight = format_w for CoT/marker boilerplate (Step, ####, Final answer).
+    Weight = w for supervised math ids (digits, operators, =, $, %, .) — this
+             overrides format_w so the gold number itself is not down-weighted.
+    Weight = 1.0 for remaining supervised tokens.
 
-    If _CONTRAST_MATH_IDS is None or empty, falls back to uniform weight 1.0
-    (non-masked tokens only). The id set is read at call time because it is
-    populated lazily by the contrastive module.
+    If _CONTRAST_MATH_IDS is None or empty, math up-weighting is skipped.
     """
     from src.training import contrastive as _contrastive
 
     valid = labels.ne(-100)
     weights = valid.to(torch.float32)
+    format_ids = collect_format_token_ids(tokenizer)
+    if format_ids and float(format_w) != 1.0:
+        fmt_t = torch.tensor(list(format_ids), dtype=torch.long, device=labels.device)
+        is_fmt = torch.isin(ids.to(labels.device), fmt_t) & valid
+        weights = torch.where(is_fmt, torch.full_like(weights, float(format_w)), weights)
     math_ids = getattr(_contrastive, "_CONTRAST_MATH_IDS", None)
     if math_ids:
         math_t = torch.tensor(sorted(math_ids), dtype=torch.long, device=labels.device)

@@ -371,9 +371,9 @@ class Phi2WithRSC(nn.Module):
                         )
                         # Shot-aware scale: modulate steering energy based on the number of
                         # in-context demonstrations.  0-shot needs strong guidance (1.0);
-                        # few-shot already has exemplars that push accuracy up, so a weaker
-                        # nudge (0.80 / 0.65) avoids over-steering collisions with in-context
-                        # attention heads.  Only active when _shot_aware_scale is set.
+                        # few-shot already has exemplars, so a weaker nudge (0.50 / 0.35)
+                        # avoids over-steering collisions with in-context attention.
+                        # Only active when _shot_aware_scale is set.
                         if wrapper._shot_aware_scale is not None and wrapper._current_n_shot is not None:
                             shot_mult = wrapper._shot_aware_scale.get(
                                 wrapper._current_n_shot,
@@ -512,7 +512,7 @@ class Phi2WithRSC(nn.Module):
                        fallback for unspecified shot counts.
                        Pass None to disable shot-aware scaling.
         Example:
-            model.set_shot_aware_scale({0: 1.0, 2: 0.80, 4: 0.65, -1: 0.75})
+            model.set_shot_aware_scale({0: 1.0, 2: 0.50, 4: 0.35, -1: 0.35})
         """
         self._shot_aware_scale = scale_map
 

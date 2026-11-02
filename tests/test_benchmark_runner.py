@@ -130,6 +130,8 @@ class FakeModel:
         self.guards   = {"enabled": False}
         self.gate     = None
         self.theta    = None
+        self.shot_aware_scale = None
+        self.current_n_shot = None
 
     def set_routing_override(self, mode=None, layers=None):
         self.override = None if mode is None else (mode, frozenset(layers or ()))
@@ -149,6 +151,18 @@ class FakeModel:
     def set_router_inference_mode(self, m):
         pass
 
+    def set_shot_aware_scale(self, scale_map):
+        self.shot_aware_scale = scale_map
+
+    def set_current_n_shot(self, n_shot):
+        self.current_n_shot = n_shot
+
+    def set_decode_only_steering(self, enabled):
+        self.decode_only = enabled
+
+    def set_shot_bucket(self, shots):
+        self.shot_bucket = shots
+
 
 # --------------------------------------------------------------------------- run_arm
 
@@ -162,9 +176,13 @@ class TestRunArm(unittest.TestCase):
         self.cache    = OutputCache(self.tmp.name, "t")
         self.model    = FakeModel()
         self.generated: list = []
+        self.seen_scale: list = []
+        self.seen_n_shot: list = []
 
         def fake_gen(model, tok, prompts, device, max_new, bs, desc=""):
             self.generated.append(list(prompts))
+            self.seen_scale.append(getattr(model, "shot_aware_scale", None))
+            self.seen_n_shot.append(getattr(model, "current_n_shot", None))
             is_base = model.override is not None and model.override[0] == "none"
             on      = bool(model.guards.get("enabled"))
             texts   = [("base:" if is_base else "steered:") + p for p in prompts]
@@ -180,10 +198,10 @@ class TestRunArm(unittest.TestCase):
         self.addCleanup(self.p_route.stop)
         self.addCleanup(self.tmp.cleanup)
 
-    def _run(self, which):
+    def _run(self, which, shots=0):
         return B.run_arm(
             self.model, None, self.PROMPTS, self.contract,
-            self.cfg, "cpu", which, self.cache,
+            self.cfg, "cpu", which, self.cache, shots=shots,
         )
 
     def test_empty_route_shares_baseline_generation(self):
@@ -221,6 +239,20 @@ class TestRunArm(unittest.TestCase):
         r = self._run("fixed")
         self.assertEqual(r["routes"], [[12], [12], [12]])
         self.assertEqual(sum(len(g) for g in self.generated), 3)
+
+    def test_fixed_arm_applies_shot_aware_scale_during_generate(self):
+        from src.configs.config import DEFAULT_SHOT_AWARE_SCALE
+
+        self._run("fixed", shots=4)
+        self.assertIn(DEFAULT_SHOT_AWARE_SCALE, self.seen_scale)
+        self.assertIn(4, self.seen_n_shot)
+        self.assertIsNone(self.model.shot_aware_scale)
+        self.assertIsNone(self.model.current_n_shot)
+
+    def test_shot_aware_can_be_disabled(self):
+        self.cfg.shot_aware_deploy = False
+        self._run("fixed", shots=2)
+        self.assertIn(None, self.seen_scale)
 
 
 # --------------------------------------------------------------------------- assemble

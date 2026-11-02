@@ -22,6 +22,7 @@ from src.training.losses import (
     unlikelihood_on_divergence,
 )
 from src.training.trainer import (
+    _s1_source_pools,
     evaluate_subset_nll,
     sample_training_subset,
     train_s1_steernet,
@@ -180,6 +181,19 @@ class TestS1Trainer(unittest.TestCase):
 
     def tearDown(self):
         contrastive._CONTRAST_MATH_IDS = self._saved_ids
+
+    def test_gold_only_drops_onpolicy_pool(self):
+        gold = [{"input_ids": 0, "is_onpolicy": False}]
+        onp = [{"input_ids": 1, "is_onpolicy": True}]
+        g, o, frac = _s1_source_pools(gold, onp, 0.0)
+        self.assertEqual(g, gold)
+        self.assertEqual(o, [])
+        self.assertEqual(frac, 0.0)
+
+        g, o, frac = _s1_source_pools(gold, onp, 0.6)
+        self.assertIs(g, gold)
+        self.assertEqual(o, onp)
+        self.assertEqual(frac, 0.6)
 
     def test_subset_sampler_distribution(self):
         catalog = Catalog.build(LAYERS, 3)

@@ -33,13 +33,13 @@ class RSCConfig:
     exemplar_set: str = "legacy"  # "legacy" for GSM8K_8SHOT_EXEMPLARS, "v5" for new handcrafted exemplars
     
     # Phase 2.3: Target style for training
-    train_target_style: str = "auto"  # "auto" (hash for 0-shot, final_answer for n>0), "hash", "final_answer"
+    train_target_style: str = "final_answer"  # match benchmark exemplars; avoid #### extractor poisoning
     
     # Phase 1.2: SteerNet architecture selection
     steernet_arch: str = "v4"  # "v4" for current architecture (default), "v5" for rank-64 with per-layer caps
     
     # Phase 1.2: V5-specific parameters
-    steer_kappa: float = 0.08  # Cap multiplier for v5: C_l = kappa * N_l (increased from 0.04 to 0.08 for stronger steering)
+    steer_kappa: float = 0.04  # C_l = kappa * N_l; 0.04 is the certified Phase-1 amplitude
     layer_norms_calibration: Optional[str] = "norms_calibration.json"  # Path to calibration JSON for per-layer norms (Phase 8 fix)
     # V5-specific regularization (less aggressive than v4 due to larger rank and convolution)
     lambda_steer_norm_v5: float = 0.30  # Reduced from 0.60 for v5 (stronger architecture needs less regularization)
@@ -61,7 +61,7 @@ class RSCConfig:
     # Engine v2.1: envelope tightened from 0.04 to 0.02 once norm regularisation is active.
     # V5: increased to 0.03 to allow stronger steering with kappa=0.08
     steer_max_relative_norm: float = 0.03
-    steer_orthogonal_projection: bool = False  # ISSUE-6: disabled (was True)
+    steer_orthogonal_projection: bool = True  # decode residual is angular, not a hidden-state gain
     # A route has one shared intervention budget.  Each selected layer receives
     # K**(-power) of its own bounded delta.  A square-root route budget keeps
     # K=2 corrections viable while still preventing linear growth in aggregate
@@ -496,10 +496,22 @@ class RSCConfig:
     # ==== M4 ====
     s1_epochs: int = 4
     s1_lr: float = 5e-3
-    s1_onpolicy_fraction: float = 0.6
+    # Phase 1: gold CoT only. On-policy NLL treats self-generated tokens as
+    # targets, so steering learns confidence on whatever the backbone already
+    # produces rather than correctness. Restore a positive fraction only when
+    # a correctness-filtered preference/RL objective is in place.
+    s1_onpolicy_fraction: float = 0.0
+    # Deployment-only shot-aware energy. Training always uses full steer_scale
+    # so the three-layer subset learns to cooperate at unit amplitude.
+    shot_aware_deploy: bool = True
     s1_lambda_unl: float = 0.1
     s1_unl_every_n_steps: int = 4
-    s1_calc_token_weight: float = 1.75
+    s1_calc_token_weight: float = 4.0
+    s1_format_token_weight: float = 0.25
+    # 0-shot greedy lenient owns the checkpoint. 0 disables generation selection (unit tests).
+    s1_greedy_sel_n: int = 40
+    s1_greedy_max_new_tokens: int = 256
+    fewshot_decode_only: bool = True
     s1_val_onpolicy_n: int = 120
     s1_k_choices: Tuple[int, ...] = (2, 3)
     s1_save_path: str = "./checkpoints/s1_steernet.pt"
@@ -632,6 +644,26 @@ class RSCConfig:
         return sorted(set(max(1, min(idx, n_total - 2)) for idx in indices))
 
 
+# Deployment-only shot-aware multipliers. Training stays at full steer_scale.
+# 0-shot has no ICL demos and needs the full residual; 2/4-shot already have
+# demonstration keys in context, so the same residual over-steers.
+DEFAULT_SHOT_AWARE_SCALE: Dict[int, float] = {0: 1.0, 2: 0.50, 4: 0.35, -1: 0.35}
+
+
+def shot_aware_scale_map(cfg: Optional["RSCConfig"] = None) -> Optional[Dict[int, float]]:
+    """Return the per-shot scale map used at evaluation time, or None if disabled."""
+    if cfg is not None and not bool(getattr(cfg, "shot_aware_deploy", True)):
+        return None
+    return dict(DEFAULT_SHOT_AWARE_SCALE)
+
+
+def decode_only_for_shot(shots: int, cfg: Optional["RSCConfig"] = None) -> bool:
+    """Few-shot decode-only keeps ICL KV pristine; 0-shot still steers question prefill."""
+    if cfg is not None and not bool(getattr(cfg, "fewshot_decode_only", True)):
+        return False
+    return int(shots) >= 2
+
+
 # The Kaggle runner must not re-specify these values cell-by-cell.  That
 # previously allowed a notebook at the correct Git commit to silently run a
 # different four-epoch, high-LR experiment.  Keep the decision-run contract in
@@ -642,7 +674,7 @@ ENGINE_V32_KAGGLE_PROFILE: Dict[str, Any] = {
     "lora_alpha": 32.0,
     "steer_magnitude_mode": "direct",
     "steer_max_relative_norm": 0.02,
-    "steer_orthogonal_projection": False,
+    "steer_orthogonal_projection": True,
     "n_samples": 3000,
     "max_tok_len": 512,
     "fewshot_train_prob": 0.0,

@@ -3916,6 +3916,23 @@ def _draw_rows(rng: random.Random, pool: List[dict], n: int) -> List[dict]:
     return [rng.choice(pool) for _ in range(n)]
 
 
+def _s1_source_pools(
+    gold_rows: List[dict],
+    onpolicy_rows: List[dict],
+    frac: float,
+) -> Tuple[List[dict], List[dict], float]:
+    """Restrict S1 to gold CoT when on-policy mixing is disabled.
+
+    On-policy NLL treats the model's own completions as labels. Without a
+    correctness filter that loop raises likelihood of already-likely (often
+    wrong) answers. Phase 1 therefore trains on gold rows only.
+    """
+    frac = float(frac)
+    if frac <= 0.0:
+        return list(gold_rows), [], 0.0
+    return gold_rows, list(onpolicy_rows), frac
+
+
 def _rows_to_questions_golds(tokenizer, rows: List[dict], n_max: int):
     """Decode prompt text and numeric gold from rows (prompt = labels == -100, non-pad)."""
     from src.evaluation.answers import extract_numeric_answer
@@ -3950,6 +3967,41 @@ def _rows_to_questions_golds(tokenizer, rows: List[dict], n_max: int):
     return questions, golds
 
 
+def _s1_greedy_route(cfg, catalog: "Catalog", nll_best_subset) -> Tuple[int, ...]:
+    """Route used for the greedy lenient probe: deployed s*_fixed, else NLL-best."""
+    override = getattr(cfg, "s_fixed_override", None)
+    if override:
+        return tuple(int(x) for x in override)
+    if nll_best_subset:
+        return tuple(int(x) for x in nll_best_subset)
+    triples = [s for s in catalog.subsets if len(s) == 3]
+    if triples:
+        return triples[0]
+    nonempty = [s for s in catalog.subsets if s]
+    return nonempty[0] if nonempty else ()
+
+
+def _s1_greedy_lenient_eval(model, tokenizer, sel_rows, route, cfg, device):
+    """0-shot greedy lenient paired eval (SteerNet route vs unsteered). None if unscorable."""
+    n_g = int(getattr(cfg, "s1_greedy_sel_n", 0))
+    if n_g <= 0 or not sel_rows or not route:
+        return None
+    questions, golds = _rows_to_questions_golds(tokenizer, sel_rows, n_g)
+    if not questions:
+        return None
+    from src.evaluation.paired_generation import paired_greedy_eval
+
+    max_new = int(getattr(cfg, "s1_greedy_max_new_tokens", 256))
+    return paired_greedy_eval(
+        model, tokenizer, questions, golds,
+        lambda m: m.set_routing_override("none", None),
+        lambda m: m.set_routing_override("only", list(route)),
+        device,
+        batch_size=min(8, len(questions)),
+        max_new_tokens=max_new,
+    )
+
+
 def _s1_fit(
     model, tokenizer, gold_rows: List[dict], onpolicy_rows: List[dict], sel_rows: List[dict],
     cfg, device: torch.device, catalog: "Catalog", epochs: int, lr: float, rng: random.Random,
@@ -3971,6 +4023,9 @@ def _s1_fit(
     if hasattr(model, "set_router_warmup"):
         model.set_router_warmup(False)
 
+    gold_rows, onpolicy_rows, frac = _s1_source_pools(
+        gold_rows, onpolicy_rows, getattr(cfg, "s1_onpolicy_fraction", 0.0)
+    )
     n_total = len(gold_rows) + len(onpolicy_rows)
     if n_total == 0:
         raise ValueError("train_s1: no training rows")
@@ -3994,13 +4049,17 @@ def _s1_fit(
 
     train_loss_history: List[float] = []
     val_gain_history: List[float] = []
+    val_greedy_history: List[float] = []
     best_gain = -float("inf")
-    best_state = None
+    init_state = {k: v.detach().clone() for k, v in model.steer_nets.state_dict().items()}
+    use_greedy = int(getattr(cfg, "s1_greedy_sel_n", 0)) > 0
+    best_state = dict(init_state) if use_greedy else None
     best_subset = None
     best_subset_gain = None
+    best_greedy_delta = 0.0
+    greedy_scored = False
     patience_ctr = 0
     micro_counter = 0
-    frac = float(cfg.s1_onpolicy_fraction)
 
     for epoch in range(max(0, epochs)):
         model.train()
@@ -4032,7 +4091,11 @@ def _s1_fit(
             _set_ctx(model, mask, lbls)
             with _autocast(device):
                 out = model(input_ids=ids, attention_mask=mask)
-            weights = compute_calc_token_weights(tokenizer, lbls, ids, cfg.s1_calc_token_weight)
+            weights = compute_calc_token_weights(
+                tokenizer, lbls, ids,
+                w=getattr(cfg, "s1_calc_token_weight", 4.0),
+                format_w=getattr(cfg, "s1_format_token_weight", 0.25),
+            )
             try:
                 task_loss = weighted_answer_nll(out.logits, lbls, weights)
             except ValueError:
@@ -4101,22 +4164,54 @@ def _s1_fit(
         gain, per_subset = _k_uniform_gain(nll, catalog, cfg.s1_k_choices)
         val_gain_history.append(gain)
         lr_reducer.step(-gain)
-
-        improved = (not sel_rows) or gain > best_gain + cfg.early_stop_delta
-        if improved:
-            best_gain = gain
-            patience_ctr = 0
-            best_state = {k: v.detach().clone() for k, v in model.steer_nets.state_dict().items()}
-            if per_subset.size:
-                idx = int(np.argmax(per_subset))
-                best_subset = catalog.subsets[idx + 1]
+        nll_best = None
+        if per_subset.size:
+            idx = int(np.argmax(per_subset))
+            nll_best = catalog.subsets[idx + 1]
+            if best_subset is None:
+                best_subset = nll_best
                 best_subset_gain = float(per_subset[idx])
+
+        greedy_res = None
+        if use_greedy:
+            greedy_res = _s1_greedy_lenient_eval(
+                model, tokenizer, sel_rows, _s1_greedy_route(cfg, catalog, nll_best), cfg, device,
+            )
+
+        if use_greedy and greedy_res is not None:
+            greedy_scored = True
+            delta = float(greedy_res["delta"])
+            val_greedy_history.append(delta)
+            improved = delta > best_greedy_delta
+            if improved:
+                best_greedy_delta = delta
+                patience_ctr = 0
+                best_state = {k: v.detach().clone() for k, v in model.steer_nets.state_dict().items()}
+                if nll_best is not None:
+                    best_subset = nll_best
+                    best_subset_gain = float(per_subset[int(np.argmax(per_subset))])
+            else:
+                patience_ctr += 1
+            print(
+                f"  {label} Epoch {epoch + 1}: train={avg_loss:.4f}  "
+                f"greedy_lenient_delta={delta:+.4f}  val_gain(K-uniform)={gain:+.4f}  "
+                f"best_subset={best_subset}  {'improved' if improved else ''}"
+            )
         else:
-            patience_ctr += 1
-        print(
-            f"  {label} Epoch {epoch + 1}: train={avg_loss:.4f}  val_gain(K-uniform)={gain:+.4f}  "
-            f"best_subset={best_subset}  {'✅' if improved else ''}"
-        )
+            improved = (not sel_rows) or gain > best_gain + cfg.early_stop_delta
+            if improved:
+                best_gain = gain
+                patience_ctr = 0
+                best_state = {k: v.detach().clone() for k, v in model.steer_nets.state_dict().items()}
+                if nll_best is not None:
+                    best_subset = nll_best
+                    best_subset_gain = float(per_subset[int(np.argmax(per_subset))])
+            else:
+                patience_ctr += 1
+            print(
+                f"  {label} Epoch {epoch + 1}: train={avg_loss:.4f}  val_gain(K-uniform)={gain:+.4f}  "
+                f"best_subset={best_subset}  {'improved' if improved else ''}"
+            )
         if ckpt_mgr is not None and (epoch + 1) % cfg.checkpoint_every_n == 0:
             ckpt_mgr.save(model, optimizer, epoch, -gain, "s1")
         if patience_ctr >= cfg.phase1_patience:
@@ -4288,7 +4383,7 @@ def train_s1_steernet(
     cfg,
     device: torch.device,
 ) -> Dict[str, Any]:
-    """Train S1' SteerNets on on-policy + gold data with random subset-level layer-dropout.
+    """Train S1' SteerNets on gold CoT (and optional on-policy rows) with subset dropout.
 
     Router and gate are frozen (set_steer_scale(cfg.steer_scale)); only steer_nets train.
     Per epoch: evaluate_subset_nll on sel_rows. After the final epoch: paired greedy
@@ -4299,7 +4394,7 @@ def train_s1_steernet(
     best_subset, final_gen_check.
     """
     print("\n" + "=" * 80)
-    print("S1': SteerNet subset trainer (on-policy + gold, subset-level layer-dropout)")
+    print("S1': SteerNet subset trainer (gold CoT; on-policy mix gated by s1_onpolicy_fraction)")
     print(f"     epochs={cfg.s1_epochs}  lr={cfg.s1_lr}  onpolicy_fraction={cfg.s1_onpolicy_fraction}")
     print("=" * 80)
 

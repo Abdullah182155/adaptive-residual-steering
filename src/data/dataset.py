@@ -16,10 +16,10 @@ class PromptTemplateBank:
     ]
     STEP_PREFIXES = ["Step {i}: ", "{i}. ", "({i}) ", "Step {i} - ", "> "]
     FINAL_PREFIXES = [
-        "#### {ans}\n",
         "Final answer: {ans}\n",
         "The answer is {ans}.\n",
         "So the result is {ans}.\n",
+        "#### {ans}\n",
     ]
 
     @classmethod
@@ -120,8 +120,10 @@ def gsm8k_to_cot(
             ds = load_dataset("openai/gsm8k", "main", split="train", verification_mode="no_checks")
         except Exception:
             ds = load_dataset("gsm8k", "main", split="train")
+    print(f"[data] GSM8K official train loaded: {len(ds)} examples (n_samples cap={cfg.n_samples})")
     if cfg.n_samples < len(ds):
         ds = ds.shuffle(seed=cfg.seed).select(range(cfg.n_samples))
+        print(f"[data] Capped to n_samples={len(ds)} from the official train split")
 
     # Keep a deterministic training-only demonstration pool.  Evaluation uses
     # few-shot prompts, so a zero-shot-only curriculum is a distribution shift
@@ -263,4 +265,9 @@ def gsm8k_to_cot(
     )
 
     splits = ds.train_test_split(test_size=split_ratio, seed=cfg.seed)
+    print(
+        f"[data] Tokenized split: train={len(splits['train'])} val={len(splits['test'])} "
+        f"(val_split={split_ratio}). Benchmark uses official GSM8K test independently; "
+        f"S1 --s1_train_n further subsets this train split and does not leak the held-out test."
+    )
     return splits["train"], splits["test"]
