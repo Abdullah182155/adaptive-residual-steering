@@ -39,7 +39,9 @@ _MARKERS = (
 def _to_float(s: str) -> Optional[float]:
     """Parse a numeric string, tolerating commas, $, % and trailing dots."""
     try:
-        return float(s.replace(",", "").replace("$", "").replace("%", "").strip().rstrip("."))
+        return float(
+            s.replace(",", "").replace("$", "").replace("%", "").strip().rstrip(".")
+        )
     except (ValueError, AttributeError):
         return None
 
@@ -159,8 +161,11 @@ def extract_numeric_answer_lenient(text: str) -> Optional[float]:
 def rescore_answers(all_details: list, extractor=None, lenient: bool = False) -> dict:
     """Rescore benchmark responses using a specified or lenient extractor."""
     import collections
+
     if extractor is None:
-        extractor = extract_numeric_answer_lenient if lenient else extract_numeric_answer
+        extractor = (
+            extract_numeric_answer_lenient if lenient else extract_numeric_answer
+        )
     acc = collections.defaultdict(list)
     for d in all_details:
         try:
@@ -172,5 +177,3 @@ def rescore_answers(all_details: list, extractor=None, lenient: bool = False) ->
             int(pred is not None and abs(pred - gold) <= 0.01)
         )
     return {k: 100.0 * sum(v) / max(1, len(v)) for k, v in acc.items()}
-
-

@@ -1,50 +1,138 @@
-"""Focused S1 trainer for the fixed [13, 20, 22] SteerNet V5 route."""
+"""Fixed-route SteerNet V5 trainer for ARS Phase 1."""
+
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Dict, Iterable, List, Optional
+
 import torch
+
 from src.training.losses import steer_norm_penalty, token_weighted_nll
 
-def _batch(rows: Iterable[dict], device: torch.device):
-    rows = list(rows)
-    return {key: torch.stack([row[key] for row in rows]).to(device)
-            for key in ("input_ids", "attention_mask", "labels") if key in rows[0]}
+
+def _stack_batch(rows: List[dict], device: torch.device) -> Dict[str, torch.Tensor]:
+    """Move the standard token tensors for a contiguous batch to a device."""
+    return {
+        name: torch.stack([row[name] for row in rows]).to(device)
+        for name in ("input_ids", "attention_mask", "labels")
+        if name in rows[0]
+    }
+
+
+def _set_prompt_shield(model, rows: List[dict], device: torch.device) -> None:
+    if "prompt_shield_mask" not in rows[0]:
+        model.set_prompt_shield_mask(None)
+        return
+    mask = torch.stack([row["prompt_shield_mask"] for row in rows]).to(device)
+    model.set_prompt_shield_mask(mask)
+
 
 @torch.no_grad()
-def evaluate_loss(model, rows, device: torch.device) -> float:
-    if not rows: return 0.0
+def evaluate_loss(model, rows: Iterable[dict], device: torch.device) -> float:
+    """Return mean teacher-forced NLL using the same fixed route as training."""
+    rows = list(rows)
+    if not rows:
+        return 0.0
     model.eval()
-    return sum(float(token_weighted_nll(model(**_batch([row], device)).logits, _batch([row], device)["labels"]))
-               for row in rows) / len(rows)
+    losses = []
+    for row in rows:
+        batch = _stack_batch([row], device)
+        _set_prompt_shield(model, [row], device)
+        output = model(**batch)
+        losses.append(float(token_weighted_nll(output.logits, batch["labels"])))
+    return sum(losses) / len(losses)
 
-def save_steer_weights(model, path: str) -> None:
+
+def checkpoint_metadata(cfg) -> Dict[str, Any]:
+    return {
+        "route": list(cfg.fixed_layers),
+        "steer_scale": cfg.steer_scale,
+        "steer_kappa": cfg.steer_kappa,
+        "k_scale_mode": cfg.k_scale_mode,
+    }
+
+
+def save_steer_weights(model, path: str, cfg) -> None:
+    """Persist Phase 1 adapter state with enough metadata to reject mismatches."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"fixed_layers": model.target_layers, "steer_nets": model.steer_nets.state_dict()}, path)
+    torch.save(
+        {
+            "metadata": checkpoint_metadata(cfg),
+            "steer_nets": model.steer_nets.state_dict(),
+        },
+        path,
+    )
 
-def load_steer_weights(model, path: str, device: Optional[torch.device] = None) -> None:
+
+def load_steer_weights(
+    model, path: str, cfg, device: Optional[torch.device] = None
+) -> Dict[str, Any]:
     state = torch.load(path, map_location=device or "cpu", weights_only=True)
-    if list(state["fixed_layers"]) != list(model.target_layers): raise ValueError("checkpoint route does not match active route")
+    metadata = state["metadata"]
+    if metadata["route"] != list(cfg.fixed_layers):
+        raise ValueError("checkpoint route does not match the active fixed route")
     model.steer_nets.load_state_dict(state["steer_nets"])
+    return metadata
 
-def train_phase1_steernet(model, train_data, eval_data, cfg, device: torch.device, tokenizer=None) -> Dict[str, Any]:
-    del tokenizer
-    params = list(model.steer_nets.parameters())
-    optimiser = torch.optim.AdamW(params, lr=cfg.phase1_lr, weight_decay=cfg.weight_decay)
-    history, best_state, best_validation = {"train": [], "validation": []}, None, float("inf")
-    model.set_routing_override("only", model.target_layers)
-    for _ in range(cfg.phase1_epochs):
-        model.train(); model.base_model.eval(); total = steps = 0; optimiser.zero_grad(set_to_none=True)
-        for start in range(0, len(train_data), cfg.batch_size):
-            rows, batch = train_data[start:start + cfg.batch_size], _batch(train_data[start:start + cfg.batch_size], device)
-            if "prompt_shield_mask" in rows[0]: model.set_prompt_shield_mask(torch.stack([r["prompt_shield_mask"] for r in rows]).to(device))
-            loss = token_weighted_nll(model(**batch).logits, batch["labels"]) + 0.30 * steer_norm_penalty(model)
-            (loss / cfg.grad_accum).backward(); steps += 1
-            if steps % cfg.grad_accum == 0 or start + cfg.batch_size >= len(train_data):
-                torch.nn.utils.clip_grad_norm_(params, cfg.clip_grad); optimiser.step(); optimiser.zero_grad(set_to_none=True)
-            total += float(loss.detach())
+
+def train_phase1_steernet(
+    model, train_data, eval_data, cfg, device: torch.device
+) -> Dict[str, Any]:
+    """Optimise only the three fixed-route SteerNets with NLL and norm control."""
+    cfg.validate()
+    model.set_routing_override("only", cfg.fixed_layers)
+    model.set_steer_scale(cfg.steer_scale)
+    parameters = list(model.steer_nets.parameters())
+    optimizer = torch.optim.AdamW(
+        parameters, lr=cfg.phase1_lr, weight_decay=cfg.weight_decay
+    )
+
+    history = {"train_nll": [], "validation_nll": []}
+    best_validation = float("inf")
+    best_state = None
+    for epoch in range(cfg.phase1_epochs):
+        model.train()
+        model.base_model.eval()
+        optimizer.zero_grad(set_to_none=True)
+        running_loss = 0.0
+        batch_count = 0
+        for offset in range(0, len(train_data), cfg.batch_size):
+            rows = train_data[offset : offset + cfg.batch_size]
+            if not rows:
+                continue
+            batch = _stack_batch(rows, device)
+            _set_prompt_shield(model, rows, device)
+            output = model(**batch)
+            task_loss = token_weighted_nll(output.logits, batch["labels"])
+            loss = task_loss + 0.30 * steer_norm_penalty(model)
+            (loss / cfg.grad_accum).backward()
+            batch_count += 1
+            if batch_count % cfg.grad_accum == 0 or offset + cfg.batch_size >= len(
+                train_data
+            ):
+                torch.nn.utils.clip_grad_norm_(parameters, cfg.clip_grad)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
+            running_loss += float(loss.detach())
+
         validation = evaluate_loss(model, eval_data, device)
-        history["train"].append(total / max(steps, 1)); history["validation"].append(validation)
+        history["train_nll"].append(running_loss / max(batch_count, 1))
+        history["validation_nll"].append(validation)
         if validation <= best_validation:
-            best_validation = validation; best_state = {k: v.detach().cpu().clone() for k, v in model.steer_nets.state_dict().items()}
-    if best_state is not None: model.steer_nets.load_state_dict(best_state)
-    save_steer_weights(model, cfg.lora_save_path)
-    return {**history, "best_validation": best_validation, "route": list(model.target_layers)}
+            best_validation = validation
+            best_state = {
+                name: value.detach().cpu().clone()
+                for name, value in model.steer_nets.state_dict().items()
+            }
+        print(
+            f"S1 epoch {epoch + 1}/{cfg.phase1_epochs}: validation_nll={validation:.4f}"
+        )
+
+    if best_state is not None:
+        model.steer_nets.load_state_dict(best_state)
+    save_steer_weights(model, cfg.lora_save_path, cfg)
+    return {
+        **history,
+        "best_validation_nll": best_validation,
+        **checkpoint_metadata(cfg),
+    }

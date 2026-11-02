@@ -1,135 +1,336 @@
-"""Phi-2 wrapper with a constant, auditable Phase 1 steering route."""
+"""Phi-2 wrapper with extensible fixed-route residual steering hooks."""
+
+from __future__ import annotations
+
 from contextlib import contextmanager
+from typing import Callable, Dict, Optional, Sequence
 import weakref
-from typing import Dict, Optional, Sequence
+
 import torch
 import torch.nn as nn
-from src.steering.steernet_v5 import RSCSteerNetV5, load_layer_norms
+
+from src.steering.steernet import SteerNet, load_layer_norms
+
+
+RouteSelector = Callable[[int, torch.device], torch.BoolTensor]
+GateProvider = Callable[[int, torch.Tensor], torch.Tensor]
+
 
 class Phi2WithRSC(nn.Module):
-    def __init__(self, base_model, cfg, device: Optional[torch.device] = None):
+    """Inject SteerNet residuals without modifying the backbone implementation.
+
+    The fixed route is the Phase 1 selector. A future router can be installed
+    through :meth:`set_route_selector`; a future gate can be installed through
+    :meth:`set_gate_provider`. Neither extension changes hook plumbing.
+    """
+
+    def __init__(
+        self, base_model: nn.Module, cfg, device: Optional[torch.device] = None
+    ):
         super().__init__()
-        self.base_model, self.cfg = base_model, cfg
+        self.base_model = base_model
+        self.cfg = cfg
         self.device = device or next(base_model.parameters()).device
-        layers = base_model.model.layers
         self.target_layers = list(cfg.fixed_layers)
-        if not self.target_layers or any(layer < 0 or layer >= len(layers) for layer in self.target_layers):
-            raise ValueError(f"fixed_layers must name valid backbone layers: {self.target_layers}")
-        hidden_dim = getattr(base_model.config, "hidden_size", getattr(base_model.config, "n_embd", None))
-        if hidden_dim is None: raise ValueError("backbone config has no hidden size")
+        self._layers = self._backbone_layers()
+        self._validate_target_layers()
+
+        hidden_size = getattr(base_model.config, "hidden_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(base_model.config, "n_embd", None)
+        if hidden_size is None:
+            raise ValueError("backbone config does not expose hidden_size or n_embd")
+
         norms = load_layer_norms(cfg.layer_norms_calibration)
-        self.steer_nets = nn.ModuleDict({str(layer): RSCSteerNetV5(
-            hidden_dim, rank=cfg.lora_rank, lora_alpha=cfg.lora_alpha, dropout=cfg.lora_dropout,
-            kappa=cfg.steer_kappa, layer_norms=norms, layer_idx=layer).to(self.device)
-            for layer in self.target_layers})
-        self._hooks, self._hooks_disabled = [], False
+        self.steer_nets = nn.ModuleDict(
+            {
+                str(layer): SteerNet(
+                    hidden_dim=hidden_size,
+                    rank=cfg.lora_rank,
+                    lora_alpha=cfg.lora_alpha,
+                    dropout=cfg.lora_dropout,
+                    kappa=cfg.steer_kappa,
+                    layer_norms=norms,
+                    layer_idx=layer,
+                ).to(self.device)
+                for layer in self.target_layers
+            }
+        )
+
+        self._hook_handles = []
+        self._hooks_disabled = False
+        self._route_selector: Optional[RouteSelector] = None
+        self._gate_provider: Optional[GateProvider] = None
         self._routing_override = ("only", set(self.target_layers))
-        self._prompt_shield_mask_pending = self._prompt_shield_mask_active = None
+        self._route_matrix: Optional[torch.BoolTensor] = None
+        self._selection: Optional[torch.BoolTensor] = None
+        self._attention_mask: Optional[torch.Tensor] = None
+        self._pending_shield_mask: Optional[torch.Tensor] = None
+        self._active_shield_mask: Optional[torch.Tensor] = None
         self._decode_only_steering = False
-        self._shot_aware_scale = self._current_n_shot = None
-        self._steer_scale = None
-        self._trace_cached_decode = False
-        self.guard_state, self.routing_step_log, self._collect_routing_trace = {}, [], False
-        self._inject(layers)
-        for parameter in self.base_model.parameters(): parameter.requires_grad = False
+        self._shot_aware_scale: Optional[Dict[int, float]] = None
+        self._current_n_shot: Optional[int] = None
+        self._steer_scale: Optional[float] = None
+        self._is_decode_step = False
+        self._collect_routing_trace = False
+        self.routing_step_log = []
+        self.guard_state: Dict[str, object] = {}
 
-    def _inject(self, layers):
-        ref = weakref.ref(self)
-        for position, layer_idx in enumerate(self.target_layers):
-            net = self.steer_nets[str(layer_idx)]
-            def hook(_, __, output, position=position, layer_idx=layer_idx, net=net):
-                wrapper = ref()
-                if wrapper is None or wrapper._hooks_disabled or not wrapper._selected(position): return output
-                h, suffix = (output[0], output[1:]) if isinstance(output, tuple) else (output, ())
-                original_2d = h.ndim == 2
-                if original_2d: h = h.unsqueeze(0)
-                h_float = h.float(); mask = wrapper._valid_mask(h_float)
-                if wrapper._decode_only_steering and not wrapper._trace_cached_decode: mask.zero_()
-                if wrapper._prompt_shield_mask_active is not None:
-                    shield = wrapper._prompt_shield_mask_active[:, -h.shape[1]:].to(h.device, torch.bool)
-                    mask &= ~shield
-                delta = net(h_float, is_decode=wrapper._trace_cached_decode)
-                scale = wrapper._effective_scale()
-                injected = delta * mask.unsqueeze(-1).to(delta.dtype) * scale
-                wrapper._record_guard(injected, h_float, mask)
-                result = (h_float + injected).to(h.dtype)
-                if original_2d: result = result.squeeze(0)
-                return (result, *suffix) if suffix else result
-            self._hooks.append(layers[layer_idx].register_forward_hook(hook))
-        def pre_hook(_, args, kwargs):
-            ids = kwargs.get("input_ids", args[0] if args else None)
-            mask = kwargs.get("attention_mask")
-            if mask is None and len(args) > 1: mask = args[1]
-            self._attention_mask = mask
-            self._trace_cached_decode = bool(ids is not None and ids.shape[1] == 1 and mask is not None and mask.shape[1] > 1)
-            self._prompt_shield_mask_active = None if self._trace_cached_decode else self._prompt_shield_mask_pending
-            if not self._trace_cached_decode:
-                for net in self.steer_nets.values(): net.reset_cache()
-            if self._collect_routing_trace:
-                self.routing_step_log.append({"routes": [tuple(self._route()) for _ in range(ids.shape[0])]})
-        self._hooks.append(self.base_model.register_forward_pre_hook(pre_hook, with_kwargs=True))
+        self._register_hooks()
+        for parameter in self.base_model.parameters():
+            parameter.requires_grad = False
 
-    def _route(self):
-        if self._routing_override is None: return self.target_layers
-        mode, value = self._routing_override
-        if mode == "none": return []
-        if mode == "only": return list(value)
-        if mode == "matrix": return []
-        raise ValueError(f"unsupported routing mode: {mode}")
+    def _backbone_layers(self):
+        try:
+            return self.base_model.model.layers
+        except AttributeError as error:
+            raise ValueError(
+                "backbone must expose transformer blocks at model.layers"
+            ) from error
 
-    def _selected(self, position):
-        if self._routing_override is None: return True
-        mode, value = self._routing_override
-        if mode == "none": return False
-        if mode == "only": return self.target_layers[position] in value
-        if mode == "matrix": return bool(value[:, position].any())
-        raise ValueError(f"unsupported routing mode: {mode}")
+    def _validate_target_layers(self) -> None:
+        if not self.target_layers:
+            raise ValueError("fixed route cannot be empty")
+        invalid = [
+            layer
+            for layer in self.target_layers
+            if layer < 0 or layer >= len(self._layers)
+        ]
+        if invalid:
+            raise ValueError(f"fixed route contains invalid layer indices: {invalid}")
 
-    def _valid_mask(self, h):
-        if getattr(self, "_attention_mask", None) is None: return torch.ones(h.shape[:2], dtype=torch.bool, device=h.device)
-        return self._attention_mask[:, -h.shape[1]:].to(h.device, torch.bool)
+    def _register_hooks(self) -> None:
+        reference = weakref.ref(self)
+        for position, layer_index in enumerate(self.target_layers):
+            steer_net = self.steer_nets[str(layer_index)]
+            handle = self._layers[layer_index].register_forward_hook(
+                self._make_layer_hook(reference, position, steer_net)
+            )
+            self._hook_handles.append(handle)
+        self._hook_handles.append(
+            self.base_model.register_forward_pre_hook(
+                self._prepare_forward, with_kwargs=True
+            )
+        )
 
-    def _effective_scale(self):
+    @staticmethod
+    def _make_layer_hook(reference, position: int, steer_net: SteerNet):
+        def hook(_, __, output):
+            wrapper = reference()
+            if wrapper is None or wrapper._hooks_disabled:
+                return output
+            return wrapper._apply_steering(position, steer_net, output)
+
+        return hook
+
+    def _prepare_forward(self, _, args, kwargs) -> None:
+        input_ids = kwargs.get("input_ids", args[0] if args else None)
+        attention_mask = kwargs.get("attention_mask")
+        if attention_mask is None and len(args) > 1:
+            attention_mask = args[1]
+        if input_ids is None:
+            raise ValueError("Phi2WithRSC requires input_ids")
+
+        self._attention_mask = attention_mask
+        self._is_decode_step = bool(
+            input_ids.shape[1] == 1
+            and attention_mask is not None
+            and attention_mask.shape[1] > 1
+        )
+        self._selection = self._select_route(input_ids.shape[0], input_ids.device)
+        if not self._is_decode_step:
+            self.guard_state = {"rel_max": 0.0, "nonfinite": False}
+            self._active_shield_mask = self._pending_shield_mask
+            self.reset_steernet_cache()
+        else:
+            self._active_shield_mask = None
+        if self._collect_routing_trace:
+            self.routing_step_log.append({"routes": self.current_routes()})
+
+    def _select_route(self, batch_size: int, device: torch.device) -> torch.BoolTensor:
+        if self._routing_override is not None:
+            mode, value = self._routing_override
+            if mode == "none":
+                return torch.zeros(
+                    batch_size, len(self.target_layers), dtype=torch.bool, device=device
+                )
+            if mode == "only":
+                route = torch.tensor(
+                    [layer in value for layer in self.target_layers],
+                    dtype=torch.bool,
+                    device=device,
+                )
+                return route.expand(batch_size, -1)
+            if mode == "matrix":
+                if (
+                    self._route_matrix is None
+                    or self._route_matrix.shape[0] != batch_size
+                ):
+                    raise ValueError("route matrix must have one row per batch item")
+                return self._route_matrix.to(device)
+            raise ValueError(f"unsupported route override: {mode}")
+        if self._route_selector is not None:
+            selection = self._route_selector(batch_size, device)
+            if selection.shape != (batch_size, len(self.target_layers)):
+                raise ValueError("route selector returned an invalid route matrix")
+            return selection.to(device=device, dtype=torch.bool)
+        return torch.ones(
+            batch_size, len(self.target_layers), dtype=torch.bool, device=device
+        )
+
+    def _apply_steering(self, position: int, steer_net: SteerNet, output):
+        hidden, suffix = (
+            (output[0], output[1:]) if isinstance(output, tuple) else (output, ())
+        )
+        was_2d = hidden.ndim == 2
+        if was_2d:
+            hidden = hidden.unsqueeze(0)
+        selection = self._selection[:, position].view(-1, 1, 1).to(hidden.dtype)
+        if not bool(selection.any()):
+            return output
+
+        hidden_float = hidden.float()
+        valid_mask = self._valid_token_mask(hidden_float)
+        if self._decode_only_steering and not self._is_decode_step:
+            valid_mask.zero_()
+        valid_mask = self._apply_prompt_shield(valid_mask)
+        active_k = self._selection.sum(dim=1).to(hidden_float.dtype)
+        delta = steer_net(
+            hidden_float, active_k=active_k, is_decode=self._is_decode_step
+        )
+        gate = self._gate_multiplier(position, delta)
+        injected = delta * selection * gate * self._effective_scale()
+        injected = injected * valid_mask.unsqueeze(-1).to(injected.dtype)
+        self._record_guard(injected, hidden_float, valid_mask)
+        result = (hidden_float + injected).to(hidden.dtype)
+        if was_2d:
+            result = result.squeeze(0)
+        return (result, *suffix) if suffix else result
+
+    def _valid_token_mask(self, hidden: torch.Tensor) -> torch.BoolTensor:
+        if self._attention_mask is None:
+            return torch.ones(hidden.shape[:2], dtype=torch.bool, device=hidden.device)
+        return self._attention_mask[:, -hidden.shape[1] :].to(
+            device=hidden.device, dtype=torch.bool
+        )
+
+    def _apply_prompt_shield(self, valid_mask: torch.BoolTensor) -> torch.BoolTensor:
+        if not self.cfg.prompt_shielding or self._active_shield_mask is None:
+            return valid_mask
+        shield = self._active_shield_mask[:, -valid_mask.shape[1] :].to(
+            valid_mask.device, torch.bool
+        )
+        return valid_mask & ~shield
+
+    def _gate_multiplier(self, position: int, delta: torch.Tensor) -> torch.Tensor:
+        if self._gate_provider is None:
+            return torch.ones_like(delta[..., :1])
+        gate = self._gate_provider(position, delta)
+        return gate.to(delta.device, delta.dtype)
+
+    def _effective_scale(self) -> float:
         scale = self.cfg.steer_scale if self._steer_scale is None else self._steer_scale
         if self._shot_aware_scale is not None and self._current_n_shot is not None:
             scale *= self._shot_aware_scale.get(self._current_n_shot, 1.0)
         return float(scale)
 
-    def _record_guard(self, delta, hidden, mask):
-        if not mask.any(): return
-        ratio = (delta.norm(dim=-1) / hidden.norm(dim=-1).clamp_min(1e-6))[mask].max()
-        self.guard_state["rel_max"] = max(float(self.guard_state.get("rel_max", 0.0)), float(ratio))
-        self.guard_state["nonfinite"] = not bool(torch.isfinite(delta).all())
+    def _record_guard(
+        self, delta: torch.Tensor, hidden: torch.Tensor, valid_mask: torch.BoolTensor
+    ) -> None:
+        if not bool(valid_mask.any()):
+            return
+        ratios = delta.norm(dim=-1) / hidden.norm(dim=-1).clamp_min(1e-6)
+        relative_max = float(ratios[valid_mask].max())
+        self.guard_state["rel_max"] = max(
+            float(self.guard_state.get("rel_max", 0.0)), relative_max
+        )
+        self.guard_state["nonfinite"] = bool(
+            self.guard_state.get("nonfinite", False)
+        ) or not bool(torch.isfinite(delta).all())
 
-    def set_routing_override(self, mode=None, layers=None):
-        if mode is None: self._routing_override = None; return
-        if mode not in {"none", "only", "matrix"}: raise ValueError(f"unsupported routing mode: {mode}")
+    def set_route_selector(self, selector: Optional[RouteSelector]) -> None:
+        self._route_selector = selector
+
+    def set_gate_provider(self, provider: Optional[GateProvider]) -> None:
+        self._gate_provider = provider
+
+    def set_routing_override(self, mode: Optional[str] = None, layers=None) -> None:
+        if mode is None:
+            self._routing_override = None
+            self._route_matrix = None
+            return
         if mode == "matrix":
-            if not isinstance(layers, torch.Tensor) or layers.ndim != 2 or layers.shape[1] != len(self.target_layers): raise ValueError("matrix route has invalid shape")
-        self._routing_override = (mode, layers if mode == "matrix" else set(layers or []))
+            matrix = torch.as_tensor(layers, dtype=torch.bool)
+            if matrix.ndim != 2 or matrix.shape[1] != len(self.target_layers):
+                raise ValueError("route matrix must have shape (batch, fixed_layers)")
+            self._route_matrix = matrix
+            self._routing_override = (mode, None)
+            return
+        if mode not in {"none", "only"}:
+            raise ValueError(f"unsupported route override: {mode}")
+        selected = set(layers or [])
+        unknown = selected - set(self.target_layers)
+        if unknown:
+            raise ValueError(f"route contains non-candidate layers: {sorted(unknown)}")
+        self._routing_override = (mode, selected)
 
-    def subset_matrix(self, subsets: Sequence[Sequence[int]]):
-        for subset in subsets:
-            unknown = set(subset) - set(self.target_layers)
-            if unknown: raise ValueError(f"not a candidate layer: {sorted(unknown)}")
-        return torch.tensor([[layer in subset for layer in self.target_layers] for subset in subsets], dtype=torch.bool)
-    def set_prompt_shield_mask(self, mask): self._prompt_shield_mask_pending = mask
-    def set_decode_only_steering(self, enabled): self._decode_only_steering = bool(enabled)
-    def set_shot_aware_scale(self, scales: Optional[Dict[int, float]]): self._shot_aware_scale = scales
-    def set_current_n_shot(self, n_shot: Optional[int]): self._current_n_shot = n_shot
-    def set_steer_scale(self, scale: Optional[float]): self._steer_scale = scale
-    def set_gate_freeze(self, _, value=1.0): self._steer_scale = float(value)
-    def set_gate_mode(self, _, scale=None): self._steer_scale = 1.0 if scale is None else float(scale)
-    def set_routing_trace(self, enabled): self._collect_routing_trace = bool(enabled)
-    def reset_steernet_cache(self):
-        for net in self.steer_nets.values(): net.reset_cache()
-    def remove_hooks(self):
-        for handle in self._hooks: handle.remove()
-        self._hooks.clear()
+    def subset_matrix(self, subsets: Sequence[Sequence[int]]) -> torch.BoolTensor:
+        return torch.tensor(
+            [[layer in subset for layer in self.target_layers] for subset in subsets],
+            dtype=torch.bool,
+        )
+
+    def current_routes(self):
+        if self._selection is None:
+            return []
+        return [
+            tuple(
+                layer
+                for layer, enabled in zip(self.target_layers, row.tolist())
+                if enabled
+            )
+            for row in self._selection
+        ]
+
+    def set_prompt_shield_mask(self, mask: Optional[torch.Tensor]) -> None:
+        self._pending_shield_mask = mask
+
+    def set_decode_only_steering(self, enabled: bool) -> None:
+        self._decode_only_steering = bool(enabled)
+
+    def set_shot_aware_scale(self, scales: Optional[Dict[int, float]]) -> None:
+        self._shot_aware_scale = scales
+
+    def set_current_n_shot(self, n_shot: Optional[int]) -> None:
+        self._current_n_shot = n_shot
+
+    def set_steer_scale(self, scale: Optional[float]) -> None:
+        self._steer_scale = scale
+
+    def set_routing_trace(self, enabled: bool) -> None:
+        self._collect_routing_trace = bool(enabled)
+
+    def reset_steernet_cache(self) -> None:
+        for steer_net in self.steer_nets.values():
+            steer_net.reset_cache()
+
+    def remove_hooks(self) -> None:
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles.clear()
+
     @contextmanager
     def hooks_disabled(self):
-        previous = self._hooks_disabled; self._hooks_disabled = True
-        try: yield
-        finally: self._hooks_disabled = previous
-    def forward(self, *args, **kwargs): return self.base_model(*args, **kwargs)
-    def generate(self, *args, **kwargs): self.reset_steernet_cache(); return self.base_model.generate(*args, **kwargs)
+        previous = self._hooks_disabled
+        self._hooks_disabled = True
+        try:
+            yield
+        finally:
+            self._hooks_disabled = previous
+
+    def forward(self, *args, **kwargs):
+        return self.base_model(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        self.reset_steernet_cache()
+        return self.base_model.generate(*args, **kwargs)
