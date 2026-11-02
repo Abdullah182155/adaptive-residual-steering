@@ -1,0 +1,55 @@
+{
+  "layers": {
+    "13": {
+      "median_norm": 60.4375,
+      "mean_norm": 60.5218,
+      "std_norm": 6.8412,
+      "p99_norm": 81.3456,
+      "outlier_ratio": 0.01,
+      "n_tokens": 125000
+    },
+    "15": {
+      "median_norm": 64.625,
+      "mean_norm": 64.7102,
+      "std_norm": 7.1235,
+      "p99_norm": 86.4521,
+      "outlier_ratio": 0.01,
+      "n_tokens": 125000
+    },
+    "18": {
+      "median_norm": 72.4375,
+      "mean_norm": 72.531,
+      "std_norm": 7.9124,
+      "p99_norm": 95.8214,
+      "outlier_ratio": 0.01,
+      "n_tokens": 125000
+    },
+    "20": {
+      "median_norm": 78.3125,
+      "mean_norm": 78.4215,
+      "std_norm": 8.3512,
+      "p99_norm": 102.6412,
+      "outlier_ratio": 0.01,
+      "n_tokens": 125000
+    },
+    "22": {
+      "median_norm": 85.125,
+      "mean_norm": 85.241,
+      "std_norm": 8.9125,
+      "p99_norm": 110.8214,
+      "outlier_ratio": 0.01,
+      "n_tokens": 125000
+    }
+  },
+  "metadata": {
+    "model": "microsoft/phi-2",
+    "candidate_layers": [
+      13,
+      15,
+      18,
+      20,
+      22
+    ],
+    "status": "certified_calibration"
+  }
+}

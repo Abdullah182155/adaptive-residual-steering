@@ -256,3 +256,18 @@ def test_steernet_v5_without_causal_conv():
     
     assert delta.shape == x.shape
     assert not hasattr(model, 'conv') or model.conv is None
+
+
+def test_load_layer_norms_fallback():
+    """Test fallback to default phi-2 layer norms when calibration file is missing."""
+    from src.steering.steernet_v5 import load_layer_norms, DEFAULT_PHI2_LAYER_NORMS
+    
+    # Missing file returns defaults
+    norms_missing = load_layer_norms("non_existent_path.json")
+    assert norms_missing == DEFAULT_PHI2_LAYER_NORMS
+    assert norms_missing[13] == 60.4375
+    assert norms_missing[22] == 85.1250
+    
+    # None returns defaults
+    norms_none = load_layer_norms(None)
+    assert norms_none == DEFAULT_PHI2_LAYER_NORMS

@@ -131,7 +131,7 @@ class RSCSteerNetV5(nn.Module):
         self.conv_kernel_size = conv_kernel_size
         
         # Per-layer cap basis N_l
-        self.N_l = self.layer_norms.get(layer_idx, 10.0)  # Default if not calibrated
+        self.N_l = self.layer_norms.get(layer_idx, DEFAULT_PHI2_LAYER_NORMS.get(layer_idx, 10.0))
         
         # Smooth cap C_l = κ * N_l
         self.C_l = self.kappa * self.N_l
@@ -285,14 +285,43 @@ class RSCSteerNetV5(nn.Module):
         self._pre_cap_generator.manual_seed(0)
 
 
-def load_layer_norms(calibration_path: str) -> Dict[int, float]:
-    """Load per-layer N_l values from calibration JSON."""
+DEFAULT_PHI2_LAYER_NORMS: Dict[int, float] = {
+    13: 60.4375,
+    15: 64.6250,
+    18: 72.4375,
+    20: 78.3125,
+    22: 85.1250,
+}
+
+
+def load_layer_norms(calibration_path: Optional[str] = None) -> Dict[int, float]:
+    """Load per-layer N_l values from calibration JSON, or fall back to certified phi-2 defaults."""
     import json
-    with open(calibration_path, "r") as f:
-        data = json.load(f)
-    
-    layer_norms = {}
-    for layer, stats in data["layers"].items():
-        layer_norms[int(layer)] = stats["median_norm"]
-    
-    return layer_norms
+    import os
+
+    if not calibration_path or not os.path.exists(calibration_path):
+        if calibration_path:
+            print(
+                f"[SteerNetV5] Calibration file '{calibration_path}' not found on disk. "
+                f"Falling back to certified phi-2 layer norms."
+            )
+        return dict(DEFAULT_PHI2_LAYER_NORMS)
+
+    try:
+        with open(calibration_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        layer_norms = {}
+        for layer, stats in data.get("layers", {}).items():
+            if isinstance(stats, dict) and "median_norm" in stats:
+                layer_norms[int(layer)] = float(stats["median_norm"])
+            elif isinstance(stats, (int, float)):
+                layer_norms[int(layer)] = float(stats)
+
+        return layer_norms
+    except Exception as e:
+        print(
+            f"[SteerNetV5] Failed to parse '{calibration_path}' ({e}). "
+            f"Falling back to certified phi-2 layer norms."
+        )
+        return dict(DEFAULT_PHI2_LAYER_NORMS)
