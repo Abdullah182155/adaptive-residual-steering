@@ -427,8 +427,10 @@ def run_arm(
         #    arithmetic nudges (0.50 for 2-shot, 0.35 for 4-shot) to avoid over-steering.
         if which is not None:
             _opt(model, "set_decode_only_steering", False)
-            _opt(model, "set_shot_aware_scale", {0: 1.0, 2: 0.50, 4: 0.35, -1: 0.50})
-            _opt(model, "set_current_n_shot", shots)
+            # BUG-6 fix: Remove shot-aware scaling to eliminate train/eval mismatch.
+            # Use single amplitude knob (steer_scale=1.0, kappa from contract) instead.
+            _opt(model, "set_shot_aware_scale", None)
+            _opt(model, "set_current_n_shot", None)
         texts, trip, timings = _generate_batch_full(
             model, tokenizer, [prompts[i] for i in miss],
             device, max_new, bs, desc=f"{which or 'baseline'} {shots}-shot",
@@ -594,16 +596,19 @@ def _load_gsm8k_test(n: Optional[int], seed: int = 42):
 
 
 def cache_fingerprint(contract: dict, cfg) -> str:
+    # BUG-6 fix: Include κ (rel_norm_cap) in fingerprint to prevent stale cache reuse
     raw = json.dumps([
         contract["steernet"]["sha256"],
         contract["router"]["sha256"],
         contract["gate"]["sha256"],
         contract["steer_scale"],
         contract.get("k_scale_mode"),
+        contract["envelope"]["rel_norm_cap"],  # κ amplitude knob
         cfg.model_name,
         int(cfg.bench_max_new_tokens),
         "rp-removed-issue12",
-        "shot-aware-calib-v2",
+        "shot-aware-removed-bug6",  # Increment cache version
+        "kappa-in-fingerprint-v1",
     ])
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
