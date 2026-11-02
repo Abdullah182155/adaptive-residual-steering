@@ -112,3 +112,18 @@ experiment_record.txt
 lastoutput.txt
 run_manifest.json
 PHASE1_EXECUTION_CHECKLIST.md
+
+# Archived research assets: retain locally, never add to the production codebase.
+diagrams/
+*.ppt
+*.pptx
+*.pdf
+*.mp4
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.ipynb
+*.tmp
+*.bak
