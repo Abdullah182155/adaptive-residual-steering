@@ -46,6 +46,39 @@ from src.utils.failure_policy import (
 )
 
 
+def _demo_shield(tokenizer, ids: torch.Tensor) -> torch.Tensor:
+    """Generate prompt shield mask for few-shot demonstrations.
+    
+    Shields all tokens before the last 'Question:' marker, protecting
+    in-context demonstrations from steering while allowing the test question
+    to be steered.
+    
+    Args:
+        tokenizer: Tokenizer with encode method
+        ids: Input token IDs (B, T)
+    
+    Returns:
+        Boolean mask (B, T) where True = shield this token (no steering)
+    """
+    q_tokens = tokenizer.encode("Question:", add_special_tokens=False)
+    shield_mask = torch.zeros_like(ids, dtype=torch.bool)
+    
+    for b in range(ids.size(0)):
+        row = ids[b].tolist()
+        # Find all occurrences of "Question:"
+        matches = []
+        for i in range(len(row) - len(q_tokens) + 1):
+            if row[i:i + len(q_tokens)] == q_tokens:
+                matches.append(i)
+        
+        # If multiple matches (few-shot), shield everything before the last one
+        if len(matches) > 1:
+            last_question_start = matches[-1]
+            shield_mask[b, :last_question_start] = True
+    
+    return shield_mask
+
+
 # --------------------------------------------------------------------------- #
 # M0 helpers
 # --------------------------------------------------------------------------- #
@@ -3821,7 +3854,7 @@ def _ensure_contrast_sets(tokenizer, device: torch.device) -> bool:
     return ok
 
 
-def evaluate_subset_nll(model, rows: List[dict], catalog: "Catalog", cfg, device: torch.device) -> np.ndarray:
+def evaluate_subset_nll(model, tokenizer, rows: List[dict], catalog: "Catalog", cfg, device: torch.device) -> np.ndarray:
     """Evaluate NLL for all 25 non-empty catalog subsets on the given rows.
 
     Returns (len(rows), C) float32 array where [:, 0] is NLL under empty subset
@@ -3846,6 +3879,14 @@ def evaluate_subset_nll(model, rows: List[dict], catalog: "Catalog", cfg, device
                 for c, subset in enumerate(catalog.subsets):
                     matrix = model.subset_matrix([subset] * bsz).to(device)
                     model.set_routing_override("matrix", matrix)
+                    
+                    # Apply prompt shield mask for few-shot demonstrations
+                    shield = _demo_shield(tokenizer, ids)
+                    if shield.any():
+                        model.set_prompt_shield_mask(shield)
+                    else:
+                        model.set_prompt_shield_mask(None)
+                    
                     _set_ctx(model, mask, lbls)
                     with _autocast(device):
                         logits = model(input_ids=ids, attention_mask=mask).logits
@@ -3980,6 +4021,14 @@ def _s1_fit(
 
             subset = sample_training_subset(catalog, rng, cfg.s1_k_choices)
             model.set_routing_override("matrix", model.subset_matrix([subset] * bsz).to(device))
+            
+            # Apply prompt shield mask for few-shot demonstrations
+            shield = _demo_shield(tokenizer, ids)
+            if shield.any():
+                model.set_prompt_shield_mask(shield)
+            else:
+                model.set_prompt_shield_mask(None)
+            
             _set_ctx(model, mask, lbls)
             with _autocast(device):
                 out = model(input_ids=ids, attention_mask=mask)
@@ -4005,6 +4054,14 @@ def _s1_fit(
                     n_lbl = pb["neg_labels"].to(device)
                     n_div = pb["div_token_mask"].to(device)
                     model.set_routing_override("matrix", model.subset_matrix([subset] * n_ids.size(0)).to(device))
+                    
+                    # Apply prompt shield mask for few-shot demonstrations
+                    n_shield = _demo_shield(tokenizer, n_ids)
+                    if n_shield.any():
+                        model.set_prompt_shield_mask(n_shield)
+                    else:
+                        model.set_prompt_shield_mask(None)
+                    
                     _set_ctx(model, n_mask, n_lbl)
                     with _autocast(device):
                         out_neg = model(input_ids=n_ids, attention_mask=n_mask)
@@ -4040,7 +4097,7 @@ def _s1_fit(
         avg_loss = epoch_loss / max(1, n_loss)
         train_loss_history.append(avg_loss)
 
-        nll = evaluate_subset_nll(model, sel_rows, catalog, cfg, device)
+        nll = evaluate_subset_nll(model, tokenizer, sel_rows, catalog, cfg, device)
         gain, per_subset = _k_uniform_gain(nll, catalog, cfg.s1_k_choices)
         val_gain_history.append(gain)
         lr_reducer.step(-gain)

@@ -55,7 +55,9 @@ class BatchAnswerStopping(StoppingCriteria):
                 continue
             if self._marker_at[b] is None:
                 text = self.tokenizer.decode(row[-self.window:], skip_special_tokens=True)
-                if _RUNAWAY in text:
+                # Check all stop markers, not just _RUNAWAY
+                from src.evaluation.answers import _STOP_MARKERS
+                if any(re.search(pattern, text) for pattern in _STOP_MARKERS):
                     self.row_done[b] = True
                     continue
                 if _ANSWER_START_RE.search(text):

@@ -489,6 +489,10 @@ def stage_bench(model, tok, cfg, device, args):
     if not os.path.exists(contract_path):
         raise FileNotFoundError(f"Deployment contract not found: {contract_path}. Please run Stage S5 first.")
     contract = load_contract(contract_path)
+    # Apply --no_revert to loaded contract
+    if args.no_revert:
+        contract["guards"]["revert_to_k0"] = False
+        print(f"[bench] --no_revert: disabled guard reversion")
     if getattr(args, "s_fixed", None) and str(args.s_fixed).strip().lower() not in ("auto", "none", ""):
         contract["s_fixed_star"] = [int(x.strip()) for x in args.s_fixed.split(",") if x.strip()]
         print(f"[bench] Overriding s_fixed_star from --s_fixed: {contract['s_fixed_star']}")
@@ -504,10 +508,16 @@ def stage_bench(model, tok, cfg, device, args):
         arms=arms_filter,
     )
     write_record(record, args.record)
+    # BUG-1 fix: Use lenient accuracy for 0-shot headline, strict for few-shot
     out = {
         "record": args.record,
         "accuracy": {
-            k: {a: round(v["accuracy_strict"], 2) for a, v in blk["arms"].items()}
+            k: {a: {
+                "strict": round(v["accuracy_strict"],2),
+                "lenient": round(v["accuracy_lenient"],2),
+                "canonical": round(v["accuracy_canonical"],2),
+                "headline": round(v["accuracy_lenient"] if int(k) == 0 else v["accuracy_strict"], 2)
+            } for a, v in blk["arms"].items()}
             for k, blk in record["shots"].items()
         },
     }

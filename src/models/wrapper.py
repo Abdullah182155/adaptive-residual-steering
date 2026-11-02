@@ -310,6 +310,16 @@ class Phi2WithRSC(nn.Module):
                             if sh.ndim == 2 and sh.shape[0] == h_fp.shape[0] and sh.shape[1] >= h_fp.shape[1]:
                                 sh_aligned = sh[:, -h_fp.shape[1]:].to(device=h_fp.device, dtype=torch.bool)
                                 steer_mask = steer_mask & (~sh_aligned)
+                        
+                        # Shield attention sink token (first real token) under left-padding
+                        # In training (right-pad), position 0 is already shielded by V5
+                        # In generation (left-pad), position 0 is pad; shield the first non-pad token
+                        if not wrapper._trace_cached_decode and mask.ndim == 2:
+                            first_real = mask.long().argmax(dim=1)  # First non-pad position per row
+                            steer_mask = steer_mask.clone()
+                            batch_indices = torch.arange(mask.size(0), device=mask.device)
+                            steer_mask[batch_indices, first_real] = False
+                        
                         # Decode-only steering: zero out the entire steering contribution
                         # during prefill (T > 1).  This keeps the prompt KV-cache completely
                         # pristine — critical for few-shot demonstrations where the base model

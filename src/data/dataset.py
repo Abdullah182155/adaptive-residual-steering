@@ -131,7 +131,7 @@ def gsm8k_to_cot(
 
     def split_answer(answer: str):
         parts = answer.split("####")
-        reasoning = parts[0].strip()
+        reasoning = re.sub(r"<<[^>]*>>", "", parts[0]).strip()
         final_num = parts[1].strip() if len(parts) > 1 else ""
         steps = [s.strip() for s in re.split(r"(?<!\d)\.(?!\d)\s+", reasoning) if s.strip()]
         return steps, final_num

@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "run_id": "e025c80a120b",
+  "failure_policy": "warn",
+  "config": {},
+  "steer_scale": 0.3,
+  "gate_mode": "learned",
+  "warnings": [
+    {
+      "ts": "2026-11-02T00:42:59.586094+00:00",
+      "stage": "",
+      "code": "W_CF_SHARD_UNREADABLE",
+      "message": "cf_table_part_0002.npz unreadable (Cannot load file containing pickled data when allow_pickle=False); recomputing",
+      "data": {}
+    },
+    {
+      "ts": "2026-11-02T00:43:12.532698+00:00",
+      "stage": "",
+      "code": "W_LAYER_MISSING",
+      "message": "non-admitted candidate layer 24 has no SteerNet weights in C:\\Users\\hp\\AppData\\Local\\Temp\\pytest-of-hp\\pytest-133\\test_load_steernets_for_audit0\\warn.pt",
+      "data": {}
+    }
+  ],
+  "advisories": {
+    "router_distill_regret_ratio": {
+      "value": 0.02542372881355932,
+      "interpretation": "held-out mean regret / best-fixed-subset regret; < 1 means the router beats the best fixed subset",
+      "ts": "2026-11-02T00:43:25.021595+00:00"
+    },
+    "router_distill_top1_agreement": {
+      "value": 0.98125,
+      "interpretation": "fraction of held-out rows where the router picks a table-optimal subset",
+      "ts": "2026-11-02T00:43:25.026588+00:00"
+    },
+    "router_distill_abstain_rate_by_shot": {
+      "value": {
+        "0": 0.2875,
+        "2": 0.275
+      },
+      "interpretation": "share of held-out rows routed to the empty subset, per shot count",
+      "ts": "2026-11-02T00:43:25.030590+00:00"
+    },
+    "router_distill_class_hist": {
+      "value": [
+        45,
+        43,
+        32,
+        40
+      ],
+      "interpretation": "held-out routing histogram over catalog classes",
+      "ts": "2026-11-02T00:43:25.036236+00:00"
+    }
+  },
+  "stages": {}
+}
