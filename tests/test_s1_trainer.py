@@ -223,11 +223,11 @@ class TestS1Trainer(unittest.TestCase):
         base_before = _param_hash(model.base_model)
         router_before = _param_hash(model.router)
         steer_before = _param_hash(model.steer_nets)
-        nll_before = evaluate_subset_nll(model, rows, catalog, cfg, DEVICE)[:, 1:].mean()
+        nll_before = evaluate_subset_nll(model, tok, rows, catalog, cfg, DEVICE)[:, 1:].mean()
 
         train_s1_steernet(model, tok, rows, [], rows, cfg, DEVICE)
 
-        nll_after = evaluate_subset_nll(model, rows, catalog, cfg, DEVICE)[:, 1:].mean()
+        nll_after = evaluate_subset_nll(model, tok, rows, catalog, cfg, DEVICE)[:, 1:].mean()
         self.assertLess(float(nll_after), 0.8 * float(nll_before))
         self.assertEqual(base_before, _param_hash(model.base_model))
         self.assertEqual(router_before, _param_hash(model.router))
