@@ -105,3 +105,10 @@ working/
 GEMINI.md
 AGENTS.md
 nul
+
+# Temporary execution files (generated during pipeline runs)
+REPORT.txt
+experiment_record.txt
+lastoutput.txt
+run_manifest.json
+PHASE1_EXECUTION_CHECKLIST.md
