@@ -262,7 +262,7 @@ def train_phase1_steernet(
             micro = [_prepare([rows[i] for i in idx], device) for idx in micro_indices]
             counts = window_counts(
                 [b["labels"] for b, _ in micro],
-                [e.get("token_types", torch.zeros_like(b["labels"])) for _, e in micro],
+                [e.get("token_types", torch.zeros_like(b["labels"])) for b, e in micro],
             )
             window_loss = 0.0
             parts: Dict[str, float] = {}
