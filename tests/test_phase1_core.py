@@ -163,3 +163,40 @@ def test_dataset_split_preparation_and_batching():
     batch = _extract_batch_rows(split, offset=0, batch_size=4)
     assert isinstance(batch, list)
     assert len(batch) == 4
+
+
+def test_wrapper_preserves_single_element_tuple_outputs():
+    from types import SimpleNamespace
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from src.steering.steernet import SteerNet
+
+    cfg = SimpleNamespace(
+        fixed_layers=[0],
+        lora_rank=4,
+        lora_alpha=32.0,
+        lora_dropout=0.0,
+        steer_kappa=0.04,
+        layer_norms_calibration="",
+        prompt_shielding=False,
+        steer_scale=0.30,
+    )
+    backbone = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32,
+            hidden_size=8,
+            intermediate_size=16,
+            num_hidden_layers=1,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+        )
+    ).eval()
+    model = Phi2WithRSC(backbone, cfg, torch.device("cpu")).eval()
+    model._selection = torch.tensor([[True]])
+    model._attention_mask = torch.ones(1, 10, dtype=torch.bool)
+
+    steer_net = SteerNet(hidden_dim=8, rank=4, kappa=0.04)
+    single_tuple = (torch.zeros(1, 10, 8),)
+    steered = model._apply_steering(0, steer_net, single_tuple)
+    assert isinstance(steered, tuple)
+    assert len(steered) == 1
+    assert steered[0].shape == (1, 10, 8)

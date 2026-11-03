@@ -184,8 +184,9 @@ class Phi2WithRSC(nn.Module):
         )
 
     def _apply_steering(self, position: int, steer_net: SteerNet, output):
+        is_tuple = isinstance(output, tuple)
         hidden, suffix = (
-            (output[0], output[1:]) if isinstance(output, tuple) else (output, ())
+            (output[0], output[1:]) if is_tuple else (output, ())
         )
         was_2d = hidden.ndim == 2
         if was_2d:
@@ -220,7 +221,7 @@ class Phi2WithRSC(nn.Module):
         result = (hidden_float + injected).to(hidden.dtype)
         if was_2d:
             result = result.squeeze(0)
-        return (result, *suffix) if suffix else result
+        return (result, *suffix) if is_tuple else result
 
     def _valid_token_mask(self, hidden: torch.Tensor) -> torch.BoolTensor:
         if self._attention_mask is None:
@@ -257,7 +258,7 @@ class Phi2WithRSC(nn.Module):
         if not bool(valid_mask.any()):
             return
         ratios = delta.norm(dim=-1) / hidden.norm(dim=-1).clamp_min(1e-6)
-        relative_max = float(ratios[valid_mask].max())
+        relative_max = float(ratios[valid_mask].detach().max())
         self.guard_state["rel_max"] = max(
             float(self.guard_state.get("rel_max", 0.0)), relative_max
         )
