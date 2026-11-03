@@ -323,9 +323,13 @@ def train_phase1_steernet(
 
             scaler.unscale_(optimizer)
             gnorm = float(torch.nn.utils.clip_grad_norm_(model.steer_nets.parameters(), cfg.clip_grad))
+            scale_before = scaler.get_scale()
             scaler.step(optimizer)
             scaler.update()
-            scheduler.step()
+            scale_after = scaler.get_scale()
+            # Only step scheduler if optimizer.step() was not skipped by GradScaler
+            if scale_before <= scale_after:
+                scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
             step_count += 1
