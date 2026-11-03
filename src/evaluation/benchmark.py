@@ -297,6 +297,17 @@ def run_benchmark(
                 taxonomy_counts[cls_tag] = taxonomy_counts.get(cls_tag, 0) + 1
             shot_record["paired"]["taxonomy"] = taxonomy_counts
 
+            # Save paired generation file for diagnostics and legacy tools: report/generations/{suite}_{n_shot}shot.jsonl
+            paired_rows = [
+                {"question": row["question"], "gold": row["answer"], "baseline": b, "fixed": f}
+                for row, b, f in zip(rows, arm_results["baseline"], arm_results["fixed"])
+            ]
+            paired_output_path = generation_dir / f"{suite}_{n_shot}shot.jsonl"
+            paired_output_path.write_text(
+                "".join(json.dumps(item) + "\n" for item in paired_rows),
+                encoding="utf-8",
+            )
+
         record["shots"][str(n_shot)] = shot_record
     return record
 
@@ -344,5 +355,7 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
                 ]
             )
     report_path = destination / f"REPORT_{suite.upper()}.md"
-    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    content = "\n".join(lines) + "\n"
+    report_path.write_text(content, encoding="utf-8")
+    (destination / "REPORT.md").write_text(content, encoding="utf-8")
     return report_path
