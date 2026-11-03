@@ -6,7 +6,13 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
 
-DEFAULT_SHOT_AWARE_SCALE: Dict[int, float] = {0: 1.0, 2: 0.50, 4: 0.35}
+DEFAULT_SHOT_AWARE_SCALE: Dict[int, float] = {
+    0: 1.0,
+    1: 0.65,
+    2: 0.40,
+    4: 0.25,
+    8: 0.15,
+}
 
 
 @dataclass
@@ -82,13 +88,9 @@ def decode_only_for_shot(shots: int, cfg: RSCConfig) -> bool:
 
 def shot_aware_scale_map(cfg: RSCConfig) -> Dict[int, float]:
     """Return deployment energy multipliers, or a neutral map when disabled."""
-    if cfg.amplitude_mode == "relative":
-        return {0: 1.0, 2: 1.0, 4: 1.0}
-    return (
-        dict(DEFAULT_SHOT_AWARE_SCALE)
-        if cfg.shot_aware_deploy
-        else {0: 1.0, 2: 1.0, 4: 1.0}
-    )
+    if not cfg.shot_aware_deploy:
+        return {0: 1.0, 1: 1.0, 2: 1.0, 4: 1.0, 8: 1.0}
+    return dict(DEFAULT_SHOT_AWARE_SCALE)
 
 
 def apply_overrides(cfg: RSCConfig, assignments: List[str]) -> RSCConfig:

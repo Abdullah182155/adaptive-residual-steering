@@ -17,7 +17,7 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.steer_kappa == 0.04
     assert cfg.steer_scale == 0.30
     assert cfg.k_scale_mode == "sqrt"
-    assert shot_aware_scale_map(cfg) == {0: 1.0, 2: 1.0, 4: 1.0}
+    assert shot_aware_scale_map(cfg) == {0: 1.0, 1: 0.65, 2: 0.40, 4: 0.25, 8: 0.15}
     assert decode_only_for_shot(0, cfg) is False
     assert decode_only_for_shot(2, cfg) is False
 

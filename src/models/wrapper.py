@@ -245,9 +245,11 @@ class Phi2WithRSC(nn.Module):
         return gate.to(delta.device, delta.dtype)
 
     def _effective_scale(self) -> float:
-        if getattr(self.cfg, "amplitude_mode", "relative") == "relative":
-            return 1.0
-        scale = self.cfg.steer_scale if self._steer_scale is None else self._steer_scale
+        scale = (
+            1.0
+            if getattr(self.cfg, "amplitude_mode", "relative") == "relative"
+            else (self.cfg.steer_scale if self._steer_scale is None else self._steer_scale)
+        )
         if self._shot_aware_scale is not None and self._current_n_shot is not None:
             scale *= self._shot_aware_scale.get(self._current_n_shot, 1.0)
         return float(scale)
