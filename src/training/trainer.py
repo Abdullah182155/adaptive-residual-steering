@@ -216,6 +216,18 @@ def train_phase1_steernet(
     model.set_routing_override("only", cfg.fixed_layers)
     model.set_steer_scale(cfg.steer_scale)
 
+    # ── Memory optimisation 1: expandable segments reduces fragmentation OOM ──
+    import os
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
+    # ── Memory optimisation 2: gradient checkpointing on the frozen backbone ──
+    # Backbone parameters have requires_grad=False, so checkpointing only
+    # costs recompute time, not accuracy. It cuts activation VRAM ~30-40%.
+    if device.type == "cuda" and hasattr(model.base_model, "gradient_checkpointing_enable"):
+        model.base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
     rows = train_data if isinstance(train_data, list) else [train_data[i] for i in range(len(train_data))]
     lengths = [int(r["attention_mask"].sum()) for r in rows]
 
@@ -273,13 +285,18 @@ def train_phase1_steernet(
                     if cfg.loss_mode == "typed":
                         base_logits = None
                         if cfg.kl_weight > 0:
-                            # Frozen backbone pass with hooks disabled
+                            # ── KL pass: frozen backbone, hooks disabled ──────────────
                             with torch.no_grad(), model.hooks_disabled():
                                 base_logits = model(
                                     input_ids=batch["input_ids"],
                                     attention_mask=batch["attention_mask"],
                                 ).logits
-                        # Steered forward pass (without passing labels to avoid duplicated CE)
+                            # Move to CPU immediately to free VRAM before the steered pass.
+                            # It will be moved back inside typed_objective only if needed.
+                            base_logits = base_logits.cpu()
+                            if device.type == "cuda":
+                                torch.cuda.empty_cache()
+                        # ── Steered pass ─────────────────────────────────────────────
                         logits = model(
                             input_ids=batch["input_ids"],
                             attention_mask=batch["attention_mask"],
@@ -338,6 +355,9 @@ def train_phase1_steernet(
 
     if best_state is not None:
         model.steer_nets.load_state_dict(best_state)
+    # Disable gradient checkpointing after training — not needed for inference/eval
+    if device.type == "cuda" and hasattr(model.base_model, "gradient_checkpointing_disable"):
+        model.base_model.gradient_checkpointing_disable()
     save_steer_weights(model, cfg.lora_save_path, cfg)
     report_path = Path(cfg.report_dir) / "training_log.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)

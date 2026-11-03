@@ -132,7 +132,9 @@ def typed_objective(
     if kl_weight > 0 and base_logits is not None:
         m = c == T_PROSE
         if bool(m.any()):
-            lq = F.log_softmax(base_logits[:, :-1][sel][m].float(), dim=-1)
+            # base_logits may have been pinned to CPU to save VRAM; move it back only now.
+            bl = base_logits.to(logits.device) if base_logits.device != logits.device else base_logits
+            lq = F.log_softmax(bl[:, :-1][sel][m].float(), dim=-1)
             kl = (lq.exp() * (lq - logp[m])).sum(-1).sum() / max(counts.get(T_PROSE, 0), 1)
             loss = loss + kl_weight * kl
             parts["kl_prose"] = float(kl.detach()) * max(counts.get(T_PROSE, 0), 1) / int(m.sum())

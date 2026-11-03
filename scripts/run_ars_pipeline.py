@@ -14,6 +14,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.utils.logging_utils import setup_quiet_logging
 setup_quiet_logging(level=_verbosity)
 
+# ── Reduce CUDA memory fragmentation (safe for all PyTorch versions ≥ 2.0) ──
+import os
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 from datasets import load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
