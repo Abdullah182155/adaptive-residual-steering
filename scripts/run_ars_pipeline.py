@@ -8,7 +8,7 @@ import sys
 
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -89,12 +89,20 @@ def build_config(args) -> RSCConfig:
 
 
 def build_model(cfg, device):
+    """Load Phi-2 with an explicit padding ID for recent Transformers releases."""
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.pad_token_id is None:
+        raise ValueError("the tokenizer does not provide an EOS or padding token ID")
+    model_config = AutoConfig.from_pretrained(cfg.model_name, trust_remote_code=True)
+    model_config.pad_token_id = tokenizer.pad_token_id
     dtype = torch.float16 if device.type == "cuda" else torch.float32
     backbone = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name, torch_dtype=dtype, trust_remote_code=True
+        cfg.model_name,
+        config=model_config,
+        dtype=dtype,
+        trust_remote_code=True,
     ).to(device)
     model = Phi2WithRSC(backbone, cfg, device)
     model.set_shot_aware_scale(shot_aware_scale_map(cfg))

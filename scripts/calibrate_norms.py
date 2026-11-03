@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from typing import Dict, List, Tuple
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from tqdm.auto import tqdm
 import numpy as np
 from datasets import load_dataset
@@ -166,7 +166,13 @@ def main():
     print(f"Loading model {args.model} on {device}")
     
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model, trust_remote_code=True).to(device)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    model_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
+    model_config.pad_token_id = tokenizer.pad_token_id
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, config=model_config, trust_remote_code=True
+    ).to(device)
     
     # Identify sink tokens (common non-content tokens)
     sink_tokens = set()
