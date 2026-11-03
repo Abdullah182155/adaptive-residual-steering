@@ -3,7 +3,7 @@ import json
 from types import SimpleNamespace
 import torch
 from scripts.run_ars_pipeline import build_config, parse_args
-from src.configs.config import RSCConfig, decode_only_for_shot, shot_aware_scale_map
+from src.configs.config import RSCConfig
 from src.deploy.calibrate import measure_envelope, write_contract
 from src.evaluation.answers import extract_numeric_answer, score_tiers
 from src.models.wrapper import Phi2WithRSC
@@ -17,9 +17,11 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.steer_kappa == 0.04
     assert cfg.steer_scale == 0.30
     assert cfg.k_scale_mode == "sqrt"
-    assert shot_aware_scale_map(cfg) == {0: 1.0, 1: 0.65, 2: 0.40, 4: 0.25, 8: 0.15}
-    assert decode_only_for_shot(0, cfg) is False
-    assert decode_only_for_shot(2, cfg) is False
+    assert cfg.max_tok_len == 1024
+    assert cfg.phase1_lr == 2e-4
+    assert cfg.loss_mode == "typed"
+    assert cfg.train_shot_probs == [0.40, 0.15, 0.20, 0.10, 0.15]
+    assert cfg.shield_policy == "context"
 
 
 def test_causal_convolution_dirac_initialization_and_cache_priming():
@@ -104,6 +106,7 @@ def test_s5_contract_records_fixed_route(tmp_path):
     path = tmp_path / "contract.json"
     contract = write_contract(path, cfg=cfg, envelope=envelope)
     assert contract["fixed_layers"] == [13, 20, 22]
+    assert contract["version"] == 3
     assert json.loads(path.read_text())["envelope"]["route"] == [13, 20, 22]
 
 
@@ -119,7 +122,7 @@ def test_pipeline_cli_smoke_configuration():
             "--s_fixed",
             "13,20,22",
             "--set",
-            "shot_aware_deploy=false",
+            "loss_mode=legacy",
             "--set",
             "catalog_max_k=3",
         ]
@@ -127,7 +130,7 @@ def test_pipeline_cli_smoke_configuration():
     cfg = build_config(args)
     assert cfg.phase1_epochs == 3
     assert cfg.phase1_lr == 0.002
-    assert cfg.shot_aware_deploy is False
+    assert cfg.loss_mode == "legacy"
 
 
 def test_batch_trimming_keeps_auxiliary_masks_aligned():

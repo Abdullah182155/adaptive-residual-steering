@@ -6,15 +6,6 @@ from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
 
-DEFAULT_SHOT_AWARE_SCALE: Dict[int, float] = {
-    0: 1.0,
-    1: 0.65,
-    2: 0.40,
-    4: 0.25,
-    8: 0.15,
-}
-
-
 @dataclass
 class RSCConfig:
     """Certified defaults for fixed-route SteerNet V5 training and deployment."""
@@ -38,25 +29,39 @@ class RSCConfig:
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
-    shot_aware_deploy: bool = True
-    fewshot_decode_only: bool = True
     guard_revert_to_k0: bool = True
     guard_relative_norm_cap: Optional[float] = None
 
-    batch_size: int = 1
-    grad_accum: int = 4
+    batch_size: int = 2
+    grad_accum: int = 8
     clip_grad: float = 1.0
     weight_decay: float = 0.01
     phase1_epochs: int = 2
-    phase1_lr: float = 1e-3
+    phase1_lr: float = 2e-4
     phase1_warmup_frac: float = 0.06
     phase1_min_lr_frac: float = 0.10
     log_every: int = 20
     n_samples: int = 7000
-    max_tok_len: int = 384
+    max_tok_len: int = 1024
     val_split: float = 0.08
     diversify_prompts: bool = False
     seed: int = 42
+
+    # V2 Typed Loss
+    loss_mode: str = "typed"  # "typed" or "legacy"
+    lambda_format: float = 0.05
+    lambda_operator: float = 0.10
+    lambda_operand: float = 0.20
+    lambda_result: float = 0.35
+    lambda_final: float = 0.30
+    focal_gamma: float = 1.0
+    kl_weight: float = 1.0
+
+    # V2 Multi-Context Training Mixture
+    train_shot_probs: List[float] = field(default_factory=lambda: [0.40, 0.15, 0.20, 0.10, 0.15])  # 0, 1, 2, 3, 4 shots
+    train_use_preface: bool = True
+    train_v5_demo_frac: float = 0.50
+    shield_policy: str = "context"
 
     checkpoint_dir: str = "checkpoints"
     lora_save_path: str = "checkpoints/steernet.pt"
@@ -79,18 +84,8 @@ class RSCConfig:
             raise ValueError("Phase 1 uses sqrt route scaling")
         if self.amplitude_mode not in {"relative", "capped"}:
             raise ValueError("amplitude_mode must be relative or capped")
-
-
-def decode_only_for_shot(shots: int, cfg: RSCConfig) -> bool:
-    """Keep 0-shot prefill active; protect demonstrations in few-shot prompts."""
-    return bool(cfg.fewshot_decode_only and shots > 0 and cfg.amplitude_mode != "relative")
-
-
-def shot_aware_scale_map(cfg: RSCConfig) -> Dict[int, float]:
-    """Return deployment energy multipliers, or a neutral map when disabled."""
-    if not cfg.shot_aware_deploy:
-        return {0: 1.0, 1: 1.0, 2: 1.0, 4: 1.0, 8: 1.0}
-    return dict(DEFAULT_SHOT_AWARE_SCALE)
+        if self.loss_mode not in {"typed", "legacy"}:
+            raise ValueError("loss_mode must be 'typed' or 'legacy'")
 
 
 def apply_overrides(cfg: RSCConfig, assignments: List[str]) -> RSCConfig:

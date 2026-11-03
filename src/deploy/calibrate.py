@@ -4,8 +4,6 @@ from pathlib import Path
 from typing import Dict, Iterable
 import torch
 
-from src.configs.config import shot_aware_scale_map
-
 
 @torch.no_grad()
 def measure_envelope(
@@ -45,15 +43,13 @@ def measure_envelope(
 def write_contract(path: str, *, cfg, envelope: Dict[str, object]) -> Dict[str, object]:
     """Write the deployment contract consumed by benchmark execution."""
     contract = {
-        "version": 2,
+        "version": 3,
         "model": cfg.model_name,
         "fixed_layers": list(cfg.fixed_layers),
         "steer_scale": cfg.steer_scale,
         "steer_kappa": cfg.steer_kappa,
         "k_scale_mode": cfg.k_scale_mode,
-        "shot_scales": {
-            str(key): value for key, value in shot_aware_scale_map(cfg).items()
-        },
+        "shield_policy": getattr(cfg, "shield_policy", "context"),
         "guard_revert_to_k0": cfg.guard_revert_to_k0,
         "envelope": envelope,
     }
@@ -72,6 +68,3 @@ def apply_contract(model, contract: Dict[str, object]) -> None:
     """Configure the wrapper for fixed-route deployment from a contract."""
     model.set_routing_override("only", contract["fixed_layers"])
     model.set_steer_scale(float(contract["steer_scale"]))
-    model.set_shot_aware_scale(
-        {int(key): float(value) for key, value in contract["shot_scales"].items()}
-    )

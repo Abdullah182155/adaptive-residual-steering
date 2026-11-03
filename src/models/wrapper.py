@@ -69,9 +69,10 @@ class Phi2WithRSC(nn.Module):
         self._attention_mask: Optional[torch.Tensor] = None
         self._pending_shield_mask: Optional[torch.Tensor] = None
         self._active_shield_mask: Optional[torch.Tensor] = None
-        self._decode_only_steering = False
-        self._shot_aware_scale: Optional[Dict[int, float]] = None
-        self._current_n_shot: Optional[int] = None
+        self._gain: float = 1.0
+        self._control: Optional[str] = None
+        self._control_seed: int = 0
+        self._control_gen: Optional[torch.Generator] = None
         self._steer_scale: Optional[float] = None
         self._is_decode_step = False
         self._collect_routing_trace = False
@@ -197,12 +198,6 @@ class Phi2WithRSC(nn.Module):
 
         hidden_float = hidden.float()
         valid_mask = self._valid_token_mask(hidden_float)
-        if (
-            self._decode_only_steering
-            and not self._is_decode_step
-            and self._active_shield_mask is None
-        ):
-            valid_mask.zero_()
         valid_mask = self._apply_prompt_shield(valid_mask)
         active_k = self._selection.sum(dim=1).to(hidden_float.dtype)
         delta = steer_net(
@@ -214,6 +209,14 @@ class Phi2WithRSC(nn.Module):
         gate = self._gate_multiplier(position, delta)
         injected = delta * selection * gate * self._effective_scale()
         injected = injected * valid_mask.unsqueeze(-1).to(injected.dtype)
+        if self._control == "random":
+            if self._control_gen is None:
+                self._control_gen = torch.Generator(device=injected.device).manual_seed(self._control_seed)
+            noise = torch.randn(
+                injected.shape, generator=self._control_gen, device=injected.device, dtype=injected.dtype
+            )
+            energy = injected.norm(dim=-1, keepdim=True)
+            injected = noise / noise.norm(dim=-1, keepdim=True).clamp_min(1e-6) * energy
         self._record_guard(injected, hidden_float, valid_mask)
         if self._collect_injection_trace:
             relative = injected.norm(dim=-1) / hidden_float.norm(dim=-1).clamp_min(1e-6)
@@ -245,14 +248,10 @@ class Phi2WithRSC(nn.Module):
         return gate.to(delta.device, delta.dtype)
 
     def _effective_scale(self) -> float:
-        scale = (
-            1.0
-            if getattr(self.cfg, "amplitude_mode", "relative") == "relative"
-            else (self.cfg.steer_scale if self._steer_scale is None else self._steer_scale)
+        base = 1.0 if getattr(self.cfg, "amplitude_mode", "relative") == "relative" else (
+            self.cfg.steer_scale if self._steer_scale is None else self._steer_scale
         )
-        if self._shot_aware_scale is not None and self._current_n_shot is not None:
-            scale *= self._shot_aware_scale.get(self._current_n_shot, 1.0)
-        return float(scale)
+        return float(base * getattr(self, "_gain", 1.0))
 
     def _record_guard(
         self, delta: torch.Tensor, hidden: torch.Tensor, valid_mask: torch.BoolTensor
@@ -267,6 +266,12 @@ class Phi2WithRSC(nn.Module):
         self.guard_state["nonfinite"] = bool(
             self.guard_state.get("nonfinite", False)
         ) or not bool(torch.isfinite(delta).all())
+
+    def set_intervention_gain(self, gain: float) -> None:
+        self._gain = float(gain)
+
+    def set_control(self, mode: Optional[str], seed: int = 0) -> None:
+        self._control, self._control_seed, self._control_gen = mode, int(seed), None
 
     def set_route_selector(self, selector: Optional[RouteSelector]) -> None:
         self._route_selector = selector
@@ -314,15 +319,6 @@ class Phi2WithRSC(nn.Module):
 
     def set_prompt_shield_mask(self, mask: Optional[torch.Tensor]) -> None:
         self._pending_shield_mask = mask
-
-    def set_decode_only_steering(self, enabled: bool) -> None:
-        self._decode_only_steering = bool(enabled)
-
-    def set_shot_aware_scale(self, scales: Optional[Dict[int, float]]) -> None:
-        self._shot_aware_scale = scales
-
-    def set_current_n_shot(self, n_shot: Optional[int]) -> None:
-        self._current_n_shot = n_shot
 
     def set_steer_scale(self, scale: Optional[float]) -> None:
         self._steer_scale = scale

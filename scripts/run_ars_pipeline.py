@@ -13,7 +13,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from src.configs.config import RSCConfig, apply_overrides, shot_aware_scale_map
+from src.configs.config import RSCConfig, apply_overrides
 from src.data.dataset import gsm8k_to_cot
 from src.deploy.calibrate import (
     apply_contract,
@@ -106,7 +106,6 @@ def build_model(cfg, device):
         trust_remote_code=True,
     ).to(device)
     model = Phi2WithRSC(backbone, cfg, device)
-    model.set_shot_aware_scale(shot_aware_scale_map(cfg))
     return model, tokenizer
 
 
@@ -192,7 +191,7 @@ def run(args) -> int:
                 dname = dataset_name.strip()
                 rows = load_ood_rows(dname, args.ood_n)
                 ood_record = run_benchmark(
-                    model, tokenizer, rows, cfg, device, args.ood_shots, arms, contract
+                    model, tokenizer, rows, cfg, device, args.ood_shots, arms, contract, suite=dname
                 )
                 rec_path = f"experiment_record_{dname}.json"
                 write_record(ood_record, rec_path)
