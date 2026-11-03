@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 import sys
+import traceback
 
 import torch
 from datasets import load_dataset
@@ -200,4 +201,9 @@ def stage_requires_checkpoint(stage: str) -> bool:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run(parse_args()))
+    try:
+        raise SystemExit(run(parse_args()))
+    except Exception:
+        print("\nARS pipeline failed. Full traceback follows:", file=sys.stderr)
+        traceback.print_exc()
+        raise
