@@ -8,6 +8,7 @@ from src.deploy.calibrate import measure_envelope, write_contract
 from src.evaluation.answers import extract_numeric_answer, score_tiers
 from src.models.wrapper import Phi2WithRSC
 from src.steering.steernet import CausalDWConv1d, SteerNet
+from src.training.trainer import _trim_to_attended_tokens
 
 
 def test_certified_config_physics_and_decode_policy():
@@ -127,6 +128,18 @@ def test_pipeline_cli_smoke_configuration():
     assert cfg.phase1_epochs == 3
     assert cfg.phase1_lr == 0.002
     assert cfg.shot_aware_deploy is False
+
+
+def test_batch_trimming_keeps_auxiliary_masks_aligned():
+    batch = {
+        "input_ids": torch.arange(12).view(1, 12),
+        "attention_mask": torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0]]),
+        "labels": torch.ones(1, 12, dtype=torch.long),
+    }
+    extras = {"prompt_shield_mask": torch.ones(1, 12, dtype=torch.bool)}
+    trimmed, trimmed_extras = _trim_to_attended_tokens(batch, extras)
+    assert trimmed["input_ids"].shape[-1] == 4
+    assert trimmed_extras["prompt_shield_mask"].shape[-1] == 4
 
 
 def test_dataset_split_preparation_and_batching():

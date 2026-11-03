@@ -29,6 +29,32 @@ def _extract_batch_rows(data, offset: int, batch_size: int) -> List[dict]:
     return [data[i] for i in range(offset, end)]
 
 
+def _trim_to_attended_tokens(
+    batch: Dict[str, torch.Tensor],
+    extras: Dict[str, torch.Tensor] | None = None,
+) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    """Drop all-padding columns while preserving every aligned auxiliary mask.
+
+    Phi-2's current rotary implementation requires position tensors to match
+    the live sequence length. Fixed-width dataset padding otherwise supplies a
+    384-token position tensor for a much shorter hidden-state sequence.
+    """
+    extras = extras or {}
+    attention_mask = batch["attention_mask"].bool()
+    live_columns = attention_mask.any(dim=0).nonzero(as_tuple=False).flatten()
+    if live_columns.numel() == 0:
+        raise ValueError("batch contains no attended tokens")
+    start = int(live_columns.min())
+    stop = int(live_columns.max()) + 1
+    trimmed_batch = {name: value[:, start:stop] for name, value in batch.items()}
+    trimmed_extras = {
+        name: value[:, start:stop]
+        for name, value in extras.items()
+        if value.ndim >= 2 and value.shape[-1] == attention_mask.shape[-1]
+    }
+    return trimmed_batch, trimmed_extras
+
+
 def _set_prompt_shield(model, rows: List[dict], device: torch.device) -> None:
     if "prompt_shield_mask" not in rows[0]:
         model.set_prompt_shield_mask(None)
@@ -50,7 +76,11 @@ def evaluate_loss(model, rows: Iterable[dict], device: torch.device) -> float:
     losses = []
     for row in row_list:
         batch = _stack_batch([row], device)
-        _set_prompt_shield(model, [row], device)
+        extras = {}
+        if "prompt_shield_mask" in row:
+            extras["prompt_shield_mask"] = row["prompt_shield_mask"].unsqueeze(0).to(device)
+        batch, extras = _trim_to_attended_tokens(batch, extras)
+        model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
         output = model(**batch)
         losses.append(float(token_weighted_nll(output.logits, batch["labels"])))
     return sum(losses) / len(losses)
@@ -128,12 +158,17 @@ def train_phase1_steernet(
             if not rows:
                 continue
             batch = _stack_batch(rows, device)
-            _set_prompt_shield(model, rows, device)
+            extras = {}
+            for name in ("prompt_shield_mask", "calc_mask"):
+                if name in rows[0]:
+                    extras[name] = torch.stack([row[name] for row in rows]).to(device)
+            batch, extras = _trim_to_attended_tokens(batch, extras)
+            model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
             with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
                 output = model(**batch)
                 calc_mask = None
-                if "calc_mask" in rows[0]:
-                    calc_mask = torch.stack([row["calc_mask"] for row in rows]).to(device)
+                if "calc_mask" in extras:
+                    calc_mask = extras["calc_mask"]
                 weights = target_weights(batch["labels"], calc_mask, cfg.calc_weight_alpha)
                 task_loss = token_weighted_nll(output.logits, batch["labels"], weights)
                 penalty = steer_norm_penalty(model, batch["attention_mask"].bool(), cfg.steer_penalty_margin)
