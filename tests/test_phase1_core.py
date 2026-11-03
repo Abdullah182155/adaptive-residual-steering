@@ -20,7 +20,7 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.max_tok_len == 1024
     assert cfg.phase1_lr == 2e-4
     assert cfg.loss_mode == "typed"
-    assert cfg.train_shot_probs == [0.40, 0.15, 0.20, 0.10, 0.15]
+    assert cfg.train_shot_probs == [0.30, 0.10, 0.25, 0.10, 0.25]
     assert cfg.shield_policy == "context"
 
 

@@ -310,6 +310,22 @@ def train_phase1_steernet(
                             counts,
                             extras.get("neg_ids"),
                         )
+                        # ── Magnitude L1 sparsity: forces selective steering ──────────
+                        # Penalises uniform high-magnitude steering so the optimizer
+                        # only keeps magnitude elevated where the typed loss gradient
+                        # (λ_result=0.40, λ_final=0.35) overrides the penalty.
+                        # Eliminates the indiscriminate full-magnitude steering that
+                        # causes arithmetic corruption at few-shot contexts.
+                        if getattr(cfg, "mag_l1_weight", 0.0) > 0:
+                            mag_penalty = logits.new_zeros(())
+                            n_nets = 0
+                            for sn in model.steer_nets.values():
+                                if sn.last_pre_cap_q is not None:
+                                    mag_penalty = mag_penalty + sn.last_pre_cap_q.abs().mean()
+                                    n_nets += 1
+                            if n_nets > 0:
+                                loss = loss + cfg.mag_l1_weight * mag_penalty / n_nets
+                                parts["mag_l1"] = float(mag_penalty.detach() / n_nets)
                     else:
                         # Legacy mode
                         output = model(**batch)

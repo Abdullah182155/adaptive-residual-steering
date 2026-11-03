@@ -36,12 +36,12 @@ class RSCConfig:
     grad_accum: int = 16
     clip_grad: float = 1.0
     weight_decay: float = 0.01
-    phase1_epochs: int = 2
+    phase1_epochs: int = 5
     phase1_lr: float = 2e-4
     phase1_warmup_frac: float = 0.06
     phase1_min_lr_frac: float = 0.10
     log_every: int = 20
-    n_samples: int = 7000
+    n_samples: int = 7473
     max_tok_len: int = 1024
     val_split: float = 0.08
     diversify_prompts: bool = False
@@ -49,16 +49,17 @@ class RSCConfig:
 
     # V2 Typed Loss
     loss_mode: str = "typed"  # "typed" or "legacy"
-    lambda_format: float = 0.05
-    lambda_operator: float = 0.10
-    lambda_operand: float = 0.20
-    lambda_result: float = 0.35
-    lambda_final: float = 0.30
+    lambda_format: float = 0.02
+    lambda_operator: float = 0.08
+    lambda_operand: float = 0.15
+    lambda_result: float = 0.40
+    lambda_final: float = 0.35
     focal_gamma: float = 1.0
     kl_weight: float = 1.0
+    mag_l1_weight: float = 0.02
 
     # V2 Multi-Context Training Mixture
-    train_shot_probs: List[float] = field(default_factory=lambda: [0.40, 0.15, 0.20, 0.10, 0.15])  # 0, 1, 2, 3, 4 shots
+    train_shot_probs: List[float] = field(default_factory=lambda: [0.30, 0.10, 0.25, 0.10, 0.25])  # 0, 1, 2, 3, 4 shots
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.50
     shield_policy: str = "context"

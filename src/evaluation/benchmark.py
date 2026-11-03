@@ -23,7 +23,7 @@ from src.evaluation.chain import (
 
 
 STOP_RE = re.compile(
-    r"(?:Final answer|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?\s*(?:\n|$)"
+    r"(?:Final answer|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*\n"
 )
 
 
@@ -38,7 +38,7 @@ class AnswerStop(StoppingCriteria):
     def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         text = self.tokenizer.decode(input_ids[0, self.prompt_length :], skip_special_tokens=True)
         m = STOP_RE.search(text)
-        if m and (m.group(0).endswith("\n") or "\n" in m.group(0)):
+        if m:
             self.reason = "answer_stop"
             return True
         if should_stop_on_repeat(text):

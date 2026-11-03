@@ -11,7 +11,7 @@ import numpy as np
 
 
 STOP_RE = re.compile(
-    r"(?:Final answer|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?\s*(?:\n|$)"
+    r"(?:Final answer|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*\n"
 )
 
 
