@@ -1,14 +1,33 @@
-import re
+"""GSM8K dataset processing with multi-context mixture and typed reasoning tokens."""
+
+from __future__ import annotations
+
 import random
-from typing import Tuple, List, Dict, Any, Optional
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
 from datasets import load_dataset
+
 from src.configs.config import RSCConfig
+from src.data.prompts import PREFACE, V5_EXEMPLARS, build_prompt_unified
+from src.training.losses import (
+    T_FINAL,
+    T_FORMAT,
+    T_NONE,
+    T_OPERAND,
+    T_OPERATOR,
+    T_PROSE,
+    T_RESULT,
+    annotate_char_types,
+    token_types_from_offsets,
+)
+
 
 class PromptTemplateBank:
     """Randomises wording/format of a CoT prompt while holding math and final answer fixed."""
 
     HEADERS = [
-        ("Question: {q}\n", "Answer: Let's think step by step.\n"),  # original
+        ("Question: {q}\n", "Answer: Let's think step by step.\n"),
         ("Problem: {q}\n", "Solution: I'll work through this step by step.\n"),
         ("Q: {q}\n", "A: Let's break this down.\n"),
         ("### Problem\n{q}\n", "### Reasoning\n"),
@@ -24,7 +43,12 @@ class PromptTemplateBank:
 
     @classmethod
     def render(
-        cls, question: str, steps: List[str], final_answer: str, rng: random.Random, fixed: bool = False,
+        cls,
+        question: str,
+        steps: List[str],
+        final_answer: str,
+        rng: random.Random,
+        fixed: bool = True,
         return_target_start: bool = False,
     ):
         if fixed:
@@ -46,52 +70,30 @@ class PromptTemplateBank:
         text = prefix + body + "\n" + final_tpl.format(ans=final_answer)
         return (text, len(prefix)) if return_target_start else text
 
-    @classmethod
-    def two_views(cls, question: str, steps: List[str], final_answer: str, seed: int):
-        r1 = random.Random(seed)
-        r2 = random.Random(seed + 999983)
-        return (
-            cls.render(question, steps, final_answer, r1),
-            cls.render(question, steps, final_answer, r2),
-        )
 
-_CALC_TOKEN_CACHE: Dict[Tuple[str, int, int], int] = {}
+def _stratified_shots(n: int, probs: List[float], seed: int) -> List[int]:
+    """Sample stratified shot counts matching the target distribution exactly."""
+    counts = [int(round(p * n)) for p in probs]
+    diff = n - sum(counts)
+    counts[0] += diff
+    shots = [k for k, c in enumerate(counts) for _ in range(c)]
+    random.Random(seed).shuffle(shots)
+    return shots
 
 
-def _calc_token_cache_key(tokenizer, token_id: int) -> Tuple[str, int, int]:
-    """Identify token IDs within a tokenizer namespace, not globally."""
-    vocab_size = getattr(tokenizer, "_ars_cached_vocab_size", None)
-    if vocab_size is None:
-        try:
-            vocab_size = getattr(tokenizer, "vocab_size", None)
-            if vocab_size is None:
-                vocab_size = len(tokenizer)
-            vocab_size = int(vocab_size)
-        except Exception:
-            vocab_size = 0
-        try:
-            tokenizer._ars_cached_vocab_size = vocab_size
-        except Exception:
-            pass
-    return (tokenizer.__class__.__name__, vocab_size, int(token_id))
+def split_answer(answer: str) -> Tuple[List[str], str]:
+    """Parse GSM8K gold solution into reasoning sentences and final number."""
+    parts = answer.split("####")
+    reasoning = re.sub(r"<<[^>]*>>", "", parts[0]).strip()
+    final_num = parts[1].strip() if len(parts) > 1 else ""
+    steps = [s.strip() for s in re.split(r"(?<!\d)\.(?!\d)\s+", reasoning) if s.strip()]
+    return steps, final_num
 
-def _is_calc_token_id(tokenizer, token_id: int) -> int:
-    """Classify token as math/calculation/outcome token vs English prose."""
-    cache_key = _calc_token_cache_key(tokenizer, token_id)
-    if cache_key in _CALC_TOKEN_CACHE:
-        return _CALC_TOKEN_CACHE[cache_key]
-    try:
-        s = tokenizer.decode([token_id])
-    except Exception:
-        s = ""
-    if "Step" in s:
-        res = 0
-    elif re.search(r"[\d\+\-\*\/=\$\%#]", s):
-        res = 1
-    else:
-        res = 0
-    _CALC_TOKEN_CACHE[cache_key] = res
-    return res
+
+def gold_to_canonical_completion(steps: List[str], final_num: str) -> str:
+    """Render canonical CoT completion with Step N: and Final answer:."""
+    body_lines = [f"Step {i+1}: {s if s.endswith('.') else s + '.'}" for i, s in enumerate(steps)]
+    return "\n".join(body_lines) + f"\nFinal answer: {final_num}\n"
 
 
 def gsm8k_to_cot(
@@ -102,7 +104,7 @@ def gsm8k_to_cot(
     val_split: Optional[float] = None,
     seed: Optional[int] = None,
 ):
-    """Loads GSM8K, applies formatting, curriculum sorting, and tokenization."""
+    """Loads GSM8K, builds multi-context stratified mixture, and tokenizes with typed targets."""
     if cfg is None:
         cfg = RSCConfig()
     if n_samples is not None:
@@ -120,77 +122,75 @@ def gsm8k_to_cot(
             ds = load_dataset("openai/gsm8k", "main", split="train", verification_mode="no_checks")
         except Exception:
             ds = load_dataset("gsm8k", "main", split="train")
+
     print(f"[data] GSM8K official train loaded: {len(ds)} examples (n_samples cap={cfg.n_samples})")
     if cfg.n_samples < len(ds):
         ds = ds.shuffle(seed=cfg.seed).select(range(cfg.n_samples))
         print(f"[data] Capped to n_samples={len(ds)} from the official train split")
 
-    # Keep a deterministic training-only demonstration pool.  Evaluation uses
-    # few-shot prompts, so a zero-shot-only curriculum is a distribution shift
-    # rather than a meaningful robustness test.
     raw_questions = list(ds["question"])
     raw_answers = list(ds["answer"])
 
-    def split_answer(answer: str):
-        parts = answer.split("####")
-        reasoning = re.sub(r"<<[^>]*>>", "", parts[0]).strip()
-        final_num = parts[1].strip() if len(parts) > 1 else ""
-        steps = [s.strip() for s in re.split(r"(?<!\d)\.(?!\d)\s+", reasoning) if s.strip()]
-        return steps, final_num
+    shot_probs = getattr(cfg, "train_shot_probs", [0.40, 0.15, 0.20, 0.10, 0.15])
+    shots = _stratified_shots(len(ds), shot_probs, cfg.seed)
+    use_preface = getattr(cfg, "train_use_preface", True)
+    v5_demo_frac = getattr(cfg, "train_v5_demo_frac", 0.50)
 
-    def make_demo(source_idx: int, rng: random.Random) -> str:
+    def make_train_demo(source_idx: int) -> Dict[str, str]:
         steps, final_num = split_answer(raw_answers[source_idx])
-        # Use exactly the benchmark's Question/Answer convention so training
-        # and multi-shot evaluation share their structural grammar.
-        rendered = PromptTemplateBank.render(raw_questions[source_idx], steps, final_num, rng, fixed=True)
-        return rendered.rstrip() + "\n\n"
+        sol = gold_to_canonical_completion(steps, final_num).strip()
+        return {"q": raw_questions[source_idx], "a": sol}
 
     def format_example(example, idx):
         question = example["question"]
         ans_text = example["answer"]
-
         sentences, final_num = split_answer(ans_text)
+        completion = gold_to_canonical_completion(sentences, final_num)
 
         rng = random.Random(cfg.seed + idx)
-        current_text, current_target_start = PromptTemplateBank.render(
-            question, sentences, final_num, rng, fixed=not cfg.diversify_prompts,
-            return_target_start=True,
-        )
-        demo_prefix = ""
-        max_demos = max(0, int(getattr(cfg, "fewshot_train_max_demos", 0)))
-        if max_demos and rng.random() < float(getattr(cfg, "fewshot_train_prob", 0.0)):
-            n_demos = rng.randint(1, max_demos)
-            candidates = [j for j in range(len(raw_questions)) if j != idx]
-            # Sampling is replacement-free and deterministic per example.
-            for source_idx in rng.sample(candidates, k=min(n_demos, len(candidates))):
-                demo_prefix += make_demo(source_idx, rng)
-        text = demo_prefix + current_text
-        target_start = len(demo_prefix) + current_target_start
+        k = shots[idx]
+
+        # Draw k demonstrations
+        if k > 0:
+            if rng.random() < v5_demo_frac:
+                exemplars = list(V5_EXEMPLARS[:k])
+            else:
+                candidates = [j for j in range(len(raw_questions)) if j != idx]
+                donors = rng.sample(candidates, k=min(k, len(candidates)))
+                exemplars = [make_train_demo(j) for j in donors]
+        else:
+            exemplars = None
+
+        # Build prompt and shrink demonstrations if length exceeds max_tok_len
+        # Never truncate the target completion!
+        while True:
+            cur_exemplars = exemplars[:k] if (exemplars and k > 0) else None
+            prompt = build_prompt_unified(
+                question,
+                n_shot=k,
+                exemplars=cur_exemplars,
+                include_preface=use_preface,
+            )
+            full_text = prompt + completion
+            token_count = len(tokenizer.encode(full_text))
+            if k == 0 or token_count <= cfg.max_tok_len:
+                break
+            k -= 1
+
+        target_start = len(prompt)
+        tail = f"Question: {question}\nAnswer: Let's think step by step.\n"
+        shield_char_end = (len(prompt) - len(tail)) if k > 0 else 0
+
         return {
-            "text": text, "target_start": target_start,
-            "steps_list": sentences, "final_num": final_num,
-            "shield_char_end": len(demo_prefix),
-            "fallback_text": current_text,
-            "fallback_target_start": current_target_start,
+            "text": full_text,
+            "target_start": target_start,
+            "shield_char_end": shield_char_end,
+            "n_shot": k,
+            "steps_list": sentences,
+            "final_num": final_num,
         }
 
     ds = ds.map(format_example, with_indices=True)
-
-    def get_difficulty(ex):
-        text = ex.get("text", "")
-        target_start = ex.get("target_start", 0)  # BUG-04 fix: use pre-computed offset instead of hardcoded string
-        ops_count = len(re.findall(r"[\+\-\*\/]", text))
-        nums = re.findall(r"-?\d+\.?\d*", text)
-        distinct_nums = len(set(nums))
-        # BUG-04 fix: was `text.find("Answer: Let's think")` which only matched template-0.
-        # Now correctly uses target_start for all template variants.
-        chain_len = len(text[target_start:]) if target_start > 0 else 0
-        score = ops_count * 2 + distinct_nums + chain_len / 100.0
-        return {"difficulty_score": score}
-
-    ds = ds.map(get_difficulty)
-    ds = ds.sort("difficulty_score", reverse=False)
-    ds = ds.remove_columns(["difficulty_score"])
 
     def tokenize_fn(examples):
         out = tokenizer(
@@ -198,62 +198,54 @@ def gsm8k_to_cot(
             truncation=True,
             max_length=cfg.max_tok_len,
             padding="max_length",
+            return_offsets_mapping=True,
         )
         labels = []
         shield_masks = []
+        token_types = []
         calc_masks = []
-        for row, (text, target_start, shield_char_end, fallback_text, fallback_target_start, ids) in enumerate(zip(
-            examples["text"], examples["target_start"], examples["shield_char_end"],
-            examples["fallback_text"], examples["fallback_target_start"], out["input_ids"]
-        )):
-            lbl = list(ids)
-            prefix_len = len(tokenizer.encode(text[:target_start], add_special_tokens=False))
-            for j in range(min(prefix_len, len(lbl))):
-                lbl[j] = -100
-            for j in range(len(lbl)):
-                if lbl[j] == tokenizer.pad_token_id:
-                    lbl[j] = -100
-            # A long demonstration must never silently truncate every target
-            # token.  Fall back to the current 0-shot item so every optimizer
-            # example has a real supervised completion.
-            if sum(token != -100 for token in lbl) < 4:
-                fallback = tokenizer(
-                    fallback_text, truncation=True, max_length=cfg.max_tok_len, padding="max_length"
-                )
-                ids = fallback["input_ids"]
-                out["input_ids"][row] = ids
-                out["attention_mask"][row] = fallback["attention_mask"]
-                lbl = list(ids)
-                prefix_len = len(tokenizer.encode(fallback_text[:fallback_target_start], add_special_tokens=False))
-                for j in range(min(prefix_len, len(lbl))):
-                    lbl[j] = -100
-                for j in range(len(lbl)):
-                    if lbl[j] == tokenizer.pad_token_id:
-                        lbl[j] = -100
-                shield_char_end = 0
+
+        for text, target_start, shield_char_end, ids, offsets, am in zip(
+            examples["text"],
+            examples["target_start"],
+            examples["shield_char_end"],
+            out["input_ids"],
+            out["offset_mapping"],
+            out["attention_mask"],
+        ):
+            # Supervised labels: only tokens starting at or after target_start
+            lbl = []
+            for tok_id, (s, e), mask in zip(ids, offsets, am):
+                if mask and e > s and s >= target_start:
+                    lbl.append(tok_id)
+                else:
+                    lbl.append(-100)
+
+            # Prompt shield mask: covers preface + demos when k > 0
+            shield = [
+                1 if (mask and e > s and e <= shield_char_end) else 0
+                for (s, e), mask in zip(offsets, am)
+            ]
+
+            # Categorize token types
+            char_labels = annotate_char_types(text, target_start)
+            tt = token_types_from_offsets(text, char_labels, offsets)
+            tt = [t if l != -100 else T_NONE for t, l in zip(tt, lbl)]
+
+            # Legacy calc mask: math-bearing tokens
+            calc = [
+                1 if t in (T_OPERAND, T_OPERATOR, T_RESULT, T_FINAL) else 0 for t in tt
+            ]
+
             labels.append(lbl)
-            # Do not assume independently tokenizing a character prefix always
-            # matches the full prompt at its boundary.  Shorten until its IDs
-            # are an exact prefix of the full token sequence.
-            shield_ids = tokenizer.encode(text[:shield_char_end], add_special_tokens=False) if shield_char_end else []
-            shield_len = min(len(shield_ids), len(ids))
-            while shield_len and list(ids[:shield_len]) != shield_ids[:shield_len]:
-                shield_len -= 1
-            shield_masks.append([1 if j < shield_len else 0 for j in range(len(ids))])
+            shield_masks.append(shield)
+            token_types.append(tt)
+            calc_masks.append(calc)
 
-            # Engine v2: Compute calculation/outcome token mask
-            calc_mask = [0] * len(lbl)
-            for j in range(len(lbl)):
-                if lbl[j] != -100:
-                    calc_mask[j] = _is_calc_token_id(tokenizer, int(ids[j]))
-            if sum(calc_mask) == 0:
-                valid_indices = [j for j, l in enumerate(lbl) if l != -100]
-                for idx in valid_indices[-8:]:
-                    calc_mask[idx] = 1
-            calc_masks.append(calc_mask)
-
+        out.pop("offset_mapping")
         out["labels"] = labels
         out["prompt_shield_mask"] = shield_masks
+        out["token_types"] = token_types
         out["calc_mask"] = calc_masks
         return out
 
@@ -261,13 +253,22 @@ def gsm8k_to_cot(
     remove_cols = [c for c in ds.column_names if c not in keep_raw_cols]
     ds = ds.map(tokenize_fn, batched=True, remove_columns=remove_cols)
     ds.set_format(
-        "torch", columns=["input_ids", "attention_mask", "labels", "prompt_shield_mask", "calc_mask"], output_all_columns=True
+        "torch",
+        columns=[
+            "input_ids",
+            "attention_mask",
+            "labels",
+            "prompt_shield_mask",
+            "token_types",
+            "calc_mask",
+        ],
+        output_all_columns=True,
     )
 
     splits = ds.train_test_split(test_size=split_ratio, seed=cfg.seed)
     print(
-        f"[data] Tokenized split: train={len(splits['train'])} val={len(splits['test'])} "
-        f"(val_split={split_ratio}). Benchmark uses official GSM8K test independently; "
-        f"S1 --s1_train_n further subsets this train split and does not leak the held-out test."
+        f"[data] Multi-context split: train={len(splits['train'])} val={len(splits['test'])} "
+        f"(val_split={split_ratio}, max_tok_len={cfg.max_tok_len}). "
+        f"Shots mixture: {shot_probs}."
     )
     return splits["train"], splits["test"]

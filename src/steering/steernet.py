@@ -168,7 +168,8 @@ class SteerNet(nn.Module):
 
         # Small non-zero output projection lets S1 optimise immediately.
         self.up = nn.Linear(rank, hidden_dim, bias=False)
-        nn.init.xavier_uniform_(self.up.weight, gain=0.1)  # Small but non-zero
+        # Forward is scale-invariant to up (direction is normalized); gain 1.0 gives stable step
+        nn.init.xavier_uniform_(self.up.weight, gain=1.0)
 
         # Per-token magnitude head
         self.mag_head = nn.Linear(rank, 1)
