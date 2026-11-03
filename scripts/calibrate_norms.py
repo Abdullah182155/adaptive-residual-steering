@@ -15,16 +15,18 @@ import sys
 import os
 from pathlib import Path
 from typing import Dict, List, Tuple
+
+# ── Silence HF weight-loading bars and INFO spam BEFORE importing transformers ──
+_repo_root = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_repo_root))
+from src.utils.logging_utils import setup_quiet_logging
+setup_quiet_logging()  # default: "quiet" — set level="verbose" for full HF output
+
 import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from tqdm.auto import tqdm
 import numpy as np
 from datasets import load_dataset
-
-# Add repo root to path for imports
-script_dir = Path(__file__).parent
-repo_root = script_dir.parent
-sys.path.insert(0, str(repo_root))
 
 
 def collect_layer_norms(

@@ -7,11 +7,16 @@ from pathlib import Path
 import sys
 import traceback
 
+# ── Silence HF weight-loading bars and INFO spam BEFORE importing transformers ──
+# Parse --verbose early (before argparse, to catch it before heavy imports).
+_verbosity = "verbose" if "--verbose" in sys.argv else "quiet"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.utils.logging_utils import setup_quiet_logging
+setup_quiet_logging(level=_verbosity)
+
 import torch
 from datasets import load_dataset
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.configs.config import RSCConfig, apply_overrides
 from src.data.dataset import gsm8k_to_cot
@@ -58,6 +63,11 @@ def parse_args(argv=None):
     parser.add_argument("--preface", choices=("on", "off"), default="on")
     parser.add_argument("--live_samples", type=int, default=0)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable full HuggingFace / transformers logging output (weight bars, downloads, etc.)",
+    )
     return parser.parse_args(argv)
 
 
