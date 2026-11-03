@@ -13,7 +13,7 @@ from tqdm.auto import tqdm
 from transformers import StoppingCriteria, StoppingCriteriaList
 
 from src.configs.config import decode_only_for_shot
-from src.data.prompts import build_prompt_unified
+from src.data.prompts import build_prompt_unified, build_prompt_with_shield
 from src.evaluation.answers import score_tiers, should_stop_on_repeat
 
 
@@ -35,16 +35,31 @@ def _gold(value) -> float:
 
 @torch.no_grad()
 def _generate(
-    model, tokenizer, prompt: str, device: torch.device, max_new_tokens: int
+    model,
+    tokenizer,
+    question: str,
+    n_shot: int,
+    device: torch.device,
+    max_new_tokens: int,
 ) -> str:
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    tokens = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=0.0,
-        stopping_criteria=StoppingCriteriaList([AnswerStop(tokenizer, inputs["input_ids"].shape[1])]),
-    )
+    prompt, enc, shield = build_prompt_with_shield(tokenizer, question, n_shot)
+    inputs = {k: v.to(device) for k, v in enc.items()}
+    if bool(shield.any()):
+        model.set_prompt_shield_mask(shield.unsqueeze(0).to(device))
+    else:
+        model.set_prompt_shield_mask(None)
+    try:
+        tokens = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            temperature=0.0,
+            stopping_criteria=StoppingCriteriaList(
+                [AnswerStop(tokenizer, inputs["input_ids"].shape[1])]
+            ),
+        )
+    finally:
+        model.set_prompt_shield_mask(None)
     prompt_tokens = inputs["input_ids"].shape[1]
     return tokenizer.decode(tokens[0, prompt_tokens:], skip_special_tokens=True)
 
@@ -113,9 +128,6 @@ def run_benchmark(
         "shots": {},
     }
     for n_shot in shots:
-        prompt_rows = [
-            (row, build_prompt_unified(row["question"], n_shot=n_shot)) for row in rows
-        ]
         arm_results: Dict[str, List[Dict[str, object]]] = {}
         for arm in arms:
             if arm not in {"baseline", "fixed"}:
@@ -126,11 +138,15 @@ def run_benchmark(
                 "none" if arm == "baseline" else "only", cfg.fixed_layers
             )
             results = []
-            progress = tqdm(prompt_rows, desc=f"{n_shot}-shot {arm}", leave=False)
-            for row, prompt in progress:
-                model.set_prompt_shield_mask(None)
+            progress = tqdm(rows, desc=f"{n_shot}-shot {arm}", leave=False)
+            for row in progress:
                 text = _generate(
-                    model, tokenizer, prompt, device, cfg.generation_max_new_tokens
+                    model,
+                    tokenizer,
+                    row["question"],
+                    n_shot,
+                    device,
+                    cfg.generation_max_new_tokens,
                 )
                 guard = dict(model.guard_state)
                 cap = (
@@ -148,7 +164,12 @@ def run_benchmark(
                 ):
                     model.set_routing_override("none", cfg.fixed_layers)
                     text = _generate(
-                        model, tokenizer, prompt, device, cfg.generation_max_new_tokens
+                        model,
+                        tokenizer,
+                        row["question"],
+                        n_shot,
+                        device,
+                        cfg.generation_max_new_tokens,
                     )
                     model.set_routing_override("only", cfg.fixed_layers)
                 scored = _score(text, _gold(row["answer"]))
@@ -204,24 +225,31 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
     lines = [
         "# ARS Phase 1 Benchmark",
         "",
-        "| Shots | Arm | Canonical | Lenient | Guard trips | Non-finite |",
-        "|---:|---|---:|---:|---:|---:|",
+        "| Shots | Arm | Strict | Marker | Lenient | Format Rate | Guard trips | Non-finite |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for shots, result in record["shots"].items():
         for arm in ("baseline", "fixed"):
             if arm not in result:
                 continue
             summary = result[arm]
+            strict_acc = summary.get("strict_accuracy", summary.get("canonical_accuracy", 0.0))
+            marker_acc = summary.get("marker_accuracy", summary.get("lenient_accuracy", 0.0))
+            lenient_acc = summary.get("lenient_accuracy", 0.0)
+            fmt_rate = summary.get("format_rate", 0.0) * 100.0
             lines.append(
-                f"| {shots} | {arm} | {summary['canonical_accuracy']:.2f}% | "
-                f"{summary['lenient_accuracy']:.2f}% | {summary['guard_trip_rate']:.3f} | {summary['nonfinite_count']} |"
+                f"| {shots} | {arm} | {strict_acc:.2f}% | {marker_acc:.2f}% | "
+                f"{lenient_acc:.2f}% | {fmt_rate:.1f}% | {summary['guard_trip_rate']:.3f} | {summary['nonfinite_count']} |"
             )
         if "paired" in result:
             paired = result["paired"]
+            p_val = paired.get("mcnemar_p_value", 1.0)
+            p_str = f"{p_val:.4f}" if p_val >= 0.0001 else f"{p_val:.2e}"
+            ident = paired.get("identical_text_rate", 0.0) * 100.0
             lines.extend(
                 [
                     "",
-                    f"{shots}-shot paired fixed vs baseline: {paired['fixed_wins']} wins, {paired['fixed_losses']} losses, {paired['ties']} ties.",
+                    f"{shots}-shot paired fixed vs baseline: {paired['fixed_wins']} wins, {paired['fixed_losses']} losses, {paired['ties']} ties (McNemar p={p_str}, identical text={ident:.1f}%).",
                     "",
                 ]
             )

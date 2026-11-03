@@ -189,9 +189,16 @@ def run(args) -> int:
             from src.evaluation.ood import load_ood_rows
 
             for dataset_name in args.ood.split(","):
-                rows = load_ood_rows(dataset_name.strip(), args.ood_n)
-                ood_record = run_benchmark(model, tokenizer, rows, cfg, device, args.ood_shots, arms, contract)
-                write_record(ood_record, f"experiment_record_{dataset_name.strip()}.json")
+                dname = dataset_name.strip()
+                rows = load_ood_rows(dname, args.ood_n)
+                ood_record = run_benchmark(
+                    model, tokenizer, rows, cfg, device, args.ood_shots, arms, contract
+                )
+                rec_path = f"experiment_record_{dname}.json"
+                write_record(ood_record, rec_path)
+                print(f"Wrote OOD benchmark record: {rec_path}")
+                if args.report:
+                    write_report(ood_record, f"{cfg.report_dir}/ood_{dname}")
     return 0
 
 

@@ -5,6 +5,7 @@ Phase 0.1: Single prompt builder with harness hash validation.
 """
 
 import hashlib
+import torch
 from typing import List, Dict, Optional
 
 # Legacy exemplars (kept for reproducibility of earlier results)
@@ -144,3 +145,27 @@ def build_prompt_from_config(question: str, n_shot: int, cfg) -> str:
 def get_harness_hash() -> str:
     """Get the current harness hash for validation."""
     return _get_harness_hash()
+
+def build_prompt_with_shield(tokenizer, question: str, n_shot: int):
+    """Return (prompt, enc, shield_mask) with shield_mask covering preface + few-shot exemplars."""
+    prompt = build_prompt_unified(question, n_shot=n_shot)
+    tail = f"Question: {question}\nAnswer: Let's think step by step.\n"
+    if n_shot > 0 and prompt.endswith(tail):
+        c_q = len(prompt) - len(tail)
+        try:
+            enc = tokenizer(prompt, return_tensors="pt", return_offsets_mapping=True)
+            offsets = enc.pop("offset_mapping")[0]
+            shield = offsets[:, 1] <= c_q
+        except Exception:
+            enc = tokenizer(prompt, return_tensors="pt")
+            input_ids = enc["input_ids"][0]
+            prefix_ids = tokenizer.encode(prompt[:c_q], add_special_tokens=False)
+            prefix_len = min(len(prefix_ids), len(input_ids))
+            while prefix_len and list(input_ids[:prefix_len]) != prefix_ids[:prefix_len]:
+                prefix_len -= 1
+            shield = torch.tensor([j < prefix_len for j in range(len(input_ids))], dtype=torch.bool)
+    else:
+        enc = tokenizer(prompt, return_tensors="pt")
+        shield = torch.zeros(enc["input_ids"].shape[1], dtype=torch.bool)
+    return prompt, enc, shield
+
