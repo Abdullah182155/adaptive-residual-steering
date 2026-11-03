@@ -50,6 +50,8 @@ class Phi2WithRSC(nn.Module):
                     lora_alpha=cfg.lora_alpha,
                     dropout=cfg.lora_dropout,
                     kappa=cfg.steer_kappa,
+                    amplitude_mode=getattr(cfg, "amplitude_mode", "relative"),
+                    rho_max=getattr(cfg, "rho_max", 0.04),
                     layer_norms=norms,
                     layer_idx=layer,
                 ).to(self.device)
@@ -75,6 +77,8 @@ class Phi2WithRSC(nn.Module):
         self._collect_routing_trace = False
         self.routing_step_log = []
         self.guard_state: Dict[str, object] = {}
+        self._collect_injection_trace = False
+        self.injection_trace: Dict[int, list] = {}
 
         self._register_hooks()
         for parameter in self.base_model.parameters():
@@ -142,6 +146,7 @@ class Phi2WithRSC(nn.Module):
             self.guard_state = {"rel_max": 0.0, "nonfinite": False}
             self._active_shield_mask = self._pending_shield_mask
             self.reset_steernet_cache()
+            self.injection_trace = {}
         else:
             self._active_shield_mask = None
         if self._collect_routing_trace:
@@ -191,17 +196,27 @@ class Phi2WithRSC(nn.Module):
 
         hidden_float = hidden.float()
         valid_mask = self._valid_token_mask(hidden_float)
-        if self._decode_only_steering and not self._is_decode_step:
+        if (
+            self._decode_only_steering
+            and not self._is_decode_step
+            and self._active_shield_mask is None
+        ):
             valid_mask.zero_()
         valid_mask = self._apply_prompt_shield(valid_mask)
         active_k = self._selection.sum(dim=1).to(hidden_float.dtype)
         delta = steer_net(
-            hidden_float, active_k=active_k, is_decode=self._is_decode_step
+            hidden_float,
+            active_k=active_k,
+            is_decode=self._is_decode_step,
+            injection_mask=valid_mask,
         )
         gate = self._gate_multiplier(position, delta)
         injected = delta * selection * gate * self._effective_scale()
         injected = injected * valid_mask.unsqueeze(-1).to(injected.dtype)
         self._record_guard(injected, hidden_float, valid_mask)
+        if self._collect_injection_trace:
+            relative = injected.norm(dim=-1) / hidden_float.norm(dim=-1).clamp_min(1e-6)
+            self.injection_trace.setdefault(self.target_layers[position], []).append(relative.detach().cpu())
         result = (hidden_float + injected).to(hidden.dtype)
         if was_2d:
             result = result.squeeze(0)
@@ -229,6 +244,8 @@ class Phi2WithRSC(nn.Module):
         return gate.to(delta.device, delta.dtype)
 
     def _effective_scale(self) -> float:
+        if getattr(self.cfg, "amplitude_mode", "relative") == "relative":
+            return 1.0
         scale = self.cfg.steer_scale if self._steer_scale is None else self._steer_scale
         if self._shot_aware_scale is not None and self._current_n_shot is not None:
             scale *= self._shot_aware_scale.get(self._current_n_shot, 1.0)
@@ -309,6 +326,13 @@ class Phi2WithRSC(nn.Module):
 
     def set_routing_trace(self, enabled: bool) -> None:
         self._collect_routing_trace = bool(enabled)
+
+    def set_injection_trace(self, enabled: bool) -> None:
+        self._collect_injection_trace = bool(enabled)
+
+    def set_telemetry(self, enabled: bool) -> None:
+        for steer_net in self.steer_nets.values():
+            steer_net.telemetry = bool(enabled)
 
     def reset_steernet_cache(self) -> None:
         for steer_net in self.steer_nets.values():

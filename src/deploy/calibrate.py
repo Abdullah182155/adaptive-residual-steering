@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Dict, Iterable
 import torch
 
+from src.configs.config import shot_aware_scale_map
+
 
 @torch.no_grad()
 def measure_envelope(
@@ -49,7 +51,9 @@ def write_contract(path: str, *, cfg, envelope: Dict[str, object]) -> Dict[str, 
         "steer_scale": cfg.steer_scale,
         "steer_kappa": cfg.steer_kappa,
         "k_scale_mode": cfg.k_scale_mode,
-        "shot_scales": {"0": 1.0, "2": 0.50, "4": 0.35},
+        "shot_scales": {
+            str(key): value for key, value in shot_aware_scale_map(cfg).items()
+        },
         "guard_revert_to_k0": cfg.guard_revert_to_k0,
         "envelope": envelope,
     }

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 from typing import Any, Dict, Iterable, List, Optional
 
 import torch
+from tqdm.auto import tqdm
 
-from src.training.losses import steer_norm_penalty, token_weighted_nll
+from src.training.losses import steer_norm_penalty, target_weights, token_weighted_nll
 
 
 def _stack_batch(rows: List[dict], device: torch.device) -> Dict[str, torch.Tensor]:
@@ -94,11 +96,24 @@ def train_phase1_steernet(
     model.set_routing_override("only", cfg.fixed_layers)
     model.set_steer_scale(cfg.steer_scale)
     parameters = list(model.steer_nets.parameters())
+    decay = [parameter for parameter in parameters if parameter.ndim >= 2]
+    no_decay = [parameter for parameter in parameters if parameter.ndim < 2]
     optimizer = torch.optim.AdamW(
-        parameters, lr=cfg.phase1_lr, weight_decay=cfg.weight_decay
+        [
+            {"params": decay, "weight_decay": cfg.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=min(cfg.phase1_lr, 5e-4),
+        betas=(0.9, 0.99),
+    )
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=device.type == "cuda" and next(model.base_model.parameters()).dtype == torch.float16
     )
 
-    history = {"train_nll": [], "validation_nll": []}
+    backbone_nll = evaluate_loss_with_hooks(model, eval_data, device, enabled=False)
+    adapter_init_nll = evaluate_loss(model, eval_data, device)
+
+    history = {"train_nll": [], "validation_nll": [], "backbone_nll": backbone_nll, "adapter_init_nll": adapter_init_nll, "steps": []}
     best_validation = float("inf")
     best_state = None
     for epoch in range(cfg.phase1_epochs):
@@ -107,23 +122,36 @@ def train_phase1_steernet(
         optimizer.zero_grad(set_to_none=True)
         running_loss = 0.0
         batch_count = 0
-        for offset in range(0, len(train_data), cfg.batch_size):
+        progress = tqdm(range(0, len(train_data), cfg.batch_size), desc=f"S1 {epoch + 1}/{cfg.phase1_epochs}")
+        for offset in progress:
             rows = _extract_batch_rows(train_data, offset, cfg.batch_size)
             if not rows:
                 continue
             batch = _stack_batch(rows, device)
             _set_prompt_shield(model, rows, device)
-            output = model(**batch)
-            task_loss = token_weighted_nll(output.logits, batch["labels"])
-            loss = task_loss + 0.30 * steer_norm_penalty(model)
-            (loss / cfg.grad_accum).backward()
+            with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+                output = model(**batch)
+                calc_mask = None
+                if "calc_mask" in rows[0]:
+                    calc_mask = torch.stack([row["calc_mask"] for row in rows]).to(device)
+                weights = target_weights(batch["labels"], calc_mask, cfg.calc_weight_alpha)
+                task_loss = token_weighted_nll(output.logits, batch["labels"], weights)
+                penalty = steer_norm_penalty(model, batch["attention_mask"].bool(), cfg.steer_penalty_margin)
+                loss = task_loss + cfg.steer_penalty_weight * penalty
+            scaler.scale(loss / cfg.grad_accum).backward()
             batch_count += 1
             if batch_count % cfg.grad_accum == 0 or offset + cfg.batch_size >= len(
                 train_data
             ):
-                torch.nn.utils.clip_grad_norm_(parameters, cfg.clip_grad)
-                optimizer.step()
+                scaler.unscale_(optimizer)
+                grad_norm = float(torch.nn.utils.clip_grad_norm_(parameters, cfg.clip_grad))
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                q_values = [net.last_pre_cap_q.mean().detach() for net in model.steer_nets.values() if net.last_pre_cap_q is not None]
+                q_mean = float(torch.stack(q_values).mean()) if q_values else 0.0
+                history["steps"].append({"epoch": epoch + 1, "loss": float(loss.detach()), "grad_norm": grad_norm, "q_mean": q_mean})
+                progress.set_postfix(nll_ema=f"{float(task_loss):.3f}", gnorm=f"{grad_norm:.2f}", q=f"{q_mean:.2f}")
             running_loss += float(loss.detach())
 
         validation = evaluate_loss(model, eval_data, device)
@@ -142,8 +170,17 @@ def train_phase1_steernet(
     if best_state is not None:
         model.steer_nets.load_state_dict(best_state)
     save_steer_weights(model, cfg.lora_save_path, cfg)
+    report_path = Path(cfg.report_dir) / "training_log.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(history, indent=2) + "\n", encoding="utf-8")
     return {
         **history,
         "best_validation_nll": best_validation,
         **checkpoint_metadata(cfg),
     }
+
+
+def evaluate_loss_with_hooks(model, rows, device: torch.device, enabled: bool) -> float:
+    context = torch.enable_grad() if enabled else model.hooks_disabled()
+    with context:
+        return evaluate_loss(model, rows, device)

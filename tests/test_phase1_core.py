@@ -5,7 +5,7 @@ import torch
 from scripts.run_ars_pipeline import build_config, parse_args
 from src.configs.config import RSCConfig, decode_only_for_shot, shot_aware_scale_map
 from src.deploy.calibrate import measure_envelope, write_contract
-from src.evaluation.answers import extract_numeric_answer
+from src.evaluation.answers import extract_numeric_answer, score_tiers
 from src.models.wrapper import Phi2WithRSC
 from src.steering.steernet import CausalDWConv1d, SteerNet
 
@@ -16,9 +16,9 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.steer_kappa == 0.04
     assert cfg.steer_scale == 0.30
     assert cfg.k_scale_mode == "sqrt"
-    assert shot_aware_scale_map(cfg) == {0: 1.0, 2: 0.50, 4: 0.35}
+    assert shot_aware_scale_map(cfg) == {0: 1.0, 2: 1.0, 4: 1.0}
     assert decode_only_for_shot(0, cfg) is False
-    assert decode_only_for_shot(2, cfg) is True
+    assert decode_only_for_shot(2, cfg) is False
 
 
 def test_causal_convolution_dirac_initialization_and_cache_priming():
@@ -76,6 +76,8 @@ def test_prompt_shielding_keeps_prefill_pristine():
 def test_canonical_and_lenient_answer_extraction():
     assert extract_numeric_answer("Work. #### 12") == 12.0
     assert extract_numeric_answer("Work\nThere are 19 left", lenient=True) == 19.0
+    tiers = score_tiers("Final answer: 12", 12.0)
+    assert tiers["strict"] and tiers["marker"] and tiers["lenient"]
 
 
 def test_s5_contract_records_fixed_route(tmp_path):

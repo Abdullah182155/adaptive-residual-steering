@@ -25,6 +25,11 @@ class RSCConfig:
     steer_kappa: float = 0.04
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
+    amplitude_mode: str = "relative"
+    rho_max: float = 0.04
+    steer_penalty_weight: float = 0.05
+    steer_penalty_margin: float = 1.0
+    calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
     shot_aware_deploy: bool = True
@@ -38,6 +43,9 @@ class RSCConfig:
     weight_decay: float = 0.01
     phase1_epochs: int = 2
     phase1_lr: float = 1e-3
+    phase1_warmup_frac: float = 0.06
+    phase1_min_lr_frac: float = 0.10
+    log_every: int = 20
     n_samples: int = 7000
     max_tok_len: int = 384
     val_split: float = 0.08
@@ -63,15 +71,19 @@ class RSCConfig:
             raise ValueError("Phase 1 fixed route must be [13, 20, 22]")
         if self.k_scale_mode != "sqrt":
             raise ValueError("Phase 1 uses sqrt route scaling")
+        if self.amplitude_mode not in {"relative", "capped"}:
+            raise ValueError("amplitude_mode must be relative or capped")
 
 
 def decode_only_for_shot(shots: int, cfg: RSCConfig) -> bool:
     """Keep 0-shot prefill active; protect demonstrations in few-shot prompts."""
-    return bool(cfg.fewshot_decode_only and shots > 0)
+    return bool(cfg.fewshot_decode_only and shots > 0 and cfg.amplitude_mode != "relative")
 
 
 def shot_aware_scale_map(cfg: RSCConfig) -> Dict[int, float]:
     """Return deployment energy multipliers, or a neutral map when disabled."""
+    if cfg.amplitude_mode == "relative":
+        return {0: 1.0, 2: 1.0, 4: 1.0}
     return (
         dict(DEFAULT_SHOT_AWARE_SCALE)
         if cfg.shot_aware_deploy

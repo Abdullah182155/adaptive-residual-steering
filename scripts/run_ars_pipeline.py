@@ -51,6 +51,11 @@ def parse_args(argv=None):
     parser.add_argument("--record", default="experiment_record.json")
     parser.add_argument("--report", action="store_true")
     parser.add_argument("--arms", default="baseline,fixed")
+    parser.add_argument("--ood", default="")
+    parser.add_argument("--ood_n", type=int, default=300)
+    parser.add_argument("--ood_shots", type=int, nargs="+", default=[0])
+    parser.add_argument("--preface", choices=("on", "off"), default="on")
+    parser.add_argument("--live_samples", type=int, default=0)
     parser.add_argument("--set", dest="overrides", action="append", default=[])
     return parser.parse_args(argv)
 
@@ -171,6 +176,13 @@ def run(args) -> int:
         if args.report:
             write_report(record, cfg.report_dir)
         print(f"Wrote benchmark record: {cfg.record_path}")
+        if args.ood:
+            from src.evaluation.ood import load_ood_rows
+
+            for dataset_name in args.ood.split(","):
+                rows = load_ood_rows(dataset_name.strip(), args.ood_n)
+                ood_record = run_benchmark(model, tokenizer, rows, cfg, device, args.ood_shots, arms, contract)
+                write_record(ood_record, f"experiment_record_{dataset_name.strip()}.json")
     return 0
 
 

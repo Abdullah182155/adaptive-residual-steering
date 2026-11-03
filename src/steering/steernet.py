@@ -110,6 +110,8 @@ class SteerNet(nn.Module):
         lora_alpha: float = 32.0,
         dropout: float = 0.1,
         kappa: float = 0.04,
+        amplitude_mode: str = "relative",
+        rho_max: float = 0.04,
         layer_norms: Optional[Dict[int, float]] = None,  # N_l per layer
         layer_idx: int = 0,  # Which layer this steernet is for
         max_magnitude: float = 2.0,
@@ -121,6 +123,8 @@ class SteerNet(nn.Module):
         super().__init__()
         self.rank = rank
         self.kappa = kappa
+        self.amplitude_mode = amplitude_mode
+        self.rho_max = rho_max
         self.layer_idx = layer_idx
         self.layer_norms = layer_norms or {}
         self.max_magnitude = max_magnitude
@@ -146,6 +150,7 @@ class SteerNet(nn.Module):
         self._pre_cap_generator = torch.Generator(device="cpu")
         self._pre_cap_generator.manual_seed(0)
         self.last_pre_cap_q = None
+        self.telemetry = True
         self._clip_stats = 0.0
 
         # Network layers
@@ -184,6 +189,7 @@ class SteerNet(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         active_k: Optional[torch.Tensor] = None,
         is_decode: bool = False,
+        injection_mask: Optional[torch.BoolTensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -218,11 +224,27 @@ class SteerNet(nn.Module):
         if self.use_causal_conv:
             x = self.conv(x, is_decode=is_decode)
 
-        # Magnitude gating
-        mag = torch.sigmoid(self.mag_head(x))
-        delta = self.up(x) * mag * self.scale.to(x.dtype)
+        magnitude = torch.sigmoid(self.mag_head(x))
+        direction = self.up(x)
 
         # Apply position shielding
+        if self.amplitude_mode == "relative":
+            centered_norm = (h_flt - h_flt.mean(dim=-1, keepdim=True)).norm(
+                dim=-1, keepdim=True
+            )
+            direction_norm = direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            active_k = (
+                torch.ones(B, device=h.device, dtype=h_flt.dtype)
+                if active_k is None
+                else active_k.to(h_flt)
+            )
+            radius = self.rho_max * active_k.clamp_min(1).rsqrt().view(B, 1, 1)
+            delta = radius * magnitude * centered_norm * direction / direction_norm
+            q = magnitude
+        else:
+            delta = direction * magnitude * self.scale.to(x.dtype)
+            q = None
+
         delta = delta * shield_mask
 
         # Smooth cap envelope: C_l = κ * N_l
@@ -235,15 +257,17 @@ class SteerNet(nn.Module):
         )
         cap = self.C_l * active_k.clamp_min(1).rsqrt().view(B, 1, 1)
 
-        # Pre-cap ratio for telemetry
-        self.last_pre_cap_q = delta_norm / (cap + 1e-7)
-
-        # Smooth saturation
-        soft = cap / torch.sqrt(delta_norm.square() + cap * cap)
-        delta = delta * soft
+        if self.amplitude_mode == "relative":
+            self.last_pre_cap_q = q * shield_mask
+            if injection_mask is not None:
+                self.last_pre_cap_q = self.last_pre_cap_q * injection_mask.unsqueeze(-1)
+        else:
+            self.last_pre_cap_q = delta_norm / (cap + 1e-7)
+            soft = cap / torch.sqrt(delta_norm.square() + cap * cap)
+            delta = delta * soft
 
         # Telemetry (same as v4)
-        if not self.training:
+        if self.telemetry and not self.training:
             r = self.last_pre_cap_q.detach().float().flatten()
             self._pre_cap_sum += float(r.sum().item())
             self._pre_cap_n += int(r.numel())

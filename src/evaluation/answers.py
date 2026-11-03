@@ -158,6 +158,27 @@ def extract_numeric_answer_lenient(text: str) -> Optional[float]:
     return extract_numeric_answer(text, lenient=True)
 
 
+def score_tiers(text: str, gold: float) -> dict:
+    """Score strict formatting, explicit markers, and lenient numeric extraction."""
+    text = cut_continuation(text)
+    strict_match = re.search(
+        r"(?m)^[ \t]*[Ff]inal[ \t]+[Aa]nswer[ \t]*:[ \t]*\$?([0-9.,-]+)", text
+    )
+    marker_prediction = extract_numeric_answer(text, lenient=False)
+    lenient_prediction = extract_numeric_answer(text, lenient=True)
+    strict_prediction = _to_float(strict_match.group(1)) if strict_match else None
+    equal = lambda prediction: prediction is not None and abs(prediction - gold) <= 1e-6
+    return {
+        "format_ok": strict_match is not None,
+        "pred_strict": strict_prediction,
+        "pred_marker": marker_prediction,
+        "pred_lenient": lenient_prediction,
+        "strict": equal(strict_prediction),
+        "marker": equal(marker_prediction),
+        "lenient": equal(lenient_prediction),
+    }
+
+
 def rescore_answers(all_details: list, extractor=None, lenient: bool = False) -> dict:
     """Rescore benchmark responses using a specified or lenient extractor."""
     import collections
