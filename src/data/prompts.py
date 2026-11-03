@@ -146,11 +146,12 @@ def get_harness_hash() -> str:
     """Get the current harness hash for validation."""
     return _get_harness_hash()
 
-def build_prompt_with_shield(tokenizer, question: str, n_shot: int):
-    """Return (prompt, enc, shield_mask) with shield_mask covering preface + few-shot exemplars."""
-    prompt = build_prompt_unified(question, n_shot=n_shot)
+
+def build_prompt_with_shield(tokenizer, question: str, n_shot: int = 0, policy: str = "context", **kw):
+    """Return (prompt, enc, shield_mask) with shield_mask covering preface + few-shot exemplars when n_shot > 0."""
+    prompt = build_prompt_unified(question, n_shot=n_shot, **kw)
     tail = f"Question: {question}\nAnswer: Let's think step by step.\n"
-    if n_shot > 0 and prompt.endswith(tail):
+    if n_shot > 0 and policy != "none" and prompt.endswith(tail):
         c_q = len(prompt) - len(tail)
         try:
             enc = tokenizer(prompt, return_tensors="pt", return_offsets_mapping=True)
@@ -168,4 +169,3 @@ def build_prompt_with_shield(tokenizer, question: str, n_shot: int):
         enc = tokenizer(prompt, return_tensors="pt")
         shield = torch.zeros(enc["input_ids"].shape[1], dtype=torch.bool)
     return prompt, enc, shield
-
