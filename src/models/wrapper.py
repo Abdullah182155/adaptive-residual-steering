@@ -199,7 +199,13 @@ class Phi2WithRSC(nn.Module):
         hidden_float = hidden.float()
         valid_mask = self._valid_token_mask(hidden_float)
         valid_mask = self._apply_prompt_shield(valid_mask)
-        active_k = self._selection.sum(dim=1).to(hidden_float.dtype)
+        routing_k = self._selection.sum(dim=1)
+        amp_k = getattr(self.cfg, "steer_amplitude_k", None)
+        active_k = (
+            torch.full_like(routing_k, float(amp_k), dtype=hidden_float.dtype)
+            if amp_k is not None
+            else routing_k.to(hidden_float.dtype)
+        )
         delta = steer_net(
             hidden_float,
             active_k=active_k,

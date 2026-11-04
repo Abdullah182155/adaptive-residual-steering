@@ -11,8 +11,8 @@ class RSCConfig:
     """Certified defaults for fixed-route SteerNet V5 training and deployment."""
 
     model_name: str = "microsoft/phi-2"
-    candidate_layers: List[int] = field(default_factory=lambda: [13, 15, 18, 20, 22])
-    fixed_layers: List[int] = field(default_factory=lambda: [13, 20, 22])
+    candidate_layers: List[int] = field(default_factory=lambda: [8, 11, 13, 15, 17, 19, 20, 21, 22, 24])
+    fixed_layers: List[int] = field(default_factory=lambda: [8, 11, 13, 15, 17, 19, 20, 21, 22, 24])
     steernet_arch: str = "v5"
     objective: str = "nll"
 
@@ -54,14 +54,16 @@ class RSCConfig:
     lambda_operand: float = 0.15
     lambda_result: float = 0.40
     lambda_final: float = 0.35
-    focal_gamma: float = 1.0
+    focal_gamma: float = 2.0
     kl_weight: float = 1.0
-    mag_l1_weight: float = 0.02
+    kl_arithmetic_weight: float = 0.30
+    mag_l1_weight: float = 0.20
+    steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
     train_shot_probs: List[float] = field(default_factory=lambda: [0.30, 0.10, 0.25, 0.10, 0.25])  # 0, 1, 2, 3, 4 shots
     train_use_preface: bool = True
-    train_v5_demo_frac: float = 0.50
+    train_v5_demo_frac: float = 0.80
     shield_policy: str = "context"
 
     checkpoint_dir: str = "checkpoints"
@@ -74,13 +76,17 @@ class RSCConfig:
     generation_temperature: float = 0.0
 
     def validate(self) -> None:
-        """Reject configurations that violate the fixed-route Phase 1 contract."""
+        """Reject configurations that violate Phase 1 contracts."""
         if self.steernet_arch != "v5":
             raise ValueError("Phase 1 supports SteerNet V5 only")
         if self.objective != "nll":
             raise ValueError("Phase 1 supports token-weighted NLL only")
-        if self.fixed_layers != [13, 20, 22]:
-            raise ValueError("Phase 1 fixed route must be [13, 20, 22]")
+        if not self.fixed_layers:
+            raise ValueError("fixed_layers cannot be empty")
+        if not all(0 <= l < 32 for l in self.fixed_layers):
+            raise ValueError("fixed_layers contains out-of-range indices for phi-2 (0–31)")
+        if self.candidate_layers and not set(self.fixed_layers).issubset(set(self.candidate_layers)):
+            raise ValueError("fixed_layers must be a subset of candidate_layers")
         if self.k_scale_mode != "sqrt":
             raise ValueError("Phase 1 uses sqrt route scaling")
         if self.amplitude_mode not in {"relative", "capped"}:

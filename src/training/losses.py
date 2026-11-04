@@ -129,15 +129,29 @@ def typed_objective(
         parts[f"nll_{cid}"] = float(nll[m].detach().mean())
 
     kl_weight = getattr(cfg, "kl_weight", 1.0)
-    if kl_weight > 0 and base_logits is not None:
-        m = c == T_PROSE
-        if bool(m.any()):
-            # base_logits may have been pinned to CPU to save VRAM; move it back only now.
-            bl = base_logits.to(logits.device) if base_logits.device != logits.device else base_logits
-            lq = F.log_softmax(bl[:, :-1][sel][m].float(), dim=-1)
-            kl = (lq.exp() * (lq - logp[m])).sum(-1).sum() / max(counts.get(T_PROSE, 0), 1)
-            loss = loss + kl_weight * kl
-            parts["kl_prose"] = float(kl.detach()) * max(counts.get(T_PROSE, 0), 1) / int(m.sum())
+    kl_arith_weight = getattr(cfg, "kl_arithmetic_weight", 0.0)
+    if base_logits is not None:
+        bl = base_logits.to(logits.device) if base_logits.device != logits.device else base_logits
+        bl_shifted = bl[:, :-1][sel].float()
+
+        # KL on prose: keeps narrative tokens anchored to frozen backbone
+        if kl_weight > 0:
+            m_prose = c == T_PROSE
+            if bool(m_prose.any()):
+                lq = F.log_softmax(bl_shifted[m_prose], dim=-1)
+                kl = (lq.exp() * (lq - logp[m_prose])).sum(-1).sum() / max(counts.get(T_PROSE, 0), 1)
+                loss = loss + kl_weight * kl
+                parts["kl_prose"] = float(kl.detach())
+
+        # KL on arithmetic operands/operators: preserves 4-shot backbone arithmetic
+        if kl_arith_weight > 0:
+            m_arith = (c == T_OPERAND) | (c == T_OPERATOR)
+            if bool(m_arith.any()):
+                lq_a = F.log_softmax(bl_shifted[m_arith], dim=-1)
+                arith_count = max(counts.get(T_OPERAND, 0) + counts.get(T_OPERATOR, 0), 1)
+                kl_a = (lq_a.exp() * (lq_a - logp[m_arith])).sum(-1).sum() / arith_count
+                loss = loss + kl_arith_weight * kl_a
+                parts["kl_arith"] = float(kl_a.detach())
 
     return loss, parts
 
