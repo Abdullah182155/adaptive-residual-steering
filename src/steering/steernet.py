@@ -114,8 +114,6 @@ class SteerNet(nn.Module):
         rho_max: float = 0.04,
         layer_norms: Optional[Dict[int, float]] = None,  # N_l per layer
         layer_idx: int = 0,  # Which layer this steernet is for
-        max_magnitude: float = 2.0,
-        orthogonal_projection: bool = False,
         telemetry_reservoir_size: int = 8192,
         use_causal_conv: bool = True,  # Use causal convolution
         conv_kernel_size: int = 4,  # Kernel size for causal conv
@@ -127,8 +125,6 @@ class SteerNet(nn.Module):
         self.rho_max = rho_max
         self.layer_idx = layer_idx
         self.layer_norms = layer_norms or {}
-        self.max_magnitude = max_magnitude
-        self.orthogonal_projection = orthogonal_projection
         self.use_causal_conv = use_causal_conv
         self.conv_kernel_size = conv_kernel_size
 
@@ -221,14 +217,14 @@ class SteerNet(nn.Module):
 
         # Process through network
         x = self.norm(h_flt)
-        x = self.drop(self.act(self.down(x)))
+        x = self.act(self.down(x))
 
         # Apply causal convolution if enabled
         if self.use_causal_conv:
             x = self.conv(x, is_decode=is_decode)
 
         magnitude = torch.sigmoid(self.mag_head(x))
-        direction = self.up(x)
+        direction = self.drop(self.up(x))
 
         # Apply position shielding
         if self.amplitude_mode == "relative":
@@ -260,14 +256,16 @@ class SteerNet(nn.Module):
         )
         cap = self.C_l * active_k.clamp_min(1).rsqrt().view(B, 1, 1)
 
+        soft = cap / torch.sqrt(delta_norm.square() + cap * cap)
+        delta = delta * soft
+
         if self.amplitude_mode == "relative":
-            self.last_pre_cap_q = q * shield_mask
+            pre_cap_q = q * shield_mask
             if injection_mask is not None:
-                self.last_pre_cap_q = self.last_pre_cap_q * injection_mask.unsqueeze(-1)
+                pre_cap_q = pre_cap_q * injection_mask.unsqueeze(-1)
         else:
-            self.last_pre_cap_q = delta_norm / (cap + 1e-7)
-            soft = cap / torch.sqrt(delta_norm.square() + cap * cap)
-            delta = delta * soft
+            pre_cap_q = delta_norm / (cap + 1e-7)
+        self.last_pre_cap_q = pre_cap_q if self.training else pre_cap_q.detach()
 
         # Telemetry (same as v4)
         if self.telemetry and not self.training:
@@ -277,12 +275,6 @@ class SteerNet(nn.Module):
             self._pre_cap_max = max(self._pre_cap_max, float(r.max().item()))
             self._update_pre_cap_reservoir(r)
             self._clip_stats = (delta_norm > cap).detach().float().mean()
-
-        # Orthogonal projection (optional)
-        if self.orthogonal_projection:
-            h_sq = torch.sum(h_flt * h_flt, dim=-1, keepdim=True) + 1e-7
-            proj = (torch.sum(delta * h_flt, dim=-1, keepdim=True) / h_sq) * h_flt
-            delta = delta - proj
 
         return delta
 

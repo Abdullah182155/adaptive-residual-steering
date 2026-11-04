@@ -147,8 +147,8 @@ def test_classify_outcome_taxonomy():
     trunc_res = {"text": "Final answer: 1\n", "pred_marker": 1.0, "stop_reason": "answer_stop"}
     assert classify_outcome(trunc_res, 1250.0) == "TRUNC_NUMBER"
 
-    # LOOP_OR_RUNON
-    loop_res = {"text": "Step 1: repeating...", "pred_marker": 42.0, "stop_reason": "max_new_tokens"}
+    # LOOP_OR_RUNON: hit max_new_tokens with no extractable answer
+    loop_res = {"text": "Step 1: repeating...", "pred_marker": None, "stop_reason": "max_new_tokens"}
     assert classify_outcome(loop_res, 100.0) == "LOOP_OR_RUNON"
 
     # NO_ANSWER

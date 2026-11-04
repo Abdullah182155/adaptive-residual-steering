@@ -15,6 +15,7 @@ from tqdm.auto import tqdm
 
 from src.configs.config import RSCConfig
 from src.training.losses import (
+    LearnedLossWeights,
     T_FINAL,
     T_NONE,
     T_PROSE,
@@ -233,7 +234,18 @@ def train_phase1_steernet(
     rows = train_data if isinstance(train_data, list) else [train_data[i] for i in range(len(train_data))]
     lengths = [int(r["attention_mask"].sum()) for r in rows]
 
-    optimizer = torch.optim.AdamW(_param_groups(model, cfg), betas=(0.9, 0.99))
+    learned_weights = None
+    if cfg.loss_mode == "typed":
+        learned_weights = LearnedLossWeights().to(device)
+
+    groups = _param_groups(model, cfg)
+    if learned_weights is not None:
+        groups.append({
+            "params": list(learned_weights.parameters()),
+            "lr": cfg.phase1_lr,
+            "weight_decay": 0.0,
+        })
+    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.99))
     n_batches = math.ceil(len(rows) / cfg.batch_size)
     total_steps = math.ceil(n_batches / cfg.grad_accum) * cfg.phase1_epochs
     warm_steps = max(1, int(cfg.phase1_warmup_frac * total_steps))
@@ -261,6 +273,8 @@ def train_phase1_steernet(
     best_crit = float("inf")
     best_state = None
 
+    model.set_telemetry(False)
+
     for epoch in range(cfg.phase1_epochs):
         model.train()
         model.base_model.eval()
@@ -286,7 +300,7 @@ def train_phase1_steernet(
                 with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
                     if cfg.loss_mode == "typed":
                         base_logits = None
-                        if cfg.kl_weight > 0:
+                        if cfg.kl_weight > 0 or learned_weights is not None:
                             # ── KL pass: frozen backbone, hooks disabled ──────────────
                             with torch.no_grad(), model.hooks_disabled():
                                 base_logits = model(
@@ -311,35 +325,36 @@ def train_phase1_steernet(
                             cfg,
                             counts,
                             extras.get("neg_ids"),
+                            learned_weights=learned_weights,
                         )
-                        # ── Typed magnitude L1: penalise prose-position magnitude only ─
-                        # Uses token_types to restrict penalty to T_PROSE positions so
-                        # that only "unnecessary" steering (on prose/narrative tokens)
-                        # is suppressed. T_RESULT/T_FINAL magnitude is left free for
-                        # the typed loss to optimise. Correct normalisation uses the
-                        # count of active (non-shielded) prose positions, avoiding the
-                        # shielded-zero dilution bug that made the old .mean() inert.
-                        if getattr(cfg, "mag_l1_weight", 0.0) > 0:
-                            mag_penalty = logits.new_zeros(())
-                            n_nets = 0
-                            tt = extras.get("token_types")  # (B, T) aligned with trimmed batch
-                            for sn in model.steer_nets.values():
-                                if sn.last_pre_cap_q is None:
-                                    continue
-                                q = sn.last_pre_cap_q  # (B, T_seq, 1)
-                                if tt is not None:
-                                    T_use = min(q.shape[1], tt.shape[1])
-                                    prose_pos = (tt[:, :T_use] == T_PROSE)
-                                    q_prose = q[:, :T_use, 0][prose_pos]
-                                    active = q_prose[q_prose > 0]
-                                else:
-                                    active = q[:, :, 0][q[:, :, 0] > 0]
-                                if active.numel() > 0:
-                                    mag_penalty = mag_penalty + active.mean()
-                                    n_nets += 1
-                            if n_nets > 0:
-                                loss = loss + cfg.mag_l1_weight * mag_penalty / n_nets
-                                parts["mag_l1"] = float(mag_penalty.detach() / n_nets)
+                        # ── Magnitude L1 on prose tokens ──
+                        l1_loss = logits.new_zeros(())
+                        mag_penalty = logits.new_zeros(())
+                        n_nets = 0
+                        tt = extras.get("token_types")
+                        for sn in model.steer_nets.values():
+                            if sn.last_pre_cap_q is None:
+                                continue
+                            q = sn.last_pre_cap_q
+                            if tt is not None:
+                                T_use = min(q.shape[1], tt.shape[1])
+                                prose_pos = (tt[:, :T_use] == T_PROSE)
+                                q_prose = q[:, :T_use, 0][prose_pos]
+                                active = q_prose[q_prose > 0]
+                            else:
+                                active = q[:, :, 0][q[:, :, 0] > 0]
+                            if active.numel() > 0:
+                                mag_penalty = mag_penalty + active.mean()
+                                n_nets += 1
+                        if n_nets > 0:
+                            l1_loss = mag_penalty / (n_nets * len(micro))
+                            parts["mag_l1"] = float(l1_loss.detach())
+                        if learned_weights is not None:
+                            loss = learned_weights(
+                                parts.pop("_nll"), parts.pop("_kl"), l1_loss
+                            )
+                        elif n_nets > 0 and cfg.mag_l1_weight > 0:
+                            loss = loss + cfg.mag_l1_weight * l1_loss
                     else:
                         # Legacy mode
                         output = model(**batch)
@@ -365,6 +380,17 @@ def train_phase1_steernet(
             step_count += 1
             running_loss += window_loss
             lr_curr = optimizer.param_groups[0]["lr"]
+            if learned_weights is not None:
+                with torch.no_grad():
+                    cw = learned_weights.category_weights()
+                    prec = torch.exp(-learned_weights.log_var)
+                parts.update({
+                    "lw_fmt": float(cw[0]), "lw_op": float(cw[1]),
+                    "lw_opd": float(cw[2]), "lw_res": float(cw[3]),
+                    "lw_fin": float(cw[4]),
+                    "prec_nll": float(prec[0]), "prec_kl": float(prec[1]),
+                    "prec_l1": float(prec[2]),
+                })
             history["steps"].append(
                 {"epoch": epoch + 1, "loss": window_loss, "grad_norm": gnorm, "lr": lr_curr, **parts}
             )
@@ -389,6 +415,7 @@ def train_phase1_steernet(
 
     if best_state is not None:
         model.steer_nets.load_state_dict(best_state)
+    model.set_telemetry(True)
     # Disable gradient checkpointing after training — not needed for inference/eval
     if device.type == "cuda" and hasattr(model.base_model, "gradient_checkpointing_disable"):
         model.base_model.gradient_checkpointing_disable()

@@ -24,13 +24,10 @@ class RSCConfig:
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
     rho_max: float = 0.04
-    steer_penalty_weight: float = 0.05
-    steer_penalty_margin: float = 1.0
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
     guard_revert_to_k0: bool = True
-    guard_relative_norm_cap: Optional[float] = None
 
     batch_size: int = 1
     grad_accum: int = 16
