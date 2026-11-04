@@ -29,8 +29,8 @@ class RSCConfig:
     prompt_shielding: bool = True
     guard_revert_to_k0: bool = True
 
-    batch_size: int = 1
-    grad_accum: int = 16
+    batch_size: int = 2
+    grad_accum: int = 8
     clip_grad: float = 1.0
     weight_decay: float = 0.01
     phase1_epochs: int = 5
@@ -39,7 +39,7 @@ class RSCConfig:
     phase1_min_lr_frac: float = 0.10
     log_every: int = 20
     n_samples: int = 7473
-    max_tok_len: int = 1024
+    max_tok_len: int = 512
     val_split: float = 0.08
     diversify_prompts: bool = False
     seed: int = 42

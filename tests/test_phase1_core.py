@@ -18,13 +18,13 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.steer_kappa == 0.04
     assert cfg.steer_scale == 0.30
     assert cfg.k_scale_mode == "sqrt"
-    assert cfg.max_tok_len == 1024
+    assert cfg.max_tok_len == 512
     assert cfg.phase1_lr == 2e-4
     assert cfg.loss_mode == "typed"
     assert cfg.train_shot_probs == [0.30, 0.10, 0.25, 0.10, 0.25]
     assert cfg.shield_policy == "context"
     assert cfg.mag_l1_weight == 0.20
-    assert cfg.focal_gamma == 2.0
+    assert cfg.focal_gamma == 1.0
     assert cfg.steer_amplitude_k is None
 
 
