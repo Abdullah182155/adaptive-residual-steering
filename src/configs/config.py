@@ -23,7 +23,7 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.04
+    rho_max: float = 0.08
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
@@ -51,7 +51,7 @@ class RSCConfig:
     lambda_operand: float = 0.15
     lambda_result: float = 0.40
     lambda_final: float = 0.35
-    focal_gamma: float = 2.0
+    focal_gamma: float = 1.0
     kl_weight: float = 1.0
     kl_arithmetic_weight: float = 0.30
     mag_l1_weight: float = 0.20
@@ -60,7 +60,7 @@ class RSCConfig:
     # V2 Multi-Context Training Mixture
     train_shot_probs: List[float] = field(default_factory=lambda: [0.30, 0.10, 0.25, 0.10, 0.25])  # 0, 1, 2, 3, 4 shots
     train_use_preface: bool = True
-    train_v5_demo_frac: float = 0.80
+    train_v5_demo_frac: float = 0.90
     shield_policy: str = "context"
 
     checkpoint_dir: str = "checkpoints"
