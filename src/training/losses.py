@@ -134,12 +134,16 @@ def typed_objective(
         bl = base_logits.to(logits.device) if base_logits.device != logits.device else base_logits
         bl_shifted = bl[:, :-1][sel].float()
 
+        # Clamp log-probs to prevent 0 × (-inf) = NaN in KL when backbone assigns
+        # near-zero probability to a token (common for low-frequency vocab entries).
+        LOG_FLOOR = -1e4
+
         # KL on prose: keeps narrative tokens anchored to frozen backbone
         if kl_weight > 0:
             m_prose = c == T_PROSE
             if bool(m_prose.any()):
-                lq = F.log_softmax(bl_shifted[m_prose], dim=-1)
-                kl = (lq.exp() * (lq - logp[m_prose])).sum(-1).sum() / max(counts.get(T_PROSE, 0), 1)
+                lq = F.log_softmax(bl_shifted[m_prose], dim=-1).clamp_min(LOG_FLOOR)
+                kl = (lq.exp() * (lq - logp[m_prose].clamp_min(LOG_FLOOR))).sum(-1).sum() / max(counts.get(T_PROSE, 0), 1)
                 loss = loss + kl_weight * kl
                 parts["kl_prose"] = float(kl.detach())
 
@@ -147,9 +151,9 @@ def typed_objective(
         if kl_arith_weight > 0:
             m_arith = (c == T_OPERAND) | (c == T_OPERATOR)
             if bool(m_arith.any()):
-                lq_a = F.log_softmax(bl_shifted[m_arith], dim=-1)
+                lq_a = F.log_softmax(bl_shifted[m_arith], dim=-1).clamp_min(LOG_FLOOR)
                 arith_count = max(counts.get(T_OPERAND, 0) + counts.get(T_OPERATOR, 0), 1)
-                kl_a = (lq_a.exp() * (lq_a - logp[m_arith])).sum(-1).sum() / arith_count
+                kl_a = (lq_a.exp() * (lq_a - logp[m_arith].clamp_min(LOG_FLOOR))).sum(-1).sum() / arith_count
                 loss = loss + kl_arith_weight * kl_a
                 parts["kl_arith"] = float(kl_a.detach())
 

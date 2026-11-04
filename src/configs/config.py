@@ -32,8 +32,8 @@ class RSCConfig:
     guard_revert_to_k0: bool = True
     guard_relative_norm_cap: Optional[float] = None
 
-    batch_size: int = 4
-    grad_accum: int = 4
+    batch_size: int = 1
+    grad_accum: int = 16
     clip_grad: float = 1.0
     weight_decay: float = 0.01
     phase1_epochs: int = 5
