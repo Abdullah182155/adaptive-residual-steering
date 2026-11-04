@@ -13,7 +13,8 @@ from src.training.trainer import _trim_to_attended_tokens
 
 def test_certified_config_physics_and_decode_policy():
     cfg = RSCConfig()
-    assert cfg.fixed_layers == [13, 20, 22]
+    assert cfg.fixed_layers == [8, 11, 13, 15, 17, 19, 20, 21, 22, 24]
+    assert cfg.candidate_layers == [8, 11, 13, 15, 17, 19, 20, 21, 22, 24]
     assert cfg.steer_kappa == 0.04
     assert cfg.steer_scale == 0.30
     assert cfg.k_scale_mode == "sqrt"
@@ -22,6 +23,9 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.loss_mode == "typed"
     assert cfg.train_shot_probs == [0.30, 0.10, 0.25, 0.10, 0.25]
     assert cfg.shield_policy == "context"
+    assert cfg.mag_l1_weight == 0.20
+    assert cfg.focal_gamma == 2.0
+    assert cfg.steer_amplitude_k is None
 
 
 def test_causal_convolution_dirac_initialization_and_cache_priming():
@@ -105,9 +109,9 @@ def test_s5_contract_records_fixed_route(tmp_path):
     envelope = measure_envelope(Model(), rows, cfg, torch.device("cpu"))
     path = tmp_path / "contract.json"
     contract = write_contract(path, cfg=cfg, envelope=envelope)
-    assert contract["fixed_layers"] == [13, 20, 22]
+    assert contract["fixed_layers"] == cfg.fixed_layers
     assert contract["version"] == 3
-    assert json.loads(path.read_text())["envelope"]["route"] == [13, 20, 22]
+    assert json.loads(path.read_text())["envelope"]["route"] == cfg.fixed_layers
 
 
 def test_pipeline_cli_smoke_configuration():

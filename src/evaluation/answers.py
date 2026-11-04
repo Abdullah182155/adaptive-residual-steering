@@ -162,7 +162,7 @@ def score_tiers(text: str, gold: float) -> dict:
     """Score strict formatting, explicit markers, and lenient numeric extraction."""
     text = cut_continuation(text)
     strict_match = re.search(
-        r"(?m)^[ \t]*[Ff]inal[ \t]+[Aa]nswer[ \t]*:[ \t]*\$?([0-9.,-]+)", text
+        r"(?m)^[ \t]*[Ff]inal[ \t]+[Aa]nswer[ \t]*:[ \t]*\$?(-?[0-9.,-]+)", text
     )
     marker_prediction = extract_numeric_answer(text, lenient=False)
     lenient_prediction = extract_numeric_answer(text, lenient=True)

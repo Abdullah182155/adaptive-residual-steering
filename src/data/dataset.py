@@ -136,8 +136,10 @@ def gsm8k_to_cot(
     use_preface = getattr(cfg, "train_use_preface", True)
     v5_demo_frac = getattr(cfg, "train_v5_demo_frac", 0.50)
 
-    def make_train_demo(source_idx: int) -> Dict[str, str]:
+    def make_train_demo(source_idx: int) -> Optional[Dict[str, str]]:
         steps, final_num = split_answer(raw_answers[source_idx])
+        if not steps or not final_num:
+            return None  # skip degenerate gold solutions with no reasoning steps
         sol = gold_to_canonical_completion(steps, final_num).strip()
         return {"q": raw_questions[source_idx], "a": sol}
 
@@ -153,11 +155,19 @@ def gsm8k_to_cot(
         # Draw k demonstrations
         if k > 0:
             if rng.random() < v5_demo_frac:
-                exemplars = list(V5_EXEMPLARS[:k])
+                # Rotate: random subset of V5_EXEMPLARS (not always the first k)
+                pool = list(range(len(V5_EXEMPLARS)))
+                chosen = rng.sample(pool, k=min(k, len(pool)))
+                exemplars = [V5_EXEMPLARS[i] for i in sorted(chosen)]
             else:
                 candidates = [j for j in range(len(raw_questions)) if j != idx]
-                donors = rng.sample(candidates, k=min(k, len(candidates)))
-                exemplars = [make_train_demo(j) for j in donors]
+                donors = rng.sample(candidates, k=min(k * 2, len(candidates)))
+                # Filter degenerate demos, then take first k valid
+                raw_demos = [make_train_demo(j) for j in donors]
+                exemplars = [d for d in raw_demos if d is not None][:k]
+                if not exemplars:
+                    exemplars = None
+                    k = 0
         else:
             exemplars = None
 

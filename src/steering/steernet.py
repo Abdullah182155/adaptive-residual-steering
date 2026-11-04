@@ -80,11 +80,11 @@ class CausalDWConv1d(nn.Module):
             # Pad left with previous cache
             x_with_cache = torch.cat([self._cache, x_1d], dim=2)  # (B, C, k-1 + T)
 
-            # Update cache to hold the last (kernel_size - 1) tokens for next step
-            self._cache = x_with_cache[:, :, -(self.kernel_size - 1) :]
-
-            # Convolve
+            # Convolve first — so cache is only updated after a successful conv
             out = F.conv1d(x_with_cache, self.weight, self.bias, groups=self.channels)
+
+            # Update cache AFTER successful convolution
+            self._cache = x_with_cache[:, :, -(self.kernel_size - 1) :]
             out = out[:, :, -(T):]  # Take only the T outputs for new tokens
             out = out.transpose(1, 2)  # (B, T, C)
 
@@ -174,7 +174,9 @@ class SteerNet(nn.Module):
         # Per-token magnitude head
         self.mag_head = nn.Linear(rank, 1)
         nn.init.zeros_(self.mag_head.weight)
-        nn.init.zeros_(self.mag_head.bias)
+        # Negative bias init: sigmoid(-3) ≈ 0.047 — starts selective, typed loss lifts
+        # result/final tokens while L1 keeps prose tokens near zero.
+        nn.init.constant_(self.mag_head.bias, -3.0)
 
         scaling_factor = lora_alpha / rank
         self.register_buffer("scale", torch.tensor(scaling_factor, dtype=torch.float32))
@@ -317,11 +319,17 @@ RSCSteerNetV5 = SteerNet
 
 
 DEFAULT_PHI2_LAYER_NORMS: Dict[int, float] = {
-    13: 60.4375,
-    15: 64.6250,
-    18: 72.4375,
-    20: 78.3125,
-    22: 85.1250,
+    8:  52.0,    # estimated (run calibrate_norms.py for exact values)
+    11: 57.0,    # estimated
+    13: 60.4375, # calibrated
+    15: 64.6250, # calibrated
+    17: 70.0,    # estimated
+    18: 72.4375, # calibrated (legacy candidate)
+    19: 76.0,    # estimated
+    20: 78.3125, # calibrated
+    21: 81.0,    # estimated
+    22: 85.1250, # calibrated
+    24: 90.0,    # estimated
 }
 
 
