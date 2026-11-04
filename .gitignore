@@ -106,6 +106,14 @@ GEMINI.md
 AGENTS.md
 nul
 
+# Agent skills (local tooling — not part of the research codebase)
+.commandcode/
+.agents/
+skills-lock.json
+
+# Claude Code local settings (never commit local overrides)
+.claude/
+
 # Temporary execution files (generated during pipeline runs)
 REPORT.txt
 experiment_record.txt
