@@ -137,11 +137,12 @@ class Phi2WithRSC(nn.Module):
             raise ValueError("Phi2WithRSC requires input_ids")
 
         self._attention_mask = attention_mask
-        self._is_decode_step = bool(
-            input_ids.shape[1] == 1
-            and attention_mask is not None
-            and attention_mask.shape[1] > 1
-        )
+        # Detect decode: single-token input = autoregressive decode step.
+        # Do NOT require attention_mask — newer transformers (>=4.44) may omit
+        # it during generate(), using cache_position instead, which caused
+        # every decode step to be misdetected as prefill (resetting guard_state,
+        # conv cache, and re-applying prompt shield → blocking few-shot decode).
+        self._is_decode_step = bool(input_ids.shape[1] == 1)
         self._selection = self._select_route(input_ids.shape[0], input_ids.device)
         if not self._is_decode_step:
             self.guard_state = {"rel_max": 0.0, "nonfinite": False}
