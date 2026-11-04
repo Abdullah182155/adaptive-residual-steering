@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+# ── MUST be first: set before any torch/transformers import initialises CUDA ──
+# setup_quiet_logging() (below) imports transformers which imports torch, so
+# PYTORCH_CUDA_ALLOC_CONF must be in the environment before that call.
+# expandable_segments:True lets the allocator satisfy fragmented-memory
+# requests without needing a single contiguous free block — fixes OOM when
+# 100+ MiB is reserved-but-unallocated and a 30-40 MiB allocation fails.
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import argparse
 from pathlib import Path
 import sys
 import traceback
 
 # ── Silence HF weight-loading bars and INFO spam BEFORE importing transformers ──
-# Parse --verbose early (before argparse, to catch it before heavy imports).
 _verbosity = "verbose" if "--verbose" in sys.argv else "quiet"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from src.utils.logging_utils import setup_quiet_logging
 setup_quiet_logging(level=_verbosity)
-
-# ── Reduce CUDA memory fragmentation (safe for all PyTorch versions ≥ 2.0) ──
-import os
-os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 from datasets import load_dataset

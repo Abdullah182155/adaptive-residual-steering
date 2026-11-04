@@ -220,7 +220,7 @@ def train_phase1_steernet(
 
     # ── Memory optimisation 1: expandable segments reduces fragmentation OOM ──
     import os
-    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     # ── Memory optimisation 2: gradient checkpointing on the frozen backbone ──
     # Backbone parameters have requires_grad=False, so checkpointing only
