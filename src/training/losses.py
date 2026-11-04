@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -32,8 +33,8 @@ _PASSES = (
     (re.compile(_NUM), T_OPERAND, 0),
     (re.compile(r"(?<=\d)\s?[+\-*/=×÷]\s?(?=[\$\-]?\d)"), T_OPERATOR, 0),
     (re.compile(r"=\s*(" + _NUM + ")"), T_RESULT, 1),
-    (re.compile(r"(?:Final answer:|####)\s*(" + _NUM + ")"), T_FINAL, 1),
-    (re.compile(r"Step \d+:|Final answer:|####"), T_FORMAT, 0),
+    (re.compile(r"(?:Final answer:|The answer is|So the result is|####)\s*(" + _NUM + ")"), T_FINAL, 1),
+    (re.compile(r"Step \d+:|Final answer:|The answer is|So the result is|####"), T_FORMAT, 0),
 )
 
 
@@ -90,6 +91,38 @@ def window_counts(
     return counts
 
 
+class LearnedLossWeights(nn.Module):
+    """Grouped Kendall uncertainty weighting (Kendall et al., CVPR 2018).
+
+    3 log-variance parameters for inter-group balance (NLL, KL, L1) and
+    5 softmax logits for intra-NLL category balance.  Replaces 8 hand-tuned
+    loss hyperparameters with 8 learned parameters.
+    """
+
+    CATEGORIES = [T_FORMAT, T_OPERATOR, T_OPERAND, T_RESULT, T_FINAL]
+
+    def __init__(self):
+        super().__init__()
+        self.log_var = nn.Parameter(torch.zeros(3))  # [nll, kl, l1]
+        self.category_logits = nn.Parameter(
+            torch.tensor([-1.85, -0.47, 0.16, 1.14, 1.01])
+        )
+
+    def category_weights(self) -> torch.Tensor:
+        return F.softmax(self.category_logits, dim=0)
+
+    def forward(
+        self, nll: torch.Tensor, kl: torch.Tensor, l1: torch.Tensor
+    ) -> torch.Tensor:
+        precision = torch.exp(-self.log_var)
+        return (
+            0.5 * precision[0] * nll
+            + 0.5 * precision[1] * kl
+            + 0.5 * precision[2] * l1
+            + 0.5 * self.log_var.sum()
+        )
+
+
 def typed_objective(
     logits: torch.Tensor,
     base_logits: Optional[torch.Tensor],
@@ -98,13 +131,21 @@ def typed_objective(
     cfg: Any,
     counts: Dict[int, int],
     neg_ids: Optional[torch.Tensor] = None,
+    learned_weights: Optional[LearnedLossWeights] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """Return window-normalized typed reasoning loss and telemetry parts."""
+    """Return window-normalized typed reasoning loss and telemetry parts.
+
+    When *learned_weights* is provided, ``parts["_nll"]`` and ``parts["_kl"]``
+    carry component tensors for the trainer to combine via Kendall weighting.
+    """
     sel = labels[:, 1:].ne(-100)
     if not sel.any():
-        return logits.new_zeros(()), {}
+        zero = logits.new_zeros(())
+        if learned_weights is not None:
+            return zero, {"_nll": zero, "_kl": zero}
+        return zero, {}
 
-    z = logits[:, :-1][sel].float()  # (N, V) fp32 for stability
+    z = logits[:, :-1][sel].float()
     y = labels[:, 1:][sel]
     c = types[:, 1:][sel]
     logp = F.log_softmax(z, dim=-1)
@@ -115,47 +156,57 @@ def typed_objective(
         gamma = getattr(cfg, "focal_gamma", 1.0)
         w = (1.0 - p).clamp_min(0).pow(gamma) if gamma > 0 else torch.ones_like(p)
 
-    loss = z.new_zeros(())
+    if learned_weights is not None:
+        cat_w = learned_weights.category_weights()
+        lam_map = dict(zip(LearnedLossWeights.CATEGORIES, cat_w.unbind()))
+    else:
+        lam_map = lambdas(cfg)
+
+    nll_loss = z.new_zeros(())
     parts = {}
-    lam_map = lambdas(cfg)
     for cid, lam in lam_map.items():
         m = c == cid
-        if lam == 0.0 or not bool(m.any()):
+        if isinstance(lam, float) and lam == 0.0:
             continue
-        # Window normalization prevents micro-batch composition bias
+        if not bool(m.any()):
+            continue
         w_norm = max(counts.get(cid, 0), 1)
-        term = lam * (w[m] * nll[m]).sum() / w_norm
-        loss = loss + term
+        term = (w[m] * nll[m]).sum() / w_norm
+        nll_loss = nll_loss + lam * term
         parts[f"nll_{cid}"] = float(nll[m].detach().mean())
 
+    kl_prose = z.new_zeros(())
+    kl_arith = z.new_zeros(())
     kl_weight = getattr(cfg, "kl_weight", 1.0)
     kl_arith_weight = getattr(cfg, "kl_arithmetic_weight", 0.0)
     if base_logits is not None:
         bl = base_logits.to(logits.device) if base_logits.device != logits.device else base_logits
         bl_shifted = bl[:, :-1][sel].float()
-
-        # Clamp log-probs to prevent 0 × (-inf) = NaN in KL when backbone assigns
-        # near-zero probability to a token (common for low-frequency vocab entries).
         LOG_FLOOR = -1e4
 
-        # KL on prose: keeps narrative tokens anchored to frozen backbone
-        if kl_weight > 0:
+        if learned_weights is not None or kl_weight > 0:
             m_prose = c == T_PROSE
             if bool(m_prose.any()):
+                lp = logp[m_prose].clamp_min(LOG_FLOOR)
                 lq = F.log_softmax(bl_shifted[m_prose], dim=-1).clamp_min(LOG_FLOOR)
-                kl = (lq.exp() * (lq - logp[m_prose].clamp_min(LOG_FLOOR))).sum(-1).sum() / max(counts.get(T_PROSE, 0), 1)
-                loss = loss + kl_weight * kl
-                parts["kl_prose"] = float(kl.detach())
+                kl_prose = (lp.exp() * (lp - lq)).sum(-1).sum() / max(counts.get(T_PROSE, 0), 1)
+                parts["kl_prose"] = float(kl_prose.detach())
 
-        # KL on arithmetic operands/operators: preserves 4-shot backbone arithmetic
-        if kl_arith_weight > 0:
+        if learned_weights is not None or kl_arith_weight > 0:
             m_arith = (c == T_OPERAND) | (c == T_OPERATOR)
             if bool(m_arith.any()):
+                lp_a = logp[m_arith].clamp_min(LOG_FLOOR)
                 lq_a = F.log_softmax(bl_shifted[m_arith], dim=-1).clamp_min(LOG_FLOOR)
                 arith_count = max(counts.get(T_OPERAND, 0) + counts.get(T_OPERATOR, 0), 1)
-                kl_a = (lq_a.exp() * (lq_a - logp[m_arith].clamp_min(LOG_FLOOR))).sum(-1).sum() / arith_count
-                loss = loss + kl_arith_weight * kl_a
-                parts["kl_arith"] = float(kl_a.detach())
+                kl_arith = (lp_a.exp() * (lp_a - lq_a)).sum(-1).sum() / arith_count
+                parts["kl_arith"] = float(kl_arith.detach())
+
+    if learned_weights is not None:
+        parts["_nll"] = nll_loss
+        parts["_kl"] = kl_prose + kl_arith
+        loss = nll_loss
+    else:
+        loss = nll_loss + kl_weight * kl_prose + kl_arith_weight * kl_arith
 
     return loss, parts
 

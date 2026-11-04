@@ -99,10 +99,11 @@ def build_prompt_unified(
     preface: Optional[str] = None,
     exemplar_set: str = "v5",
     include_preface: bool = True,
+    question_idx: Optional[int] = None,
 ) -> str:
     """
     Unified prompt builder for training, evaluation, and sampling.
-    
+
     Args:
         question: The test question
         n_shot: Number of exemplars (0 for 0-shot)
@@ -110,21 +111,26 @@ def build_prompt_unified(
         preface: Optional custom preface (uses default if None)
         exemplar_set: "legacy" or "v5" (default "v5")
         include_preface: Whether to include preface (True for v5, False for legacy compatibility)
-    
+        question_idx: When set, deterministically rotates exemplars so eval
+                      sees the same distribution of orderings as training.
+
     Returns:
         Complete prompt string
     """
     if exemplars is None:
         exemplars = V5_EXEMPLARS if exemplar_set == "v5" else LEGACY_GSM8K_EXEMPLARS
-    
+
     if preface is None:
         preface = PREFACE
-    
+
+    if question_idx is not None and n_shot > 0 and n_shot < len(exemplars):
+        start = question_idx % len(exemplars)
+        exemplars = exemplars[start:] + exemplars[:start]
+
     prompt = ""
     if include_preface:
         prompt = f"{preface}\n\n"
-    
-    # Add exemplars (shielded tokens - not counted in steering)
+
     for i in range(min(n_shot, len(exemplars))):
         ex = exemplars[i]
         prompt += f"Question: {ex['q']}\nAnswer: Let's think step by step.\n{ex['a']}\n\n"

@@ -11,7 +11,7 @@ import numpy as np
 
 
 STOP_RE = re.compile(
-    r"(?:Final answer|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*\n"
+    r"(?:Final answer|The answer is|So the result is|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*(?:\n|$)"
 )
 
 
@@ -262,12 +262,13 @@ def classify_outcome(
     if stop_reason == "answer_stop" and is_numeric_prefix(pred, gold_val):
         return "TRUNC_NUMBER"
 
-    # 2. LOOP_OR_RUNON
-    if stop_reason in {"max_new_tokens", "repeat_stop"}:
+    # 2. LOOP_OR_RUNON — only when generation ran away AND no answer found
+    no_answer = pred is None or (isinstance(pred, str) and not pred.strip())
+    if stop_reason in {"max_new_tokens", "repeat_stop"} and no_answer:
         return "LOOP_OR_RUNON"
 
     # 3. NO_ANSWER
-    if pred is None or (isinstance(pred, str) and not pred.strip()):
+    if no_answer:
         return "NO_ANSWER"
 
     audit = audit_chain(text, question)
@@ -311,7 +312,7 @@ def paired_bootstrap_ci(
     diffs = 100.0 * (s_boot - b_boot)
 
     ci_lo = float(np.percentile(diffs, 2.5))
-    ci_hi = float(np.percentile(diffs, 97.7))
+    ci_hi = float(np.percentile(diffs, 97.5))
     return delta_pp, ci_lo, ci_hi
 
 

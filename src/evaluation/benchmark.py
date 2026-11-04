@@ -23,7 +23,7 @@ from src.evaluation.chain import (
 
 
 STOP_RE = re.compile(
-    r"(?:Final answer|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*\n"
+    r"(?:Final answer|The answer is|So the result is|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*\n"
 )
 
 
@@ -60,8 +60,9 @@ def _generate(
     device: torch.device,
     max_new_tokens: int,
     policy: str = "context",
+    **prompt_kw,
 ) -> Tuple[str, Dict[str, Any]]:
-    prompt, enc, shield = build_prompt_with_shield(tokenizer, question, n_shot=n_shot, policy=policy)
+    prompt, enc, shield = build_prompt_with_shield(tokenizer, question, n_shot=n_shot, policy=policy, **prompt_kw)
     inputs = {k: v.to(device) for k, v in enc.items()}
     if bool(shield.any()):
         model.set_prompt_shield_mask(shield.unsqueeze(0).to(device))
@@ -205,6 +206,7 @@ def run_benchmark(
                     device,
                     cfg.generation_max_new_tokens,
                     policy=shield_policy,
+                    question_idx=row_idx,
                 )
                 guard = dict(model.guard_state)
                 cap = (
@@ -229,6 +231,7 @@ def run_benchmark(
                         device,
                         cfg.generation_max_new_tokens,
                         policy=shield_policy,
+                        question_idx=row_idx,
                     )
                     model.set_routing_override("only", cfg.fixed_layers)
 
