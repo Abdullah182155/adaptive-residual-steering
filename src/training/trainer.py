@@ -392,7 +392,7 @@ def train_phase1_steernet(
         step_count = 0
 
         batches = _epoch_batches(lengths, cfg.batch_size, epoch, cfg.seed)
-        bar = tqdm(range(0, len(batches), cfg.grad_accum), desc=f"S1 {epoch + 1}/{cfg.phase1_epochs}", leave=False, miniters=len(batches))
+        bar = tqdm(range(0, len(batches), cfg.grad_accum), desc=f"S1 {epoch + 1}/{cfg.phase1_epochs}", disable=True)
 
         for w0 in bar:
             micro_indices = batches[w0 : w0 + cfg.grad_accum]
