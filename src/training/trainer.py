@@ -234,7 +234,8 @@ def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=2
 
 
 def _tokenize_onpolicy(tokenizer, question, completion, cfg):
-    prompt_text = f"Question: {question}\nAnswer: Let's think step by step.\n"
+    from src.data.prompts import build_prompt_unified
+    prompt_text = build_prompt_unified(question, n_shot=0)
     full_text = prompt_text + completion
     target_start = len(prompt_text)
 
@@ -261,17 +262,19 @@ def _tokenize_onpolicy(tokenizer, question, completion, cfg):
 
 
 @torch.no_grad()
-def collect_onpolicy_data(model, tokenizer, rows, device, cfg):
+def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
     from src.evaluation.answers import extract_numeric_answer
 
     n_gen = max(1, int(len(rows) * cfg.on_policy_frac))
     indices = torch.randperm(
-        len(rows), generator=torch.Generator().manual_seed(cfg.seed)
+        len(rows), generator=torch.Generator().manual_seed(cfg.seed + epoch)
     )[:n_gen].tolist()
+
+    from src.data.prompts import build_prompt_unified
 
     questions = [rows[i]["question"] for i in indices]
     golds = [rows[i]["final_num"] for i in indices]
-    prompts = [f"Question: {q}\nAnswer: Let's think step by step.\n" for q in questions]
+    prompts = [build_prompt_unified(q, n_shot=0) for q in questions]
 
     gc_enabled = getattr(model.base_model, "is_gradient_checkpointing", False)
     if gc_enabled and hasattr(model.base_model, "gradient_checkpointing_disable"):
@@ -354,7 +357,7 @@ def train_phase1_steernet(
             "lr": cfg.phase1_lr,
             "weight_decay": 0.0,
         })
-    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.99))
+    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999))
     n_batches = math.ceil(len(rows) / cfg.batch_size)
     total_steps = math.ceil(n_batches / cfg.grad_accum) * cfg.phase1_epochs
     warm_steps = max(1, int(cfg.phase1_warmup_frac * total_steps))
@@ -419,8 +422,6 @@ def train_phase1_steernet(
                             # Move to CPU immediately to free VRAM before the steered pass.
                             # It will be moved back inside typed_objective only if needed.
                             base_logits = base_logits.cpu()
-                            if device.type == "cuda":
-                                torch.cuda.empty_cache()
                         # ── Steered pass ─────────────────────────────────────────────
                         logits = model(
                             input_ids=batch["input_ids"],
@@ -464,6 +465,7 @@ def train_phase1_steernet(
                             )
                         elif n_nets > 0 and cfg.mag_l1_weight > 0:
                             loss = loss + cfg.mag_l1_weight * l1_loss
+                        loss = loss / len(micro)
                     else:
                         # Legacy mode
                         output = model(**batch)
@@ -525,16 +527,28 @@ def train_phase1_steernet(
         if (
             cfg.on_policy
             and tokenizer is not None
-            and (epoch + 1) == cfg.on_policy_start_epoch
+            and (epoch + 1) >= cfg.on_policy_start_epoch
             and len(rows) > 0
             and "question" in rows[0]
             and "final_num" in rows[0]
         ):
-            new_rows = collect_onpolicy_data(model, tokenizer, rows, device, cfg)
+            new_rows = collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=epoch)
             if new_rows:
                 new_lengths = [int(r["attention_mask"].sum()) for r in new_rows]
                 rows.extend(new_rows)
                 lengths.extend(new_lengths)
+                remaining_epochs = cfg.phase1_epochs - (epoch + 1)
+                if remaining_epochs > 0:
+                    new_n_batches = math.ceil(len(rows) / cfg.batch_size)
+                    new_steps = math.ceil(new_n_batches / cfg.grad_accum) * remaining_epochs
+                    total_steps = step_count + new_steps
+                    warm_steps = 0
+                    scheduler = torch.optim.lr_scheduler.LambdaLR(
+                        optimizer,
+                        lambda s, _ts=total_steps, _sc=step_count: _lr_lambda(
+                            s + _sc, _ts, 0, cfg.phase1_min_lr_frac
+                        ),
+                    )
                 print(f"[on-policy] Training data: {len(rows)} rows (added {len(new_rows)})")
 
     if best_state is not None:

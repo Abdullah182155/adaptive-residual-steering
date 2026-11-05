@@ -103,7 +103,7 @@ class LearnedLossWeights(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.log_var = nn.Parameter(torch.zeros(3))  # [nll, kl, l1]
+        self.log_var = nn.Parameter(torch.tensor([0.0, 0.0, 0.916]))  # [nll, kl, l1]; l1 init ~log(2.5) so effective weight ≈ 0.20
         self.category_logits = nn.Parameter(
             torch.tensor([-1.85, -0.47, 0.16, 1.14, 1.01])
         )
@@ -203,7 +203,7 @@ def typed_objective(
 
     if learned_weights is not None:
         parts["_nll"] = nll_loss
-        parts["_kl"] = kl_prose + kl_arith
+        parts["_kl"] = kl_prose + kl_arith_weight * kl_arith
         loss = nll_loss
     else:
         loss = nll_loss + kl_weight * kl_prose + kl_arith_weight * kl_arith

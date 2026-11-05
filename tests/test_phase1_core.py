@@ -24,7 +24,7 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.train_shot_probs == [0.50, 0.10, 0.20, 0.05, 0.15]
     assert cfg.shield_policy == "context"
     assert cfg.mag_l1_weight == 0.20
-    assert cfg.focal_gamma == 1.0
+    assert cfg.focal_gamma == 2.0
     assert cfg.steer_amplitude_k is None
 
 
