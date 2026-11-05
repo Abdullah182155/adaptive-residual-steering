@@ -19,7 +19,7 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.steer_scale == 0.30
     assert cfg.k_scale_mode == "sqrt"
     assert cfg.max_tok_len == 512
-    assert cfg.phase1_lr == 2e-4
+    assert cfg.phase1_lr == 5e-4
     assert cfg.loss_mode == "typed"
     assert cfg.train_shot_probs == [0.50, 0.10, 0.20, 0.05, 0.15]
     assert cfg.shield_policy == "context"

@@ -170,7 +170,7 @@ def run(args) -> int:
 
     if stage in {"S1", "all"}:
         print("Running S1 fixed-route SteerNet training")
-        train_phase1_steernet(model, train_data, validation_data, cfg, device)
+        train_phase1_steernet(model, train_data, validation_data, cfg, device, tokenizer=tokenizer)
     if stage in {"S5", "all"}:
         print("Running S5 deployment-envelope calibration")
         rows = (

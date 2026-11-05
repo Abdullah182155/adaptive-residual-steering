@@ -18,7 +18,7 @@ class RSCConfig:
 
     lora_rank: int = 64
     lora_alpha: float = 32.0
-    lora_dropout: float = 0.0
+    lora_dropout: float = 0.05
     steer_kappa: float = 0.04
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
@@ -33,8 +33,8 @@ class RSCConfig:
     grad_accum: int = 8
     clip_grad: float = 1.0
     weight_decay: float = 0.01
-    phase1_epochs: int = 5
-    phase1_lr: float = 2e-4
+    phase1_epochs: int = 3
+    phase1_lr: float = 5e-4
     phase1_warmup_frac: float = 0.06
     phase1_min_lr_frac: float = 0.10
     log_every: int = 20
@@ -62,6 +62,12 @@ class RSCConfig:
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.90
     shield_policy: str = "context"
+
+    # On-policy training
+    on_policy: bool = True
+    on_policy_frac: float = 0.15
+    on_policy_start_epoch: int = 1
+    on_policy_gen_batch: int = 8
 
     checkpoint_dir: str = "checkpoints"
     lora_save_path: str = "checkpoints/steernet.pt"
