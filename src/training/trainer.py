@@ -17,11 +17,16 @@ from src.configs.config import RSCConfig
 from src.training.losses import (
     LearnedLossWeights,
     T_FINAL,
+    T_FORMAT,
     T_NONE,
+    T_OPERAND,
+    T_OPERATOR,
     T_PROSE,
     T_RESULT,
+    annotate_char_types,
     lambdas,
     target_weights,
+    token_types_from_offsets,
     token_weighted_nll,
     typed_objective,
     window_counts,
@@ -211,8 +216,112 @@ def load_steer_weights(
     return metadata
 
 
+@torch.no_grad()
+def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=256):
+    enc = tokenizer(prompts, return_tensors="pt", truncation=True,
+                    max_length=512, padding=True)
+    inputs = {k: v.to(device) for k, v in enc.items()}
+    model.set_prompt_shield_mask(None)
+    tokens = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                            do_sample=False, temperature=0.0)
+    prompt_lens = inputs["attention_mask"].sum(dim=1)
+    outputs = []
+    for i in range(len(prompts)):
+        plen = int(prompt_lens[i])
+        text = tokenizer.decode(tokens[i, plen:], skip_special_tokens=True)
+        outputs.append(text)
+    return outputs
+
+
+def _tokenize_onpolicy(tokenizer, question, completion, cfg):
+    prompt_text = f"Question: {question}\nAnswer: Let's think step by step.\n"
+    full_text = prompt_text + completion
+    target_start = len(prompt_text)
+
+    enc = tokenizer(full_text, truncation=True, max_length=cfg.max_tok_len,
+                    padding="max_length", return_offsets_mapping=True)
+
+    ids, offsets, am = enc["input_ids"], enc["offset_mapping"], enc["attention_mask"]
+    labels = [tid if (m and e > s and s >= target_start) else -100
+              for tid, (s, e), m in zip(ids, offsets, am)]
+    shield = [0] * len(ids)
+    char_labels = annotate_char_types(full_text, target_start)
+    tt = token_types_from_offsets(full_text, char_labels, offsets)
+    tt = [t if l != -100 else T_NONE for t, l in zip(tt, labels)]
+    calc = [1 if t in (T_OPERAND, T_OPERATOR, T_RESULT, T_FINAL) else 0 for t in tt]
+
+    return {
+        "input_ids": torch.tensor(ids),
+        "attention_mask": torch.tensor(am),
+        "labels": torch.tensor(labels),
+        "prompt_shield_mask": torch.tensor(shield),
+        "token_types": torch.tensor(tt),
+        "calc_mask": torch.tensor(calc),
+    }
+
+
+@torch.no_grad()
+def collect_onpolicy_data(model, tokenizer, rows, device, cfg):
+    from src.evaluation.answers import extract_numeric_answer
+
+    n_gen = max(1, int(len(rows) * cfg.on_policy_frac))
+    indices = torch.randperm(
+        len(rows), generator=torch.Generator().manual_seed(cfg.seed)
+    )[:n_gen].tolist()
+
+    questions = [rows[i]["question"] for i in indices]
+    golds = [rows[i]["final_num"] for i in indices]
+    prompts = [f"Question: {q}\nAnswer: Let's think step by step.\n" for q in questions]
+
+    gc_enabled = getattr(model.base_model, "is_gradient_checkpointing", False)
+    if gc_enabled and hasattr(model.base_model, "gradient_checkpointing_disable"):
+        model.base_model.gradient_checkpointing_disable()
+
+    model.eval()
+    model.set_routing_override("only", cfg.fixed_layers)
+
+    completions: List[str] = []
+    gen_bs = cfg.on_policy_gen_batch
+    for i in tqdm(range(0, len(prompts), gen_bs), desc="on-policy gen", leave=False):
+        batch = prompts[i : i + gen_bs]
+        completions.extend(
+            _generate_onpolicy_batch(model, tokenizer, batch, device)
+        )
+
+    if gc_enabled and hasattr(model.base_model, "gradient_checkpointing_enable"):
+        model.base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
+    new_rows: List[Dict[str, Any]] = []
+    n_correct = 0
+    for q, comp, gold in zip(questions, completions, golds):
+        try:
+            gold_num = float(str(gold).replace(",", "").replace("$", "").strip())
+        except (ValueError, AttributeError):
+            continue
+        pred = extract_numeric_answer(comp)
+        if pred is None:
+            continue
+        if abs(pred - gold_num) > max(0.01, abs(gold_num) * 0.005):
+            continue
+        n_correct += 1
+        row = _tokenize_onpolicy(tokenizer, q, comp, cfg)
+        new_rows.append(row)
+
+    print(
+        f"[on-policy] {n_gen} generated → {n_correct} correct "
+        f"({100 * n_correct / max(n_gen, 1):.1f}%) → {len(new_rows)} new rows"
+    )
+
+    model.train()
+    model.base_model.eval()
+    return new_rows
+
+
 def train_phase1_steernet(
-    model, train_data, eval_data, cfg: RSCConfig, device: torch.device
+    model, train_data, eval_data, cfg: RSCConfig, device: torch.device,
+    tokenizer=None,
 ) -> Dict[str, Any]:
     """Optimise SteerNet with V2 typed reasoning objective, focal hardness, and KL anchor."""
     cfg.validate()
@@ -412,6 +521,21 @@ def train_phase1_steernet(
                 name: value.detach().cpu().clone()
                 for name, value in model.steer_nets.state_dict().items()
             }
+
+        if (
+            cfg.on_policy
+            and tokenizer is not None
+            and (epoch + 1) == cfg.on_policy_start_epoch
+            and len(rows) > 0
+            and "question" in rows[0]
+            and "final_num" in rows[0]
+        ):
+            new_rows = collect_onpolicy_data(model, tokenizer, rows, device, cfg)
+            if new_rows:
+                new_lengths = [int(r["attention_mask"].sum()) for r in new_rows]
+                rows.extend(new_rows)
+                lengths.extend(new_lengths)
+                print(f"[on-policy] Training data: {len(rows)} rows (added {len(new_rows)})")
 
     if best_state is not None:
         model.steer_nets.load_state_dict(best_state)
