@@ -265,10 +265,12 @@ def _tokenize_onpolicy(tokenizer, question, completion, cfg):
 def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
     from src.evaluation.answers import extract_numeric_answer
 
-    n_gen = max(1, int(len(rows) * cfg.on_policy_frac))
-    indices = torch.randperm(
-        len(rows), generator=torch.Generator().manual_seed(cfg.seed + epoch)
+    orig_indices = [i for i, r in enumerate(rows) if "question" in r]
+    n_gen = max(1, int(len(orig_indices) * cfg.on_policy_frac))
+    perm = torch.randperm(
+        len(orig_indices), generator=torch.Generator().manual_seed(cfg.seed + epoch)
     )[:n_gen].tolist()
+    indices = [orig_indices[j] for j in perm]
 
     from src.data.prompts import build_prompt_unified
 
