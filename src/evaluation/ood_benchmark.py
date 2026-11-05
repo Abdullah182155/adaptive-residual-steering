@@ -2,6 +2,7 @@
 
 Runs baseline vs steered generation on out-of-distribution datasets,
 supporting both numeric (open-ended math) and MCQ answer types.
+Uses batched generation for speed.
 """
 
 from __future__ import annotations
@@ -24,15 +25,21 @@ from src.evaluation.ood import (
 
 
 @torch.no_grad()
-def _generate_simple(
+def _generate_batch(
     model,
     tokenizer,
-    prompt: str,
+    prompts: List[str],
     device: torch.device,
     max_new_tokens: int = 256,
-) -> str:
-    """Generate text from a prompt without shielding or stopping criteria."""
-    enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024)
+) -> List[str]:
+    """Generate text for a batch of prompts."""
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        truncation=True,
+        max_length=1024,
+        padding=True,
+    )
     inputs = {k: v.to(device) for k, v in enc.items()}
     model.set_prompt_shield_mask(None)
     tokens = model.generate(
@@ -41,8 +48,13 @@ def _generate_simple(
         do_sample=False,
         temperature=0.0,
     )
-    prompt_len = inputs["input_ids"].shape[1]
-    return tokenizer.decode(tokens[0, prompt_len:], skip_special_tokens=True)
+    prompt_lens = inputs["attention_mask"].sum(dim=1)
+    outputs = []
+    for i in range(len(prompts)):
+        plen = int(prompt_lens[i])
+        text = tokenizer.decode(tokens[i, plen:], skip_special_tokens=True)
+        outputs.append(text)
+    return outputs
 
 
 def _build_ood_prompt(row: Dict[str, Any], answer_type: str) -> str:
@@ -91,6 +103,7 @@ def run_ood_eval(
     dataset_name: str,
     n_samples: int = 100,
     max_new_tokens: int = 256,
+    batch_size: int = 8,
     fixed_layers: Optional[List[int]] = None,
     report_dir: str = "report",
 ) -> Dict[str, Any]:
@@ -110,6 +123,7 @@ def run_ood_eval(
         "answer_type": answer_type,
     }
 
+    all_prompts = [_build_ood_prompt(r, answer_type) for r in rows]
     arm_results: Dict[str, List[Dict[str, Any]]] = {}
 
     for arm in ["baseline", "fixed"]:
@@ -121,14 +135,25 @@ def run_ood_eval(
             model.set_intervention_gain(1.0)
 
         scored_rows: List[Dict[str, Any]] = []
-        progress = tqdm(rows, desc=f"{dataset_name} {arm}", leave=False)
-        for row in progress:
-            prompt = _build_ood_prompt(row, answer_type)
-            text = _generate_simple(model, tokenizer, prompt, device, max_new_tokens)
-            scored = _score_row(text, row["answer"], answer_type)
-            scored["question"] = row["question"]
-            scored["gold"] = row["answer"]
-            scored_rows.append(scored)
+        n_batches = (len(rows) + batch_size - 1) // batch_size
+        progress = tqdm(range(n_batches), desc=f"{dataset_name} {arm}", leave=False)
+
+        for bi in progress:
+            start = bi * batch_size
+            end = min(start + batch_size, len(rows))
+            batch_prompts = all_prompts[start:end]
+            batch_rows = rows[start:end]
+
+            texts = _generate_batch(
+                model, tokenizer, batch_prompts, device, max_new_tokens
+            )
+
+            for row, text in zip(batch_rows, texts):
+                scored = _score_row(text, row["answer"], answer_type)
+                scored["question"] = row["question"]
+                scored["gold"] = row["answer"]
+                scored_rows.append(scored)
+
             n_correct = sum(r["correct"] for r in scored_rows)
             progress.set_postfix(acc=f"{100*n_correct/len(scored_rows):.1f}%")
 
@@ -168,6 +193,7 @@ def run_all_ood(
     device: torch.device,
     datasets_config: Dict[str, int],
     max_new_tokens: int = 256,
+    batch_size: int = 8,
     fixed_layers: Optional[List[int]] = None,
     report_dir: str = "report",
 ) -> Dict[str, Any]:
@@ -176,6 +202,7 @@ def run_all_ood(
     Args:
         datasets_config: dict mapping dataset_name → n_samples,
             e.g. {"svamp": 100, "arc": 100, "math500": 100}
+        batch_size: number of prompts per forward pass (default 8)
 
     Returns combined results dict.
     """
@@ -187,6 +214,7 @@ def run_all_ood(
         all_results[dname] = run_ood_eval(
             model, tokenizer, device, dname, n,
             max_new_tokens=max_new_tokens,
+            batch_size=batch_size,
             fixed_layers=fixed_layers,
             report_dir=report_dir,
         )
