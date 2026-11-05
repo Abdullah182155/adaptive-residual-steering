@@ -21,7 +21,7 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.max_tok_len == 512
     assert cfg.phase1_lr == 2e-4
     assert cfg.loss_mode == "typed"
-    assert cfg.train_shot_probs == [0.30, 0.10, 0.25, 0.10, 0.25]
+    assert cfg.train_shot_probs == [0.50, 0.10, 0.20, 0.05, 0.15]
     assert cfg.shield_policy == "context"
     assert cfg.mag_l1_weight == 0.20
     assert cfg.focal_gamma == 1.0

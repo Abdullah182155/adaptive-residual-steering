@@ -58,7 +58,7 @@ class RSCConfig:
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
-    train_shot_probs: List[float] = field(default_factory=lambda: [0.30, 0.10, 0.25, 0.10, 0.25])  # 0, 1, 2, 3, 4 shots
+    train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.10, 0.20, 0.05, 0.15])  # 0, 1, 2, 3, 4 shots
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.90
     shield_policy: str = "context"
