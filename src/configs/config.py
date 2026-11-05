@@ -16,14 +16,15 @@ class RSCConfig:
     steernet_arch: str = "v5"
     objective: str = "nll"
 
-    lora_rank: int = 64
-    lora_alpha: float = 32.0
+    lora_rank: int = 16
+    lora_alpha: float = 16.0
     lora_dropout: float = 0.05
     steer_kappa: float = 0.04
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.08
+    rho_max: float = 0.04
+    # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
@@ -51,7 +52,7 @@ class RSCConfig:
     lambda_operand: float = 0.15
     lambda_result: float = 0.40
     lambda_final: float = 0.35
-    focal_gamma: float = 1.0
+    focal_gamma: float = 2.0
     kl_weight: float = 1.0
     kl_arithmetic_weight: float = 0.30
     mag_l1_weight: float = 0.20

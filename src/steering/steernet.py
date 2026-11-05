@@ -224,7 +224,7 @@ class SteerNet(nn.Module):
             x = self.conv(x, is_decode=is_decode)
 
         magnitude = torch.sigmoid(self.mag_head(x))
-        direction = self.drop(self.up(x))
+        direction = self.up(self.drop(x))
 
         # Apply position shielding
         if self.amplitude_mode == "relative":

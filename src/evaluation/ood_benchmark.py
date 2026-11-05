@@ -15,7 +15,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import torch
 from tqdm.auto import tqdm
 
-from src.evaluation.answers import extract_numeric_answer, score_tiers
+from src.data.prompts import build_prompt_unified
+from src.evaluation.answers import cut_continuation, extract_numeric_answer, score_tiers
 from src.evaluation.chain import audit_chain, paired_bootstrap_ci, mcnemar_one_sided
 from src.evaluation.ood import (
     extract_mcq_answer,
@@ -58,7 +59,7 @@ def _generate_batch(
 
 
 def _build_ood_prompt(row: Dict[str, Any], answer_type: str) -> str:
-    """Build a simple 0-shot prompt for OOD evaluation."""
+    """Build a 0-shot prompt for OOD evaluation with preface."""
     q = row["question"]
     if answer_type == "mcq":
         choices = row.get("choices", [])
@@ -67,16 +68,14 @@ def _build_ood_prompt(row: Dict[str, Any], answer_type: str) -> str:
             f"Question: {q}\n"
             f"Answer: Let's think step by step, then give the answer letter.\n"
         )
-    return (
-        f"Question: {q}\n"
-        f"Answer: Let's think step by step.\n"
-    )
+    return build_prompt_unified(q, n_shot=0)
 
 
 def _score_row(
     text: str, gold: str, answer_type: str
 ) -> Dict[str, Any]:
     """Score a single generation against gold."""
+    text = cut_continuation(text)
     if answer_type == "mcq":
         pred = extract_mcq_answer(text)
         correct = pred is not None and pred.upper() == gold.upper()
