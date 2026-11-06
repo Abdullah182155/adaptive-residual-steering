@@ -66,9 +66,30 @@ class RSCConfig:
 
     # On-policy training
     on_policy: bool = True
-    on_policy_frac: float = 0.15
+    on_policy_frac: float = 0.25
     on_policy_start_epoch: int = 1
-    on_policy_gen_batch: int = 8
+    on_policy_gen_batch: int = 4
+    on_policy_k: int = 4                  # pass@k: samples per question
+    on_policy_temperature: float = 0.7    # sampling temperature for pass@k
+
+    # Phase 2 Router
+    phase2_lr: float = 5e-5
+    phase2_epochs: int = 2
+    router_max_k: int = 4
+    router_min_k: int = 2
+    router_semantic_dim: int = 16
+    router_d_model: int = 32
+    router_n_heads: int = 2
+    router_beta_entropy_k: float = 0.05
+    router_beta_entropy_subset: float = 0.02
+    router_balance_weight: float = 0.1
+    router_warmup_epochs: int = 1
+    use_gate: bool = True
+    gate_dim: int = 64
+    gate_dropout: float = 0.1
+    gate_init_alpha: float = 0.8
+    lambda_cost: float = 0.005
+    router_save_path: str = "checkpoints/router.pt"
 
     checkpoint_dir: str = "checkpoints"
     lora_save_path: str = "checkpoints/steernet.pt"

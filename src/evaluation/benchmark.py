@@ -164,7 +164,7 @@ def run_benchmark(
     for n_shot in shots:
         arm_results: Dict[str, List[Dict[str, object]]] = {}
         for arm in arms:
-            if arm not in {"baseline", "fixed", "identity", "random"}:
+            if arm not in {"baseline", "fixed", "identity", "random", "router"}:
                 raise ValueError(f"unsupported benchmark arm: {arm}")
 
             if arm == "baseline":
@@ -191,6 +191,13 @@ def run_benchmark(
                     model.set_intervention_gain(1.0)
                 if hasattr(model, "set_control"):
                     model.set_control("random")
+            elif arm == "router":
+                # Router arm: use installed route_selector; steering gain = 1.0
+                model.set_routing_override(None)
+                if hasattr(model, "set_intervention_gain"):
+                    model.set_intervention_gain(1.0)
+                if hasattr(model, "set_control"):
+                    model.set_control(None)
 
             results = []
             progress = tqdm(rows, desc=f"{suite} {n_shot}-shot {arm}", leave=False)
@@ -309,6 +316,14 @@ def run_benchmark(
             paired_output_path.write_text(
                 "".join(json.dumps(item) + "\n" for item in paired_rows),
                 encoding="utf-8",
+            )
+
+        # Paired stats: baseline vs router (when both present)
+        if "baseline" in arm_results and "router" in arm_results:
+            router_paired = _paired_counts(arm_results["baseline"], arm_results["router"])
+            shot_record["paired_router"] = router_paired
+            shot_record["paired_router"]["mcnemar_p_value"] = mcnemar_exact(
+                router_paired["fixed_wins"], router_paired["fixed_losses"]
             )
 
         record["shots"][str(n_shot)] = shot_record
