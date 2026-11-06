@@ -401,22 +401,45 @@ def load_router_weights(
         gate_adaptor.register_hooks(model)
         model.set_gate_provider(gate_adaptor)
 
-    # Install probe hook + route selector for inference
+    # Probe hook: captures hidden states at probe layer during no-steer forward
     probe_layer_idx = cfg.fixed_layers[0]
     probe = ProbeCapture().register(model._layers[probe_layer_idx])
 
-    # Build selector that reads from probe cache
     min_k = ckpt.get("router_min_k", cfg.router_min_k)
     max_k = ckpt.get("router_max_k", cfg.router_max_k)
+    N_layers = len(cfg.fixed_layers)
 
-    def inference_selector(batch_size: int, device_: torch.device):
-        if probe.h is not None:
-            with torch.no_grad():
-                router(probe.h.to(device_), (probe.valid_mask or torch.ones(batch_size, probe.h.shape[1], dtype=torch.bool, device=device_)))
-        return router.make_selector(min_k=min_k, max_k=max_k)(batch_size, device_)
+    @torch.no_grad()
+    def router_prefill(ids: torch.Tensor, mask: torch.Tensor) -> None:
+        """Run a probe forward to capture hidden states, compute route, fix via matrix override.
 
-    model.set_routing_override(None)
-    model.set_route_selector(inference_selector)
+        Must be called BEFORE model.generate() for each question so the route is
+        computed from the current prompt's hidden states and stays fixed throughout
+        the entire generation (prefill + all decode steps).
+        """
+        # 1. Probe forward (no steering) → populates probe.h
+        model.set_routing_override("none")
+        probe.set_mask(mask.bool())
+        model(input_ids=ids, attention_mask=mask)
+
+        if probe.h is None:
+            # Fallback: activate all layers (same as fixed)
+            model.set_routing_override("only", cfg.fixed_layers)
+            return
+
+        # 2. Compute route from router
+        h = probe.h.to(ids.device)
+        valid = mask.bool()
+        router(h, valid)
+        sel = router.make_selector(min_k=min_k, max_k=max_k)
+        route_matrix = sel(ids.shape[0], ids.device)  # (B, N_layers) bool
+
+        # 3. Fix route via matrix override — stays constant for entire generate()
+        model.set_routing_override("matrix", route_matrix)
+
+    # Clear any stale override/selector — route will be set per-question via router_prefill
+    model.set_route_selector(None)
+    model.set_routing_override("only", cfg.fixed_layers)  # safe default until first prefill
 
     print(f"[router] Loaded checkpoint from {path}")
-    return router, gate
+    return router, gate, router_prefill

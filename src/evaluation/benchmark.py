@@ -60,6 +60,7 @@ def _generate(
     device: torch.device,
     max_new_tokens: int,
     policy: str = "context",
+    route_prefill_fn=None,
     **prompt_kw,
 ) -> Tuple[str, Dict[str, Any]]:
     prompt, enc, shield = build_prompt_with_shield(tokenizer, question, n_shot=n_shot, policy=policy, **prompt_kw)
@@ -68,6 +69,10 @@ def _generate(
         model.set_prompt_shield_mask(shield.unsqueeze(0).to(device))
     else:
         model.set_prompt_shield_mask(None)
+    # Router arm: compute route from prompt hidden states BEFORE generation.
+    # This fixes the race condition where _prepare_forward fires before probe hook.
+    if route_prefill_fn is not None:
+        route_prefill_fn(inputs["input_ids"], inputs["attention_mask"])
     stop = AnswerStop(tokenizer, inputs["input_ids"].shape[1])
     try:
         tokens = model.generate(
@@ -151,6 +156,7 @@ def run_benchmark(
     arms: Sequence[str],
     contract: Dict[str, object] | None = None,
     suite: str = "gsm8k",
+    router_prefill_fn=None,
 ) -> Dict[str, object]:
     """Run greedy paired baseline/fixed evaluation and return a serializable record."""
     rows = list(rows)
@@ -214,6 +220,7 @@ def run_benchmark(
                     cfg.generation_max_new_tokens,
                     policy=shield_policy,
                     question_idx=row_idx,
+                    route_prefill_fn=router_prefill_fn if arm == "router" else None,
                 )
                 guard = dict(model.guard_state)
                 cap = (
