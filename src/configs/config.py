@@ -84,7 +84,7 @@ class RSCConfig:
     router_beta_entropy_subset: float = 0.02
     router_balance_weight: float = 0.1
     router_warmup_epochs: int = 1
-    use_gate: bool = True
+    use_gate: bool = False
     gate_dim: int = 64
     gate_dropout: float = 0.1
     gate_init_alpha: float = 0.8
