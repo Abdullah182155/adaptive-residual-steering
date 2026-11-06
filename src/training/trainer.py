@@ -217,20 +217,29 @@ def load_steer_weights(
 
 
 @torch.no_grad()
-def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=256):
+def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=256,
+                              num_return_sequences=1, temperature=0.0):
     enc = tokenizer(prompts, return_tensors="pt", truncation=True,
                     max_length=512, padding=True)
     inputs = {k: v.to(device) for k, v in enc.items()}
     model.set_prompt_shield_mask(None)
-    tokens = model.generate(**inputs, max_new_tokens=max_new_tokens,
-                            do_sample=False, temperature=0.0)
-    prompt_lens = inputs["attention_mask"].sum(dim=1)
+    do_sample = (num_return_sequences > 1 or temperature > 0.0)
+    tokens = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=do_sample,
+        temperature=temperature if do_sample else 1.0,
+        num_return_sequences=num_return_sequences,
+    )
+    B = len(prompts)
+    # prompt lengths broadcast across the k sequences per prompt
+    prompt_lens = inputs["attention_mask"].sum(dim=1).repeat_interleave(num_return_sequences)
     outputs = []
-    for i in range(len(prompts)):
+    for i in range(B * num_return_sequences):
         plen = int(prompt_lens[i])
         text = tokenizer.decode(tokens[i, plen:], skip_special_tokens=True)
         outputs.append(text)
-    return outputs
+    return outputs  # length = B * num_return_sequences, grouped as [prompt0_k0, prompt0_k1, ..., prompt1_k0, ...]
 
 
 def _tokenize_onpolicy(tokenizer, question, completion, cfg):
@@ -263,7 +272,8 @@ def _tokenize_onpolicy(tokenizer, question, completion, cfg):
 
 @torch.no_grad()
 def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
-    from src.evaluation.answers import extract_numeric_answer
+    import random
+    from src.evaluation.answers import extract_numeric_answer, score_tiers
 
     orig_indices = [i for i, r in enumerate(rows) if "question" in r]
     n_gen = max(1, int(len(orig_indices) * cfg.on_policy_frac))
@@ -274,9 +284,14 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
 
     from src.data.prompts import build_prompt_unified
 
+    # Mixed-shot prompts: 60% 0-shot, 20% 1-shot, 20% 2-shot
+    rng = random.Random(cfg.seed + epoch + 1000)
     questions = [rows[i]["question"] for i in indices]
     golds = [rows[i]["final_num"] for i in indices]
-    prompts = [build_prompt_unified(q, n_shot=0) for q in questions]
+    prompts = [
+        build_prompt_unified(q, n_shot=rng.choices([0, 1, 2], weights=[0.6, 0.2, 0.2])[0])
+        for q in questions
+    ]
 
     gc_enabled = getattr(model.base_model, "is_gradient_checkpointing", False)
     if gc_enabled and hasattr(model.base_model, "gradient_checkpointing_disable"):
@@ -285,12 +300,20 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
     model.eval()
     model.set_routing_override("only", cfg.fixed_layers)
 
-    completions: List[str] = []
+    # Pass@k: generate k completions per question
+    on_policy_k = getattr(cfg, "on_policy_k", 1)
+    on_policy_temperature = getattr(cfg, "on_policy_temperature", 0.0)
+
+    completions_flat: List[str] = []
     gen_bs = cfg.on_policy_gen_batch
     for i in tqdm(range(0, len(prompts), gen_bs), desc="on-policy gen", leave=False):
         batch = prompts[i : i + gen_bs]
-        completions.extend(
-            _generate_onpolicy_batch(model, tokenizer, batch, device)
+        completions_flat.extend(
+            _generate_onpolicy_batch(
+                model, tokenizer, batch, device,
+                num_return_sequences=on_policy_k,
+                temperature=on_policy_temperature,
+            )
         )
 
     if gc_enabled and hasattr(model.base_model, "gradient_checkpointing_enable"):
@@ -298,25 +321,33 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
 
+    # completions_flat is grouped: [q0_k0, q0_k1, ..., q1_k0, q1_k1, ...]
+    # For each question, keep the first correct completion (lenient scoring)
     new_rows: List[Dict[str, Any]] = []
+    n_tried = 0
     n_correct = 0
-    for q, comp, gold in zip(questions, completions, golds):
+    for qi, (q, gold) in enumerate(zip(questions, golds)):
         try:
             gold_num = float(str(gold).replace(",", "").replace("$", "").strip())
         except (ValueError, AttributeError):
             continue
-        pred = extract_numeric_answer(comp)
-        if pred is None:
-            continue
-        if abs(pred - gold_num) > max(0.01, abs(gold_num) * 0.005):
-            continue
-        n_correct += 1
-        row = _tokenize_onpolicy(tokenizer, q, comp, cfg)
-        new_rows.append(row)
+        base = qi * on_policy_k
+        found = False
+        for ki in range(on_policy_k):
+            n_tried += 1
+            comp = completions_flat[base + ki]
+            scored = score_tiers(comp, gold_num)
+            if scored["lenient"]:
+                n_correct += 1
+                row = _tokenize_onpolicy(tokenizer, q, comp, cfg)
+                new_rows.append(row)
+                found = True
+                break  # one correct example per question is enough
 
     print(
-        f"[on-policy] {n_gen} generated → {n_correct} correct "
-        f"({100 * n_correct / max(n_gen, 1):.1f}%) → {len(new_rows)} new rows"
+        f"[on-policy] {n_gen} questions × {on_policy_k} samples = {n_tried} tried "
+        f"→ {n_correct} correct ({100 * n_correct / max(n_gen, 1):.1f}%) "
+        f"→ {len(new_rows)} new rows"
     )
 
     model.train()

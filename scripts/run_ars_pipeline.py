@@ -37,6 +37,11 @@ from src.deploy.calibrate import (
 from src.evaluation.benchmark import run_benchmark, write_record, write_report
 from src.models.wrapper import Phi2WithRSC
 from src.training.trainer import load_steer_weights, train_phase1_steernet
+from src.training.router_trainer import (
+    train_phase2_router,
+    save_router_weights,
+    load_router_weights,
+)
 
 
 LEGACY_NOTEBOOK_OVERRIDES = {"catalog_max_k", "s1_k_choices", "s1_onpolicy_fraction"}
@@ -46,7 +51,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="ARS fixed-route Phase 1 pipeline")
     parser.add_argument(
         "--stage",
-        choices=("S1", "S5", "bench", "all", "train", "calibrate"),
+        choices=("S1", "S2", "S5", "bench", "all", "train", "calibrate", "router"),
         default="all",
     )
     parser.add_argument("--steernet_arch", choices=("v5",), default="v5")
@@ -160,10 +165,10 @@ def run(args) -> int:
                 f"S1 checkpoint is required for {args.stage}: {checkpoint}"
             )
         load_steer_weights(model, str(checkpoint), cfg, device)
-    stage = {"train": "S1", "calibrate": "S5"}.get(args.stage, args.stage)
+    stage = {"train": "S1", "calibrate": "S5", "router": "S2"}.get(args.stage, args.stage)
 
     train_data = validation_data = []
-    if stage in {"S1", "S5", "all"}:
+    if stage in {"S1", "S2", "S5", "all"}:
         raw_train, raw_val = gsm8k_to_cot(tokenizer, cfg)
         train_data = prepare_dataset_split(raw_train, args.s1_train_n)
         validation_data = prepare_dataset_split(raw_val, args.s1_val_n)
@@ -171,6 +176,23 @@ def run(args) -> int:
     if stage in {"S1", "all"}:
         print("Running S1 fixed-route SteerNet training")
         train_phase1_steernet(model, train_data, validation_data, cfg, device, tokenizer=tokenizer)
+    if stage in {"S2", "all"}:
+        print("Running S2 Phase 2 Router training")
+        if stage == "S2":
+            # Load S1 checkpoint when running S2 standalone
+            checkpoint = Path(cfg.lora_save_path)
+            if checkpoint.exists():
+                load_steer_weights(model, str(checkpoint), cfg, device)
+            else:
+                print(f"[warning] No S1 checkpoint found at {checkpoint}, training router from scratch")
+        router_result = train_phase2_router(
+            model, train_data, validation_data, cfg, device, tokenizer=tokenizer
+        )
+        save_router_weights(
+            router_result["router"], router_result["gate"], cfg, cfg.router_save_path
+        )
+        print(f"Wrote router checkpoint: {cfg.router_save_path}")
+
     if stage in {"S5", "all"}:
         print("Running S5 deployment-envelope calibration")
         rows = (
@@ -188,6 +210,15 @@ def run(args) -> int:
         apply_contract(model, contract)
         shots = args.shots or cfg.bench_shots
         arms = [arm.strip() for arm in args.arms.split(",") if arm.strip()]
+        # Load router checkpoint if "router" arm requested
+        if "router" in arms:
+            router_ckpt = Path(cfg.router_save_path)
+            if router_ckpt.exists():
+                load_router_weights(model, cfg, str(router_ckpt), device)
+                print(f"Loaded router checkpoint: {router_ckpt}")
+            else:
+                print(f"[warning] Router arm requested but no checkpoint found at {router_ckpt}; skipping")
+                arms = [a for a in arms if a != "router"]
         record = run_benchmark(
             model,
             tokenizer,
@@ -221,7 +252,7 @@ def run(args) -> int:
 
 def stage_requires_checkpoint(stage: str) -> bool:
     """Separate S5 and benchmark invocations reload the S1 adapter checkpoint."""
-    return stage in {"S5", "bench", "calibrate"}
+    return stage in {"S5", "bench", "calibrate", "S2", "router"}
 
 
 if __name__ == "__main__":
