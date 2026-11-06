@@ -211,10 +211,11 @@ def run(args) -> int:
         shots = args.shots or cfg.bench_shots
         arms = [arm.strip() for arm in args.arms.split(",") if arm.strip()]
         # Load router checkpoint if "router" arm requested
+        router_prefill_fn = None
         if "router" in arms:
             router_ckpt = Path(cfg.router_save_path)
             if router_ckpt.exists():
-                load_router_weights(model, cfg, str(router_ckpt), device)
+                _, _, router_prefill_fn = load_router_weights(model, cfg, str(router_ckpt), device)
                 print(f"Loaded router checkpoint: {router_ckpt}")
             else:
                 print(f"[warning] Router arm requested but no checkpoint found at {router_ckpt}; skipping")
@@ -228,6 +229,7 @@ def run(args) -> int:
             shots,
             arms,
             contract,
+            router_prefill_fn=router_prefill_fn,
         )
         write_record(record, cfg.record_path)
         if args.report:
