@@ -190,8 +190,7 @@ def compute_router_rloo_loss(
         h_k, h_subset = policy_entropy_bonus(u, k_logits, K_max)
     else:
         h_k = torch.zeros((), device=ids.device)
-        h_subset, _ = policy_entropy_bonus(u, k_logits, K_max)[1], None
-        h_subset = torch.zeros((), device=ids.device)
+        _, h_subset = policy_entropy_bonus(u, k_logits, K_max)
 
     # Anti-monopoly balance loss
     mean_selected = (subset_a_mask.float() + subset_b_mask.float()).mean(dim=0) / 2.0
@@ -201,8 +200,9 @@ def compute_router_rloo_loss(
 
     loss = policy_loss - beta_k * h_k - beta_subset * h_subset + lambda_balance * balance_loss
 
-    # Track observations for router diagnostics
+    # Track observations for router diagnostics (both subsets for less noisy EMA)
     router.observe(u.detach(), subset_a_mask.detach())
+    router.observe(u.detach(), subset_b_mask.detach())
 
     diag: Dict[str, float] = {
         "policy_loss": float(policy_loss.detach()),

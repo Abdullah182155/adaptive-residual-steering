@@ -153,7 +153,7 @@ class JointLayerRouter(nn.Module):
         self.k_dist_ema.mul_(0.98).add_(0.02 * k_onehot)
 
     def make_selector(self, min_k: int = 2, max_k: int = 4) -> Callable:
-        """Return a RouteSelector callable for inference (greedy K + top-k subset).
+        """Return a RouteSelector callable for inference (synergy-aware greedy selection).
 
         The selector reads from the router's cached pooled representation, so a
         forward pass must have been completed (via the probe hook) before each call.
@@ -162,20 +162,38 @@ class JointLayerRouter(nn.Module):
 
         def selector(batch_size: int, device: torch.device) -> torch.BoolTensor:
             if router_ref._last_pooled is None:
-                # Fallback: activate all layers (safe default)
                 return torch.ones(batch_size, router_ref.n_candidates, dtype=torch.bool, device=device)
             with torch.no_grad():
-                u, k_logits = router_ref.recompute_from_cache()
-                # Greedy K selection with min/max clamp
-                k = k_logits.argmax(dim=-1) + 1  # 1-indexed: {1, ..., max_active_layers}
+                result = router_ref.recompute_from_cache(return_synergy=True)
+                if len(result) == 3:
+                    u, k_logits, synergy = result
+                else:
+                    u, k_logits = result
+                    synergy = None
+
+                k = k_logits.argmax(dim=-1) + 1
                 k = k.clamp(min=min_k, max=max_k)
-                # Greedy subset: top-k by utility
-                K = int(k.max().item())
-                top_idx = u.topk(K, dim=-1).indices
-                mask = torch.zeros(batch_size, router_ref.n_candidates, dtype=torch.bool, device=device)
-                for b in range(batch_size):
-                    kb = int(k[b].item()) if k.ndim > 0 else int(k.item())
-                    mask[b].scatter_(0, top_idx[b, :kb], True)
+
+                B, N = u.shape
+                mask = torch.zeros(B, N, dtype=torch.bool, device=device)
+
+                if synergy is not None:
+                    for b in range(B):
+                        kb = int(k[b].item())
+                        remaining = torch.ones(N, dtype=torch.bool, device=device)
+                        scores = u[b].clone()
+                        for _ in range(kb):
+                            scores_masked = scores.masked_fill(~remaining, float("-inf"))
+                            chosen = scores_masked.argmax()
+                            mask[b, chosen] = True
+                            remaining[chosen] = False
+                            scores = u[b] + synergy[b, chosen]
+                else:
+                    K = int(k.max().item())
+                    top_idx = u.topk(K, dim=-1).indices
+                    for b in range(B):
+                        kb = int(k[b].item()) if k.ndim > 0 else int(k.item())
+                        mask[b].scatter_(0, top_idx[b, :kb], True)
             return mask
 
         return selector

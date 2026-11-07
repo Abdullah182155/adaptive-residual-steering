@@ -248,13 +248,9 @@ class SteerNet(nn.Module):
 
         # Smooth cap envelope: C_l = κ * N_l
         # f(n) = n * C_l / sqrt(n^2 + C_l^2)
+        # Cap is fixed (not K-dependent) — amplitude scaling is handled by radius only
         delta_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
-        active_k = (
-            torch.ones(B, device=h.device, dtype=h_flt.dtype)
-            if active_k is None
-            else active_k.to(h_flt)
-        )
-        cap = self.C_l * active_k.clamp_min(1).rsqrt().view(B, 1, 1)
+        cap = self.C_l
 
         soft = cap / torch.sqrt(delta_norm.square() + cap * cap)
         delta = delta * soft

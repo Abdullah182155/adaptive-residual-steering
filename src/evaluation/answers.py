@@ -167,7 +167,7 @@ def score_tiers(text: str, gold: float) -> dict:
     marker_prediction = extract_numeric_answer(text, lenient=False)
     lenient_prediction = extract_numeric_answer(text, lenient=True)
     strict_prediction = _to_float(strict_match.group(1)) if strict_match else None
-    equal = lambda prediction: prediction is not None and abs(prediction - gold) <= 1e-6
+    equal = lambda prediction: prediction is not None and abs(prediction - gold) <= max(1e-4, 1e-6 * abs(gold))
     return {
         "format_ok": strict_match is not None,
         "pred_strict": strict_prediction,

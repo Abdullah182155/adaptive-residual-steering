@@ -150,8 +150,8 @@ def train_phase2_router(
         gate_adaptor.register_hooks(model)
         model.set_gate_provider(gate_adaptor)
 
-    # ── Probe hook: captures hidden states from first candidate layer ─────────
-    probe_layer_idx = cfg.fixed_layers[0]
+    # ── Probe hook: captures hidden states from middle candidate layer ────────
+    probe_layer_idx = cfg.router_probe_layer if cfg.router_probe_layer is not None else cfg.fixed_layers[len(cfg.fixed_layers) // 2]
     probe = ProbeCapture().register(model._layers[probe_layer_idx])
 
     # ── Optimizer & scheduler ─────────────────────────────────────────────────
@@ -160,13 +160,15 @@ def train_phase2_router(
         trainable_params += list(gate.parameters())
 
     optimizer = torch.optim.Adam(trainable_params, lr=cfg.phase2_lr, betas=(0.9, 0.999))
-    total_steps = max(1, len(train_data) * cfg.phase2_epochs)
+    router_bs = max(1, cfg.batch_size)
+    total_steps = max(1, math.ceil(len(train_data) / router_bs) * cfg.phase2_epochs)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=total_steps, eta_min=cfg.phase2_lr * 0.1
     )
     scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     rows = train_data if isinstance(train_data, list) else [train_data[i] for i in range(len(train_data))]
+    router_bs = max(1, cfg.batch_size)
     history: List[Dict[str, float]] = []
     best_val_nll = float("inf")
     best_router_state = None
@@ -182,15 +184,17 @@ def train_phase2_router(
         epoch_diags: List[Dict[str, float]] = []
 
         perm = torch.randperm(len(rows)).tolist()
-        progress = tqdm(perm, desc=f"router epoch {epoch+1}/{cfg.phase2_epochs}", leave=False)
+        batched_perm = [perm[i:i + router_bs] for i in range(0, len(perm), router_bs)]
+        progress = tqdm(batched_perm, desc=f"S2 epoch {epoch+1}/{cfg.phase2_epochs}", leave=False)
 
-        for idx in progress:
-            row = rows[idx]
-            ids = row["input_ids"].unsqueeze(0).to(device)
-            mask = row["attention_mask"].unsqueeze(0).to(device)
-            labels = row["labels"].unsqueeze(0).to(device) if "labels" in row else None
-            if labels is None:
+        for batch_indices in progress:
+            batch_rows = [rows[i] for i in batch_indices]
+            ids = torch.stack([r["input_ids"] for r in batch_rows]).to(device)
+            mask = torch.stack([r["attention_mask"] for r in batch_rows]).to(device)
+            labels_list = [r["labels"] for r in batch_rows if "labels" in r]
+            if len(labels_list) != len(batch_rows):
                 continue
+            labels = torch.stack(labels_list).to(device)
 
             # ── Probe forward: capture hidden states (routing disabled) ────
             model.set_routing_override("none")
@@ -201,7 +205,7 @@ def train_phase2_router(
             if probe.h is None:
                 continue
 
-            cached_h = probe.h  # (1, T, D) float32
+            cached_h = probe.h  # (B, T, D) float32
             cached_valid = mask.bool()
 
             # ── Compute RLOO loss ──────────────────────────────────────────
@@ -306,28 +310,29 @@ def _eval_router_nll(
 ) -> float:
     """Evaluate mean NLL using greedy router decisions on the validation set."""
     rows = eval_data if isinstance(eval_data, list) else [eval_data[i] for i in range(len(eval_data))]
-    selector = router.make_selector(min_k=cfg.router_min_k, max_k=cfg.router_max_k)
-    model.set_routing_override(None)
-    model.set_route_selector(selector)
+    rows = rows[:min(len(rows), 200)]
+    eval_bs = max(1, cfg.batch_size)
 
     nlls: List[float] = []
-    for row in rows[:min(len(rows), 200)]:
-        ids = row["input_ids"].unsqueeze(0).to(device)
-        mask = row["attention_mask"].unsqueeze(0).to(device)
-        labels = row["labels"].unsqueeze(0).to(device) if "labels" in row else None
-        if labels is None:
+    for i in range(0, len(rows), eval_bs):
+        batch_rows = rows[i:i + eval_bs]
+        ids = torch.stack([r["input_ids"] for r in batch_rows]).to(device)
+        mask = torch.stack([r["attention_mask"] for r in batch_rows]).to(device)
+        labels_list = [r["labels"] for r in batch_rows if "labels" in r]
+        if len(labels_list) != len(batch_rows):
             continue
+        labels = torch.stack(labels_list).to(device)
         # Probe forward to populate router cache
         model.set_routing_override("none")
         probe.set_mask(mask.bool())
         model(input_ids=ids, attention_mask=mask)
         if probe.h is None:
             continue
-        # Update router cache so selector uses fresh hidden states
-        router(probe.h, mask.bool())
-        # Evaluate with router selector
-        model.set_routing_override(None)
-        model.set_route_selector(selector)
+        # Compute route via router + set as matrix override
+        u, k_logits = router(probe.h, mask.bool())
+        sel_fn = router.make_selector(min_k=cfg.router_min_k, max_k=cfg.router_max_k)
+        route_matrix = sel_fn(ids.shape[0], ids.device)
+        model.set_routing_override("matrix", route_matrix)
         logits = model(input_ids=ids, attention_mask=mask).logits
         nll = per_example_answer_nll(logits, labels)
         nlls.append(float(nll.mean().detach()))
@@ -402,7 +407,7 @@ def load_router_weights(
         model.set_gate_provider(gate_adaptor)
 
     # Probe hook: captures hidden states at probe layer during no-steer forward
-    probe_layer_idx = cfg.fixed_layers[0]
+    probe_layer_idx = cfg.router_probe_layer if cfg.router_probe_layer is not None else cfg.fixed_layers[len(cfg.fixed_layers) // 2]
     probe = ProbeCapture().register(model._layers[probe_layer_idx])
 
     min_k = ckpt.get("router_min_k", cfg.router_min_k)
