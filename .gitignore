@@ -139,3 +139,4 @@ PHASE1_EXECUTION_CHECKLIST.md
 !diagrams/
 !diagrams/*.drawio
 !diagrams/*.png
+diagrams/_gen_all.py
