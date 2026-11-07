@@ -71,6 +71,7 @@ def lambdas(cfg: Any) -> Dict[int, float]:
     """Category loss weights lambda_c."""
     return {
         T_FORMAT: getattr(cfg, "lambda_format", 0.05),
+        T_PROSE: getattr(cfg, "lambda_prose", 0.05),
         T_OPERATOR: getattr(cfg, "lambda_operator", 0.10),
         T_OPERAND: getattr(cfg, "lambda_operand", 0.20),
         T_RESULT: getattr(cfg, "lambda_result", 0.35),
@@ -99,13 +100,13 @@ class LearnedLossWeights(nn.Module):
     loss hyperparameters with 8 learned parameters.
     """
 
-    CATEGORIES = [T_FORMAT, T_OPERATOR, T_OPERAND, T_RESULT, T_FINAL]
+    CATEGORIES = [T_FORMAT, T_PROSE, T_OPERATOR, T_OPERAND, T_RESULT, T_FINAL]
 
     def __init__(self):
         super().__init__()
         self.log_var = nn.Parameter(torch.tensor([0.0, 0.0, 0.916]))  # [nll, kl, l1]; l1 init ~log(2.5) so effective weight ≈ 0.20
         self.category_logits = nn.Parameter(
-            torch.tensor([-1.85, -0.47, 0.16, 1.14, 1.01])
+            torch.tensor([-1.85, -2.5, -0.47, 0.16, 1.14, 1.01])
         )
 
     def category_weights(self) -> torch.Tensor:
@@ -152,8 +153,14 @@ def typed_objective(
     nll = -logp.gather(-1, y[:, None]).squeeze(-1)
 
     with torch.no_grad():
-        p = (-nll).exp()
         gamma = getattr(cfg, "focal_gamma", 1.0)
+        if gamma > 0 and base_logits is not None:
+            bl = base_logits.to(logits.device) if base_logits.device != logits.device else base_logits
+            bl_z = bl[:, :-1][sel].float()
+            base_nll = -F.log_softmax(bl_z, dim=-1).gather(-1, y[:, None]).squeeze(-1)
+            p = (-base_nll).exp()
+        else:
+            p = (-nll).exp()
         w = (1.0 - p).clamp_min(0).pow(gamma) if gamma > 0 else torch.ones_like(p)
 
     if learned_weights is not None:

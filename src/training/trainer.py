@@ -242,9 +242,11 @@ def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=2
     return outputs  # length = B * num_return_sequences, grouped as [prompt0_k0, prompt0_k1, ..., prompt1_k0, ...]
 
 
-def _tokenize_onpolicy(tokenizer, question, completion, cfg):
-    from src.data.prompts import build_prompt_unified
-    prompt_text = build_prompt_unified(question, n_shot=0)
+def _tokenize_onpolicy(tokenizer, question, completion, cfg, n_shot=0):
+    from src.data.prompts import build_prompt_with_shield
+    prompt_text, enc_full, shield_mask = build_prompt_with_shield(
+        tokenizer, question, n_shot=n_shot, policy=getattr(cfg, "shield_policy", "context")
+    )
     full_text = prompt_text + completion
     target_start = len(prompt_text)
 
@@ -254,7 +256,10 @@ def _tokenize_onpolicy(tokenizer, question, completion, cfg):
     ids, offsets, am = enc["input_ids"], enc["offset_mapping"], enc["attention_mask"]
     labels = [tid if (m and e > s and s >= target_start) else -100
               for tid, (s, e), m in zip(ids, offsets, am)]
-    shield = [0] * len(ids)
+    # Compute shield mask aligned to the full tokenization
+    shield_char_end = target_start if n_shot > 0 else 0
+    shield = [1 if (m and e > 0 and e <= shield_char_end) else 0
+              for (s, e), m in zip(offsets, am)]
     char_labels = annotate_char_types(full_text, target_start)
     tt = token_types_from_offsets(full_text, char_labels, offsets)
     tt = [t if l != -100 else T_NONE for t, l in zip(tt, labels)]
@@ -288,9 +293,10 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
     rng = random.Random(cfg.seed + epoch + 1000)
     questions = [rows[i]["question"] for i in indices]
     golds = [rows[i]["final_num"] for i in indices]
+    gold_cots = [rows[i].get("answer", "") for i in indices]
+    shot_counts = [rng.choices([0, 1, 2], weights=[0.6, 0.2, 0.2])[0] for _ in questions]
     prompts = [
-        build_prompt_unified(q, n_shot=rng.choices([0, 1, 2], weights=[0.6, 0.2, 0.2])[0])
-        for q in questions
+        build_prompt_unified(q, n_shot=ns) for q, ns in zip(questions, shot_counts)
     ]
 
     gc_enabled = getattr(model.base_model, "is_gradient_checkpointing", False)
@@ -306,7 +312,8 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
 
     completions_flat: List[str] = []
     gen_bs = cfg.on_policy_gen_batch
-    for i in tqdm(range(0, len(prompts), gen_bs), desc="on-policy gen", leave=False):
+    total_batches = math.ceil(len(prompts) / gen_bs)
+    for bi, i in enumerate(range(0, len(prompts), gen_bs)):
         batch = prompts[i : i + gen_bs]
         completions_flat.extend(
             _generate_onpolicy_batch(
@@ -315,6 +322,8 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
                 temperature=on_policy_temperature,
             )
         )
+        if (bi + 1) % 25 == 0 or (bi + 1) == total_batches:
+            print(f"  on-policy gen: {bi + 1}/{total_batches} batches", flush=True)
 
     if gc_enabled and hasattr(model.base_model, "gradient_checkpointing_enable"):
         model.base_model.gradient_checkpointing_enable(
@@ -322,11 +331,12 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
         )
 
     # completions_flat is grouped: [q0_k0, q0_k1, ..., q1_k0, q1_k1, ...]
-    # For each question, keep the first correct completion (lenient scoring)
+    # For each question: keep first correct completion, or fall back to gold CoT
     new_rows: List[Dict[str, Any]] = []
     n_tried = 0
     n_correct = 0
-    for qi, (q, gold) in enumerate(zip(questions, golds)):
+    n_gold_fallback = 0
+    for qi, (q, gold, gold_cot, ns) in enumerate(zip(questions, golds, gold_cots, shot_counts)):
         try:
             gold_num = float(str(gold).replace(",", "").replace("$", "").strip())
         except (ValueError, AttributeError):
@@ -339,15 +349,23 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
             scored = score_tiers(comp, gold_num)
             if scored["lenient"]:
                 n_correct += 1
-                row = _tokenize_onpolicy(tokenizer, q, comp, cfg)
+                row = _tokenize_onpolicy(tokenizer, q, comp, cfg, n_shot=ns)
+                row["question"] = q
+                row["final_num"] = gold
                 new_rows.append(row)
                 found = True
-                break  # one correct example per question is enough
+                break
+        if not found and gold_cot:
+            row = _tokenize_onpolicy(tokenizer, q, gold_cot, cfg, n_shot=ns)
+            row["question"] = q
+            row["final_num"] = gold
+            new_rows.append(row)
+            n_gold_fallback += 1
 
     print(
         f"[on-policy] {n_gen} questions × {on_policy_k} samples = {n_tried} tried "
         f"→ {n_correct} correct ({100 * n_correct / max(n_gen, 1):.1f}%) "
-        f"→ {len(new_rows)} new rows"
+        f"+ {n_gold_fallback} gold fallback → {len(new_rows)} new rows"
     )
 
     model.train()
@@ -428,7 +446,7 @@ def train_phase1_steernet(
         step_count = 0
 
         batches = _epoch_batches(lengths, cfg.batch_size, epoch, cfg.seed)
-        bar = tqdm(range(0, len(batches), cfg.grad_accum), desc=f"S1 {epoch + 1}/{cfg.phase1_epochs}", disable=True)
+        bar = tqdm(range(0, len(batches), cfg.grad_accum), desc=f"S1 epoch {epoch + 1}/{cfg.phase1_epochs}", leave=False)
 
         for w0 in bar:
             micro_indices = batches[w0 : w0 + cfg.grad_accum]
@@ -557,10 +575,17 @@ def train_phase1_steernet(
                 for name, value in model.steer_nets.state_dict().items()
             }
 
+        on_policy_interval = getattr(cfg, "on_policy_interval", 1)
+        is_last_epoch = (epoch + 1) >= cfg.phase1_epochs
+        on_policy_due = (
+            (epoch + 1) >= cfg.on_policy_start_epoch
+            and not is_last_epoch
+            and (epoch + 1 - cfg.on_policy_start_epoch) % on_policy_interval == 0
+        )
         if (
             cfg.on_policy
             and tokenizer is not None
-            and (epoch + 1) >= cfg.on_policy_start_epoch
+            and on_policy_due
             and len(rows) > 0
             and "question" in rows[0]
             and "final_num" in rows[0]

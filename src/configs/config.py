@@ -23,7 +23,7 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.04
+    rho_max: float = 0.06
     # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
@@ -34,7 +34,7 @@ class RSCConfig:
     grad_accum: int = 8
     clip_grad: float = 1.0
     weight_decay: float = 0.01
-    phase1_epochs: int = 3
+    phase1_epochs: int = 5
     phase1_lr: float = 5e-4
     phase1_warmup_frac: float = 0.06
     phase1_min_lr_frac: float = 0.10
@@ -52,8 +52,9 @@ class RSCConfig:
     lambda_operand: float = 0.15
     lambda_result: float = 0.40
     lambda_final: float = 0.35
+    lambda_prose: float = 0.05
     focal_gamma: float = 2.0
-    kl_weight: float = 1.0
+    kl_weight: float = 2.0
     kl_arithmetic_weight: float = 0.30
     mag_l1_weight: float = 0.20
     steer_amplitude_k: Optional[int] = None
@@ -67,15 +68,16 @@ class RSCConfig:
     # On-policy training
     on_policy: bool = True
     on_policy_frac: float = 0.25
-    on_policy_start_epoch: int = 1
+    on_policy_start_epoch: int = 2
     on_policy_gen_batch: int = 4
     on_policy_k: int = 4                  # pass@k: samples per question
     on_policy_temperature: float = 0.7    # sampling temperature for pass@k
+    on_policy_interval: int = 2           # run on-policy every N epochs (saves ~1h per skipped epoch)
 
     # Phase 2 Router
     phase2_lr: float = 5e-5
-    phase2_epochs: int = 2
-    router_max_k: int = 4
+    phase2_epochs: int = 3
+    router_max_k: int = 8
     router_min_k: int = 2
     router_semantic_dim: int = 16
     router_d_model: int = 32
@@ -88,7 +90,8 @@ class RSCConfig:
     gate_dim: int = 64
     gate_dropout: float = 0.1
     gate_init_alpha: float = 0.8
-    lambda_cost: float = 0.005
+    lambda_cost: float = 0.0
+    router_probe_layer: Optional[int] = None
     router_save_path: str = "checkpoints/router.pt"
 
     checkpoint_dir: str = "checkpoints"
