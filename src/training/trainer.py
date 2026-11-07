@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from tqdm.auto import tqdm
+
 
 from src.configs.config import RSCConfig
 from src.training.losses import (
@@ -446,9 +446,11 @@ def train_phase1_steernet(
         step_count = 0
 
         batches = _epoch_batches(lengths, cfg.batch_size, epoch, cfg.seed)
-        bar = tqdm(range(0, len(batches), cfg.grad_accum), desc=f"S1 epoch {epoch + 1}/{cfg.phase1_epochs}", leave=False)
+        window_steps = list(range(0, len(batches), cfg.grad_accum))
+        n_windows = len(window_steps)
+        print_every = max(1, n_windows // 6)
 
-        for w0 in bar:
+        for wi, w0 in enumerate(window_steps):
             micro_indices = batches[w0 : w0 + cfg.grad_accum]
             micro = [_prepare([rows[i] for i in idx], device) for idx in micro_indices]
             counts = window_counts(
@@ -556,7 +558,8 @@ def train_phase1_steernet(
             history["steps"].append(
                 {"epoch": epoch + 1, "loss": window_loss, "grad_norm": gnorm, "lr": lr_curr, **parts}
             )
-            bar.set_postfix(loss=f"{window_loss:.3f}", gnorm=f"{gnorm:.2f}", lr=f"{lr_curr:.1e}")
+            if (wi + 1) % print_every == 0 or wi == n_windows - 1:
+                print(f"  S1 epoch {epoch+1}/{cfg.phase1_epochs} [{wi+1}/{n_windows}] loss={window_loss:.3f} gnorm={gnorm:.2f} lr={lr_curr:.1e}")
 
         # Checkpoint selection metric: critical loss on result/final tokens
         val_eval = evaluate_typed(model, eval_data, device, cfg, steered=True)

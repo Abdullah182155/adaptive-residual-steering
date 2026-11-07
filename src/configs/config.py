@@ -83,7 +83,7 @@ class RSCConfig:
     router_d_model: int = 32
     router_n_heads: int = 2
     router_beta_entropy_k: float = 0.05
-    router_beta_entropy_subset: float = 0.02
+    router_beta_entropy_subset: float = 0.10
     router_balance_weight: float = 0.1
     router_warmup_epochs: int = 1
     use_gate: bool = False

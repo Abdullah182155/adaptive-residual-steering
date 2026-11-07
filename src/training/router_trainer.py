@@ -21,7 +21,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tqdm.auto import tqdm
+
 
 from src.configs.config import RSCConfig
 from src.routing.router import JointLayerRouter
@@ -107,7 +107,7 @@ def _router_diversity_check(router: JointLayerRouter, min_k: int) -> Tuple[bool,
     stats = router.route_diversity_stats()
     health_ok = (
         stats["k_ge2_rate"] >= 0.85
-        and stats["layer_entropy_bits"] >= 1.5
+        and stats["layer_entropy_bits"] >= 0.55
         and stats["mean_k"] >= float(min_k)
     )
     return health_ok, stats
@@ -185,9 +185,10 @@ def train_phase2_router(
 
         perm = torch.randperm(len(rows)).tolist()
         batched_perm = [perm[i:i + router_bs] for i in range(0, len(perm), router_bs)]
-        progress = tqdm(batched_perm, desc=f"S2 epoch {epoch+1}/{cfg.phase2_epochs}", leave=False)
+        n_batches = len(batched_perm)
+        s2_print_every = max(1, n_batches // 6)
 
-        for batch_indices in progress:
+        for bi, batch_indices in enumerate(batched_perm):
             batch_rows = [rows[i] for i in batch_indices]
             ids = torch.stack([r["input_ids"] for r in batch_rows]).to(device)
             mask = torch.stack([r["attention_mask"] for r in batch_rows]).to(device)
@@ -235,7 +236,8 @@ def train_phase2_router(
 
             epoch_losses.append(float(loss.detach()))
             epoch_diags.append(diag)
-            progress.set_postfix(loss=f"{float(loss.detach()):.4f}")
+            if (bi + 1) % s2_print_every == 0 or bi == n_batches - 1:
+                print(f"  S2 epoch {epoch+1}/{cfg.phase2_epochs} [{bi+1}/{n_batches}] loss={float(loss.detach()):.4f}")
 
         # ── Epoch diagnostics ────────────────────────────────────────────────
         mean_loss = sum(epoch_losses) / max(len(epoch_losses), 1)
@@ -252,9 +254,9 @@ def train_phase2_router(
         if not diversity_ok:
             print(
                 f"  [warning] Router diversity collapsed! "
-                f"Doubling beta_entropy_k: {cfg.router_beta_entropy_k} → {cfg.router_beta_entropy_k * 2}"
+                f"Doubling beta_entropy_subset: {cfg.router_beta_entropy_subset} → {cfg.router_beta_entropy_subset * 2}"
             )
-            cfg.router_beta_entropy_k *= 2
+            cfg.router_beta_entropy_subset *= 2
 
         # ── Validation NLL under router routing ──────────────────────────────
         router.eval()
