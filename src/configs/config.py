@@ -1,118 +1,115 @@
-import os
-from dataclasses import dataclass
-from typing import List, Tuple
-import torch
+"""Typed configuration and CLI override support for ARS Phase 1."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field, fields
+from typing import Any, Dict, List, Optional
+
 
 @dataclass
 class RSCConfig:
-    """Hyperparameter configuration for Adaptive Residual Steering (ARS / RSC)."""
+    """Certified defaults for fixed-route SteerNet V5 training and deployment."""
+
     model_name: str = "microsoft/phi-2"
-    # Layer positions are intentionally discovered from the backbone depth.
-    # The router decides which candidates to use for each forward pass and selects at most max_active_layers.
-    max_active_layers: int = 4
-    # Catalog router: distribution over subsets. Empty is a legal action.
-    catalog_include_pairs: bool = True
-    catalog_consecutive_triples: bool = True
-    router_catalog_samples: int = 2  # extra subset forwards besides empty
-    router_max_tok_len: int = 512
-    router_shot_mix: Tuple[int, ...] = (0, 2, 4)
+    candidate_layers: List[int] = field(default_factory=lambda: [13, 15, 18, 20, 22])
+    fixed_layers: List[int] = field(default_factory=lambda: [13, 20, 22])
+    steernet_arch: str = "v5"
+    objective: str = "nll"
 
-    # SteerNet
-    lora_rank: int = 16
+    lora_rank: int = 64
     lora_alpha: float = 32.0
-    lora_dropout: float = 0.05
+    lora_dropout: float = 0.0
+    steer_kappa: float = 0.04
+    steer_scale: float = 0.30
+    k_scale_mode: str = "sqrt"
+    amplitude_mode: str = "relative"
+    rho_max: float = 0.04
+    steer_penalty_weight: float = 0.05
+    steer_penalty_margin: float = 1.0
+    calc_weight_alpha: float = 1.0
+    layer_norms_calibration: str = "norms_calibration.json"
+    prompt_shielding: bool = True
+    guard_revert_to_k0: bool = True
+    guard_relative_norm_cap: Optional[float] = None
 
-    # Data
-    n_samples: int = 7000
-    max_tok_len: int = 384
-    fewshot_train_prob: float = 0.30
-    fewshot_train_max_demos: int = 2
-
-    # Phase 1: SteerNet only
-    phase1_lr: float = 5e-3
-    phase1_epochs: int = 12
-    phase1_warmup_ratio: float = 0.06
-    phase1_patience: int = 4
-
-    # Phase 2 staged parameters
-    phase2_warmup_ratio: float = 0.03
-    phase2_patience: int = 5
-
-    # Gate architecture
-    gate_dim: int = 16
-    gate_dropout: float = 0.05
-    gate_init_alpha: float = 0.80
-
-    # Gate loss regularisation
-    lambda_pg: float = 2.0
-    lambda_l1_gate: float = 0.001
-    lambda_gate_usefulness: float = 0.80
-    lambda_gate_antisat: float = 0.25
-    lambda_gate_diversity: float = 3.0
-    gate_diversity_floor: float = 0.05
-    pg_n_samples: int = 4
-    pg_baseline_momentum: float = 0.8
-    pg_every_n_steps: int = 8
-
-    # Regularisation & Hardware optimization
-    weight_decay: float = 0.01
-    clip_grad: float = 1.0
     batch_size: int = 1
     grad_accum: int = 16
+    clip_grad: float = 1.0
+    weight_decay: float = 0.01
+    phase1_epochs: int = 5
+    phase1_lr: float = 2e-4
+    phase1_warmup_frac: float = 0.06
+    phase1_min_lr_frac: float = 0.10
+    log_every: int = 20
+    n_samples: int = 7473
+    max_tok_len: int = 1024
+    val_split: float = 0.08
+    diversify_prompts: bool = False
     seed: int = 42
 
-    # Monitoring
-    verifier_every_n: int = 10
-    log_gpu_memory: bool = True
+    # V2 Typed Loss
+    loss_mode: str = "typed"  # "typed" or "legacy"
+    lambda_format: float = 0.02
+    lambda_operator: float = 0.08
+    lambda_operand: float = 0.15
+    lambda_result: float = 0.40
+    lambda_final: float = 0.35
+    focal_gamma: float = 1.0
+    kl_weight: float = 1.0
+    mag_l1_weight: float = 0.02
 
-    # Checkpoint selection
-    use_accuracy_checkpoint: bool = True
-    accuracy_eval_n: int = 100
-    accuracy_eval_every_n: int = 1
+    # V2 Multi-Context Training Mixture
+    train_shot_probs: List[float] = field(default_factory=lambda: [0.30, 0.10, 0.25, 0.10, 0.25])  # 0, 1, 2, 3, 4 shots
+    train_use_preface: bool = True
+    train_v5_demo_frac: float = 0.50
+    shield_policy: str = "context"
 
-    # Checkpoint paths (relative by default, portable for local and Kaggle)
-    lora_save_path: str = "./checkpoints/steer_phase1_adaptive_v11.pt"
-    phase2_save_path: str = "./checkpoints/rsc_phase2_catalog_v14.pt"
-    checkpoint_dir: str = "./checkpoints"
+    checkpoint_dir: str = "checkpoints"
+    lora_save_path: str = "checkpoints/steernet.pt"
+    contract_path: str = "deployment_contract.json"
+    record_path: str = "experiment_record.json"
+    report_dir: str = "report"
+    bench_shots: List[int] = field(default_factory=lambda: [0, 2, 4])
+    generation_max_new_tokens: int = 256
+    generation_temperature: float = 0.0
 
-    # Router bootstrap settings
-    router_bootstrap_epochs: int = 3
-    router_bootstrap_n_examples: int = 2000
-    router_bootstrap_lr: float = 1e-3
-    router_bootstrap_patience: int = 2
-    router_bootstrap_save_path: str = "./checkpoints/router_catalog_v14.pt"
-    router_probe_every_n_steps: int = 1
+    def validate(self) -> None:
+        """Reject configurations that violate the fixed-route Phase 1 contract."""
+        if self.steernet_arch != "v5":
+            raise ValueError("Phase 1 supports SteerNet V5 only")
+        if self.objective != "nll":
+            raise ValueError("Phase 1 supports token-weighted NLL only")
+        if self.fixed_layers != [13, 20, 22]:
+            raise ValueError("Phase 1 fixed route must be [13, 20, 22]")
+        if self.k_scale_mode != "sqrt":
+            raise ValueError("Phase 1 uses sqrt route scaling")
+        if self.amplitude_mode not in {"relative", "capped"}:
+            raise ValueError("amplitude_mode must be relative or capped")
+        if self.loss_mode not in {"typed", "legacy"}:
+            raise ValueError("loss_mode must be 'typed' or 'legacy'")
 
-    checkpoint_every_n: int = 3
-    lr_reduce_factor: float = 0.5
-    lr_reduce_patience: int = 3
-    lr_reduce_min_lr: float = 1e-6
-    early_stop_delta: float = 1e-4
-    use_gradient_monitor: bool = True
-    grad_warn_threshold: float = 2.0
 
-    # Prompt Diversification & Invariance
-    diversify_prompts: bool = True
-    lambda_invariance: float = 0.5
-    invariance_every_n_steps: int = 4
-    pg_mode: str = "teacher_forced"  # 'teacher_forced' or 'generation'
-
-    def __post_init__(self):
-        os.makedirs(self.checkpoint_dir, exist_ok=True)
-        # Ensure parent dirs exist for paths
-        for path in [self.lora_save_path, self.phase2_save_path, self.router_bootstrap_save_path]:
-            pdir = os.path.dirname(path)
-            if pdir:
-                os.makedirs(pdir, exist_ok=True)
-
-    @property
-    def effective_batch_size(self) -> int:
-        return self.batch_size * self.grad_accum
-
-    def rsc_layers_for(self, n_total: int) -> List[int]:
-        if not 1 <= self.max_active_layers <= 4:
-            raise ValueError("max_active_layers must be in [1, 4]")
-        start, stop = int(0.30 * n_total), int(0.80 * n_total)
-        count = min(8, max(1, stop - start))
-        indices = torch.linspace(start, stop - 1, steps=count).round().long().tolist()
-        return sorted(set(max(1, min(idx, n_total - 2)) for idx in indices))
+def apply_overrides(cfg: RSCConfig, assignments: List[str]) -> RSCConfig:
+    """Apply repeatable ``key=value`` CLI overrides with type-aware parsing."""
+    known = {item.name: getattr(cfg, item.name) for item in fields(cfg)}
+    for assignment in assignments:
+        if "=" not in assignment:
+            raise ValueError(f"override must be key=value: {assignment}")
+        key, raw = assignment.split("=", 1)
+        if key not in known:
+            raise ValueError(f"unknown configuration key: {key}")
+        current = known[key]
+        if isinstance(current, bool):
+            value: Any = raw.strip().lower() in {"1", "true", "yes", "on"}
+        elif isinstance(current, int):
+            value = int(raw)
+        elif isinstance(current, float):
+            value = float(raw)
+        elif isinstance(current, list):
+            subtype = type(current[0]) if current else str
+            value = [subtype(part.strip()) for part in raw.split(",") if part.strip()]
+        else:
+            value = raw
+        setattr(cfg, key, value)
+    cfg.validate()
+    return cfg

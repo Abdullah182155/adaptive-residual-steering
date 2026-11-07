@@ -1,3 +1,9 @@
+# ── Presentation files (local only — not for repo) ────────────────────────────
+ARC_Research.pptx
+ARS_Research_Presentation.pptx
+scripts/build_full_ars_presentation.py
+scratch/
+
 # Original project sources (kept locally as immutable source of truth, excluded from repo)
 RSC_Training.py
 reference_implementation/
@@ -25,6 +31,7 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+*.zip
 
 # Virtual environments
 venv/
@@ -64,6 +71,7 @@ datasets_cache/
 # Logs & outputs
 logs/
 runs/
+experiments/runs/
 *.log
 outputs/
 results/
@@ -92,3 +100,30 @@ secrets.json
 # Kaggle / Cloud specific temporary dirs
 kaggle/
 working/
+
+# Local Project Instructions (private instructions — kept locally, excluded from repo)
+GEMINI.md
+AGENTS.md
+nul
+
+# Temporary execution files (generated during pipeline runs)
+REPORT.txt
+experiment_record.txt
+lastoutput.txt
+run_manifest.json
+PHASE1_EXECUTION_CHECKLIST.md
+
+# Archived research assets: retain locally, never add to the production codebase.
+diagrams/
+*.ppt
+*.pptx
+*.pdf
+*.mp4
+*.gif
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.ipynb
+*.tmp
+*.bak
