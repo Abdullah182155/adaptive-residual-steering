@@ -259,7 +259,7 @@ def gsm8k_to_cot(
         out["calc_mask"] = calc_masks
         return out
 
-    keep_raw_cols = ["question", "steps_list", "final_num"]
+    keep_raw_cols = ["question", "steps_list", "final_num", "answer"]
     remove_cols = [c for c in ds.column_names if c not in keep_raw_cols]
     ds = ds.map(tokenize_fn, batched=True, remove_columns=remove_cols)
     ds.set_format(
