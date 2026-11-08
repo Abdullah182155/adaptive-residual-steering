@@ -1,0 +1,206 @@
+<mxfile host="app.diagrams.net" modified="2026-11-07T00:00:00.000Z" agent="ARS" version="24.0.0" type="device">
+  <diagram name="ARS Full System Architecture" id="ars-full-system">
+    <mxGraphModel dx="1422" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="788" math="0" shadow="0" background="#111111">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <!-- Title -->
+        <mxCell id="title" value="&lt;b&gt;Adaptive Residual Steering (ARS)&lt;/b&gt;" style="text;html=1;align=center;fontSize=24;fontColor=#FF7A00;" vertex="1" parent="1">
+          <mxGeometry x="300" y="10" width="800" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="subtitle" value="Frozen Phi-2 (2.7B) + SteerNet Adapters + Adaptive Router" style="text;html=1;align=center;fontSize=12;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="300" y="46" width="800" height="25" as="geometry"/>
+        </mxCell>
+
+        <!-- Col 1: Input -->
+        <mxCell id="input" value="&lt;b&gt;Input&lt;/b&gt;&lt;br&gt;&lt;font color='#888888' size='1'&gt;GSM8K + demos&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF7A00;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="10" y="330" width="130" height="75" as="geometry"/>
+        </mxCell>
+
+        <!-- Col 2: Phi-2 Backbone -->
+        <mxCell id="phi2" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#181818;strokeColor=#555555;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="185" y="75" width="220" height="615" as="geometry"/>
+        </mxCell>
+        <mxCell id="phi2_title" value="&lt;b&gt;Phi-2 — FROZEN&lt;/b&gt;" style="text;html=1;align=center;fontSize=13;fontColor=#777777;" vertex="1" parent="1">
+          <mxGeometry x="195" y="82" width="200" height="25" as="geometry"/>
+        </mxCell>
+
+        <!-- Backbone layers -->
+        <mxCell id="emb" value="&lt;b&gt;Embedding&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1E1E1E;strokeColor=#555555;fontColor=#888888;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="110" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l07" value="&lt;b&gt;Layers 0–7&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1E1E1E;strokeColor=#555555;fontColor=#888888;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="155" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l8" value="&lt;b&gt;8&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF7A00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="200" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l11" value="&lt;b&gt;11&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF7A00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="245" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l13" value="&lt;b&gt;13&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF7A00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="290" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l15" value="&lt;b&gt;15  &lt;-- probe&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#FF7A00;fontColor=#FFFFFF;strokeWidth=2;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="335" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l17" value="&lt;b&gt;17&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF7A00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="380" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l1922" value="&lt;b&gt;19–22&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF7A00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="425" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l24" value="&lt;b&gt;24&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF7A00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="470" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="l2531" value="&lt;b&gt;Layers 25–31&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1E1E1E;strokeColor=#555555;fontColor=#888888;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="515" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="lmhead" value="&lt;b&gt;LM Head&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1E1E1E;strokeColor=#555555;fontColor=#888888;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="200" y="560" width="190" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="genans" value="&lt;b&gt;Generated Answer&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="200" y="620" width="190" height="45" as="geometry"/>
+        </mxCell>
+        <mxCell id="e_lm_gen" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="lmhead" target="genans" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Bracket for 10 candidate layers -->
+        <mxCell id="bracket" value="10" style="text;html=1;align=right;fontSize=11;fontColor=#FF7A00;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="185" y="375" width="30" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- Input -> Phi-2 -->
+        <mxCell id="e_in_phi" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="input" target="l15" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Col 3 top: SteerNet -->
+        <mxCell id="steer_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1A1000;strokeColor=#FF7A00;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="460" y="270" width="285" height="290" as="geometry"/>
+        </mxCell>
+        <mxCell id="steer_title" value="&lt;b&gt;SteerNet V5&lt;/b&gt;" style="text;html=1;align=center;fontSize=15;fontColor=#FF7A00;" vertex="1" parent="1">
+          <mxGeometry x="490" y="278" width="225" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="steer_sub" value="one per selected layer" style="text;html=1;align=center;fontSize=10;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="490" y="300" width="225" height="18" as="geometry"/>
+        </mxCell>
+        <mxCell id="sn1" value="&lt;b&gt;LN -&gt; W_down (D-&gt;16)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="472" y="322" width="260" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="sn2" value="&lt;b&gt;CausalDWConv1d (k=4)&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="472" y="367" width="260" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="sn3" value="&lt;b&gt;GELU -&gt; mag/dir split&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="472" y="412" width="260" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="sn4" value="&lt;b&gt;d = rho/sqrtK x mag x ||h|| x d_hat&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="472" y="457" width="260" height="38" as="geometry"/>
+        </mxCell>
+        <mxCell id="sn_cap" value="Cap: C_l = kappa * N_l" style="text;html=1;align=center;fontSize=10;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="490" y="502" width="225" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- h arrow: backbone -> steernet -->
+        <mxCell id="e_h_sn" value="h" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;fontColor=#FF7A00;fontSize=11;fontStyle=1;" edge="1" source="l8" target="steer_box" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- h+d arrow: steernet -> backbone -->
+        <mxCell id="e_hd_bk" value="h+d" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#CC6200;strokeWidth=2;endArrow=block;endFill=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;fontColor=#CC6200;fontSize=11;fontStyle=1;" edge="1" source="steer_box" target="l11" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Col 3 bottom: Router -->
+        <mxCell id="router_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1A1000;strokeColor=#FF7A00;strokeWidth=2;" vertex="1" parent="1">
+          <mxGeometry x="460" y="75" width="285" height="185" as="geometry"/>
+        </mxCell>
+        <mxCell id="rtr_title" value="&lt;b&gt;JointLayerRouter&lt;/b&gt;" style="text;html=1;align=center;fontSize=15;fontColor=#FF7A00;" vertex="1" parent="1">
+          <mxGeometry x="490" y="83" width="225" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="rt1" value="Scalars + Semantic" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF9933;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="472" y="112" width="260" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="rt2" value="Pass 1 -&gt; Pass 2" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF9933;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="472" y="148" width="260" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="rt3" value="u_final + K + S_ij" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#2A1A00;strokeColor=#CC6200;fontColor=#FF9933;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="472" y="184" width="260" height="30" as="geometry"/>
+        </mxCell>
+        <mxCell id="rt4" value="&lt;b&gt;Synergy-aware greedy&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="472" y="220" width="260" height="30" as="geometry"/>
+        </mxCell>
+
+        <!-- Probe arrow: backbone layer 15 -> router (L-shape right then up) -->
+        <mxCell id="e_probe" value="probe" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#CC6200;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#888888;fontSize=10;" edge="1" source="l15" target="router_box" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="445" y="354"/><mxPoint x="445" y="167"/></Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Mask arrow: router -> backbone (L-shape down then left) -->
+        <mxCell id="e_mask" value="mask" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#CC6200;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#888888;fontSize=10;" edge="1" source="router_box" target="l2531" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="445" y="215"/><mxPoint x="445" y="534"/></Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Col 4 top: Phase 1 -->
+        <mxCell id="ph1_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1C1200;strokeColor=#FF7A00;strokeWidth=2;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="800" y="270" width="390" height="290" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph1_title" value="&lt;b&gt;Phase 1 (S1)&lt;/b&gt;" style="text;html=1;align=center;fontSize=16;fontColor=#FF7A00;" vertex="1" parent="1">
+          <mxGeometry x="840" y="278" width="310" height="28" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph1_sub" value="Fixed-Route SteerNet Training" style="text;html=1;align=center;fontSize=11;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="840" y="305" width="310" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph1_l1" value="Typed NLL Loss (6 categories)" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="820" y="338" width="360" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph1_l2" value="Focal + KL divergence (w=2.0)" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="820" y="368" width="360" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph1_l3" value="On-policy collection (pass@4)" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="820" y="398" width="360" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph1_l4" value="Gold fallback + prompt shielding" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="820" y="428" width="360" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph1_footer" value="5 epochs | lr=5e-4 | rho=0.06  -&gt;  steernet.pt" style="text;html=1;align=center;fontSize=9;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="820" y="518" width="360" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- trains arrow: steernet -> ph1 -->
+        <mxCell id="e_sn_ph1" value="trains" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#CC6200;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#888888;fontSize=10;" edge="1" source="steer_box" target="ph1_box" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Col 4 bottom: Phase 2 -->
+        <mxCell id="ph2_box" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1C1200;strokeColor=#FF7A00;strokeWidth=2;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="800" y="75" width="390" height="185" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph2_title" value="&lt;b&gt;Phase 2 (S2)&lt;/b&gt;" style="text;html=1;align=center;fontSize=16;fontColor=#FF7A00;" vertex="1" parent="1">
+          <mxGeometry x="840" y="83" width="310" height="28" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph2_sub" value="Router Training" style="text;html=1;align=center;fontSize=11;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="840" y="110" width="310" height="20" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph2_l1" value="RLOO policy gradient" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="820" y="138" width="360" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph2_l2" value="Coop. Plackett-Luce sampling" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="820" y="163" width="360" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph2_l3" value="Entropy bonuses H(K) + H(sub)" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="820" y="188" width="360" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph2_l4" value="Health check + auto-recovery" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="820" y="213" width="360" height="22" as="geometry"/>
+        </mxCell>
+        <mxCell id="ph2_footer" value="3 epochs | lr=5e-5 | K=[2,8]  -&gt;  router.pt" style="text;html=1;align=center;fontSize=9;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="820" y="238" width="360" height="22" as="geometry"/>
+        </mxCell>
+
+        <!-- trains arrow: router -> ph2 -->
+        <mxCell id="e_rtr_ph2" value="trains" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#CC6200;strokeWidth=1.5;endArrow=block;endFill=1;fontColor=#888888;fontSize=10;" edge="1" source="router_box" target="ph2_box" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Footer -->
+        <mxCell id="footer" value="Zero heuristics  |  Frozen backbone  |  Relative amplitude  |  Prompt shielding" style="text;html=1;align=center;fontSize=10;fontColor=#555555;" vertex="1" parent="1">
+          <mxGeometry x="200" y="720" width="900" height="25" as="geometry"/>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

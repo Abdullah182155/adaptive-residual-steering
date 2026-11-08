@@ -42,6 +42,7 @@ from src.training.router_trainer import (
     save_router_weights,
     load_router_weights,
 )
+from src.training.gate_trainer import train_phase2b_gate, load_gate_weights
 
 
 LEGACY_NOTEBOOK_OVERRIDES = {"catalog_max_k", "s1_k_choices", "s1_onpolicy_fraction"}
@@ -165,10 +166,10 @@ def run(args) -> int:
                 f"S1 checkpoint is required for {args.stage}: {checkpoint}"
             )
         load_steer_weights(model, str(checkpoint), cfg, device)
-    stage = {"train": "S1", "calibrate": "S5", "router": "S2"}.get(args.stage, args.stage)
+    stage = {"train": "S1", "calibrate": "S5", "router": "S2", "gate": "S2B"}.get(args.stage, args.stage)
 
     train_data = validation_data = []
-    if stage in {"S1", "S2", "S5", "all"}:
+    if stage in {"S1", "S2", "S2B", "S5", "all"}:
         raw_train, raw_val = gsm8k_to_cot(tokenizer, cfg)
         train_data = prepare_dataset_split(raw_train, args.s1_train_n)
         validation_data = prepare_dataset_split(raw_val, args.s1_val_n)
@@ -192,6 +193,21 @@ def run(args) -> int:
             router_result["router"], router_result["gate"], cfg, cfg.router_save_path
         )
         print(f"Wrote router checkpoint: {cfg.router_save_path}")
+
+    if stage in {"S2B", "all"}:
+        print("Running S2B Phase 2B Gate training")
+        checkpoint = Path(cfg.lora_save_path)
+        if checkpoint.exists():
+            load_steer_weights(model, str(checkpoint), cfg, device)
+        else:
+            print(f"[warning] No S1 checkpoint found at {checkpoint}, using current weights")
+        # Enable gate on the model before training
+        cfg.use_gate = True
+        gate_result = train_phase2b_gate(
+            model, train_data, validation_data, cfg, device, tokenizer=tokenizer
+        )
+        if gate_result:
+            print(f"[S2B] best_val_nll={gate_result.get('best_val_nll', 'N/A'):.4f}")
 
     if stage in {"S5", "all"}:
         print("Running S5 deployment-envelope calibration")
@@ -254,7 +270,7 @@ def run(args) -> int:
 
 def stage_requires_checkpoint(stage: str) -> bool:
     """Separate S5 and benchmark invocations reload the S1 adapter checkpoint."""
-    return stage in {"S5", "bench", "calibrate", "S2", "router"}
+    return stage in {"S5", "bench", "calibrate", "S2", "S2B", "router", "gate"}
 
 
 if __name__ == "__main__":

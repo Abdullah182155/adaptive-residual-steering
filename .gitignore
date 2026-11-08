@@ -122,7 +122,6 @@ run_manifest.json
 PHASE1_EXECUTION_CHECKLIST.md
 
 # Archived research assets: retain locally, never add to the production codebase.
-diagrams/
 *.ppt
 *.pptx
 *.pdf
@@ -135,3 +134,12 @@ diagrams/
 *.ipynb
 *.tmp
 *.bak
+
+# Allow diagram assets in diagrams/
+!diagrams/
+!diagrams/*.drawio
+!diagrams/*.png
+diagrams/_gen_all.py
+
+# EGM internal contract files (local-only, used by Claude + agents)
+**/EGM.md

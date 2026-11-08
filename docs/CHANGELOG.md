@@ -278,11 +278,85 @@ Deep audit of the entire SteerNet + Router system, identifying and fixing 21 bug
 - val_nll converging steadily: 0.855 → 0.826 over 5 epochs
 - On-policy pass rate: 32% (80/250 questions correct)
 
+High variance due to small test set (n=50). First properly-scaled run documented below.
+
+---
+
+### Run 6 — Balanced Profile Validation
+
+**Date**: 2026-11-08  
+**Profile**: `balanced` — 2000 train, 300 test, 5 S1 epochs + 3 S2 epochs  
+**Hardware**: 2× Tesla T4 (15360 MiB each)
+
+#### Results
+
+| Shots | Baseline | Fixed | Router | Delta (Fixed) | Delta (Router) |
+|-------|----------|-------|--------|---------------|----------------|
+| 0-shot | 49.0% | 53.0% | 52.3% | **+4.0 pp** | +3.3 pp |
+| 2-shot | 55.7% | 57.0% | 59.0% | +1.3 pp | **+3.3 pp** |
+| 4-shot | 59.7% | 59.7% | 58.7% | +0.0 pp | -1.0 pp |
+
+- 0-shot format compliance: **18% → 80.7%** (large improvement confirms SteerNet working for format)
+- 4-shot regression: eliminated (+0.0 pp vs -1.3 pp in v4.0)
+- Router p=0.0525 on 2-shot (approaching significance)
+
+#### Training Diagnostics
+
+| Epoch | crit | result_top1 | val_nll |
+|-------|------|-------------|---------|
+| 1 | 0.3585 | 0.955 | 0.8191 |
+| 2 | 0.3432 | 0.959 | 0.8083 |
+| 3 | 0.3433 | 0.959 | **0.8083** ← plateau |
+| 4 | 0.3383 | 0.961 | 0.8051 |
+| 5 | 0.3377 | 0.961 | 0.8055 |
+
+val_nll plateaued after epoch 2. Training loss continued falling (0.510 → 0.136), indicating overfitting on format patterns without generalising to multi-step reasoning.
+
+On-policy collection:
+- Epoch 2: 142/500 correct (28.4%) + 358 gold fallback → 500 new rows
+- Epoch 4: 188/625 correct (30.1%) + 340 gold fallback → 528 new rows
+- ~70% of on-policy rows came from gold fallback (not model-generated correct solutions)
+
+Router training:
+- Epoch 1: COLLAPSED (mean_k=2.00, entropy=0.55 bits) — auto-recovery doubled beta_entropy_subset
+- Epoch 2-3: OK (mean_k≈4.9, entropy=0.77 bits)
+- Final layer entropy 0.77 bits — still below 1.5-bit target; near-uniform subset selection
+
+#### Error Taxonomy (0-shot, n=300)
+
+| Category | Count | % |
+|----------|-------|---|
+| CORRECT | 128 | 42.7% |
+| PLAN_ERROR | 102 | 34.0% |
+| ARITHMETIC | 37 | 12.3% |
+| UNGROUNDED_OPERAND | 18 | 6.0% |
+| LOOP_OR_RUNON | 9 | 3.0% |
+| EXTRACTION | 5 | 1.7% |
+| NO_ANSWER | 1 | 0.3% |
+
+PLAN_ERROR (34%) is the dominant failure mode. The SteerNet improved format but not multi-step reasoning planning. This points to prose tokens still receiving insufficient gradient signal.
+
+#### Gaps to Target
+
+| Metric | This Run | Target | Gap |
+|--------|----------|--------|-----|
+| 0-shot delta | +4.0 pp | +15 pp | −11 pp |
+| 2-shot delta | +1.3 pp (fixed) | +5 pp | −3.7 pp |
+| 4-shot delta | 0.0 pp | ≥ 0 pp | ✅ |
+| Router entropy | 0.77 bits | > 1.5 bits | −0.73 bits |
+| Router collapse | epoch 1 | none | fix pending |
+
+#### Root Causes and Pending Fixes
+
+1. **RTR 5 (warmup entropy) not yet code-applied**: Router collapsed in epoch 1 despite being in the plan. Fix: keep subset entropy active during warmup.
+2. **Training set size**: 2000 examples vs full 7473. More data expected to reduce plateau effect.
+3. **val_nll plateau**: Suggests SteerNet is memorising format patterns from training data rather than learning generalizable reasoning improvements.
+4. **FIX 1 verification needed**: 34% PLAN_ERROR with plateau after epoch 2 is consistent with prose tokens still receiving low or zero gradient.
+
 ### Current Status
 
-- Full-scale run (7473 training examples, 5 S1 epochs + 3 S2 epochs) in progress
 - Target: 0-shot ≥ +15pp, 2-shot ≥ +5pp, 4-shot ≥ 0pp
-- Router health to be validated with fixed entropy threshold and correct collapse recovery
+- Next: apply remaining plan fixes (RTR 5 warmup entropy, FIX 1 prose gradient verification, FIX 5 cap scaling), then run full profile (7473 training examples)
 
 ### Configuration Snapshot
 

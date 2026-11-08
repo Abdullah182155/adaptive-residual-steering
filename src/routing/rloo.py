@@ -22,6 +22,41 @@ def per_example_answer_nll(logits: torch.Tensor, labels: torch.Tensor) -> torch.
     return (token_nll * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
 
 
+def per_example_answer_nll_weighted(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    answer_end_frac: float = 0.30,
+    answer_weight: float = 2.0,
+) -> torch.Tensor:
+    """NLL with higher weight on the final answer tokens (last `answer_end_frac`).
+
+    The answer region is approximated as the last `answer_end_frac` fraction of
+    each example's valid (non-masked) tokens — where T_FINAL and T_RESULT tokens
+    tend to concentrate. This gives the router a sharper reward signal for routing
+    that directly improves answer quality rather than intermediate prose.
+    """
+    shift_logits = logits[:, :-1, :].float()
+    shift_labels = labels[:, 1:]
+    token_nll = F.cross_entropy(
+        shift_logits.transpose(1, 2), shift_labels, ignore_index=-100, reduction="none"
+    )
+    valid = shift_labels.ne(-100)                     # (B, T-1)
+    n_valid = valid.sum(dim=1, keepdim=True)          # (B, 1)
+
+    # Build per-token weight: tokens in the last fraction get higher weight
+    # Compute cumulative position within valid tokens only
+    cumpos = valid.float().cumsum(dim=1)              # (B, T-1): 1-indexed valid position
+    threshold = n_valid * (1.0 - answer_end_frac)     # (B, 1)
+    in_answer = (cumpos > threshold) & valid          # (B, T-1)
+
+    weight = torch.where(in_answer, torch.full_like(token_nll, answer_weight), torch.ones_like(token_nll))
+    weight = weight * valid.float()                   # zero out padding
+
+    weighted_nll = (token_nll * weight).sum(dim=1)
+    weight_sum = weight.sum(dim=1).clamp(min=1)
+    return weighted_nll / weight_sum
+
+
 def sample_subset_plackett_luce(
     logits: torch.Tensor,
     k: torch.Tensor,
@@ -147,21 +182,26 @@ def compute_router_rloo_loss(
     logprob_a = logprob_k_a + logprob_subset_a
     logprob_b = logprob_k_b + logprob_subset_b
 
-    # Evaluate NLL for each route (no gradient through backbone / steer_nets)
+    # Evaluate NLL for each route using answer-weighted NLL for sharper reward signal
+    answer_nll_weight = getattr(cfg, "router_answer_nll_weight", 2.0)
     old_override = model._routing_override
     try:
         model.set_routing_override("matrix", subset_a_mask.detach())
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                nll_a = per_example_answer_nll(
-                    model(input_ids=ids, attention_mask=mask).logits, labels
+                nll_a = per_example_answer_nll_weighted(
+                    model(input_ids=ids, attention_mask=mask).logits,
+                    labels,
+                    answer_weight=answer_nll_weight,
                 )
 
         model.set_routing_override("matrix", subset_b_mask.detach())
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=ids.is_cuda):
-                nll_b = per_example_answer_nll(
-                    model(input_ids=ids, attention_mask=mask).logits, labels
+                nll_b = per_example_answer_nll_weighted(
+                    model(input_ids=ids, attention_mask=mask).logits,
+                    labels,
+                    answer_weight=answer_nll_weight,
                 )
     finally:
         # Restore previous override
@@ -175,7 +215,7 @@ def compute_router_rloo_loss(
                 model.set_routing_override(mode, list(val) if val is not None else [])
 
     # RLOO advantage: reward = -NLL - cost * (K - 1)
-    lambda_cost = getattr(cfg, "lambda_cost", 0.005)
+    lambda_cost = getattr(cfg, "lambda_cost", 0.0)
     reward_a = (-nll_a - lambda_cost * (k_a.float() - 1.0)).detach()
     reward_b = (-nll_b - lambda_cost * (k_b.float() - 1.0)).detach()
     advantage_a = reward_a - reward_b  # leave-one-out: A vs B as baseline
@@ -185,7 +225,7 @@ def compute_router_rloo_loss(
 
     # Entropy bonuses (prevent collapse)
     beta_k = getattr(cfg, "router_beta_entropy_k", 0.05)
-    beta_subset = getattr(cfg, "router_beta_entropy_subset", 0.02)
+    beta_subset = getattr(cfg, "router_beta_entropy_subset", 0.30)
     if warmup_k is None:
         h_k, h_subset = policy_entropy_bonus(u, k_logits, K_max)
     else:
@@ -198,7 +238,19 @@ def compute_router_rloo_loss(
     balance_loss = F.mse_loss(mean_selected, target_sel.expand_as(mean_selected))
     lambda_balance = getattr(cfg, "router_balance_weight", 0.1)
 
-    loss = policy_loss - beta_k * h_k - beta_subset * h_subset + lambda_balance * balance_loss
+    # Diversity penalty: encourage routes A and B to differ from each other.
+    # High overlap between subsets means the router is collapsing to one pattern.
+    overlap = (subset_a_mask & subset_b_mask).float().mean()
+    lambda_diversity = getattr(cfg, "router_diversity_weight", 0.05)
+    diversity_loss = lambda_diversity * overlap
+
+    loss = (
+        policy_loss
+        - beta_k * h_k
+        - beta_subset * h_subset
+        + lambda_balance * balance_loss
+        + diversity_loss
+    )
 
     # Track observations for router diagnostics (both subsets for less noisy EMA)
     router.observe(u.detach(), subset_a_mask.detach())
@@ -209,6 +261,8 @@ def compute_router_rloo_loss(
         "h_k": float(h_k.detach()),
         "h_subset": float(h_subset.detach()),
         "balance_loss": float(balance_loss.detach()),
+        "diversity_loss": float(diversity_loss.detach()),
+        "overlap": float(overlap.detach()),
         "mean_k": float((k_a.float() + k_b.float()).mean().detach() / 2.0),
         "mean_nll_a": float(nll_a.mean().detach()),
         "mean_nll_b": float(nll_b.mean().detach()),

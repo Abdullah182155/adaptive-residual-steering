@@ -51,6 +51,20 @@ def _gold(value) -> float:
     return float(str(value).replace(",", "").replace("$", "").strip())
 
 
+def _set_gate_mode(model, enabled: bool) -> None:
+    """Enable or disable the per-token gate on the model.
+
+    When disabled the gate is frozen at alpha=1.0 (pass-through, no selectivity).
+    When enabled the learned gate is active and applies per-token steering weights.
+    """
+    if not hasattr(model, "gates") or not model.gates:
+        return
+    for gate in model.gates.values():
+        gate._freeze_gate = not enabled
+        if not enabled:
+            gate._freeze_gate_value = 1.0
+
+
 @torch.no_grad()
 def _generate(
     model,
@@ -170,7 +184,7 @@ def run_benchmark(
     for n_shot in shots:
         arm_results: Dict[str, List[Dict[str, object]]] = {}
         for arm in arms:
-            if arm not in {"baseline", "fixed", "identity", "random", "router"}:
+            if arm not in {"baseline", "fixed", "identity", "random", "router", "gate", "full"}:
                 raise ValueError(f"unsupported benchmark arm: {arm}")
 
             if arm == "baseline":
@@ -179,31 +193,52 @@ def run_benchmark(
                     model.set_intervention_gain(1.0)
                 if hasattr(model, "set_control"):
                     model.set_control(None)
+                _set_gate_mode(model, enabled=False)
             elif arm == "identity":
                 model.set_routing_override("only", cfg.fixed_layers)
                 if hasattr(model, "set_intervention_gain"):
                     model.set_intervention_gain(0.0)
                 if hasattr(model, "set_control"):
                     model.set_control(None)
+                _set_gate_mode(model, enabled=False)
             elif arm == "fixed":
                 model.set_routing_override("only", cfg.fixed_layers)
                 if hasattr(model, "set_intervention_gain"):
                     model.set_intervention_gain(1.0)
                 if hasattr(model, "set_control"):
                     model.set_control(None)
+                _set_gate_mode(model, enabled=False)
             elif arm == "random":
                 model.set_routing_override("only", cfg.fixed_layers)
                 if hasattr(model, "set_intervention_gain"):
                     model.set_intervention_gain(1.0)
                 if hasattr(model, "set_control"):
                     model.set_control("random")
+                _set_gate_mode(model, enabled=False)
             elif arm == "router":
-                # Router arm: use installed route_selector; steering gain = 1.0
+                # Router arm: use installed route_selector; no gate
                 model.set_routing_override(None)
                 if hasattr(model, "set_intervention_gain"):
                     model.set_intervention_gain(1.0)
                 if hasattr(model, "set_control"):
                     model.set_control(None)
+                _set_gate_mode(model, enabled=False)
+            elif arm == "gate":
+                # Gate arm: fixed layers with learned per-token gate; no router
+                model.set_routing_override("only", cfg.fixed_layers)
+                if hasattr(model, "set_intervention_gain"):
+                    model.set_intervention_gain(1.0)
+                if hasattr(model, "set_control"):
+                    model.set_control(None)
+                _set_gate_mode(model, enabled=True)
+            elif arm == "full":
+                # Full arm: router selects layers + gate applies per-token weights
+                model.set_routing_override(None)
+                if hasattr(model, "set_intervention_gain"):
+                    model.set_intervention_gain(1.0)
+                if hasattr(model, "set_control"):
+                    model.set_control(None)
+                _set_gate_mode(model, enabled=True)
 
             results = []
             progress = tqdm(rows, desc=f"{suite} {n_shot}-shot {arm}", leave=False)
@@ -220,7 +255,7 @@ def run_benchmark(
                     cfg.generation_max_new_tokens,
                     policy=shield_policy,
                     question_idx=row_idx,
-                    route_prefill_fn=router_prefill_fn if arm == "router" else None,
+                    route_prefill_fn=router_prefill_fn if arm in {"router", "full"} else None,
                 )
                 guard = dict(model.guard_state)
                 cap = (
@@ -232,7 +267,7 @@ def run_benchmark(
                     guard.get("rel_max", 0.0)
                 ) > float(cap)
                 if (
-                    arm in {"fixed", "random"}
+                    arm in {"fixed", "random", "gate"}
                     and cfg.guard_revert_to_k0
                     and (guard_trip or guard.get("nonfinite", False))
                 ):

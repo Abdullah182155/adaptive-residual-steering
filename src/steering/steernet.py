@@ -162,6 +162,12 @@ class SteerNet(nn.Module):
         self.act = nn.GELU()
         self.drop = nn.Dropout(dropout)
 
+        # Bottleneck residual mixer: adds intra-rank feature interactions.
+        # Initialized near-zero so it starts as identity; learns compound
+        # conditions ("if dim A and dim B both active → adjust dim C").
+        self.mid = nn.Linear(rank, rank, bias=False)
+        nn.init.xavier_uniform_(self.mid.weight, gain=0.02)
+
         # Small non-zero output projection lets S1 optimise immediately.
         self.up = nn.Linear(rank, hidden_dim, bias=False)
         # Forward is scale-invariant to up (direction is normalized); gain 1.0 gives stable step
@@ -222,6 +228,9 @@ class SteerNet(nn.Module):
         # Apply causal convolution if enabled
         if self.use_causal_conv:
             x = self.conv(x, is_decode=is_decode)
+
+        # Bottleneck residual: compound feature interactions
+        x = x + self.act(self.mid(x))
 
         magnitude = torch.sigmoid(self.mag_head(x))
         direction = self.up(self.drop(x))

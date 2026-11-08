@@ -1,0 +1,157 @@
+<mxfile host="app.diagrams.net" modified="2026-11-07T00:00:00.000Z" agent="ARS" version="24.0.0" type="device">
+  <diagram name="SteerNet V5 Architecture" id="steernet-v5">
+    <mxGraphModel dx="1422" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1400" pageHeight="788" math="0" shadow="0" background="#111111">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+        <!-- Title -->
+        <mxCell id="title" value="&lt;b&gt;SteerNet V5 — Rank-16 Causal Residual Adapter&lt;/b&gt;" style="text;html=1;align=center;verticalAlign=middle;whiteSpace=wrap;fontSize=20;fontColor=#FF7A00;" vertex="1" parent="1">
+          <mxGeometry x="200" y="15" width="1000" height="40" as="geometry"/>
+        </mxCell>
+
+        <!-- ROW M: Main pipeline -->
+        <mxCell id="h" value="&lt;b&gt;h&lt;/b&gt;&lt;br&gt;&lt;font color='#888888' size='1'&gt;(B, T, D)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF7A00;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="20" y="280" width="120" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="ln" value="&lt;b&gt;LayerNorm&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF7A00;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="180" y="280" width="130" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="wdown" value="&lt;b&gt;W_down&lt;/b&gt;&lt;br&gt;&lt;font color='#FFE0B2' size='1'&gt;D → 16&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="350" y="280" width="130" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="conv" value="&lt;b&gt;CausalDWConv1d&lt;/b&gt;&lt;br&gt;&lt;font color='#FFE0B2' size='1'&gt;k=4, depthwise&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="530" y="278" width="160" height="59" as="geometry"/>
+        </mxCell>
+        <mxCell id="gelu" value="&lt;b&gt;GELU&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF7A00;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="740" y="280" width="100" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- M row arrows -->
+        <mxCell id="e_h_ln" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="h" target="ln" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_ln_wd" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="ln" target="wdown" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_wd_cv" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="wdown" target="conv" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_cv_gl" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="conv" target="gelu" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Split spine (decorative line from GELU right) -->
+        <mxCell id="spine_h" value="" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=none;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="930" y="307"/><mxPoint x="960" y="307"/></Array>
+            <mxPoint x="840" y="307" as="sourcePoint"/>
+            <mxPoint x="960" y="307" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="spine_v" value="" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=3;endArrow=none;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="960" y="175" as="sourcePoint"/>
+            <mxPoint x="960" y="440" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- ROW T: Magnitude branch -->
+        <mxCell id="mag_head" value="&lt;b&gt;mag_head&lt;/b&gt;&lt;br&gt;&lt;font color='#FFE0B2' size='1'&gt;Linear(16, 1)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="140" width="140" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="sigma" value="&lt;b&gt;σ&lt;/b&gt;" style="ellipse;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF7A00;fontColor=#FFFFFF;fontSize=16;" vertex="1" parent="1">
+          <mxGeometry x="1185" y="148" width="50" height="40" as="geometry"/>
+        </mxCell>
+        <mxCell id="mag_out" value="&lt;b&gt;&lt;font color='#FF7A00'&gt;magnitude&lt;/font&gt;&lt;/b&gt;&lt;br&gt;&lt;font color='#888888' size='1'&gt;[0, 1]&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF9933;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1275" y="143" width="110" height="50" as="geometry"/>
+        </mxCell>
+
+        <!-- T branch arrows -->
+        <mxCell id="e_sp_mh" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="960" y="167" as="sourcePoint"/>
+            <mxPoint x="1000" y="167" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_mh_sig" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="mag_head" target="sigma" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_sig_mo" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="sigma" target="mag_out" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- ROW B: Direction branch -->
+        <mxCell id="dropout" value="&lt;b&gt;Dropout&lt;/b&gt;&lt;br&gt;&lt;font color='#888888' size='1'&gt;p = 0.05&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF7A00;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1000" y="425" width="120" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="wup" value="&lt;b&gt;W_up&lt;/b&gt;&lt;br&gt;&lt;font color='#FFE0B2' size='1'&gt;16 → D&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=13;" vertex="1" parent="1">
+          <mxGeometry x="1165" y="425" width="120" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="dir_out" value="&lt;b&gt;&lt;font color='#FF7A00'&gt;direction&lt;/font&gt;&lt;/b&gt;&lt;br&gt;&lt;font color='#888888' size='1'&gt;(B, T, D)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF9933;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="1330" y="425" width="50" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- B branch arrows -->
+        <mxCell id="e_sp_do" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="960" y="452" as="sourcePoint"/>
+            <mxPoint x="1000" y="452" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_do_wu" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="dropout" target="wup" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_wu_do2" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="wup" target="dir_out" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Formula boxes -->
+        <mxCell id="fbox" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1C1200;strokeColor=#FF7A00;strokeWidth=2;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="20" y="560" width="620" height="95" as="geometry"/>
+        </mxCell>
+        <mxCell id="ftitle" value="&lt;b&gt;Relative Amplitude Computation&lt;/b&gt;" style="text;html=1;align=center;fontSize=13;fontColor=#FF7A00;" vertex="1" parent="1">
+          <mxGeometry x="120" y="570" width="380" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="feq" value="δ = (ρ_max / √K) × magnitude × ‖h_centered‖ × direction / ‖direction‖" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="30" y="600" width="600" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="fparams" value="ρ_max = 0.06  |  K = active layers  |  h_centered = h − mean(h)" style="text;html=1;align=center;fontSize=9;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="30" y="626" width="600" height="20" as="geometry"/>
+        </mxCell>
+
+        <mxCell id="cbox" value="" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#1C1200;strokeColor=#FF7A00;strokeWidth=2;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="680" y="560" width="620" height="95" as="geometry"/>
+        </mxCell>
+        <mxCell id="ctitle" value="&lt;b&gt;Smooth Cap Envelope&lt;/b&gt;" style="text;html=1;align=center;fontSize=13;fontColor=#FF7A00;" vertex="1" parent="1">
+          <mxGeometry x="800" y="570" width="280" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="ceq" value="C_l = κ × N_l      f(n) = n·C_l / √(n² + C_l²)" style="text;html=1;align=center;fontSize=11;fontColor=#FFFFFF;" vertex="1" parent="1">
+          <mxGeometry x="690" y="600" width="600" height="25" as="geometry"/>
+        </mxCell>
+        <mxCell id="cparams" value="κ = 0.04  |  N_l = calibrated per-layer norm" style="text;html=1;align=center;fontSize=9;fontColor=#888888;" vertex="1" parent="1">
+          <mxGeometry x="690" y="626" width="600" height="20" as="geometry"/>
+        </mxCell>
+
+        <!-- Arrow formula -> cap -->
+        <mxCell id="e_f_c" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=1.5;endArrow=block;endFill=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="640" y="607" as="sourcePoint"/>
+            <mxPoint x="680" y="607" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Output row -->
+        <mxCell id="delta_out" value="&lt;b&gt;δ  steering correction&lt;/b&gt;&lt;br&gt;&lt;font color='#FFE0B2' size='1'&gt;(B, T, D)&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="20" y="695" width="210" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="shield" value="&lt;b&gt;&lt;font color='#FF7A00'&gt;Position-0 Shield&lt;/font&gt;&lt;/b&gt;&lt;br&gt;&lt;font color='#888888' size='1'&gt;No steering on attention-sink&lt;/font&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#3A3A3A;strokeColor=#FF9933;fontColor=#FFFFFF;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="275" y="695" width="240" height="55" as="geometry"/>
+        </mxCell>
+        <mxCell id="hplusd" value="&lt;b&gt;h + δ&lt;/b&gt;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#FF7A00;strokeColor=#CC6200;fontColor=#FFFFFF;fontSize=15;" vertex="1" parent="1">
+          <mxGeometry x="560" y="695" width="130" height="55" as="geometry"/>
+        </mxCell>
+
+        <!-- Output arrows -->
+        <mxCell id="e_f_d" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="125" y="655" as="sourcePoint"/>
+            <mxPoint x="125" y="695" as="targetPoint"/>
+          </mxGeometry>
+        </mxCell>
+        <mxCell id="e_d_sh" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#888888;strokeWidth=1.5;endArrow=block;endFill=0;" edge="1" source="delta_out" target="shield" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+        <mxCell id="e_sh_hp" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#FF7A00;strokeWidth=2;endArrow=block;endFill=1;" edge="1" source="shield" target="hplusd" parent="1"><mxGeometry relative="1" as="geometry"/></mxCell>
+
+        <!-- Skip connection (dashed) -->
+        <mxCell id="skip" value="skip" style="edgeStyle=orthogonalEdgeStyle;strokeColor=#888888;strokeWidth=1.5;endArrow=block;endFill=0;dashed=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;" edge="1" source="h" target="hplusd" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="80" y="740"/><mxPoint x="625" y="740"/></Array>
+          </mxGeometry>
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
