@@ -80,6 +80,8 @@ class Phi2WithRSC(nn.Module):
         self.guard_state: Dict[str, object] = {}
         self._collect_injection_trace = False
         self.injection_trace: Dict[int, list] = {}
+        self._capture_deltas = False
+        self._captured_deltas: Dict[int, torch.Tensor] = {}
 
         self._register_hooks()
         for parameter in self.base_model.parameters():
@@ -228,6 +230,8 @@ class Phi2WithRSC(nn.Module):
         if self._collect_injection_trace:
             relative = injected.norm(dim=-1) / hidden_float.norm(dim=-1).clamp_min(1e-6)
             self.injection_trace.setdefault(self.target_layers[position], []).append(relative.detach().cpu())
+        if self._capture_deltas:
+            self._captured_deltas[self.target_layers[position]] = injected
         result = (hidden_float + injected).to(hidden.dtype)
         if was_2d:
             result = result.squeeze(0)
@@ -357,6 +361,27 @@ class Phi2WithRSC(nn.Module):
             yield
         finally:
             self._hooks_disabled = previous
+
+    @contextmanager
+    def capture_base_hidden(self):
+        """Run a forward pass without steering, capturing hidden states at target layers."""
+        captured: Dict[int, torch.Tensor] = {}
+        handles = []
+        for layer_idx in self.target_layers:
+            def _make_hook(li):
+                def _hook(module, _input, output):
+                    h = output[0] if isinstance(output, tuple) else output
+                    captured[li] = h.detach().float()
+                return _hook
+            handles.append(self._layers[layer_idx].register_forward_hook(_make_hook(layer_idx)))
+        prev = self._hooks_disabled
+        self._hooks_disabled = True
+        try:
+            yield captured
+        finally:
+            for h in handles:
+                h.remove()
+            self._hooks_disabled = prev
 
     def forward(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)

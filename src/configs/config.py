@@ -52,6 +52,17 @@ class RSCConfig:
     s1_answer_weight: float = 1.0     # >1.0 upweights last s1_answer_region_frac tokens
     s1_answer_region_frac: float = 0.30
 
+    # Phase 1C: Contrastive Residual Training
+    contrastive_phase: bool = False
+    contrastive_epochs: int = 3
+    contrastive_lr: float = 5e-5
+    contrastive_weight: float = 1.0
+    contrastive_nll_weight: float = 0.3
+    contrastive_gen_batch: int = 4
+    contrastive_temperature: float = 0.0
+    contrastive_n_samples: int = 1
+    contrastive_frac: float = 1.0
+
     # V2 Typed Loss
     loss_mode: str = "typed"  # "typed" or "legacy"
     lambda_format: float = 0.02

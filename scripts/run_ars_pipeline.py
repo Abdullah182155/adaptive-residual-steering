@@ -37,6 +37,7 @@ from src.deploy.calibrate import (
 from src.evaluation.benchmark import run_benchmark, write_record, write_report
 from src.models.wrapper import Phi2WithRSC
 from src.training.trainer import load_steer_weights, train_phase1_steernet
+from src.training.contrastive import train_phase1c_contrastive
 from src.training.router_trainer import (
     train_phase2_router,
     save_router_weights,
@@ -52,7 +53,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="ARS fixed-route Phase 1 pipeline")
     parser.add_argument(
         "--stage",
-        choices=("S1", "S2", "S2B", "S5", "bench", "all", "train", "calibrate", "router", "gate"),
+        choices=("S1", "S1C", "S2", "S2B", "S5", "bench", "all", "train", "calibrate", "router", "gate"),
         default="all",
     )
     parser.add_argument("--steernet_arch", choices=("v5",), default="v5")
@@ -169,7 +170,7 @@ def run(args) -> int:
     stage = {"train": "S1", "calibrate": "S5", "router": "S2", "gate": "S2B"}.get(args.stage, args.stage)
 
     train_data = validation_data = []
-    if stage in {"S1", "S2", "S2B", "S5", "all"}:
+    if stage in {"S1", "S1C", "S2", "S2B", "S5", "all"}:
         raw_train, raw_val = gsm8k_to_cot(tokenizer, cfg)
         train_data = prepare_dataset_split(raw_train, args.s1_train_n)
         validation_data = prepare_dataset_split(raw_val, args.s1_val_n)
@@ -177,6 +178,9 @@ def run(args) -> int:
     if stage in {"S1", "all"}:
         print("Running S1 fixed-route SteerNet training")
         train_phase1_steernet(model, train_data, validation_data, cfg, device, tokenizer=tokenizer)
+    if stage in {"S1C"}:
+        print("Running S1C contrastive residual training")
+        train_phase1c_contrastive(model, train_data, validation_data, cfg, device, tokenizer=tokenizer)
     if stage in {"S2", "all"}:
         print("Running S2 Phase 2 Router training")
         if stage == "S2":
@@ -270,7 +274,7 @@ def run(args) -> int:
 
 def stage_requires_checkpoint(stage: str) -> bool:
     """Separate S5 and benchmark invocations reload the S1 adapter checkpoint."""
-    return stage in {"S5", "bench", "calibrate", "S2", "S2B", "router", "gate"}
+    return stage in {"S5", "bench", "calibrate", "S1C", "S2", "S2B", "router", "gate"}
 
 
 if __name__ == "__main__":
