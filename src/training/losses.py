@@ -146,6 +146,18 @@ def typed_objective(
             return zero, {"_nll": zero, "_kl": zero}
         return zero, {}
 
+    # Answer-region positional weight (upweights last N% of completion tokens)
+    _aw = getattr(cfg, "s1_answer_weight", 1.0)
+    if _aw > 1.0:
+        _frac = getattr(cfg, "s1_answer_region_frac", 0.30)
+        _valid = sel.float()
+        _cumpos = _valid.cumsum(dim=1)
+        _n_valid = _cumpos.max(dim=1, keepdim=True).values.clamp_min(1)
+        _in_answer = (_cumpos > _n_valid * (1.0 - _frac)) & sel
+        _pos_w = torch.where(_in_answer, _aw, 1.0)[sel]
+    else:
+        _pos_w = None
+
     z = logits[:, :-1][sel].float()
     y = labels[:, 1:][sel]
     c = types[:, 1:][sel]
@@ -162,6 +174,8 @@ def typed_objective(
         else:
             p = (-nll).exp()
         w = (1.0 - p).clamp_min(0).pow(gamma) if gamma > 0 else torch.ones_like(p)
+        if _pos_w is not None:
+            w = w * _pos_w
 
     if learned_weights is not None:
         cat_w = learned_weights.category_weights()

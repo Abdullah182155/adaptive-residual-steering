@@ -48,6 +48,10 @@ class RSCConfig:
     diversify_prompts: bool = True
     seed: int = 42
 
+    # S1 answer-region upweighting — focuses gradient on the answer portion
+    s1_answer_weight: float = 1.0     # >1.0 upweights last s1_answer_region_frac tokens
+    s1_answer_region_frac: float = 0.30
+
     # V2 Typed Loss
     loss_mode: str = "typed"  # "typed" or "legacy"
     lambda_format: float = 0.02
