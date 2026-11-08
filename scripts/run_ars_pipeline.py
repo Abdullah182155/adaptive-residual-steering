@@ -52,7 +52,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="ARS fixed-route Phase 1 pipeline")
     parser.add_argument(
         "--stage",
-        choices=("S1", "S2", "S5", "bench", "all", "train", "calibrate", "router"),
+        choices=("S1", "S2", "S2B", "S5", "bench", "all", "train", "calibrate", "router", "gate"),
         default="all",
     )
     parser.add_argument("--steernet_arch", choices=("v5",), default="v5")
