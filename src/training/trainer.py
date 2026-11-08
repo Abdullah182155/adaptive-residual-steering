@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import contextlib
+import gc
 import json
 import math
 from pathlib import Path
@@ -415,6 +416,10 @@ def train_phase1_steernet(
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda s: _lr_lambda(s, total_steps, warm_steps, cfg.phase1_min_lr_frac)
     )
+    # Manual plateau tracker — mutates cosine scheduler's base_lrs so the
+    # reduction persists across subsequent per-step cosine updates.
+    _plateau_best_nll = float("inf")
+    _plateau_wait = 0
 
     scaler = torch.amp.GradScaler(
         "cuda",
@@ -577,6 +582,38 @@ def train_phase1_steernet(
                 name: value.detach().cpu().clone()
                 for name, value in model.steer_nets.state_dict().items()
             }
+
+        # Plateau-aware LR reduction — mutates cosine base_lrs so reduction persists
+        _val_nll_now = val_eval["validation_nll"]
+        if _val_nll_now < _plateau_best_nll - 1e-4:
+            _plateau_best_nll = _val_nll_now
+            _plateau_wait = 0
+        else:
+            _plateau_wait += 1
+            if _plateau_wait >= getattr(cfg, "phase1_plateau_patience", 2):
+                _factor = getattr(cfg, "phase1_plateau_factor", 0.5)
+                _min_lr = getattr(cfg, "phase1_plateau_min_lr", 5e-6)
+                scheduler.base_lrs = [max(lr * _factor, _min_lr) for lr in scheduler.base_lrs]
+                _plateau_wait = 0
+                print(f"  [plateau] LR reduced: {[f'{lr:.1e}' for lr in scheduler.base_lrs]}")
+
+        # Per-epoch checkpoint for ablation analysis
+        epoch_ckpt_path = Path(cfg.checkpoint_dir) / f"steernet_epoch{epoch + 1}.pt"
+        epoch_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "steer_nets": {n: v.detach().cpu().clone() for n, v in model.steer_nets.state_dict().items()},
+                "epoch": epoch + 1,
+                "crit": val_eval["crit"],
+                "val_nll": val_eval["validation_nll"],
+            },
+            epoch_ckpt_path,
+        )
+
+        # Free GPU cache between epochs to reduce fragmentation
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         on_policy_interval = getattr(cfg, "on_policy_interval", 1)
         is_last_epoch = (epoch + 1) >= cfg.phase1_epochs

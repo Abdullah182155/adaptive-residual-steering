@@ -16,8 +16,8 @@ class RSCConfig:
     steernet_arch: str = "v5"
     objective: str = "nll"
 
-    lora_rank: int = 16
-    lora_alpha: float = 16.0
+    lora_rank: int = 32
+    lora_alpha: float = 32.0
     lora_dropout: float = 0.05
     steer_kappa: float = 0.04
     steer_scale: float = 0.30
@@ -31,18 +31,21 @@ class RSCConfig:
     guard_revert_to_k0: bool = True
 
     batch_size: int = 2
-    grad_accum: int = 8
+    grad_accum: int = 16
     clip_grad: float = 1.0
     weight_decay: float = 0.01
     phase1_epochs: int = 5
-    phase1_lr: float = 5e-4
-    phase1_warmup_frac: float = 0.06
+    phase1_lr: float = 1.5e-4
+    phase1_warmup_frac: float = 0.08
     phase1_min_lr_frac: float = 0.10
+    phase1_plateau_factor: float = 0.5
+    phase1_plateau_patience: int = 2
+    phase1_plateau_min_lr: float = 5e-6
     log_every: int = 20
     n_samples: int = 7473
     max_tok_len: int = 512
     val_split: float = 0.08
-    diversify_prompts: bool = False
+    diversify_prompts: bool = True
     seed: int = 42
 
     # V2 Typed Loss
@@ -54,7 +57,7 @@ class RSCConfig:
     lambda_final: float = 0.35
     lambda_prose: float = 0.05
     focal_gamma: float = 2.0
-    kl_weight: float = 2.0
+    kl_weight: float = 0.5
     kl_arithmetic_weight: float = 0.30
     mag_l1_weight: float = 0.20
     steer_amplitude_k: Optional[int] = None
@@ -76,20 +79,30 @@ class RSCConfig:
 
     # Phase 2 Router
     phase2_lr: float = 5e-5
-    phase2_epochs: int = 3
+    phase2_epochs: int = 2
     router_max_k: int = 8
     router_min_k: int = 2
     router_semantic_dim: int = 16
     router_d_model: int = 32
     router_n_heads: int = 2
     router_beta_entropy_k: float = 0.05
-    router_beta_entropy_subset: float = 0.10
+    router_beta_entropy_subset: float = 0.30
     router_balance_weight: float = 0.1
-    router_warmup_epochs: int = 1
+    router_warmup_epochs: int = 0
+    router_diversity_weight: float = 0.05
+    router_answer_nll_weight: float = 2.0
     use_gate: bool = False
     gate_dim: int = 64
     gate_dropout: float = 0.1
     gate_init_alpha: float = 0.8
+    gate_lr: float = 1e-4
+    gate_epochs: int = 2
+    gate_l1_weight: float = 0.01
+    gate_rloo_weight: float = 1.0
+    gate_finetune_steernet: bool = True
+    gate_steernet_lr: float = 1e-5
+    gate_save_path: str = "checkpoints/gate.pt"
+    steernet_gated_save_path: str = "checkpoints/steernet_gated.pt"
     lambda_cost: float = 0.0
     router_probe_layer: Optional[int] = None
     router_save_path: str = "checkpoints/router.pt"

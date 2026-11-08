@@ -140,3 +140,6 @@ PHASE1_EXECUTION_CHECKLIST.md
 !diagrams/*.drawio
 !diagrams/*.png
 diagrams/_gen_all.py
+
+# EGM internal contract files (local-only, used by Claude + agents)
+**/EGM.md

@@ -179,7 +179,8 @@ def train_phase2_router(
         if gate is not None:
             gate.train()
 
-        warmup_k = cfg.router_min_k if epoch < cfg.router_warmup_epochs else None
+        # warmup_epochs=0 means no warmup — skip entirely so all epochs are real training
+        warmup_k = cfg.router_min_k if (cfg.router_warmup_epochs > 0 and epoch < cfg.router_warmup_epochs) else None
         epoch_losses: List[float] = []
         epoch_diags: List[Dict[str, float]] = []
 
@@ -251,12 +252,13 @@ def train_phase2_router(
             f"health={'OK' if diversity_ok else 'COLLAPSED'}"
         )
 
-        if not diversity_ok:
+        in_warmup = cfg.router_warmup_epochs > 0 and epoch < cfg.router_warmup_epochs
+        if not diversity_ok and not in_warmup:
             print(
                 f"  [warning] Router diversity collapsed! "
                 f"Doubling beta_entropy_subset: {cfg.router_beta_entropy_subset} → {cfg.router_beta_entropy_subset * 2}"
             )
-            cfg.router_beta_entropy_subset *= 2
+            cfg.router_beta_entropy_subset = min(cfg.router_beta_entropy_subset * 2, 2.0)
 
         # ── Validation NLL under router routing ──────────────────────────────
         router.eval()

@@ -13,7 +13,7 @@ from src.steering.steernet import SteerNet, load_layer_norms
 
 
 RouteSelector = Callable[[int, torch.device], torch.BoolTensor]
-GateProvider = Callable[[int, torch.Tensor], torch.Tensor]
+GateProvider = Callable[[int, torch.Tensor, torch.Tensor], torch.Tensor]
 
 
 class Phi2WithRSC(nn.Module):
@@ -213,7 +213,7 @@ class Phi2WithRSC(nn.Module):
             is_decode=self._is_decode_step,
             injection_mask=valid_mask,
         )
-        gate = self._gate_multiplier(position, delta)
+        gate = self._gate_multiplier(position, hidden_float, delta)
         injected = delta * selection * gate * self._effective_scale()
         injected = injected * valid_mask.unsqueeze(-1).to(injected.dtype)
         if self._control == "random":
@@ -248,10 +248,10 @@ class Phi2WithRSC(nn.Module):
         )
         return valid_mask & ~shield
 
-    def _gate_multiplier(self, position: int, delta: torch.Tensor) -> torch.Tensor:
+    def _gate_multiplier(self, position: int, hidden: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
         if self._gate_provider is None:
             return torch.ones_like(delta[..., :1])
-        gate = self._gate_provider(position, delta)
+        gate = self._gate_provider(position, hidden, delta)
         return gate.to(delta.device, delta.dtype)
 
     def _effective_scale(self) -> float:
