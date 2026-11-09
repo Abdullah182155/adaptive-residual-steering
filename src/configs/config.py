@@ -100,6 +100,7 @@ class RSCConfig:
     on_policy_k: int = 4                  # pass@k: samples per question
     on_policy_temperature: float = 0.7    # sampling temperature for pass@k
     on_policy_interval: int = 2           # run on-policy every N epochs (saves ~1h per skipped epoch)
+    on_policy_gold_fallback: bool = True   # False = pure rejection sampling (STaR-like, no gold CoT)
 
     # Phase 2 Router
     phase2_lr: float = 5e-5

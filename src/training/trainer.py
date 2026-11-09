@@ -356,7 +356,7 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
                 new_rows.append(row)
                 found = True
                 break
-        if not found and gold_cot:
+        if not found and gold_cot and getattr(cfg, "on_policy_gold_fallback", True):
             row = _tokenize_onpolicy(tokenizer, q, gold_cot, cfg, n_shot=ns)
             row["question"] = q
             row["final_num"] = gold
