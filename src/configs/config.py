@@ -63,6 +63,15 @@ class RSCConfig:
     contrastive_n_samples: int = 1
     contrastive_frac: float = 1.0
 
+    # Phase 1R: Self-Taught Reasoning (STaR)
+    star_k: int = 8
+    star_temperature: float = 0.7
+    star_epochs: int = 2
+    star_lr: float = 5e-5
+    star_rounds: int = 1
+    star_hint_k: int = 4
+    star_gen_batch: int = 2
+
     # V2 Typed Loss
     loss_mode: str = "typed"  # "typed" or "legacy"
     lambda_format: float = 0.02
