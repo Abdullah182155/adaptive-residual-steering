@@ -54,6 +54,7 @@ class Phi2WithRSC(nn.Module):
                     rho_max=getattr(cfg, "rho_max", 0.04),
                     layer_norms=norms,
                     layer_idx=layer,
+                    mag_head_init_bias=getattr(cfg, "mag_head_init_bias", -3.0),
                 ).to(self.device)
                 for layer in self.target_layers
             }

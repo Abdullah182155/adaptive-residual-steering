@@ -234,6 +234,30 @@ def run(args) -> int:
         apply_contract(model, contract)
         shots = args.shots or cfg.bench_shots
         arms = [arm.strip() for arm in args.arms.split(",") if arm.strip()]
+
+        # Load gated SteerNet + gate if available
+        if getattr(cfg, "use_gate", False):
+            import torch.nn as nn_mod
+            from src.gating.gate import RSCUsefulnessGate as _Gate
+            gated_sn_path = Path(getattr(cfg, "steernet_gated_save_path", "checkpoints/steernet_gated.pt"))
+            gate_ckpt_path = Path(getattr(cfg, "gate_save_path", "checkpoints/gate.pt"))
+            if gated_sn_path.exists():
+                load_steer_weights(model, str(gated_sn_path), cfg, device)
+                print(f"Loaded gated SteerNet: {gated_sn_path}")
+            if gate_ckpt_path.exists():
+                hidden_size = model.base_model.config.hidden_size
+                model.gates = nn_mod.ModuleDict({
+                    str(layer): _Gate(hidden_size, cfg).to(device)
+                    for layer in model.target_layers
+                })
+                load_gate_weights(model, str(gate_ckpt_path), device)
+                target_layers = model.target_layers
+                gates_ref = model.gates
+                def _gate_provider(position, hidden, delta):
+                    return gates_ref[str(target_layers[position])](hidden, delta)
+                model.set_gate_provider(_gate_provider)
+                print(f"Loaded gate: {gate_ckpt_path}")
+
         # Load router checkpoint if "router" arm requested
         router_prefill_fn = None
         if "router" in arms:

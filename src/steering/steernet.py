@@ -117,6 +117,7 @@ class SteerNet(nn.Module):
         telemetry_reservoir_size: int = 8192,
         use_causal_conv: bool = True,  # Use causal convolution
         conv_kernel_size: int = 4,  # Kernel size for causal conv
+        mag_head_init_bias: float = -3.0,
     ):
         super().__init__()
         self.rank = rank
@@ -176,9 +177,7 @@ class SteerNet(nn.Module):
         # Per-token magnitude head
         self.mag_head = nn.Linear(rank, 1)
         nn.init.zeros_(self.mag_head.weight)
-        # Negative bias init: sigmoid(-3) ≈ 0.047 — starts selective, typed loss lifts
-        # result/final tokens while L1 keeps prose tokens near zero.
-        nn.init.constant_(self.mag_head.bias, -3.0)
+        nn.init.constant_(self.mag_head.bias, mag_head_init_bias)
 
         scaling_factor = lora_alpha / rank
         self.register_buffer("scale", torch.tensor(scaling_factor, dtype=torch.float32))

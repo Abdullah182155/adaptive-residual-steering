@@ -25,6 +25,7 @@ class RSCConfig:
     amplitude_mode: str = "relative"
     rho_max: float = 0.06
     # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
+    mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05 (typed); set 2.0 for legacy (sigmoid(2)≈0.88)
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
@@ -124,6 +125,7 @@ class RSCConfig:
     gate_epochs: int = 2
     gate_l1_weight: float = 0.01
     gate_rloo_weight: float = 1.0
+    gate_contrastive_weight: float = 0.5
     gate_finetune_steernet: bool = True
     gate_steernet_lr: float = 1e-5
     gate_save_path: str = "checkpoints/gate.pt"

@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from src.configs.config import RSCConfig
 from src.gating.gate import RSCUsefulnessGate
 from src.routing.rloo import per_example_answer_nll_weighted
+from src.training.losses import T_FORMAT, T_OPERAND, T_OPERATOR, T_PROSE, T_RESULT, T_FINAL
 from src.training.trainer import (
     _epoch_batches,
     _prepare,
@@ -69,6 +70,49 @@ def _nll_with_gate_alpha(
     return per_example_answer_nll_weighted(logits, labels, answer_weight=answer_weight)
 
 
+def _contrastive_gate_loss(
+    gates: nn.ModuleDict,
+    token_types: torch.Tensor,
+    labels: torch.Tensor,
+) -> torch.Tensor:
+    """Push gate alpha UP on math tokens and DOWN on format tokens.
+
+    Targets (from the old RSC notebook that achieved +18pp):
+      math/operator/result/final → 0.85
+      format                     → 0.15
+      prose/discourse            → 0.65
+    """
+    valid = labels[:, 1:].ne(-100)
+    if not valid.any():
+        return labels.new_zeros((), dtype=torch.float32)
+
+    tt = token_types[:, 1:]
+    loss = labels.new_zeros((), dtype=torch.float32)
+    n_gates = 0
+    for gate in gates.values():
+        alpha = gate._alpha_for_aux  # (B, T, 1) — grad-carrying
+        if alpha is None:
+            continue
+        T_use = min(alpha.shape[1], tt.shape[1])
+        a = alpha[:, :T_use, 0]
+        t = tt[:, :T_use]
+        v = valid[:, :T_use]
+
+        math_mask = v & ((t == T_OPERAND) | (t == T_OPERATOR) | (t == T_RESULT) | (t == T_FINAL))
+        fmt_mask = v & (t == T_FORMAT)
+        prose_mask = v & (t == T_PROSE)
+
+        if math_mask.any():
+            loss = loss + (a[math_mask] - 0.85).pow(2).mean()
+        if fmt_mask.any():
+            loss = loss + (a[fmt_mask] - 0.15).pow(2).mean()
+        if prose_mask.any():
+            loss = loss + (a[prose_mask] - 0.65).pow(2).mean()
+        n_gates += 1
+
+    return loss / max(n_gates, 1)
+
+
 # ── Main training function ──────────────────────────────────────────────────
 
 def train_phase2b_gate(
@@ -91,6 +135,7 @@ def train_phase2b_gate(
     gate_lr        = getattr(cfg, "gate_lr", 1e-4)
     gate_l1_weight = getattr(cfg, "gate_l1_weight", 0.01)
     gate_rloo_w    = getattr(cfg, "gate_rloo_weight", 1.0)
+    gate_contrastive_w = getattr(cfg, "gate_contrastive_weight", 0.5)
     finetune_sn    = getattr(cfg, "gate_finetune_steernet", True)
     sn_lr          = getattr(cfg, "gate_steernet_lr", 1e-5)
     answer_w       = getattr(cfg, "router_answer_nll_weight", 2.0)
@@ -98,7 +143,7 @@ def train_phase2b_gate(
 
     print(f"\n{'='*70}")
     print(f"Phase 2B — Gate Training  ({gate_epochs} epochs, lr={gate_lr:.1e})")
-    print(f"  answer_weight={answer_w}  l1={gate_l1_weight}  rloo_w={gate_rloo_w}")
+    print(f"  answer_weight={answer_w}  l1={gate_l1_weight}  rloo_w={gate_rloo_w}  contrastive_w={gate_contrastive_w}")
     print(f"  finetune_steernet={'YES lr=' + str(sn_lr) if finetune_sn else 'NO'}")
     print(f"{'='*70}")
 
@@ -179,8 +224,10 @@ def train_phase2b_gate(
                 batch_rows = [rows[i] for i in bi] if isinstance(bi, list) else rows[bi : bi + cfg.batch_size]
                 if not batch_rows:
                     continue
-                batch, _ = _prepare(batch_rows, device)
+                batch, extras = _prepare(batch_rows, device)
                 ids, mask, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
+                token_types = extras.get("token_types")
+                model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
                 if ids.numel() == 0:
                     continue
 
@@ -202,8 +249,6 @@ def train_phase2b_gate(
 
                 # ── RLOO-style advantage ───────────────────────────────────
                 advantage = (nll_baseline - nll_learned).detach()   # positive = gate helps
-                # Policy gradient: maximise log-likelihood of alpha under positive advantage
-                # Use mean alpha as proxy for log-prob (simpler than exact gate log-prob)
                 mean_alpha_log = torch.stack([
                     gate._alpha_for_aux.clamp(1e-6, 1 - 1e-6).log().mean()
                     for gate in model.gates.values()
@@ -221,7 +266,12 @@ def train_phase2b_gate(
                     if gate.last_alpha is not None
                 ]).mean()
 
-                step_loss = task_loss + rloo_loss + gate_l1_weight * l1_loss
+                # ── Contrastive gate loss (math↑ format↓) ────────────────
+                cg_loss = ids.new_zeros((), dtype=torch.float32)
+                if token_types is not None and gate_contrastive_w > 0:
+                    cg_loss = _contrastive_gate_loss(model.gates, token_types, labels)
+
+                step_loss = task_loss + rloo_loss + gate_l1_weight * l1_loss + gate_contrastive_w * cg_loss
                 step_loss = step_loss / len(window_batches)
 
                 if torch.isfinite(step_loss):
