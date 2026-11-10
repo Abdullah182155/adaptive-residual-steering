@@ -68,13 +68,13 @@ def token_types_from_offsets(
 
 
 def lambdas(cfg: Any) -> Dict[int, float]:
-    """Category loss weights lambda_c."""
+    """Category loss weights lambda_c. Defaults match RSCConfig."""
     return {
-        T_FORMAT: getattr(cfg, "lambda_format", 0.05),
-        T_PROSE: getattr(cfg, "lambda_prose", 0.05),
+        T_FORMAT: getattr(cfg, "lambda_format", 0.02),
+        T_PROSE: getattr(cfg, "lambda_prose", 0.03),
         T_OPERATOR: getattr(cfg, "lambda_operator", 0.10),
-        T_OPERAND: getattr(cfg, "lambda_operand", 0.20),
-        T_RESULT: getattr(cfg, "lambda_result", 0.35),
+        T_OPERAND: getattr(cfg, "lambda_operand", 0.15),
+        T_RESULT: getattr(cfg, "lambda_result", 0.40),
         T_FINAL: getattr(cfg, "lambda_final", 0.30),
     }
 

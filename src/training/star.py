@@ -268,7 +268,8 @@ def train_phase1r_star(
         groups = _param_groups(model, cfg)
         for g in groups:
             g["lr"] = cfg.star_lr
-        optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999))
+        _betas = (0.9, 0.98) if cfg.loss_mode in ("legacy", "legacy_pure") else (0.9, 0.999)
+        optimizer = torch.optim.AdamW(groups, betas=_betas, eps=1e-6)
 
         lengths = [int(r["attention_mask"].sum()) for r in tokenized_rows]
         n_batches = math.ceil(len(tokenized_rows) / cfg.batch_size)
@@ -329,7 +330,9 @@ def train_phase1r_star(
                         device_type=device.type, enabled=device.type == "cuda"
                     ):
                         base_logits = None
-                        if cfg.kl_weight > 0:
+                        _need_base = (cfg.kl_weight > 0
+                                      or getattr(cfg, "focal_gamma", 0) > 0)
+                        if _need_base:
                             with torch.no_grad(), model.hooks_disabled():
                                 base_logits = model(
                                     input_ids=batch["input_ids"],
@@ -341,9 +344,12 @@ def train_phase1r_star(
                             attention_mask=batch["attention_mask"],
                         ).logits
 
+                        _tt = extras.get(
+                            "token_types", torch.zeros_like(batch["labels"])
+                        )
                         loss, _ = typed_objective(
                             logits, base_logits, batch["labels"],
-                            extras["token_types"], cfg, counts,
+                            _tt, cfg, counts,
                         )
                         loss = loss / len(micro)
 
@@ -377,8 +383,8 @@ def train_phase1r_star(
             )
             round_history["epochs"].append({"train_loss": avg_loss, **val_eval})
 
-            if val_eval["validation_nll"] <= best_val_nll:
-                best_val_nll = val_eval["validation_nll"]
+            if val_eval["crit"] <= best_val_nll:
+                best_val_nll = val_eval["crit"]
                 best_state = {
                     n: v.detach().cpu().clone()
                     for n, v in model.steer_nets.state_dict().items()

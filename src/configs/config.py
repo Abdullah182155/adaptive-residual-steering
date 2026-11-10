@@ -29,6 +29,10 @@ class RSCConfig:
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
+    steernet_init_gain: float = 1.0     # xavier gain for down/up projections; old code used 0.02
+    steernet_use_mag_head: bool = True   # per-token magnitude head; old code had none
+    steernet_use_soft_cap: bool = True   # smooth cap envelope; old code had none
+    steernet_use_conv: bool = True       # causal depthwise convolution; old code had none
     guard_revert_to_k0: bool = True
 
     batch_size: int = 2
@@ -40,7 +44,7 @@ class RSCConfig:
     phase1_warmup_frac: float = 0.08
     phase1_min_lr_frac: float = 0.10
     phase1_plateau_factor: float = 0.5
-    phase1_plateau_patience: int = 2
+    phase1_plateau_patience: int = 3
     phase1_plateau_min_lr: float = 5e-6
     log_every: int = 20
     n_samples: int = 7473
@@ -74,17 +78,18 @@ class RSCConfig:
     star_gen_batch: int = 2
 
     # V2 Typed Loss
-    loss_mode: str = "typed"  # "typed" or "legacy"
+    loss_mode: str = "typed"  # "typed", "legacy", or "legacy_pure"
+    typed_learned_weights: bool = True   # Kendall auto-weighting; False = manual lambdas
     lambda_format: float = 0.02
-    lambda_operator: float = 0.08
+    lambda_operator: float = 0.10
     lambda_operand: float = 0.15
     lambda_result: float = 0.40
-    lambda_final: float = 0.35
-    lambda_prose: float = 0.05
+    lambda_final: float = 0.30
+    lambda_prose: float = 0.03
     focal_gamma: float = 2.0
-    kl_weight: float = 0.5
+    kl_weight: float = 0.3
     kl_arithmetic_weight: float = 0.30
-    mag_l1_weight: float = 0.20
+    mag_l1_weight: float = 0.0
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
@@ -142,6 +147,8 @@ class RSCConfig:
     bench_shots: List[int] = field(default_factory=lambda: [0, 2, 4])
     generation_max_new_tokens: int = 256
     generation_temperature: float = 0.0
+    generation_repetition_penalty: float = 1.1    # old code used 1.1; 1.0 = disabled
+    generation_no_repeat_ngram: int = 6           # old code used 6; 0 = disabled
 
     def validate(self) -> None:
         """Reject configurations that violate Phase 1 contracts."""
@@ -159,8 +166,8 @@ class RSCConfig:
             raise ValueError("Phase 1 uses sqrt route scaling")
         if self.amplitude_mode not in {"relative", "capped"}:
             raise ValueError("amplitude_mode must be relative or capped")
-        if self.loss_mode not in {"typed", "legacy"}:
-            raise ValueError("loss_mode must be 'typed' or 'legacy'")
+        if self.loss_mode not in {"typed", "legacy", "legacy_pure"}:
+            raise ValueError("loss_mode must be 'typed', 'legacy', or 'legacy_pure'")
 
 
 def apply_overrides(cfg: RSCConfig, assignments: List[str]) -> RSCConfig:

@@ -50,7 +50,7 @@ def collect_layer_norms(
     print(f"Sink tokens: {sink_tokens}")
     
     for prompt_idx, prompt in enumerate(tqdm(prompts, desc="Collecting norms")):
-        enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048).to(device)
+        enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=args.max_length).to(device)
         input_ids = enc["input_ids"]
         attention_mask = enc["attention_mask"]
         
@@ -162,6 +162,7 @@ def main():
     parser.add_argument("--output", default="norms_calibration.json", help="Output JSON path")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--candidate_layers", nargs="+", type=int, default=[13, 15, 18, 20, 22])
+    parser.add_argument("--max_length", type=int, default=512, help="Max token length (should match max_tok_len)")
     args = parser.parse_args()
     
     device = torch.device(args.device)

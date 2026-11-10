@@ -75,6 +75,9 @@ def _generate(
     max_new_tokens: int,
     policy: str = "context",
     route_prefill_fn=None,
+    temperature: float = 0.0,
+    repetition_penalty: float = 1.1,
+    no_repeat_ngram_size: int = 6,
     **prompt_kw,
 ) -> Tuple[str, Dict[str, Any]]:
     prompt, enc, shield = build_prompt_with_shield(tokenizer, question, n_shot=n_shot, policy=policy, **prompt_kw)
@@ -88,14 +91,20 @@ def _generate(
     if route_prefill_fn is not None:
         route_prefill_fn(inputs["input_ids"], inputs["attention_mask"])
     stop = AnswerStop(tokenizer, inputs["input_ids"].shape[1])
+    do_sample = temperature > 0.0
     try:
-        tokens = model.generate(
-            **inputs,
+        gen_kwargs: Dict[str, Any] = dict(
             max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=0.0,
+            do_sample=do_sample,
             stopping_criteria=StoppingCriteriaList([stop]),
         )
+        if do_sample:
+            gen_kwargs["temperature"] = temperature
+        if repetition_penalty > 1.0:
+            gen_kwargs["repetition_penalty"] = repetition_penalty
+        if no_repeat_ngram_size > 0:
+            gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
+        tokens = model.generate(**inputs, **gen_kwargs)
     finally:
         model.set_prompt_shield_mask(None)
     prompt_tokens = inputs["input_ids"].shape[1]
@@ -256,6 +265,9 @@ def run_benchmark(
                     policy=shield_policy,
                     question_idx=row_idx,
                     route_prefill_fn=router_prefill_fn if arm in {"router", "full"} else None,
+                    temperature=getattr(cfg, "generation_temperature", 0.0),
+                    repetition_penalty=getattr(cfg, "generation_repetition_penalty", 1.1),
+                    no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
                 )
                 guard = dict(model.guard_state)
                 cap = (
@@ -281,6 +293,9 @@ def run_benchmark(
                         cfg.generation_max_new_tokens,
                         policy=shield_policy,
                         question_idx=row_idx,
+                        temperature=getattr(cfg, "generation_temperature", 0.0),
+                        repetition_penalty=getattr(cfg, "generation_repetition_penalty", 1.1),
+                        no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
                     )
                     model.set_routing_override("only", cfg.fixed_layers)
 

@@ -118,6 +118,9 @@ class SteerNet(nn.Module):
         use_causal_conv: bool = True,  # Use causal convolution
         conv_kernel_size: int = 4,  # Kernel size for causal conv
         mag_head_init_bias: float = -3.0,
+        init_gain: float = 1.0,       # xavier gain for down/up; old code = 0.02
+        use_mag_head: bool = True,     # per-token magnitude head; old code = False
+        use_soft_cap: bool = True,     # smooth cap envelope; old code = False
     ):
         super().__init__()
         self.rank = rank
@@ -128,6 +131,8 @@ class SteerNet(nn.Module):
         self.layer_norms = layer_norms or {}
         self.use_causal_conv = use_causal_conv
         self.conv_kernel_size = conv_kernel_size
+        self.use_mag_head = use_mag_head
+        self.use_soft_cap = use_soft_cap
 
         # Per-layer cap basis N_l
         self.N_l = self.layer_norms.get(
@@ -153,31 +158,32 @@ class SteerNet(nn.Module):
         # Network layers
         self.norm = nn.LayerNorm(hidden_dim)
         self.down = nn.Linear(hidden_dim, rank, bias=False)
-        # Use standard initialization (gain=1.0) instead of tiny 0.02
-        nn.init.xavier_uniform_(self.down.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.down.weight, gain=init_gain)
 
         # Causal convolution for sequence mixing
         if self.use_causal_conv:
             self.conv = CausalDWConv1d(rank, kernel_size=conv_kernel_size)
 
         self.act = nn.GELU()
-        self.drop = nn.Dropout(dropout)
 
-        # Bottleneck residual mixer: adds intra-rank feature interactions.
-        # Initialized near-zero so it starts as identity; learns compound
-        # conditions ("if dim A and dim B both active → adjust dim C").
+        # Only create the dropout modules for the active path (avoid unused parameters)
+        if use_mag_head:
+            self.drop = nn.Dropout(dropout)       # V5 path: before up projection
+        else:
+            self.drop_down = nn.Dropout(dropout)  # Legacy path: after down
+            self.drop_mid = nn.Dropout(dropout)   # Legacy path: after mid
+
         self.mid = nn.Linear(rank, rank, bias=False)
         nn.init.xavier_uniform_(self.mid.weight, gain=0.02)
 
-        # Small non-zero output projection lets S1 optimise immediately.
         self.up = nn.Linear(rank, hidden_dim, bias=False)
-        # Forward is scale-invariant to up (direction is normalized); gain 1.0 gives stable step
-        nn.init.xavier_uniform_(self.up.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.up.weight, gain=init_gain)
 
-        # Per-token magnitude head
-        self.mag_head = nn.Linear(rank, 1)
-        nn.init.zeros_(self.mag_head.weight)
-        nn.init.constant_(self.mag_head.bias, mag_head_init_bias)
+        # Per-token magnitude head (only when enabled)
+        if self.use_mag_head:
+            self.mag_head = nn.Linear(rank, 1)
+            nn.init.zeros_(self.mag_head.weight)
+            nn.init.constant_(self.mag_head.bias, mag_head_init_bias)
 
         scaling_factor = lora_alpha / rank
         self.register_buffer("scale", torch.tensor(scaling_factor, dtype=torch.float32))
@@ -222,17 +228,24 @@ class SteerNet(nn.Module):
 
         # Process through network
         x = self.norm(h_flt)
-        x = self.act(self.down(x))
 
-        # Apply causal convolution if enabled
-        if self.use_causal_conv:
-            x = self.conv(x, is_decode=is_decode)
-
-        # Bottleneck residual: compound feature interactions
-        x = x + self.act(self.mid(x))
-
-        magnitude = torch.sigmoid(self.mag_head(x))
-        direction = self.up(self.drop(x))
+        if self.use_mag_head:
+            # V5 path: dropout only before up projection
+            x = self.act(self.down(x))
+            if self.use_causal_conv:
+                x = self.conv(x, is_decode=is_decode)
+            x = x + self.act(self.mid(x))
+            magnitude = torch.sigmoid(self.mag_head(x))
+            direction = self.up(self.drop(x))
+        else:
+            # Legacy path: dropout after down AND mid (matches old RSCSteerNet)
+            x = self.drop_down(self.act(self.down(x)))
+            if self.use_causal_conv:
+                x = self.conv(x, is_decode=is_decode)
+            mid = self.drop_mid(self.act(self.mid(x)))
+            x = x + mid
+            magnitude = 1.0
+            direction = self.up(x)
 
         # Apply position shielding
         if self.amplitude_mode == "relative":
@@ -254,14 +267,15 @@ class SteerNet(nn.Module):
 
         delta = delta * shield_mask
 
-        # Smooth cap envelope: C_l = κ * N_l
-        # f(n) = n * C_l / sqrt(n^2 + C_l^2)
-        # Cap is fixed (not K-dependent) — amplitude scaling is handled by radius only
-        delta_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
-        cap = self.C_l
-
-        soft = cap / torch.sqrt(delta_norm.square() + cap * cap)
-        delta = delta * soft
+        # Smooth cap envelope (optional — old code had none)
+        if self.use_soft_cap:
+            delta_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
+            cap = self.C_l
+            soft = cap / torch.sqrt(delta_norm.square() + cap * cap)
+            delta = delta * soft
+        else:
+            delta_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
+            cap = self.C_l
 
         if self.amplitude_mode == "relative":
             pre_cap_q = q * shield_mask

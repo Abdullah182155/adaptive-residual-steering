@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 import math
 import re
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 

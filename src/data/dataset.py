@@ -147,9 +147,21 @@ def gsm8k_to_cot(
         question = example["question"]
         ans_text = example["answer"]
         sentences, final_num = split_answer(ans_text)
-        completion = gold_to_canonical_completion(sentences, final_num)
 
         rng = random.Random(cfg.seed + idx)
+        diversify = getattr(cfg, "diversify_prompts", False)
+        if diversify:
+            # Vary step prefix and final answer marker to prevent format memorisation.
+            # Question header stays stable so the prompt-completion boundary is predictable.
+            step_tpl = rng.choice(PromptTemplateBank.STEP_PREFIXES)
+            final_tpl = rng.choice(PromptTemplateBank.FINAL_PREFIXES)
+            body_lines = []
+            for si, s in enumerate(sentences):
+                s = s if s.endswith(".") else s + "."
+                body_lines.append(step_tpl.format(i=si + 1) + s)
+            completion = "\n".join(body_lines) + "\n" + final_tpl.format(ans=final_num)
+        else:
+            completion = gold_to_canonical_completion(sentences, final_num)
         k = shots[idx]
 
         # Draw k demonstrations

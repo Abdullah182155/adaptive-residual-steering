@@ -71,17 +71,14 @@ def collect_contrastive_pairs(
     total_batches = math.ceil(len(prompts) / gen_bs)
     for bi, i in enumerate(range(0, len(prompts), gen_bs)):
         batch = prompts[i : i + gen_bs]
+        # Always generate k completions to maximize coverage of wrong answers.
+        # With temp=0 (greedy), all k completions are identical but we still
+        # find one to compare against the gold completion.
         completions_flat.extend(
             _generate_onpolicy_batch(
                 model, tokenizer, batch, device,
                 num_return_sequences=k,
-                temperature=temp if temp > 0 else 1.0,
-            )
-            if temp > 0
-            else _generate_onpolicy_batch(
-                model, tokenizer, batch, device,
-                num_return_sequences=1,
-                temperature=0.0,
+                temperature=temp,
             )
         )
         if (bi + 1) % 50 == 0 or (bi + 1) == total_batches:
@@ -275,7 +272,8 @@ def train_phase1c_contrastive(
     groups = _param_groups(model, cfg)
     for g in groups:
         g["lr"] = cfg.contrastive_lr
-    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999))
+    _betas = (0.9, 0.98) if cfg.loss_mode in ("legacy", "legacy_pure") else (0.9, 0.999)
+    optimizer = torch.optim.AdamW(groups, betas=_betas, eps=1e-6)
 
     bs = cfg.batch_size
     n_batches = math.ceil(n_data / bs)
@@ -390,8 +388,8 @@ def train_phase1c_contrastive(
             {"cos_loss": avg_cos, "nll_reg": avg_nll, **val_eval}
         )
 
-        if val_eval["validation_nll"] <= best_val_nll:
-            best_val_nll = val_eval["validation_nll"]
+        if val_eval["crit"] <= best_val_nll:
+            best_val_nll = val_eval["crit"]
             best_state = {
                 n: v.detach().cpu().clone()
                 for n, v in model.steer_nets.state_dict().items()

@@ -68,3 +68,6 @@ def apply_contract(model, contract: Dict[str, object]) -> None:
     """Configure the wrapper for fixed-route deployment from a contract."""
     model.set_routing_override("only", contract["fixed_layers"])
     model.set_steer_scale(float(contract["steer_scale"]))
+    # Restore guard setting from contract to ensure benchmark/training consistency
+    if "guard_revert_to_k0" in contract and hasattr(model, "cfg"):
+        model.cfg.guard_revert_to_k0 = bool(contract["guard_revert_to_k0"])

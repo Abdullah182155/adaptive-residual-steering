@@ -55,6 +55,10 @@ class Phi2WithRSC(nn.Module):
                     layer_norms=norms,
                     layer_idx=layer,
                     mag_head_init_bias=getattr(cfg, "mag_head_init_bias", -3.0),
+                    init_gain=getattr(cfg, "steernet_init_gain", 1.0),
+                    use_mag_head=getattr(cfg, "steernet_use_mag_head", True),
+                    use_soft_cap=getattr(cfg, "steernet_use_soft_cap", True),
+                    use_causal_conv=getattr(cfg, "steernet_use_conv", True),
                 ).to(self.device)
                 for layer in self.target_layers
             }

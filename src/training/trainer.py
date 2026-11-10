@@ -140,9 +140,11 @@ def evaluate_typed(
     n = defaultdict(int)
     hit = defaultdict(int)
     ctx = contextlib.nullcontext() if steered else model.hooks_disabled()
+    bs = max(1, getattr(cfg, "batch_size", 2))
     with ctx:
-        for row in row_list:
-            batch, extras = _prepare([row], device)
+        for start in range(0, len(row_list), bs):
+            chunk = row_list[start : start + bs]
+            batch, extras = _prepare(chunk, device)
             model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
             logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
             sel = batch["labels"][:, 1:].ne(-100)
@@ -219,9 +221,9 @@ def load_steer_weights(
 
 @torch.no_grad()
 def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=256,
-                              num_return_sequences=1, temperature=0.0):
+                              num_return_sequences=1, temperature=0.0, max_prompt_length=512):
     enc = tokenizer(prompts, return_tensors="pt", truncation=True,
-                    max_length=512, padding=True)
+                    max_length=max_prompt_length, padding=True)
     inputs = {k: v.to(device) for k, v in enc.items()}
     model.set_prompt_shield_mask(None)
     do_sample = (num_return_sequences > 1 or temperature > 0.0)
@@ -321,6 +323,7 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
                 model, tokenizer, batch, device,
                 num_return_sequences=on_policy_k,
                 temperature=on_policy_temperature,
+                max_prompt_length=cfg.max_tok_len,
             )
         )
         if (bi + 1) % 25 == 0 or (bi + 1) == total_batches:
@@ -399,7 +402,7 @@ def train_phase1_steernet(
     lengths = [int(r["attention_mask"].sum()) for r in rows]
 
     learned_weights = None
-    if cfg.loss_mode == "typed":
+    if cfg.loss_mode == "typed" and getattr(cfg, "typed_learned_weights", True):
         learned_weights = LearnedLossWeights().to(device)
 
     groups = _param_groups(model, cfg)
@@ -409,7 +412,9 @@ def train_phase1_steernet(
             "lr": cfg.phase1_lr,
             "weight_decay": 0.0,
         })
-    optimizer = torch.optim.AdamW(groups, betas=(0.9, 0.999))
+    # Old code used betas=(0.9, 0.98), eps=1e-6; V5 uses (0.9, 0.999)
+    _betas = (0.9, 0.98) if cfg.loss_mode in ("legacy", "legacy_pure") else (0.9, 0.999)
+    optimizer = torch.optim.AdamW(groups, betas=_betas, eps=1e-6)
     n_batches = math.ceil(len(rows) / cfg.batch_size)
     total_steps = math.ceil(n_batches / cfg.grad_accum) * cfg.phase1_epochs
     warm_steps = max(1, int(cfg.phase1_warmup_frac * total_steps))
@@ -433,7 +438,8 @@ def train_phase1_steernet(
         "backbone": backbone_eval,
         "adapter_init": adapter_init,
         "train_nll": [],
-        "validation_nll": [],
+        "validation_nll": [],   # uniform average NLL (absolute value)
+        "crit_history": [],     # reasoning-focused weighted loss (checkpoint metric)
         "epochs": [],
         "steps": [],
     }
@@ -470,7 +476,9 @@ def train_phase1_steernet(
                 with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
                     if cfg.loss_mode == "typed":
                         base_logits = None
-                        if cfg.kl_weight > 0 or learned_weights is not None:
+                        _need_base = (cfg.kl_weight > 0 or learned_weights is not None
+                                      or getattr(cfg, "focal_gamma", 0) > 0)
+                        if _need_base:
                             # ── KL pass: frozen backbone, hooks disabled ──────────────
                             with torch.no_grad(), model.hooks_disabled():
                                 base_logits = model(
@@ -485,11 +493,12 @@ def train_phase1_steernet(
                             input_ids=batch["input_ids"],
                             attention_mask=batch["attention_mask"],
                         ).logits
+                        _tt = extras.get("token_types", torch.zeros_like(batch["labels"]))
                         loss, parts = typed_objective(
                             logits,
                             base_logits,
                             batch["labels"],
-                            extras["token_types"],
+                            _tt,
                             cfg,
                             counts,
                             extras.get("neg_ids"),
@@ -524,8 +533,12 @@ def train_phase1_steernet(
                         elif n_nets > 0 and cfg.mag_l1_weight > 0:
                             loss = loss + cfg.mag_l1_weight * l1_loss
                         loss = loss / len(micro)
+                    elif cfg.loss_mode == "legacy_pure":
+                        # Pure legacy: model's built-in uniform NLL (matches old RSC_Training.py)
+                        output = model(**batch)
+                        loss = output.loss / len(micro)
                     else:
-                        # Legacy mode
+                        # Legacy mode with calc-token weighting
                         output = model(**batch)
                         weights = target_weights(
                             batch["labels"], extras.get("calc_mask"), cfg.calc_weight_alpha
@@ -570,7 +583,8 @@ def train_phase1_steernet(
         val_eval = evaluate_typed(model, eval_data, device, cfg, steered=True)
         history["epochs"].append(val_eval)
         history["train_nll"].append(running_loss / max(step_count, 1))
-        history["validation_nll"].append(val_eval["crit"])
+        history["validation_nll"].append(val_eval["validation_nll"])
+        history["crit_history"].append(val_eval["crit"])
         print(
             f"S1 epoch {epoch + 1}/{cfg.phase1_epochs}: crit={val_eval['crit']:.4f} "
             f"result_top1={val_eval['result_top1']:.3f} val_nll={val_eval['validation_nll']:.4f}"
@@ -583,8 +597,8 @@ def train_phase1_steernet(
                 for name, value in model.steer_nets.state_dict().items()
             }
 
-        # Plateau-aware LR reduction — mutates cosine base_lrs so reduction persists
-        _val_nll_now = val_eval["validation_nll"]
+        # Plateau-aware LR reduction — monitors same metric as checkpoint selection (crit)
+        _val_nll_now = val_eval["crit"]
         if _val_nll_now < _plateau_best_nll - 1e-4:
             _plateau_best_nll = _val_nll_now
             _plateau_wait = 0
