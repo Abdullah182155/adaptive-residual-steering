@@ -23,7 +23,7 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.loss_mode == "typed"
     assert cfg.train_shot_probs == [0.50, 0.10, 0.20, 0.05, 0.15]
     assert cfg.shield_policy == "context"
-    assert cfg.mag_l1_weight == 0.01
+    assert cfg.mag_l1_weight == 0.1
     assert cfg.focal_gamma == 2.0
     assert cfg.kl_weight == 0.3
     assert cfg.lambda_result == 0.40
