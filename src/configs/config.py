@@ -23,7 +23,7 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.10
+    rho_max: float = 0.05
     # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
     mag_head_init_bias: float = -1.0  # sigmoid(-1)≈0.27; V12 had -3.0 (0.05 → starved early training)
     calc_weight_alpha: float = 1.0
@@ -89,7 +89,7 @@ class RSCConfig:
     focal_gamma: float = 2.0
     kl_weight: float = 0.3
     kl_arithmetic_weight: float = 0.30
-    mag_l1_weight: float = 0.0
+    mag_l1_weight: float = 0.01
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture

@@ -538,6 +538,21 @@ def train_phase1_steernet(
                         # Pure legacy: model's built-in uniform NLL (matches old RSC_Training.py)
                         output = model(**batch)
                         loss = output.loss / len(micro)
+                        if cfg.mag_l1_weight > 0:
+                            mag_pen = loss.new_zeros(())
+                            n_sn = 0
+                            for sn in model.steer_nets.values():
+                                if sn.last_pre_cap_q is None:
+                                    continue
+                                q = sn.last_pre_cap_q[:, :, 0]
+                                active = q[q > 0]
+                                if active.numel() > 0:
+                                    mag_pen = mag_pen + active.mean()
+                                    n_sn += 1
+                            if n_sn > 0:
+                                l1 = mag_pen / (n_sn * len(micro))
+                                loss = loss + cfg.mag_l1_weight * l1
+                                parts["mag_l1"] = float(l1.detach())
                     else:
                         # Legacy mode with calc-token weighting
                         output = model(**batch)
