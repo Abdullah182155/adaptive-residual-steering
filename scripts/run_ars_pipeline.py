@@ -132,6 +132,9 @@ def build_model(cfg, device):
         trust_remote_code=True,
     ).to(device)
     model = Phi2WithRSC(backbone, cfg, device)
+    # SteerNet modules start in train() mode (nn.Module default).
+    # Switch to eval so dropout is off outside of explicit training loops.
+    model.eval()
     return model, tokenizer
 
 

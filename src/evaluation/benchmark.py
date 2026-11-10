@@ -22,8 +22,12 @@ from src.evaluation.chain import (
 )
 
 
+# Only "Final answer" and "####" are unambiguous final-answer markers.
+# "The answer is" and "So the result is" also appear in INTERMEDIATE steps
+# (e.g. "Step 2: So the result is 24 apples.") — including them here causes
+# premature stopping before the actual final answer is written.
 STOP_RE = re.compile(
-    r"(?:Final answer|The answer is|So the result is|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*\n"
+    r"(?:Final answer|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*\n"
 )
 
 
@@ -182,6 +186,8 @@ def run_benchmark(
     router_prefill_fn=None,
 ) -> Dict[str, object]:
     """Run greedy paired baseline/fixed evaluation and return a serializable record."""
+    # Ensure SteerNet dropout is off during generation (SteerNet starts in train mode).
+    model.eval()
     rows = list(rows)
     record: Dict[str, object] = {
         "model": cfg.model_name,

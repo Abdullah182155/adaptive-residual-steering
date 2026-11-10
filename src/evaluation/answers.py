@@ -33,6 +33,7 @@ _MARKERS = (
     r"\\+boxed\{\s*\$?(" + _NUM + r")\s*\}",
     r"[Ff]inal\s+[Aa]nswer(?:\s+is)?\s*[:\-]?\s*\$?(" + _NUM + ")",
     r"[Tt]he\s+answer\s+is\s*[:\-]?\s*\$?(" + _NUM + ")",
+    r"[Ss]o\s+the\s+result\s+is\s*[:\-]?\s*\$?(" + _NUM + ")",
 )
 
 

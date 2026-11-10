@@ -35,7 +35,7 @@ def measure_envelope(
         "route": list(cfg.fixed_layers),
         "samples": sample_count,
         "relative_norm_max": maximum,
-        "relative_norm_cap": maximum,
+        "relative_norm_cap": maximum * 1.5,  # 50% headroom avoids spurious guard trips
         "nonfinite_count": nonfinite_count,
     }
 

@@ -86,7 +86,9 @@ def split_answer(answer: str) -> Tuple[List[str], str]:
     parts = answer.split("####")
     reasoning = re.sub(r"<<[^>]*>>", "", parts[0]).strip()
     final_num = parts[1].strip() if len(parts) > 1 else ""
-    steps = [s.strip() for s in re.split(r"(?<!\d)\.(?!\d)\s+", reasoning) if s.strip()]
+    # Split on ". " (not decimal) OR newlines to handle GSM8K sentences that end
+    # in computed numbers like "= $50.\n" (the lookbehind (?<!\d) blocked those splits).
+    steps = [s.strip() for s in re.split(r"\.(?!\d)\s+|\n+", reasoning) if s.strip()]
     return steps, final_num
 
 

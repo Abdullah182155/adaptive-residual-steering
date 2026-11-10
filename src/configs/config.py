@@ -147,8 +147,8 @@ class RSCConfig:
     bench_shots: List[int] = field(default_factory=lambda: [0, 2, 4])
     generation_max_new_tokens: int = 256
     generation_temperature: float = 0.0
-    generation_repetition_penalty: float = 1.1    # old code used 1.1; 1.0 = disabled
-    generation_no_repeat_ngram: int = 6           # old code used 6; 0 = disabled
+    generation_repetition_penalty: float = 1.1    # 1.0 = disabled
+    generation_no_repeat_ngram: int = 0           # disabled: prompt tokens cause false bans in 2-shot
 
     def validate(self) -> None:
         """Reject configurations that violate Phase 1 contracts."""

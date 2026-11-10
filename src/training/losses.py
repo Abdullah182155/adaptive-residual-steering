@@ -34,7 +34,9 @@ _PASSES = (
     (re.compile(r"(?<=\d)\s?[+\-*/=×÷]\s?(?=[\$\-]?\d)"), T_OPERATOR, 0),
     (re.compile(r"=\s*(" + _NUM + ")"), T_RESULT, 1),
     (re.compile(r"(?:Final answer:|The answer is|So the result is|####)\s*(" + _NUM + ")"), T_FINAL, 1),
-    (re.compile(r"Step \d+:|Final answer:|The answer is|So the result is|####"), T_FORMAT, 0),
+    # T_FORMAT covers all step-prefix styles produced by PromptTemplateBank.STEP_PREFIXES
+    # so that step indices are not mistakenly labelled T_OPERAND.
+    (re.compile(r"Step \d+[:\-]|^\d+\.\s+|^\(\d+\)\s+|^>\s+|Final answer:|The answer is|So the result is|####", re.MULTILINE), T_FORMAT, 0),
 )
 
 
@@ -57,13 +59,25 @@ def token_types_from_offsets(
     out = []
     for s, e in offsets:
         best = None
+        is_real_token = False  # has at least one non-whitespace, non-padding char
         for i in range(s, e):
-            if i >= len(text) or text[i].isspace():
+            if i >= len(text):
                 continue
+            if text[i].isspace():
+                continue
+            is_real_token = True
             t = char_labels[i]
             if best is None or _PRIORITY[t] > _PRIORITY[best]:
                 best = t
-        out.append(T_NONE if best is None else best)
+        if best is not None:
+            out.append(best)
+        elif is_real_token or (s == 0 and e == 0):
+            # Padding token (0,0 offset) → T_NONE; otherwise unreachable
+            out.append(T_NONE)
+        else:
+            # Whitespace-only token (e.g. "\n", " ") gets T_FORMAT so the loss
+            # applies a small structural weight instead of silently dropping it.
+            out.append(T_FORMAT)
     return out
 
 
@@ -173,7 +187,10 @@ def typed_objective(
             p = (-base_nll).exp()
         else:
             p = (-nll).exp()
-        w = (1.0 - p).clamp_min(0).pow(gamma) if gamma > 0 else torch.ones_like(p)
+        # Floor of 0.05 prevents regressions on easy tokens from becoming invisible:
+        # without it, a token the base model gets right (p≈1) has w≈0 and any
+        # damage done by steering on that token gets near-zero gradient.
+        w = (1.0 - p).clamp_min(0.05).pow(gamma) if gamma > 0 else torch.ones_like(p)
         if _pos_w is not None:
             w = w * _pos_w
 

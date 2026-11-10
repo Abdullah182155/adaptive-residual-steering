@@ -36,6 +36,7 @@ def collect_layer_norms(
     device: torch.device,
     candidate_layers: List[int],
     sink_tokens: List[int],
+    max_length: int = 512,
 ) -> Dict[int, List[float]]:
     """
     Collect hidden state norms for each candidate layer using output_hidden_states.
@@ -50,7 +51,7 @@ def collect_layer_norms(
     print(f"Sink tokens: {sink_tokens}")
     
     for prompt_idx, prompt in enumerate(tqdm(prompts, desc="Collecting norms")):
-        enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=args.max_length).to(device)
+        enc = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=max_length).to(device)
         input_ids = enc["input_ids"]
         attention_mask = enc["attention_mask"]
         
@@ -198,7 +199,7 @@ def main():
     
     print("Collecting layer norms...")
     start_time = time.time()
-    layer_norms = collect_layer_norms(model, tokenizer, prompts, device, args.candidate_layers, sink_tokens)
+    layer_norms = collect_layer_norms(model, tokenizer, prompts, device, args.candidate_layers, sink_tokens, max_length=args.max_length)
     elapsed = time.time() - start_time
     print(f"Collected norms in {elapsed:.2f}s")
     

@@ -532,7 +532,8 @@ def train_phase1_steernet(
                             )
                         elif n_nets > 0 and cfg.mag_l1_weight > 0:
                             loss = loss + cfg.mag_l1_weight * l1_loss
-                        loss = loss / len(micro)
+                        # typed_objective is already window-normalized across all micro-batches;
+                        # do NOT divide by len(micro) again (double-normalization bug).
                     elif cfg.loss_mode == "legacy_pure":
                         # Pure legacy: model's built-in uniform NLL (matches old RSC_Training.py)
                         output = model(**batch)
