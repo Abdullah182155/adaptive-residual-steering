@@ -19,13 +19,13 @@ class RSCConfig:
     lora_rank: int = 32
     lora_alpha: float = 32.0
     lora_dropout: float = 0.05
-    steer_kappa: float = 0.04
+    steer_kappa: float = 0.15
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.06
+    rho_max: float = 0.10
     # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
-    mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05 (typed); set 2.0 for legacy (sigmoid(2)≈0.88)
+    mag_head_init_bias: float = -1.0  # sigmoid(-1)≈0.27; V12 had -3.0 (0.05 → starved early training)
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
