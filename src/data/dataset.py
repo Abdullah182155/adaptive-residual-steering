@@ -58,7 +58,7 @@ class PromptTemplateBank:
         else:
             head_tpl, ans_tpl = rng.choice(cls.HEADERS)
             step_tpl = rng.choice(cls.STEP_PREFIXES)
-            final_tpl = rng.choice(cls.FINAL_PREFIXES)
+            final_tpl = cls.FINAL_PREFIXES[0]  # always "Final answer:" for strict scoring
 
         body_lines = []
         for i, s in enumerate(steps):
@@ -153,10 +153,10 @@ def gsm8k_to_cot(
         rng = random.Random(cfg.seed + idx)
         diversify = getattr(cfg, "diversify_prompts", False)
         if diversify:
-            # Vary step prefix and final answer marker to prevent format memorisation.
-            # Question header stays stable so the prompt-completion boundary is predictable.
+            # Vary step prefix to prevent format memorisation.
+            # Final marker is ALWAYS "Final answer:" — strict scoring requires it.
             step_tpl = rng.choice(PromptTemplateBank.STEP_PREFIXES)
-            final_tpl = rng.choice(PromptTemplateBank.FINAL_PREFIXES)
+            final_tpl = PromptTemplateBank.FINAL_PREFIXES[0]
             body_lines = []
             for si, s in enumerate(sentences):
                 s = s if s.endswith(".") else s + "."
