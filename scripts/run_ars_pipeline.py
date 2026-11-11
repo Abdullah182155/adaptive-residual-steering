@@ -218,7 +218,11 @@ def run(args) -> int:
             model, train_data, validation_data, cfg, device, tokenizer=tokenizer
         )
         if gate_result:
-            print(f"[S2B] best_val_nll={gate_result.get('best_val_nll', 'N/A'):.4f}")
+            best_imp = gate_result.get("best_val_improvement", "N/A")
+            if isinstance(best_imp, float):
+                print(f"[S2B] best_val_improvement={best_imp:+.4f}")
+            else:
+                print(f"[S2B] best_val_improvement={best_imp}")
 
     if stage in {"S5", "all"}:
         print("Running S5 deployment-envelope calibration")
