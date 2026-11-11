@@ -350,10 +350,17 @@ def train_phase2b_gate(
         {"gates": {k: v.cpu() for k, v in model.gates.state_dict().items()},
          "fixed_layers": cfg.fixed_layers,
          "gate_epochs": gate_epochs,
-         "best_val_nll": best_val_nll},
+         "best_val_nll": best_val_nll,
+         "history": history},
         gate_path,
     )
     print(f"[gate] Saved gate checkpoint: {gate_path}")
+
+    report_dir = Path(getattr(cfg, "report_dir", "report"))
+    report_dir.mkdir(parents=True, exist_ok=True)
+    gate_log_path = report_dir / "gate_training_log.json"
+    gate_log_path.write_text(json.dumps(history, indent=2))
+    print(f"[gate] Saved gate training log: {gate_log_path}")
 
     # Save gated SteerNet (if fine-tuned)
     if finetune_sn:
