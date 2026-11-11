@@ -1,20 +1,15 @@
-"""Phase 2B: Gate training via RLOO + teacher-forced NLL.
+"""Phase 2B: Gate training — V19 overhaul.
 
-The gate (RSCUsefulnessGate) learns per-token steering weights that estimate
-whether applying the SteerNet correction at a given position helps or hurts.
+V18 changes (architecture):
+- Task NLL removed from gate loss (overwhelmed contrastive)
+- Hinge contrastive replaces MSE
+- Anti-saturation loss
+- RLOO baseline=0.0, answer_weight=1.0
+- Per-layer LR scaling
 
-Training approach:
-- SteerNet weights: frozen (from Phase 1)
-- Router weights:   frozen (from Phase 2) — provides routing context
-- Gate weights:     trained via RLOO policy gradient + task NLL
-
-Reward signal: difference in answer-weighted NLL between
-  gate=learned (alpha from gate)  vs  gate=fixed (alpha=0.5 baseline)
-Using teacher-forced NLL (no generation needed) keeps training fast.
-
-Checkpoint outputs:
-  cfg.gate_save_path          — gate weights only
-  cfg.steernet_gated_save_path — steernet fine-tuned alongside gate (if enabled)
+V19 changes (methods):
+- Generation-based accuracy reward every N steps (teacher-forced NLL ≠ accuracy)
+- Checkpoint selection by NLL improvement (val_nll_base - val_nll_gate), not absolute NLL
 """
 
 from __future__ import annotations
@@ -35,6 +30,7 @@ from src.routing.rloo import per_example_answer_nll_weighted
 from src.training.losses import T_FORMAT, T_OPERAND, T_OPERATOR, T_PROSE, T_RESULT, T_FINAL
 from src.training.trainer import (
     _epoch_batches,
+    _generate_onpolicy_batch,
     _prepare,
     save_steer_weights,
 )
@@ -47,40 +43,96 @@ def _nll_with_gate_alpha(
     ids: torch.Tensor,
     mask: torch.Tensor,
     labels: torch.Tensor,
-    gate_value: Optional[float],       # None = use learned gate
-    answer_weight: float = 2.0,
+    gate_value: Optional[float],
+    answer_weight: float = 1.0,
 ) -> torch.Tensor:
-    """Teacher-forced NLL with gate fixed at `gate_value` or learned.
-
-    When gate_value is not None the gate is frozen at that constant α so we
-    can compute a counterfactual baseline without extra gradient tracking.
-    """
+    """Teacher-forced NLL with gate fixed at `gate_value` (None = learned)."""
     for gate in model.gates.values():
         gate._freeze_gate = gate_value is not None
         gate._freeze_gate_value = gate_value if gate_value is not None else 1.0
-
     try:
         with torch.amp.autocast("cuda", enabled=ids.is_cuda):
             logits = model(input_ids=ids, attention_mask=mask).logits
     finally:
-        # Always restore gate to learned mode, even on OOM or NaN
         for gate in model.gates.values():
             gate._freeze_gate = False
-
     return per_example_answer_nll_weighted(logits, labels, answer_weight=answer_weight)
+
+
+@torch.no_grad()
+def _generation_accuracy_reward(
+    model,
+    tokenizer,
+    sample_rows: List[dict],
+    device: torch.device,
+    max_new_tokens: int = 150,
+) -> torch.Tensor:
+    """Generate greedy with gate=0 and gate=active; return correctness delta.
+
+    reward[i] = int(gate_on_correct[i]) - int(gate_off_correct[i])
+    Positive = steering helped, negative = steering hurt.
+    """
+    from src.data.prompts import build_prompt_unified
+    from src.evaluation.answers import score_tiers
+
+    questions = [r.get("question", "") for r in sample_rows]
+    golds = [r.get("final_num", "") for r in sample_rows]
+
+    valid = [(i, q, g) for i, (q, g) in enumerate(zip(questions, golds)) if q and g]
+    if not valid:
+        return torch.zeros(1, device=device)
+
+    indices, valid_questions, valid_golds = zip(*valid)
+    prompts = [build_prompt_unified(q, n_shot=0) for q in valid_questions]
+
+    model.eval()
+    model.set_routing_override("only", model.target_layers)
+
+    # Generate with gate OFF (alpha=0 → no steering)
+    for gate in model.gates.values():
+        gate._freeze_gate = True
+        gate._freeze_gate_value = 0.0
+    completions_off = _generate_onpolicy_batch(
+        model, tokenizer, list(prompts), device,
+        max_new_tokens=max_new_tokens, num_return_sequences=1, temperature=0.0,
+    )
+    for gate in model.gates.values():
+        gate._freeze_gate = False
+
+    # Generate with gate ON (learned alpha)
+    completions_on = _generate_onpolicy_batch(
+        model, tokenizer, list(prompts), device,
+        max_new_tokens=max_new_tokens, num_return_sequences=1, temperature=0.0,
+    )
+
+    # Score both
+    rewards = []
+    for text_off, text_on, gold in zip(completions_off, completions_on, valid_golds):
+        try:
+            gold_val = float(str(gold).replace(",", "").replace("$", "").strip())
+        except (ValueError, TypeError):
+            rewards.append(0.0)
+            continue
+        correct_off = float(score_tiers(text_off, gold_val).get("lenient", False))
+        correct_on = float(score_tiers(text_on, gold_val).get("lenient", False))
+        rewards.append(correct_on - correct_off)
+
+    model.train()
+    model.base_model.eval()
+
+    return torch.tensor(rewards, dtype=torch.float32, device=device)
 
 
 def _contrastive_gate_loss(
     gates: nn.ModuleDict,
     token_types: torch.Tensor,
     labels: torch.Tensor,
+    mode: str = "hinge",
 ) -> torch.Tensor:
     """Push gate alpha UP on math tokens and DOWN on format tokens.
 
-    Targets (from the old RSC notebook that achieved +18pp):
-      math/operator/result/final → 0.85
-      format                     → 0.15
-      prose/discourse            → 0.65
+    mode="hinge": ReLU one-sided — zero gradient once target is met.
+    mode="mse": symmetric MSE (old behavior).
     """
     valid = labels[:, 1:].ne(-100)
     if not valid.any():
@@ -90,7 +142,7 @@ def _contrastive_gate_loss(
     loss = labels.new_zeros((), dtype=torch.float32)
     n_gates = 0
     for gate in gates.values():
-        alpha = gate._alpha_for_aux  # (B, T, 1) — grad-carrying
+        alpha = gate._alpha_for_aux
         if alpha is None:
             continue
         T_use = min(alpha.shape[1], tt.shape[1])
@@ -102,15 +154,52 @@ def _contrastive_gate_loss(
         fmt_mask = v & (t == T_FORMAT)
         prose_mask = v & (t == T_PROSE)
 
-        if math_mask.any():
-            loss = loss + (a[math_mask] - 0.85).pow(2).mean()
-        if fmt_mask.any():
-            loss = loss + (a[fmt_mask] - 0.15).pow(2).mean()
-        if prose_mask.any():
-            loss = loss + (a[prose_mask] - 0.65).pow(2).mean()
+        if mode == "hinge":
+            if math_mask.any():
+                loss = loss + F.relu(0.85 - a[math_mask]).mean()
+            if fmt_mask.any():
+                loss = loss + F.relu(a[fmt_mask] - 0.15).mean()
+            if prose_mask.any():
+                loss = loss + F.relu(0.65 - a[prose_mask]).mean()
+        else:
+            if math_mask.any():
+                loss = loss + (a[math_mask] - 0.85).pow(2).mean()
+            if fmt_mask.any():
+                loss = loss + (a[fmt_mask] - 0.15).pow(2).mean()
+            if prose_mask.any():
+                loss = loss + (a[prose_mask] - 0.65).pow(2).mean()
         n_gates += 1
 
     return loss / max(n_gates, 1)
+
+
+def _antisat_loss(
+    gates: nn.ModuleDict,
+    threshold: float = 0.85,
+) -> torch.Tensor:
+    """Penalize gate alpha above threshold. Earlier layers get tighter ceiling."""
+    device = next(iter(gates.parameters())).device
+    total = torch.tensor(0.0, device=device)
+    layer_keys = sorted(gates.keys(), key=lambda k: int(k))
+    n_layers = max(1, len(layer_keys))
+    count = 0
+    for rank_idx, key in enumerate(layer_keys):
+        gate = gates[key]
+        alpha = gate._alpha_for_aux
+        if alpha is None:
+            continue
+        a = alpha.float().squeeze(-1)
+        layer_thresh = threshold - 0.15 * (1.0 - rank_idx / (n_layers - 1 + 1e-8))
+        layer_thresh = max(0.50, layer_thresh)
+        over = F.relu(a - layer_thresh).pow(2)
+        vm = gate._valid_mask
+        if vm is not None and vm.shape == over.shape:
+            denom = vm.sum().clamp(min=1)
+            total = total + (over * vm.float()).sum() / denom
+        else:
+            total = total + over.mean()
+        count += 1
+    return total / max(count, 1)
 
 
 # ── Main training function ──────────────────────────────────────────────────
@@ -123,31 +212,43 @@ def train_phase2b_gate(
     device: torch.device,
     tokenizer=None,
 ) -> Dict[str, Any]:
-    """Train RSCUsefulnessGate while SteerNet (and optionally Router) are frozen.
+    """Train RSCUsefulnessGate with SteerNet jointly fine-tuned.
 
-    Returns history dict with loss / val_nll curves.
+    V19 loss: RLOO + gen-accuracy reward + hinge contrastive + L1 + anti-saturation.
+    Checkpoint selected by max NLL improvement (val_nll_base - val_nll_gate).
     """
     if not getattr(cfg, "use_gate", False):
         print("[gate] use_gate=False — skipping Phase 2B gate training")
         return {}
 
-    gate_epochs    = getattr(cfg, "gate_epochs", 2)
-    gate_lr        = getattr(cfg, "gate_lr", 1e-4)
-    gate_l1_weight = getattr(cfg, "gate_l1_weight", 0.01)
-    gate_rloo_w    = getattr(cfg, "gate_rloo_weight", 1.0)
-    gate_contrastive_w = getattr(cfg, "gate_contrastive_weight", 0.5)
-    finetune_sn    = getattr(cfg, "gate_finetune_steernet", True)
-    sn_lr          = getattr(cfg, "gate_steernet_lr", 1e-5)
-    answer_w       = getattr(cfg, "router_answer_nll_weight", 2.0)
-    baseline_alpha = 0.5   # fixed alpha for RLOO baseline comparison
+    gate_epochs        = getattr(cfg, "gate_epochs", 5)
+    gate_lr            = getattr(cfg, "gate_lr", 1e-4)
+    gate_l1_weight     = getattr(cfg, "gate_l1_weight", 0.005)
+    gate_rloo_w        = getattr(cfg, "gate_rloo_weight", 1.0)
+    gate_contrastive_w = getattr(cfg, "gate_contrastive_weight", 1.0)
+    contrastive_mode   = getattr(cfg, "gate_contrastive_mode", "hinge")
+    use_task_nll       = getattr(cfg, "gate_use_task_nll", False)
+    antisat_w          = getattr(cfg, "gate_antisat_weight", 0.25)
+    antisat_thresh     = getattr(cfg, "gate_antisat_threshold", 0.85)
+    finetune_sn        = getattr(cfg, "gate_finetune_steernet", True)
+    sn_lr              = getattr(cfg, "gate_steernet_lr", 1e-5)
+    baseline_alpha     = getattr(cfg, "gate_rloo_baseline", 0.0)
+    gen_reward_every   = getattr(cfg, "gate_gen_reward_every", 4)
+    gen_subset         = getattr(cfg, "gate_gen_subset", 2)
+    gen_weight         = getattr(cfg, "gate_gen_weight", 2.0)
+    gen_max_tokens     = getattr(cfg, "gate_gen_max_tokens", 150)
+
+    use_gen_reward = gen_reward_every > 0 and tokenizer is not None and gen_subset > 0
 
     print(f"\n{'='*70}")
-    print(f"Phase 2B — Gate Training  ({gate_epochs} epochs, lr={gate_lr:.1e})")
-    print(f"  answer_weight={answer_w}  l1={gate_l1_weight}  rloo_w={gate_rloo_w}  contrastive_w={gate_contrastive_w}")
-    print(f"  finetune_steernet={'YES lr=' + str(sn_lr) if finetune_sn else 'NO'}")
+    print(f"Phase 2B — Gate Training V19  ({gate_epochs} epochs, lr={gate_lr:.1e})")
+    print(f"  contrastive={contrastive_mode} w={gate_contrastive_w}  l1={gate_l1_weight}")
+    print(f"  antisat w={antisat_w} thresh={antisat_thresh}  rloo baseline={baseline_alpha}")
+    print(f"  gen_reward={'YES every=' + str(gen_reward_every) + ' subset=' + str(gen_subset) + ' w=' + str(gen_weight) if use_gen_reward else 'NO (tokenizer not passed)'}")
+    print(f"  checkpoint_by=nll_improvement  finetune_sn={'YES lr=' + str(sn_lr) if finetune_sn else 'NO'}")
     print(f"{'='*70}")
 
-    # ── Create gates if they don't exist yet on the model ─────────────────
+    # ── Create gates if needed ─────────────────────────────────────────────
     if not hasattr(model, "gates") or not model.gates:
         hidden_size = model.base_model.config.hidden_size
         model.gates = nn.ModuleDict({
@@ -156,15 +257,13 @@ def train_phase2b_gate(
         })
         print(f"[gate] Created {len(model.gates)} gate objects for layers {model.target_layers}")
 
-    # Install gate provider: routes (position, hidden, delta) → alpha per layer
     target_layers = model.target_layers
     gates_ref = model.gates
     def _gate_provider(position: int, hidden: torch.Tensor, delta: torch.Tensor) -> torch.Tensor:
-        layer_key = str(target_layers[position])
-        return gates_ref[layer_key](hidden, delta)
+        return gates_ref[str(target_layers[position])](hidden, delta)
     model.set_gate_provider(_gate_provider)
 
-    # ── Freeze backbone and SteerNets (unless fine-tuning SteerNets) ────────
+    # ── Freeze backbone ───────────────────────────────────────────────────
     for p in model.base_model.parameters():
         p.requires_grad = False
 
@@ -176,8 +275,14 @@ def train_phase2b_gate(
     for p in gate_params:
         p.requires_grad = True
 
-    # ── Optimizer ──────────────────────────────────────────────────────────
-    param_groups = [{"params": gate_params, "lr": gate_lr, "weight_decay": 0.01}]
+    # ── Optimizer: per-layer gate LR ─────────────────────────────────────
+    layer_keys_sorted = sorted(model.gates.keys(), key=lambda k: int(k))
+    n_gate_layers = len(layer_keys_sorted)
+    param_groups = []
+    for rank_idx, key in enumerate(layer_keys_sorted):
+        g_params = list(model.gates[key].parameters())
+        lr_scale = 1.0 + 0.5 * (1.0 - rank_idx / (n_gate_layers - 1 + 1e-8))
+        param_groups.append({"params": g_params, "lr": gate_lr * lr_scale, "weight_decay": 0.01})
     if finetune_sn and steer_params:
         param_groups.append({"params": steer_params, "lr": sn_lr, "weight_decay": 0.01})
     optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.999))
@@ -197,13 +302,17 @@ def train_phase2b_gate(
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
 
-    best_val_nll = float("inf")
+    best_val_improvement = -float("inf")  # nll_base - nll_gate; higher = gate helps more
     best_gate_state = None
     best_sn_state = None
-    history: Dict[str, Any] = {"gate_train_loss": [], "gate_val_nll": [], "epochs": []}
+    history: Dict[str, Any] = {
+        "gate_train_loss": [], "gate_val_nll": [], "gate_val_improvement": [], "epochs": []
+    }
 
     model.train()
     model.base_model.eval()
+
+    global_opt_step = 0
 
     for epoch in range(gate_epochs):
         batches = _epoch_batches(lengths, cfg.batch_size, epoch, cfg.seed)
@@ -220,7 +329,6 @@ def train_phase2b_gate(
             window_loss_sum = torch.tensor(0.0, device=device)
 
             for bi in window_batches:
-                # _epoch_batches returns List[List[int]] — each bi is a list of row indices
                 batch_rows = [rows[i] for i in bi] if isinstance(bi, list) else rows[bi : bi + cfg.batch_size]
                 if not batch_rows:
                     continue
@@ -231,24 +339,23 @@ def train_phase2b_gate(
                 if ids.numel() == 0:
                     continue
 
-                # ── Baseline NLL (fixed alpha=0.5, no gradient) ────────────
+                # ── Baseline NLL (gate=0.0, no gradient) ──────────────────
                 with torch.no_grad():
                     nll_baseline = _nll_with_gate_alpha(
-                        model, ids, mask, labels,
-                        gate_value=baseline_alpha, answer_weight=answer_w,
+                        model, ids, mask, labels, gate_value=baseline_alpha, answer_weight=1.0,
                     )
 
-                # ── Learned NLL (gate active, gradient flows through gate) ──
+                # ── Learned NLL (gate active, gradient through gate) ───────
                 for gate in model.gates.values():
                     gate._freeze_gate = False
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                     logits_learned = model(input_ids=ids, attention_mask=mask).logits
                 nll_learned = per_example_answer_nll_weighted(
-                    logits_learned, labels, answer_weight=answer_w,
+                    logits_learned, labels, answer_weight=1.0,
                 )
 
-                # ── RLOO-style advantage ───────────────────────────────────
-                advantage = (nll_baseline - nll_learned).detach()   # positive = gate helps
+                # ── RLOO advantage ─────────────────────────────────────────
+                advantage = (nll_baseline - nll_learned).detach()
                 mean_alpha_log = torch.stack([
                     gate._alpha_for_aux.clamp(1e-6, 1 - 1e-6).log().mean()
                     for gate in model.gates.values()
@@ -256,27 +363,58 @@ def train_phase2b_gate(
                 ]).mean()
                 rloo_loss = -gate_rloo_w * (advantage.mean() * mean_alpha_log)
 
-                # ── Task NLL (direct supervision) ─────────────────────────
-                task_loss = nll_learned.mean()
-
-                # ── L1 sparsity on gate activations ───────────────────────
+                # ── L1 sparsity ────────────────────────────────────────────
                 l1_loss = torch.stack([
                     gate.last_alpha.float().mean()
                     for gate in model.gates.values()
                     if gate.last_alpha is not None
                 ]).mean()
 
-                # ── Contrastive gate loss (math↑ format↓) ────────────────
+                # ── Hinge contrastive ──────────────────────────────────────
                 cg_loss = ids.new_zeros((), dtype=torch.float32)
                 if token_types is not None and gate_contrastive_w > 0:
-                    cg_loss = _contrastive_gate_loss(model.gates, token_types, labels)
+                    cg_loss = _contrastive_gate_loss(
+                        model.gates, token_types, labels, mode=contrastive_mode,
+                    )
 
-                step_loss = task_loss + rloo_loss + gate_l1_weight * l1_loss + gate_contrastive_w * cg_loss
+                # ── Anti-saturation ────────────────────────────────────────
+                asat_loss = _antisat_loss(model.gates, threshold=antisat_thresh)
+
+                # ── Compose gate loss ──────────────────────────────────────
+                step_loss = (
+                    rloo_loss
+                    + gate_l1_weight * l1_loss
+                    + gate_contrastive_w * cg_loss
+                    + antisat_w * asat_loss
+                )
+                if use_task_nll:
+                    step_loss = step_loss + nll_learned.mean()
+
                 step_loss = step_loss / len(window_batches)
 
                 if torch.isfinite(step_loss):
                     scaler.scale(step_loss).backward()
                     window_loss_sum = window_loss_sum + step_loss.detach()
+
+            # ── Generation-based accuracy reward (every N opt steps) ───────
+            gen_pg_loss_val = 0.0
+            if use_gen_reward and global_opt_step > 0 and global_opt_step % gen_reward_every == 0:
+                gen_indices = torch.randint(len(rows), (gen_subset,), generator=torch.Generator().manual_seed(global_opt_step)).tolist()
+                gen_rows = [rows[i] for i in gen_indices]
+                gen_reward = _generation_accuracy_reward(
+                    model, tokenizer, gen_rows, device, max_new_tokens=gen_max_tokens,
+                )
+                model.train()
+                model.base_model.eval()
+                if gen_reward.abs().sum().item() > 0:
+                    # Recompute mean_alpha_log after switching back to train
+                    for gate in model.gates.values():
+                        gate._freeze_gate = False
+                    gen_pg_loss = -(gen_weight * gen_reward.mean() * mean_alpha_log.detach())
+                    if torch.isfinite(gen_pg_loss):
+                        scaler.scale(gen_pg_loss).backward()
+                        gen_pg_loss_val = float(gen_pg_loss.detach())
+                        window_loss_sum = window_loss_sum + gen_pg_loss.detach()
 
             # ── Optimizer step ─────────────────────────────────────────────
             scaler.unscale_(optimizer)
@@ -290,16 +428,20 @@ def train_phase2b_gate(
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
+            global_opt_step += 1
             epoch_loss += float(window_loss_sum)
             step_count += 1
+
             if (wi + 1) % print_every == 0 or wi == n_windows - 1:
                 lr_now = optimizer.param_groups[0]["lr"]
+                gen_str = f" gen_pg={gen_pg_loss_val:.3f}" if gen_pg_loss_val != 0.0 else ""
                 print(f"  S2B epoch {epoch+1}/{gate_epochs} [{wi+1}/{n_windows}] "
-                      f"loss={float(window_loss_sum):.3f} lr={lr_now:.1e}")
+                      f"loss={float(window_loss_sum):.3f} lr={lr_now:.1e}{gen_str}")
 
-        # ── Validation NLL ─────────────────────────────────────────────────
+        # ── Validation: measure NLL with gate AND without gate ─────────────
         model.eval()
-        val_nlls: List[float] = []
+        val_nlls_gate: List[float] = []
+        val_nlls_base: List[float] = []
         eval_rows = eval_data if isinstance(eval_data, list) else [eval_data[i] for i in range(len(eval_data))]
         for start in range(0, len(eval_rows), cfg.batch_size):
             batch_rows = eval_rows[start : start + cfg.batch_size]
@@ -309,30 +451,54 @@ def train_phase2b_gate(
             ids, mask, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
             model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
             with torch.no_grad():
+                # With gate
                 for gate in model.gates.values():
                     gate._freeze_gate = False
                 with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                    logits = model(input_ids=ids, attention_mask=mask).logits
-                val_nlls.append(float(per_example_answer_nll_weighted(logits, labels, answer_weight=answer_w).mean()))
-        val_nll = sum(val_nlls) / max(len(val_nlls), 1)
-        avg_train = epoch_loss / max(step_count, 1)
-        print(f"S2B epoch {epoch+1}/{gate_epochs}: train_loss={avg_train:.4f}  val_nll={val_nll:.4f}")
+                    logits_g = model(input_ids=ids, attention_mask=mask).logits
+                val_nlls_gate.append(float(per_example_answer_nll_weighted(logits_g, labels).mean()))
 
-        # Checkpoint selection by val_nll
-        if val_nll < best_val_nll:
-            best_val_nll = val_nll
+                # Without gate (baseline)
+                for gate in model.gates.values():
+                    gate._freeze_gate = True
+                    gate._freeze_gate_value = 0.0
+                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                    logits_b = model(input_ids=ids, attention_mask=mask).logits
+                val_nlls_base.append(float(per_example_answer_nll_weighted(logits_b, labels).mean()))
+                for gate in model.gates.values():
+                    gate._freeze_gate = False
+
+        val_nll = sum(val_nlls_gate) / max(len(val_nlls_gate), 1)
+        val_nll_base = sum(val_nlls_base) / max(len(val_nlls_base), 1)
+        val_improvement = val_nll_base - val_nll  # positive = gate helps
+        avg_train = epoch_loss / max(step_count, 1)
+
+        print(f"S2B epoch {epoch+1}/{gate_epochs}: train={avg_train:.4f}  "
+              f"val_nll={val_nll:.4f}  val_base={val_nll_base:.4f}  "
+              f"improvement={val_improvement:+.4f}")
+
+        # Select checkpoint by maximum NLL improvement (gate benefit), not min NLL
+        if val_improvement > best_val_improvement:
+            best_val_improvement = val_improvement
             best_gate_state = {k: v.cpu().clone() for k, v in model.gates.state_dict().items()}
             if finetune_sn:
                 best_sn_state = {k: v.cpu().clone() for k, v in model.steer_nets.state_dict().items()}
+            print(f"  ** New best: improvement={val_improvement:+.4f} (epoch {epoch+1})")
 
         history["gate_train_loss"].append(avg_train)
         history["gate_val_nll"].append(val_nll)
-        history["epochs"].append({"epoch": epoch + 1, "val_nll": val_nll, "train_loss": avg_train})
+        history["gate_val_improvement"].append(val_improvement)
+        history["epochs"].append({
+            "epoch": epoch + 1,
+            "val_nll": val_nll,
+            "val_nll_base": val_nll_base,
+            "val_improvement": val_improvement,
+            "train_loss": avg_train,
+        })
 
         model.train()
         model.base_model.eval()
 
-        # Free cache between epochs
         gc.collect()
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -343,18 +509,17 @@ def train_phase2b_gate(
     if best_sn_state is not None:
         model.steer_nets.load_state_dict(best_sn_state)
 
-    # Save gate
     gate_path = Path(getattr(cfg, "gate_save_path", "checkpoints/gate.pt"))
     gate_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {"gates": {k: v.cpu() for k, v in model.gates.state_dict().items()},
          "fixed_layers": cfg.fixed_layers,
          "gate_epochs": gate_epochs,
-         "best_val_nll": best_val_nll,
+         "best_val_improvement": best_val_improvement,
          "history": history},
         gate_path,
     )
-    print(f"[gate] Saved gate checkpoint: {gate_path}")
+    print(f"[gate] Saved gate checkpoint: {gate_path}  (best_improvement={best_val_improvement:+.4f})")
 
     report_dir = Path(getattr(cfg, "report_dir", "report"))
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -362,13 +527,12 @@ def train_phase2b_gate(
     gate_log_path.write_text(json.dumps(history, indent=2))
     print(f"[gate] Saved gate training log: {gate_log_path}")
 
-    # Save gated SteerNet (if fine-tuned)
     if finetune_sn:
         sn_gated_path = Path(getattr(cfg, "steernet_gated_save_path", "checkpoints/steernet_gated.pt"))
         save_steer_weights(model, str(sn_gated_path), cfg)
         print(f"[gate] Saved gated SteerNet checkpoint: {sn_gated_path}")
 
-    history["best_val_nll"] = best_val_nll
+    history["best_val_improvement"] = best_val_improvement
     return history
 
 
