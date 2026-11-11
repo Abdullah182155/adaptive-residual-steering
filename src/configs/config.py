@@ -19,19 +19,19 @@ class RSCConfig:
     lora_rank: int = 32
     lora_alpha: float = 32.0
     lora_dropout: float = 0.05
-    steer_kappa: float = 0.04
+    steer_kappa: float = 0.15
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.06
+    rho_max: float = 0.05
     # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
-    mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05 (typed); set 2.0 for legacy (sigmoid(2)≈0.88)
+    mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05; start low so network must earn magnitude
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
-    steernet_init_gain: float = 1.0     # xavier gain for down/up projections; old code used 0.02
-    steernet_use_mag_head: bool = True   # per-token magnitude head; old code had none
-    steernet_use_soft_cap: bool = True   # smooth cap envelope; old code had none
+    steernet_init_gain: float = 0.02    # xavier gain; small init → organic amplitude growth
+    steernet_use_mag_head: bool = False  # disabled: saturates to 1.0, makes amplitude unlearnable
+    steernet_use_soft_cap: bool = False  # disabled: rho_max is the single amplitude bound
     steernet_use_conv: bool = True       # causal depthwise convolution; old code had none
     guard_revert_to_k0: bool = True
 
@@ -54,7 +54,7 @@ class RSCConfig:
     seed: int = 42
 
     # S1 answer-region upweighting — focuses gradient on the answer portion
-    s1_answer_weight: float = 1.0     # >1.0 upweights last s1_answer_region_frac tokens
+    s1_answer_weight: float = 2.0     # V20: upweight final answer region 2× (was 1.0)
     s1_answer_region_frac: float = 0.30
 
     # Phase 1C: Contrastive Residual Training
@@ -89,7 +89,7 @@ class RSCConfig:
     focal_gamma: float = 2.0
     kl_weight: float = 0.3
     kl_arithmetic_weight: float = 0.30
-    mag_l1_weight: float = 0.0
+    mag_l1_weight: float = 0.10
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
@@ -125,16 +125,27 @@ class RSCConfig:
     use_gate: bool = False
     gate_dim: int = 64
     gate_dropout: float = 0.1
-    gate_init_alpha: float = 0.8
+    gate_init_alpha: float = 0.25
+    gate_use_global_context: bool = False
     gate_lr: float = 1e-4
-    gate_epochs: int = 2
-    gate_l1_weight: float = 0.01
+    gate_epochs: int = 3               # V20: GRPO converges in 2-3 epochs (was 5)
+    gate_l1_weight: float = 0.0        # V20: replaced by gate_entropy_weight (kept for compat)
     gate_rloo_weight: float = 1.0
-    gate_contrastive_weight: float = 0.5
+    gate_contrastive_weight: float = 1.0
+    gate_contrastive_mode: str = "hinge"
+    gate_use_task_nll: bool = False
+    gate_antisat_weight: float = 0.25
+    gate_antisat_threshold: float = 0.85
+    gate_rloo_baseline: float = 0.0
     gate_finetune_steernet: bool = True
     gate_steernet_lr: float = 1e-5
     gate_save_path: str = "checkpoints/gate.pt"
     steernet_gated_save_path: str = "checkpoints/steernet_gated.pt"
+    gate_gen_reward_every: int = 4     # every N optimizer steps: generate + score accuracy
+    gate_gen_subset: int = 4            # V20: 4 examples for GRPO normalization (was 2)
+    gate_gen_weight: float = 2.0        # weight of generation-based PG loss
+    gate_gen_max_tokens: int = 150      # max new tokens for fast gate gen reward
+    gate_entropy_weight: float = 0.1   # V20: binary entropy reg (crisp 0/1 decisions)
     lambda_cost: float = 0.0
     router_probe_layer: Optional[int] = None
     router_save_path: str = "checkpoints/router.pt"

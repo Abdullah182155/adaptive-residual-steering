@@ -444,7 +444,8 @@ def train_phase1_steernet(
         "steps": [],
     }
 
-    best_crit = float("inf")
+    best_crit = float("inf")       # kept for history logging
+    best_result_top1 = -1.0        # V20: checkpoint by result_top1 (better proxy for test accuracy)
     best_state = None
 
     model.set_telemetry(False)
@@ -536,8 +537,37 @@ def train_phase1_steernet(
                         # do NOT divide by len(micro) again (double-normalization bug).
                     elif cfg.loss_mode == "legacy_pure":
                         # Pure legacy: model's built-in uniform NLL (matches old RSC_Training.py)
-                        output = model(**batch)
-                        loss = output.loss / len(micro)
+                        # V20: support answer region upweighting when s1_answer_weight > 1.0
+                        _aw = getattr(cfg, "s1_answer_weight", 1.0)
+                        if _aw > 1.0:
+                            from src.routing.rloo import per_example_answer_nll_weighted
+                            _logits = model(
+                                input_ids=batch["input_ids"],
+                                attention_mask=batch["attention_mask"],
+                            ).logits
+                            loss = per_example_answer_nll_weighted(
+                                _logits, batch["labels"],
+                                answer_end_frac=getattr(cfg, "s1_answer_region_frac", 0.30),
+                                answer_weight=_aw,
+                            ).mean() / len(micro)
+                        else:
+                            output = model(**batch)
+                            loss = output.loss / len(micro)
+                        if cfg.mag_l1_weight > 0:
+                            mag_pen = loss.new_zeros(())
+                            n_sn = 0
+                            for sn in model.steer_nets.values():
+                                if sn.last_pre_cap_q is None:
+                                    continue
+                                q = sn.last_pre_cap_q[:, :, 0]
+                                active = q[q > 0]
+                                if active.numel() > 0:
+                                    mag_pen = mag_pen + active.mean()
+                                    n_sn += 1
+                            if n_sn > 0:
+                                l1 = mag_pen / (n_sn * len(micro))
+                                loss = loss + cfg.mag_l1_weight * l1
+                                parts["mag_l1"] = float(l1.detach())
                     else:
                         # Legacy mode with calc-token weighting
                         output = model(**batch)
@@ -593,6 +623,10 @@ def train_phase1_steernet(
 
         if val_eval["crit"] <= best_crit:
             best_crit = val_eval["crit"]
+        # V20: select checkpoint by result_top1 (top-1 accuracy on result/final tokens)
+        # Better proxy for greedy generation accuracy than weighted NLL loss.
+        if val_eval["result_top1"] >= best_result_top1:
+            best_result_top1 = val_eval["result_top1"]
             best_state = {
                 name: value.detach().cpu().clone()
                 for name, value in model.steer_nets.state_dict().items()
