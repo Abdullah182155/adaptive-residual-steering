@@ -438,10 +438,24 @@ def train_phase2b_gate(
                 model.train()
                 model.base_model.eval()
                 if gen_reward.abs().sum().item() > 0:
-                    # Recompute mean_alpha_log after switching back to train
+                    # Fresh forward pass to get live alpha values with gradients.
+                    # mean_alpha_log from the micro-batch loop is stale — its
+                    # computation graph was freed by the earlier backward() calls.
                     for gate in model.gates.values():
                         gate._freeze_gate = False
-                    gen_pg_loss = -(gen_weight * gen_reward.mean() * mean_alpha_log.detach())
+                    fresh_batch, fresh_extras = _prepare(gen_rows, device)
+                    model.set_prompt_shield_mask(fresh_extras.get("prompt_shield_mask"))
+                    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                        _ = model(
+                            input_ids=fresh_batch["input_ids"],
+                            attention_mask=fresh_batch["attention_mask"],
+                        ).logits
+                    fresh_alpha_log = torch.stack([
+                        gate._alpha_for_aux.clamp(1e-6, 1 - 1e-6).log().mean()
+                        for gate in model.gates.values()
+                        if gate._alpha_for_aux is not None
+                    ]).mean()
+                    gen_pg_loss = -(gen_weight * gen_reward.mean() * fresh_alpha_log)
                     if torch.isfinite(gen_pg_loss):
                         scaler.scale(gen_pg_loss).backward()
                         gen_pg_loss_val = float(gen_pg_loss.detach())
