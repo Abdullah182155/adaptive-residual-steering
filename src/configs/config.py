@@ -54,7 +54,7 @@ class RSCConfig:
     seed: int = 42
 
     # S1 answer-region upweighting — focuses gradient on the answer portion
-    s1_answer_weight: float = 1.0     # >1.0 upweights last s1_answer_region_frac tokens
+    s1_answer_weight: float = 2.0     # V20: upweight final answer region 2× (was 1.0)
     s1_answer_region_frac: float = 0.30
 
     # Phase 1C: Contrastive Residual Training
@@ -128,8 +128,8 @@ class RSCConfig:
     gate_init_alpha: float = 0.25
     gate_use_global_context: bool = False
     gate_lr: float = 1e-4
-    gate_epochs: int = 5
-    gate_l1_weight: float = 0.005
+    gate_epochs: int = 3               # V20: GRPO converges in 2-3 epochs (was 5)
+    gate_l1_weight: float = 0.0        # V20: replaced by gate_entropy_weight (kept for compat)
     gate_rloo_weight: float = 1.0
     gate_contrastive_weight: float = 1.0
     gate_contrastive_mode: str = "hinge"
@@ -142,9 +142,10 @@ class RSCConfig:
     gate_save_path: str = "checkpoints/gate.pt"
     steernet_gated_save_path: str = "checkpoints/steernet_gated.pt"
     gate_gen_reward_every: int = 4     # every N optimizer steps: generate + score accuracy
-    gate_gen_subset: int = 2            # examples per generation reward step
+    gate_gen_subset: int = 4            # V20: 4 examples for GRPO normalization (was 2)
     gate_gen_weight: float = 2.0        # weight of generation-based PG loss
     gate_gen_max_tokens: int = 150      # max new tokens for fast gate gen reward
+    gate_entropy_weight: float = 0.1   # V20: binary entropy reg (crisp 0/1 decisions)
     lambda_cost: float = 0.0
     router_probe_layer: Optional[int] = None
     router_save_path: str = "checkpoints/router.pt"
