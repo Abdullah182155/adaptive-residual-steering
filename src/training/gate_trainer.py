@@ -305,8 +305,9 @@ def train_phase2b_gate(
             batch_rows = eval_rows[start : start + cfg.batch_size]
             if not batch_rows:
                 continue
-            batch, _ = _prepare(batch_rows, device)
+            batch, extras = _prepare(batch_rows, device)
             ids, mask, labels = batch["input_ids"], batch["attention_mask"], batch["labels"]
+            model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
             with torch.no_grad():
                 for gate in model.gates.values():
                     gate._freeze_gate = False
