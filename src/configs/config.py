@@ -23,7 +23,7 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.08
+    rho_max: float = 0.05
     # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
     mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05; start low so network must earn magnitude
     calc_weight_alpha: float = 1.0
