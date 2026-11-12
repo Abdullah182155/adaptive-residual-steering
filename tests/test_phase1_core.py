@@ -23,7 +23,7 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.loss_mode == "typed"
     assert cfg.train_shot_probs == [0.50, 0.10, 0.20, 0.05, 0.15]
     assert cfg.shield_policy == "context"
-    assert cfg.mag_l1_weight == 0.1
+    assert cfg.mag_l1_weight == 0.01
     assert cfg.focal_gamma == 2.0
     assert cfg.kl_weight == 0.3
     assert cfg.lambda_result == 0.40
@@ -210,3 +210,47 @@ def test_wrapper_preserves_single_element_tuple_outputs():
     assert isinstance(steered, tuple)
     assert len(steered) == 1
     assert steered[0].shape == (1, 10, 8)
+
+
+def test_steernet_norm_capped_below_ceiling():
+    """V21: When MLP output is small (init), scale=1.0 — no capping."""
+    net = SteerNet(hidden_dim=8, rank=4, kappa=0.08, amplitude_mode="norm_capped",
+                   init_gain=0.02)
+    h = torch.randn(2, 5, 8)
+    delta = net(h, active_k=torch.tensor([4, 4]))
+    centered_norm = (h - h.mean(dim=-1, keepdim=True)).norm(dim=-1, keepdim=True)
+    max_norm = 0.08 / (4 ** 0.5) * centered_norm
+    delta_norms = delta.norm(dim=-1, keepdim=True)
+    assert (delta_norms <= max_norm + 1e-5).all(), "delta should be below ceiling at init"
+    assert delta_norms.mean() > 0, "delta should be non-zero"
+
+
+def test_steernet_norm_capped_at_ceiling():
+    """V21: With large init, MLP output hits the ceiling."""
+    net = SteerNet(hidden_dim=8, rank=4, kappa=0.08, amplitude_mode="norm_capped",
+                   init_gain=5.0)
+    h = torch.randn(2, 5, 8) * 10
+    delta = net(h, active_k=torch.tensor([4, 4]))
+    centered_norm = (h.float() - h.float().mean(dim=-1, keepdim=True)).norm(dim=-1, keepdim=True)
+    max_norm = 0.08 / (4 ** 0.5) * centered_norm
+    delta_norms = delta.norm(dim=-1, keepdim=True)
+    assert (delta_norms <= max_norm + 1e-4).all(), "delta should be capped at ceiling"
+
+
+def test_steernet_norm_capped_gradient_flow():
+    """V21: Gradients flow through both direction and magnitude below ceiling."""
+    net = SteerNet(hidden_dim=8, rank=4, kappa=0.08, amplitude_mode="norm_capped",
+                   init_gain=0.02)
+    net.train()
+    h = torch.randn(2, 5, 8, requires_grad=False)
+    delta = net(h, active_k=torch.tensor([4, 4]))
+    loss = delta.sum()
+    loss.backward()
+    assert net.up.weight.grad is not None, "up.weight should have gradient"
+    assert net.up.weight.grad.abs().sum() > 0, "gradient should be non-zero"
+
+
+def test_config_validates_norm_capped():
+    """V21: norm_capped is a valid amplitude_mode."""
+    cfg = RSCConfig(amplitude_mode="norm_capped")
+    cfg.validate()

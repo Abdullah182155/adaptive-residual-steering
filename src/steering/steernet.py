@@ -261,6 +261,27 @@ class SteerNet(nn.Module):
             radius = self.rho_max * active_k.clamp_min(1).rsqrt().view(B, 1, 1)
             delta = radius * magnitude * centered_norm * direction / direction_norm
             q = magnitude
+        elif self.amplitude_mode == "norm_capped":
+            # V21: MLP controls both direction AND magnitude through raw output norm.
+            # Safety ceiling prevents runaway amplitudes; below the cap, full gradient
+            # flows through the norm so the network learns per-token magnitude.
+            centered_norm = (h_flt - h_flt.mean(dim=-1, keepdim=True)).norm(
+                dim=-1, keepdim=True
+            )
+            active_k = (
+                torch.ones(B, device=h.device, dtype=h_flt.dtype)
+                if active_k is None
+                else active_k.to(h_flt)
+            )
+            max_norm = (
+                self.rho_max
+                * active_k.clamp_min(1).rsqrt().view(B, 1, 1)
+                * centered_norm
+            )
+            delta_norm = direction.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            scale = (max_norm / delta_norm).clamp(max=1.0)
+            delta = direction * scale
+            q = (delta_norm / max_norm.clamp_min(1e-6)).clamp(max=1.0)
         else:
             delta = direction * magnitude * self.scale.to(x.dtype)
             q = None
@@ -277,7 +298,7 @@ class SteerNet(nn.Module):
             delta_norm = torch.norm(delta, dim=-1, keepdim=True) + 1e-7
             cap = self.C_l
 
-        if self.amplitude_mode == "relative":
+        if self.amplitude_mode in ("relative", "norm_capped"):
             pre_cap_q = q * shield_mask
             if injection_mask is not None:
                 pre_cap_q = pre_cap_q * injection_mask.unsqueeze(-1)

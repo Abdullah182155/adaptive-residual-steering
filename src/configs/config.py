@@ -89,7 +89,7 @@ class RSCConfig:
     focal_gamma: float = 2.0
     kl_weight: float = 0.3
     kl_arithmetic_weight: float = 0.30
-    mag_l1_weight: float = 0.10
+    mag_l1_weight: float = 0.01
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
@@ -100,13 +100,13 @@ class RSCConfig:
 
     # On-policy training
     on_policy: bool = True
-    on_policy_frac: float = 0.25
-    on_policy_start_epoch: int = 2
+    on_policy_frac: float = 0.50
+    on_policy_start_epoch: int = 1
     on_policy_gen_batch: int = 4
     on_policy_k: int = 4                  # pass@k: samples per question
     on_policy_temperature: float = 0.7    # sampling temperature for pass@k
-    on_policy_interval: int = 2           # run on-policy every N epochs (saves ~1h per skipped epoch)
-    on_policy_gold_fallback: bool = True   # False = pure rejection sampling (STaR-like, no gold CoT)
+    on_policy_interval: int = 1           # V21: every epoch (was 2)
+    on_policy_gold_fallback: bool = False  # V21: pure rejection sampling (no gold CoT contamination)
 
     # Phase 2 Router
     phase2_lr: float = 5e-5
@@ -175,7 +175,7 @@ class RSCConfig:
             raise ValueError("fixed_layers must be a subset of candidate_layers")
         if self.k_scale_mode != "sqrt":
             raise ValueError("Phase 1 uses sqrt route scaling")
-        if self.amplitude_mode not in {"relative", "capped"}:
+        if self.amplitude_mode not in {"relative", "capped", "norm_capped"}:
             raise ValueError("amplitude_mode must be relative or capped")
         if self.loss_mode not in {"typed", "legacy", "legacy_pure"}:
             raise ValueError("loss_mode must be 'typed', 'legacy', or 'legacy_pure'")
