@@ -186,6 +186,50 @@ def evaluate_loss_with_hooks(model, rows, device: torch.device, enabled: bool) -
         return evaluate_loss(model, rows, device)
 
 
+@torch.no_grad()
+def _validate_generation(model, tokenizer, rows, device, cfg, n=50):
+    """Generate on val questions, compute lenient accuracy for checkpoint selection."""
+    from src.data.prompts import build_prompt_unified
+    from src.evaluation.answers import score_tiers
+
+    model.eval()
+    model.set_routing_override("only", cfg.fixed_layers)
+
+    gc_on = getattr(model.base_model, "is_gradient_checkpointing", False)
+    if gc_on and hasattr(model.base_model, "gradient_checkpointing_disable"):
+        model.base_model.gradient_checkpointing_disable()
+
+    correct, total = 0, 0
+    gen_bs = max(1, getattr(cfg, "on_policy_gen_batch", 1))
+    sample = rows[: min(n, len(rows))]
+    for i in range(0, len(sample), gen_bs):
+        batch_rows = sample[i : i + gen_bs]
+        prompts = [build_prompt_unified(r["question"], n_shot=0) for r in batch_rows]
+        texts = _generate_onpolicy_batch(
+            model, tokenizer, prompts, device,
+            max_new_tokens=256, temperature=0.0,
+        )
+        for r, text in zip(batch_rows, texts):
+            try:
+                gold_val = float(
+                    str(r.get("final_num", "")).replace(",", "").replace("$", "").strip()
+                )
+            except (ValueError, TypeError):
+                continue
+            total += 1
+            if score_tiers(text, gold_val).get("lenient", False):
+                correct += 1
+
+    if gc_on and hasattr(model.base_model, "gradient_checkpointing_enable"):
+        model.base_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
+    acc = correct / max(total, 1)
+    print(f"  [gen-val] {correct}/{total} = {100 * acc:.1f}% lenient (0-shot)")
+    return acc
+
+
 def checkpoint_metadata(cfg: RSCConfig) -> Dict[str, Any]:
     return {
         "route": list(cfg.fixed_layers),
@@ -446,6 +490,7 @@ def train_phase1_steernet(
 
     best_crit = float("inf")       # kept for history logging
     best_result_top1 = -1.0        # V20: checkpoint by result_top1 (better proxy for test accuracy)
+    best_gen_acc = -1.0            # V21: checkpoint by generation accuracy (actual lenient acc)
     best_state = None
 
     model.set_telemetry(False)
@@ -616,16 +661,30 @@ def train_phase1_steernet(
         history["train_nll"].append(running_loss / max(step_count, 1))
         history["validation_nll"].append(val_eval["validation_nll"])
         history["crit_history"].append(val_eval["crit"])
+        # V21: generation-based validation for checkpoint selection
+        gen_acc = -1.0
+        eval_rows_list = eval_data if isinstance(eval_data, list) else [eval_data[i] for i in range(len(eval_data))]
+        has_questions = eval_rows_list and "question" in eval_rows_list[0] and "final_num" in eval_rows_list[0]
+        if tokenizer is not None and has_questions:
+            gen_acc = _validate_generation(model, tokenizer, eval_rows_list, device, cfg, n=50)
+            model.train()
+            model.base_model.eval()
+
+        _gen_str = f" gen_acc={gen_acc:.3f}" if gen_acc >= 0 else ""
         print(
             f"S1 epoch {epoch + 1}/{cfg.phase1_epochs}: crit={val_eval['crit']:.4f} "
             f"result_top1={val_eval['result_top1']:.3f} val_nll={val_eval['validation_nll']:.4f}"
+            f"{_gen_str}"
         )
 
         if val_eval["crit"] <= best_crit:
             best_crit = val_eval["crit"]
-        # V20: select checkpoint by result_top1 (top-1 accuracy on result/final tokens)
-        # Better proxy for greedy generation accuracy than weighted NLL loss.
-        if val_eval["result_top1"] >= best_result_top1:
+        # V21: prefer generation accuracy for checkpoint; fall back to result_top1
+        select_by_gen = gen_acc >= 0 and tokenizer is not None
+        improved = (gen_acc > best_gen_acc) if select_by_gen else (val_eval["result_top1"] >= best_result_top1)
+        if improved:
+            if select_by_gen:
+                best_gen_acc = gen_acc
             best_result_top1 = val_eval["result_top1"]
             best_state = {
                 name: value.detach().cpu().clone()

@@ -101,6 +101,8 @@ def _grpo_accuracy_reward(
     )
     for gate in model.gates.values():
         gate._freeze_gate = False
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     # Generate with gate ON (learned alpha)
     completions_on = _generate_onpolicy_batch(
@@ -435,6 +437,9 @@ def train_phase2b_gate(
                 gen_reward = _grpo_accuracy_reward(
                     model, tokenizer, gen_rows, device, max_new_tokens=gen_max_tokens,
                 )
+                gc.collect()
+                if device.type == "cuda":
+                    torch.cuda.empty_cache()
                 model.train()
                 model.base_model.eval()
                 if gen_reward.abs().sum().item() > 0:
@@ -445,11 +450,14 @@ def train_phase2b_gate(
                         gate._freeze_gate = False
                     fresh_batch, fresh_extras = _prepare(gen_rows, device)
                     model.set_prompt_shield_mask(fresh_extras.get("prompt_shield_mask"))
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                        _ = model(
+                        _logits = model(
                             input_ids=fresh_batch["input_ids"],
                             attention_mask=fresh_batch["attention_mask"],
                         ).logits
+                    del _logits, fresh_batch, fresh_extras
                     fresh_alpha_log = torch.stack([
                         gate._alpha_for_aux.clamp(1e-6, 1 - 1e-6).log().mean()
                         for gate in model.gates.values()
@@ -529,6 +537,20 @@ def train_phase2b_gate(
             if finetune_sn:
                 best_sn_state = {k: v.cpu().clone() for k, v in model.steer_nets.state_dict().items()}
             print(f"  ** New best: improvement={val_improvement:+.4f} (epoch {epoch+1})")
+            # Save checkpoint immediately so it survives OOM/crash in later epochs
+            _gate_path = Path(getattr(cfg, "gate_save_path", "checkpoints/gate.pt"))
+            _gate_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {"gates": {k: v.cpu() for k, v in model.gates.state_dict().items()},
+                 "fixed_layers": cfg.fixed_layers,
+                 "gate_epochs": gate_epochs,
+                 "best_val_improvement": best_val_improvement,
+                 "history": history},
+                _gate_path,
+            )
+            if finetune_sn:
+                _sn_path = Path(getattr(cfg, "steernet_gated_save_path", "checkpoints/steernet_gated.pt"))
+                save_steer_weights(model, str(_sn_path), cfg)
 
         history["gate_train_loss"].append(avg_train)
         history["gate_val_nll"].append(val_nll)
