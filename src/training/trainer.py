@@ -104,7 +104,7 @@ def _param_groups(model, cfg: RSCConfig) -> List[Dict[str, Any]]:
     return [
         {"params": decay, "lr": lr, "weight_decay": cfg.weight_decay},
         {"params": no_decay, "lr": lr, "weight_decay": 0.0},
-        {"params": up, "lr": lr, "weight_decay": 0.0},
+        {"params": up, "lr": lr, "weight_decay": cfg.weight_decay * 0.1},
     ]
 
 
@@ -336,12 +336,12 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
 
     from src.data.prompts import build_prompt_unified
 
-    # Mixed-shot prompts: 60% 0-shot, 20% 1-shot, 20% 2-shot
     rng = random.Random(cfg.seed + epoch + 1000)
     questions = [rows[i]["question"] for i in indices]
     golds = [rows[i]["final_num"] for i in indices]
     gold_cots = [rows[i].get("answer", "") for i in indices]
-    shot_counts = [rng.choices([0, 1, 2], weights=[0.6, 0.2, 0.2])[0] for _ in questions]
+    _on_shot_probs = cfg.train_shot_probs[:3]
+    shot_counts = [rng.choices([0, 1, 2], weights=_on_shot_probs)[0] for _ in questions]
     prompts = [
         build_prompt_unified(q, n_shot=ns) for q, ns in zip(questions, shot_counts)
     ]
@@ -561,13 +561,21 @@ def train_phase1_steernet(
                             q = sn.last_pre_cap_q
                             if tt is not None:
                                 T_use = min(q.shape[1], tt.shape[1])
-                                prose_pos = (tt[:, :T_use] == T_PROSE)
-                                q_prose = q[:, :T_use, 0][prose_pos]
-                                active = q_prose[q_prose > 0]
+                                q_flat = q[:, :T_use, 0]
+                                tt_use = tt[:, :T_use]
+                                type_mult = torch.ones_like(q_flat)
+                                type_mult[tt_use == T_RESULT] = 0.1
+                                type_mult[tt_use == T_FINAL] = 0.1
+                                type_mult[tt_use == T_OPERAND] = 0.3
+                                type_mult[tt_use == T_OPERATOR] = 0.3
+                                type_mult[tt_use == T_PROSE] = 1.0
+                                type_mult[tt_use == T_FORMAT] = 3.0
+                                active_mask = q_flat > 0
+                                weighted_q = (q_flat * type_mult)[active_mask]
                             else:
-                                active = q[:, :, 0][q[:, :, 0] > 0]
-                            if active.numel() > 0:
-                                mag_penalty = mag_penalty + active.mean()
+                                weighted_q = q[:, :, 0][q[:, :, 0] > 0]
+                            if weighted_q.numel() > 0:
+                                mag_penalty = mag_penalty + weighted_q.mean()
                                 n_nets += 1
                         if n_nets > 0:
                             l1_loss = mag_penalty / (n_nets * len(micro))
@@ -640,6 +648,7 @@ def train_phase1_steernet(
             lr_curr = optimizer.param_groups[0]["lr"]
             if learned_weights is not None:
                 with torch.no_grad():
+                    learned_weights.log_var.clamp_(-3.0, 3.0)
                     cw = learned_weights.category_weights()
                     prec = torch.exp(-learned_weights.log_var)
                 parts.update({

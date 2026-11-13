@@ -272,14 +272,19 @@ def train_phase2b_gate(
     gen_subset         = getattr(cfg, "gate_gen_subset", 2)
     gen_weight         = getattr(cfg, "gate_gen_weight", 2.0)
     gen_max_tokens     = getattr(cfg, "gate_gen_max_tokens", 150)
+    training_mode      = getattr(cfg, "gate_training_mode", "rloo")
+    adv_temperature    = getattr(cfg, "gate_supervised_temperature", 5.0)
 
     use_gen_reward = gen_reward_every > 0 and tokenizer is not None and gen_subset > 0
 
     print(f"\n{'='*70}")
-    print(f"Phase 2B — Gate Training V19  ({gate_epochs} epochs, lr={gate_lr:.1e})")
-    print(f"  contrastive={contrastive_mode} w={gate_contrastive_w}  entropy_w={gate_entropy_w}")
-    print(f"  antisat w={antisat_w} thresh={antisat_thresh}  rloo baseline={baseline_alpha}")
-    print(f"  gen_reward={'YES every=' + str(gen_reward_every) + ' subset=' + str(gen_subset) + ' w=' + str(gen_weight) if use_gen_reward else 'NO (tokenizer not passed)'}")
+    print(f"Phase 2B — Gate Training V22  ({gate_epochs} epochs, lr={gate_lr:.1e}, mode={training_mode})")
+    if training_mode == "supervised":
+        print(f"  supervised: adv_temperature={adv_temperature}  contrastive_aux=0.3")
+    else:
+        print(f"  contrastive={contrastive_mode} w={gate_contrastive_w}  entropy_w={gate_entropy_w}")
+        print(f"  antisat w={antisat_w} thresh={antisat_thresh}  rloo baseline={baseline_alpha}")
+    print(f"  gen_reward={'YES every=' + str(gen_reward_every) + ' subset=' + str(gen_subset) + ' w=' + str(gen_weight) if use_gen_reward and training_mode != 'supervised' else 'OFF'}")
     print(f"  checkpoint_by=nll_improvement  finetune_sn={'YES lr=' + str(sn_lr) if finetune_sn else 'NO'}")
     print(f"{'='*70}")
 
@@ -374,64 +379,123 @@ def train_phase2b_gate(
                 if ids.numel() == 0:
                     continue
 
-                # ── Baseline NLL (gate=0.0, no gradient) ──────────────────
-                with torch.no_grad():
-                    nll_baseline = _nll_with_gate_alpha(
-                        model, ids, mask, labels, gate_value=baseline_alpha, answer_weight=1.0,
+                if training_mode == "supervised":
+                    # ── V22 Supervised Advantage Gate ─────────────────────
+                    # Step 1: per-token NLL baseline (gate=OFF, no grad)
+                    with torch.no_grad():
+                        for gate in model.gates.values():
+                            gate._freeze_gate = True
+                            gate._freeze_gate_value = 0.0
+                        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                            logits_off = model(input_ids=ids, attention_mask=mask).logits
+                        # per-token NLL: shift so token i predicts token i+1
+                        shift_logits = logits_off[:, :-1].contiguous()
+                        shift_labels = labels[:, 1:].contiguous()
+                        per_tok_off = F.cross_entropy(
+                            shift_logits.view(-1, shift_logits.size(-1)),
+                            shift_labels.view(-1),
+                            reduction="none",
+                        ).view(shift_labels.shape)  # (B, T-1)
+
+                    # Step 2: per-token NLL with full steering (gate=ON, no grad)
+                    with torch.no_grad():
+                        for gate in model.gates.values():
+                            gate._freeze_gate = True
+                            gate._freeze_gate_value = 1.0
+                        with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                            logits_on = model(input_ids=ids, attention_mask=mask).logits
+                        shift_logits_on = logits_on[:, :-1].contiguous()
+                        per_tok_on = F.cross_entropy(
+                            shift_logits_on.view(-1, shift_logits_on.size(-1)),
+                            shift_labels.view(-1),
+                            reduction="none",
+                        ).view(shift_labels.shape)  # (B, T-1)
+
+                    # Step 3: per-token advantage → gate target
+                    advantage_per_tok = (per_tok_off - per_tok_on).detach()  # positive = steering helps
+                    gate_target = torch.sigmoid(advantage_per_tok * adv_temperature)  # (B, T-1)
+
+                    # Step 4: forward with learned gate
+                    for gate in model.gates.values():
+                        gate._freeze_gate = False
+                    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                        _ = model(input_ids=ids, attention_mask=mask).logits
+
+                    # Step 5: supervised MSE loss (primary)
+                    supervised_loss = ids.new_zeros((), dtype=torch.float32)
+                    n_gates = 0
+                    for gate in model.gates.values():
+                        alpha = gate._alpha_for_aux
+                        if alpha is None:
+                            continue
+                        # alpha is (B, T, 1); gate_target is (B, T-1)
+                        T_use = min(alpha.shape[1], gate_target.shape[1])
+                        a = alpha[:, :T_use, 0]
+                        tgt = gate_target[:, :T_use]
+                        valid = shift_labels[:, :T_use].ne(-100)
+                        if valid.any():
+                            supervised_loss = supervised_loss + F.mse_loss(a[valid], tgt[valid].to(a.dtype))
+                            n_gates += 1
+                    if n_gates > 0:
+                        supervised_loss = supervised_loss / n_gates
+
+                    # Step 6: contrastive hinge as auxiliary
+                    cg_loss = ids.new_zeros((), dtype=torch.float32)
+                    if token_types is not None:
+                        cg_loss = _contrastive_gate_loss(
+                            model.gates, token_types, labels, mode="hinge",
+                        )
+
+                    step_loss = (supervised_loss + 0.3 * cg_loss) / len(window_batches)
+
+                else:
+                    # ── Legacy RLOO mode ───────────────────────────────────
+                    # Baseline NLL (gate=0.0, no gradient)
+                    with torch.no_grad():
+                        nll_baseline = _nll_with_gate_alpha(
+                            model, ids, mask, labels, gate_value=baseline_alpha, answer_weight=1.0,
+                        )
+
+                    # Learned NLL (gate active, gradient through gate)
+                    for gate in model.gates.values():
+                        gate._freeze_gate = False
+                    with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                        logits_learned = model(input_ids=ids, attention_mask=mask).logits
+                    nll_learned = per_example_answer_nll_weighted(
+                        logits_learned, labels, answer_weight=1.0,
                     )
 
-                # ── Learned NLL (gate active, gradient through gate) ───────
-                for gate in model.gates.values():
-                    gate._freeze_gate = False
-                with torch.amp.autocast("cuda", enabled=device.type == "cuda"):
-                    logits_learned = model(input_ids=ids, attention_mask=mask).logits
-                nll_learned = per_example_answer_nll_weighted(
-                    logits_learned, labels, answer_weight=1.0,
-                )
-
-                # ── RLOO advantage ─────────────────────────────────────────
-                advantage = (nll_baseline - nll_learned).detach()
-                mean_alpha_log = torch.stack([
-                    gate._alpha_for_aux.clamp(1e-6, 1 - 1e-6).log().mean()
-                    for gate in model.gates.values()
-                    if gate._alpha_for_aux is not None
-                ]).mean()
-                rloo_loss = -gate_rloo_w * (advantage.mean() * mean_alpha_log)
-
-                # ── Entropy regularization (V20: replaces L1 mean-alpha) ──
-                # Binary entropy H(alpha) encourages crisp 0/1 decisions.
-                # Works WITH contrastive (math→1, format→0) unlike mean-alpha L1.
-                entropy_loss = _entropy_reg(model.gates)
-
-                # ── Hinge contrastive ──────────────────────────────────────
-                cg_loss = ids.new_zeros((), dtype=torch.float32)
-                if token_types is not None and gate_contrastive_w > 0:
-                    cg_loss = _contrastive_gate_loss(
-                        model.gates, token_types, labels, mode=contrastive_mode,
+                    advantage = (nll_baseline - nll_learned).detach()
+                    mean_alpha_log = torch.stack([
+                        gate._alpha_for_aux.clamp(1e-6, 1 - 1e-6).log().mean()
+                        for gate in model.gates.values()
+                        if gate._alpha_for_aux is not None
+                    ]).mean()
+                    rloo_loss = -gate_rloo_w * (advantage.mean() * mean_alpha_log)
+                    entropy_loss = _entropy_reg(model.gates)
+                    cg_loss = ids.new_zeros((), dtype=torch.float32)
+                    if token_types is not None and gate_contrastive_w > 0:
+                        cg_loss = _contrastive_gate_loss(
+                            model.gates, token_types, labels, mode=contrastive_mode,
+                        )
+                    asat_loss = _antisat_loss(model.gates, threshold=antisat_thresh)
+                    step_loss = (
+                        rloo_loss
+                        + gate_entropy_w * entropy_loss
+                        + gate_contrastive_w * cg_loss
+                        + antisat_w * asat_loss
                     )
-
-                # ── Anti-saturation ────────────────────────────────────────
-                asat_loss = _antisat_loss(model.gates, threshold=antisat_thresh)
-
-                # ── Compose gate loss ──────────────────────────────────────
-                step_loss = (
-                    rloo_loss
-                    + gate_entropy_w * entropy_loss
-                    + gate_contrastive_w * cg_loss
-                    + antisat_w * asat_loss
-                )
-                if use_task_nll:
-                    step_loss = step_loss + nll_learned.mean()
-
-                step_loss = step_loss / len(window_batches)
+                    if use_task_nll:
+                        step_loss = step_loss + nll_learned.mean()
+                    step_loss = step_loss / len(window_batches)
 
                 if torch.isfinite(step_loss):
                     scaler.scale(step_loss).backward()
                     window_loss_sum = window_loss_sum + step_loss.detach()
 
-            # ── Generation-based accuracy reward (every N opt steps) ───────
+            # ── Generation-based accuracy reward (legacy RLOO mode only) ───
             gen_pg_loss_val = 0.0
-            if use_gen_reward and global_opt_step > 0 and global_opt_step % gen_reward_every == 0:
+            if use_gen_reward and training_mode != "supervised" and global_opt_step > 0 and global_opt_step % gen_reward_every == 0:
                 gen_indices = torch.randint(len(rows), (gen_subset,), generator=torch.Generator().manual_seed(global_opt_step)).tolist()
                 gen_rows = [rows[i] for i in gen_indices]
                 gen_reward = _grpo_accuracy_reward(

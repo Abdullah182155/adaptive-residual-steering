@@ -23,14 +23,13 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.05
-    # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
+    rho_max: float = 0.10
     mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05; start low so network must earn magnitude
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
-    steernet_init_gain: float = 0.02    # xavier gain; small init → organic amplitude growth
-    steernet_use_mag_head: bool = False  # disabled: saturates to 1.0, makes amplitude unlearnable
+    steernet_init_gain: float = 1.0     # V22: direction is unit-normalized; gain only affects feature expressivity
+    steernet_use_mag_head: bool = True   # V22: per-token magnitude via sigmoid(mag_head(x))
     steernet_use_soft_cap: bool = False  # disabled: rho_max is the single amplitude bound
     steernet_use_conv: bool = True       # causal depthwise convolution; old code had none
     guard_revert_to_k0: bool = True
@@ -88,19 +87,19 @@ class RSCConfig:
     lambda_prose: float = 0.03
     focal_gamma: float = 2.0
     kl_weight: float = 0.3
-    kl_arithmetic_weight: float = 0.30
-    mag_l1_weight: float = 0.01
+    kl_arithmetic_weight: float = 0.05     # V22: reduced from 0.30; allows arithmetic distribution shift
+    mag_l1_weight: float = 0.03            # V22: raised from 0.01; all token types now penalized
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
-    train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.10, 0.20, 0.05, 0.15])  # 0, 1, 2, 3, 4 shots
+    train_shot_probs: List[float] = field(default_factory=lambda: [0.90, 0.05, 0.05, 0.0, 0.0])  # V22: 90% 0-shot focus
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.90
     shield_policy: str = "context"
 
     # On-policy training
     on_policy: bool = True
-    on_policy_frac: float = 0.50
+    on_policy_frac: float = 0.20            # V22: reduced from 0.50 (80min/epoch → 20min)
     on_policy_start_epoch: int = 1
     on_policy_gen_batch: int = 4
     on_policy_k: int = 4                  # pass@k: samples per question
@@ -146,6 +145,8 @@ class RSCConfig:
     gate_gen_weight: float = 2.0        # weight of generation-based PG loss
     gate_gen_max_tokens: int = 150      # max new tokens for fast gate gen reward
     gate_entropy_weight: float = 0.1   # V20: binary entropy reg (crisp 0/1 decisions)
+    gate_training_mode: str = "supervised"   # V22: "supervised" (per-token advantage) or "rloo" (legacy)
+    gate_supervised_temperature: float = 5.0 # V22: sigmoid(advantage * temp) sharpness for gate targets
     lambda_cost: float = 0.0
     router_probe_layer: Optional[int] = None
     router_save_path: str = "checkpoints/router.pt"
