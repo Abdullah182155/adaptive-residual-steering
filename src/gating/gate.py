@@ -29,7 +29,7 @@ class RSCUsefulnessGate(nn.Module):
         self.drop = nn.Dropout(cfg.gate_dropout)
         self.fc2 = nn.Linear(gate_dim, 1)
 
-        nn.init.zeros_(self.fc2.weight)
+        nn.init.xavier_uniform_(self.fc2.weight, gain=0.1)
         init_alpha = max(0.01, min(0.99, cfg.gate_init_alpha))
         init_logit = math.log(init_alpha / (1.0 - init_alpha))
         self.fc2.bias.data.fill_(init_logit)

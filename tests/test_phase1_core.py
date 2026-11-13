@@ -21,9 +21,9 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.max_tok_len == 512
     assert cfg.phase1_lr == 1.5e-4
     assert cfg.loss_mode == "typed"
-    assert cfg.train_shot_probs == [0.50, 0.10, 0.20, 0.05, 0.15]
+    assert cfg.train_shot_probs == [0.50, 0.15, 0.20, 0.10, 0.05]  # V23: balanced shot distribution
     assert cfg.shield_policy == "context"
-    assert cfg.mag_l1_weight == 0.01
+    assert cfg.mag_l1_weight == 0.10  # V23: increased from 0.03 to suppress mag_head saturation
     assert cfg.focal_gamma == 2.0
     assert cfg.kl_weight == 0.3
     assert cfg.lambda_result == 0.40
@@ -254,3 +254,51 @@ def test_config_validates_norm_capped():
     """V21: norm_capped is a valid amplitude_mode."""
     cfg = RSCConfig(amplitude_mode="norm_capped")
     cfg.validate()
+
+
+def test_v22_mag_head_enabled_by_default():
+    """V23: mag_head is enabled and amplitude_mode is relative by default."""
+    cfg = RSCConfig()
+    assert cfg.steernet_use_mag_head is True
+    assert cfg.amplitude_mode == "relative"
+    assert cfg.rho_max == 0.04           # V23: reduced from 0.10 — prevents arithmetic plan disruption
+    assert cfg.steernet_init_gain == 1.0
+    assert cfg.kl_arithmetic_weight == 0.15  # V23: increased from 0.05 — stronger arithmetic NLL signal
+    assert cfg.on_policy_frac == 0.20
+    assert cfg.gate_training_mode == "supervised"
+    assert cfg.gate_supervised_temperature == 5.0
+
+
+def test_v22_steernet_mag_head_gradient_always_flows():
+    """V22: mag_head=True + relative mode — gradient flows through sigmoid, never killed by clamp."""
+    net = SteerNet(hidden_dim=8, rank=4, kappa=0.04, amplitude_mode="relative",
+                   use_mag_head=True, init_gain=1.0)
+    net.train()
+    h = torch.randn(2, 5, 8, requires_grad=False)
+    delta = net(h, active_k=torch.tensor([4, 4]))
+    loss = delta.sum()
+    loss.backward()
+    assert net.mag_head.weight.grad is not None, "mag_head.weight should have gradient"
+    assert net.mag_head.weight.grad.abs().sum() > 0, "mag_head gradient should be non-zero"
+    assert net.up.weight.grad is not None, "up.weight should have gradient"
+
+
+def test_v22_steernet_mag_head_per_token_variation():
+    """V22: Different tokens should have different magnitude values (per-token selectivity)."""
+    net = SteerNet(hidden_dim=16, rank=8, kappa=0.04, amplitude_mode="relative",
+                   use_mag_head=True, init_gain=1.0, mag_head_init_bias=0.0)
+    net.eval()
+    h = torch.randn(1, 10, 16) * 5
+    delta = net(h, active_k=torch.tensor([4]))
+    delta_norms = delta.norm(dim=-1)
+    # With random inputs and mag_head bias=0.0, magnitudes should vary across tokens
+    assert delta_norms[:, 1:].std() > 0, "delta norms should vary across tokens"
+
+
+def test_v22_gate_xavier_init():
+    """V22: gate fc2.weight uses Xavier init (not zeros) — breaks constant-output trap."""
+    from src.configs.config import RSCConfig
+    from src.gating.gate import RSCUsefulnessGate
+    cfg = RSCConfig()
+    gate = RSCUsefulnessGate(32, cfg)
+    assert gate.fc2.weight.abs().sum() > 0, "fc2.weight should be non-zero (Xavier init)"

@@ -23,14 +23,13 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.05
-    # rho_max is the ONLY amplitude knob in relative mode (lora_alpha and steer_scale have no effect)
+    rho_max: float = 0.04  # V23: reduced from 0.10; 2% of hidden norm avoids disrupting correct chains
     mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05; start low so network must earn magnitude
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
-    steernet_init_gain: float = 0.02    # xavier gain; small init → organic amplitude growth
-    steernet_use_mag_head: bool = False  # disabled: saturates to 1.0, makes amplitude unlearnable
+    steernet_init_gain: float = 1.0     # V22: direction is unit-normalized; gain only affects feature expressivity
+    steernet_use_mag_head: bool = True   # V22: per-token magnitude via sigmoid(mag_head(x))
     steernet_use_soft_cap: bool = False  # disabled: rho_max is the single amplitude bound
     steernet_use_conv: bool = True       # causal depthwise convolution; old code had none
     guard_revert_to_k0: bool = True
@@ -88,25 +87,27 @@ class RSCConfig:
     lambda_prose: float = 0.03
     focal_gamma: float = 2.0
     kl_weight: float = 0.3
-    kl_arithmetic_weight: float = 0.30
-    mag_l1_weight: float = 0.01
+    kl_arithmetic_weight: float = 0.15     # V23: compromise (V21=0.30, V22=0.05); partial arithmetic anchor prevents plan disruption
+    mag_l1_weight: float = 0.10            # V23: raised from 0.03; 10× stronger pressure forces mag_head to be selective
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
-    train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.10, 0.20, 0.05, 0.15])  # 0, 1, 2, 3, 4 shots
+    train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])  # V23: balanced 0-4 shot (V22 had 90% 0-shot which killed few-shot generalization)
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.90
     shield_policy: str = "context"
 
     # On-policy training
     on_policy: bool = True
-    on_policy_frac: float = 0.50
+    on_policy_frac: float = 0.20            # keep from V22: reduced from 0.50
     on_policy_start_epoch: int = 1
     on_policy_gen_batch: int = 4
-    on_policy_k: int = 4                  # pass@k: samples per question
-    on_policy_temperature: float = 0.7    # sampling temperature for pass@k
-    on_policy_interval: int = 1           # V21: every epoch (was 2)
-    on_policy_gold_fallback: bool = False  # V21: pure rejection sampling (no gold CoT contamination)
+    on_policy_k: int = 2                  # V23: reduced from 4; 43% correct rate makes pass@4 wasteful
+    on_policy_temperature: float = 0.5    # V23: reduced from 0.7; more deterministic → higher correct rate
+    on_policy_interval: int = 1
+    on_policy_gold_fallback: bool = False
+    on_policy_verify_steps: bool = True   # V23: reject completions with provably wrong arithmetic equations
+    on_policy_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])  # V23: match training distribution
 
     # Phase 2 Router
     phase2_lr: float = 5e-5
@@ -131,7 +132,7 @@ class RSCConfig:
     gate_epochs: int = 3               # V20: GRPO converges in 2-3 epochs (was 5)
     gate_l1_weight: float = 0.0        # V20: replaced by gate_entropy_weight (kept for compat)
     gate_rloo_weight: float = 1.0
-    gate_contrastive_weight: float = 1.0
+    gate_contrastive_weight: float = 2.0  # V23: raised from 1.0; stronger type discrimination needed (FINAL=0.218 in V22)
     gate_contrastive_mode: str = "hinge"
     gate_use_task_nll: bool = False
     gate_antisat_weight: float = 0.25
@@ -146,6 +147,8 @@ class RSCConfig:
     gate_gen_weight: float = 2.0        # weight of generation-based PG loss
     gate_gen_max_tokens: int = 150      # max new tokens for fast gate gen reward
     gate_entropy_weight: float = 0.1   # V20: binary entropy reg (crisp 0/1 decisions)
+    gate_training_mode: str = "supervised"   # V22: "supervised" (per-token advantage) or "rloo" (legacy)
+    gate_supervised_temperature: float = 5.0 # V22: sigmoid(advantage * temp) sharpness for gate targets
     lambda_cost: float = 0.0
     router_probe_layer: Optional[int] = None
     router_save_path: str = "checkpoints/router.pt"

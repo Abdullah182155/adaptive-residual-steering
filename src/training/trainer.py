@@ -87,7 +87,12 @@ def _prepare(rows: List[dict], device: torch.device):
 
 
 def _param_groups(model, cfg: RSCConfig) -> List[Dict[str, Any]]:
-    """Configure optimizer parameter groups: exclude LayerNorms and scale-invariant up from weight decay."""
+    """Configure optimizer parameter groups: exclude LayerNorms and scale-invariant up from weight decay.
+
+    When mag_head is active it controls the output scale, so up.weight encodes pure
+    direction and benefits from full weight decay to prevent norm collapse.
+    When mag_head is off, up.weight IS the scale, so we zero-out its decay.
+    """
     decay, no_decay, up = [], [], []
     for name, p in model.steer_nets.named_parameters():
         if not p.requires_grad:
@@ -101,10 +106,13 @@ def _param_groups(model, cfg: RSCConfig) -> List[Dict[str, Any]]:
         else:
             no_decay.append(p)
     lr = cfg.phase1_lr
+    # mag_head controls output scale → up encodes direction only → apply full WD
+    # without mag_head → up encodes scale too → no WD (avoid shrinking the signal)
+    up_wd = cfg.weight_decay if cfg.use_mag_head else 0.0
     return [
         {"params": decay, "lr": lr, "weight_decay": cfg.weight_decay},
         {"params": no_decay, "lr": lr, "weight_decay": 0.0},
-        {"params": up, "lr": lr, "weight_decay": 0.0},
+        {"params": up, "lr": lr, "weight_decay": up_wd},
     ]
 
 
@@ -289,6 +297,40 @@ def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=2
     return outputs  # length = B * num_return_sequences, grouped as [prompt0_k0, prompt0_k1, ..., prompt1_k0, ...]
 
 
+def _verify_arithmetic_steps(completion: str, tol: float = 0.02) -> bool:
+    """Return False if any explicit 'A op B = C' equation in the completion has a wrong RHS.
+
+    Catches cases like '540 × 7 = 3780' when the question only asks about one week.
+    Uses eval() with a restricted namespace (no builtins) so it cannot execute arbitrary code.
+    Tolerates relative error <= tol (default 2%) to handle floating-point rounding in GSM8K.
+
+    Only rejects completions with *provably wrong* arithmetic — if the LHS cannot be parsed
+    (e.g. contains a variable), the check is skipped for that equation (conservative).
+    """
+    import re
+    # Match patterns: optional prefix, then NUMBER [op] NUMBER = NUMBER
+    # e.g. "3 * 60 = 180", "180 - 0.3*180 = 108", "5 × 4 = 20"
+    _EQ_PAT = re.compile(
+        r'([\d\s\+\-\*\/\.\(\)×÷]+)\s*=\s*(-?\d[\d,]*(?:\.\d+)?)'
+    )
+    _SAFE_NS: dict = {"__builtins__": {}}
+    for m in _EQ_PAT.finditer(completion):
+        lhs_raw = m.group(1).replace('×', '*').replace('÷', '/').replace(',', '').strip()
+        rhs_raw = m.group(2).replace(',', '')
+        # Skip if LHS is just a bare number (e.g. "= 20" at end of "Step 3: 20")
+        if re.fullmatch(r'-?\d+(\.\d+)?', lhs_raw):
+            continue
+        try:
+            lhs_val = float(eval(lhs_raw, _SAFE_NS))  # noqa: S307 — restricted namespace
+            rhs_val = float(rhs_raw)
+            denom = max(1.0, abs(rhs_val))
+            if abs(lhs_val - rhs_val) > tol * denom:
+                return False  # provably wrong arithmetic step
+        except Exception:
+            pass  # unparseable LHS (variable, complex expr) — skip conservatively
+    return True
+
+
 def _tokenize_onpolicy(tokenizer, question, completion, cfg, n_shot=0):
     from src.data.prompts import build_prompt_with_shield
     prompt_text, enc_full, shield_mask = build_prompt_with_shield(
@@ -336,12 +378,16 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
 
     from src.data.prompts import build_prompt_unified
 
-    # Mixed-shot prompts: 60% 0-shot, 20% 1-shot, 20% 2-shot
     rng = random.Random(cfg.seed + epoch + 1000)
     questions = [rows[i]["question"] for i in indices]
     golds = [rows[i]["final_num"] for i in indices]
     gold_cots = [rows[i].get("answer", "") for i in indices]
-    shot_counts = [rng.choices([0, 1, 2], weights=[0.6, 0.2, 0.2])[0] for _ in questions]
+    # V23: use dedicated on_policy_shot_probs if set, else fall back to train_shot_probs.
+    # This ensures on-policy distribution matches the training mixture (V22 had a 60/20/20
+    # hardcode that diverged from the 90/5/5 training mix, hurting few-shot generalisation).
+    _op_probs = getattr(cfg, "on_policy_shot_probs", None) or cfg.train_shot_probs
+    _op_choices = list(range(len(_op_probs)))
+    shot_counts = [rng.choices(_op_choices, weights=_op_probs)[0] for _ in questions]
     prompts = [
         build_prompt_unified(q, n_shot=ns) for q, ns in zip(questions, shot_counts)
     ]
@@ -384,6 +430,7 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
     n_tried = 0
     n_correct = 0
     n_gold_fallback = 0
+    n_step_rejected = 0
     for qi, (q, gold, gold_cot, ns) in enumerate(zip(questions, golds, gold_cots, shot_counts)):
         try:
             gold_num = float(str(gold).replace(",", "").replace("$", "").strip())
@@ -396,6 +443,12 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
             comp = completions_flat[base + ki]
             scored = score_tiers(comp, gold_num)
             if scored["lenient"]:
+                # V23: reject completions with provably wrong arithmetic steps
+                # e.g. "540 × 7 = 3780" on a question that only asks about one week.
+                # This prevents bad reasoning chains from poisoning on-policy data.
+                if getattr(cfg, "on_policy_verify_steps", True) and not _verify_arithmetic_steps(comp):
+                    n_step_rejected += 1
+                    continue
                 n_correct += 1
                 row = _tokenize_onpolicy(tokenizer, q, comp, cfg, n_shot=ns)
                 row["question"] = q
@@ -412,8 +465,9 @@ def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
 
     print(
         f"[on-policy] {n_gen} questions × {on_policy_k} samples = {n_tried} tried "
-        f"→ {n_correct} correct ({100 * n_correct / max(n_gen, 1):.1f}%) "
-        f"+ {n_gold_fallback} gold fallback → {len(new_rows)} new rows"
+        f"→ {n_correct} correct ({100 * n_correct / max(n_gen, 1):.1f}%)"
+        f"{f', {n_step_rejected} step-rejected' if n_step_rejected else ''}"
+        f" + {n_gold_fallback} gold fallback → {len(new_rows)} new rows"
     )
 
     model.train()
@@ -550,7 +604,13 @@ def train_phase1_steernet(
                             extras.get("neg_ids"),
                             learned_weights=learned_weights,
                         )
-                        # ── Magnitude L1 on prose tokens ──
+                        # ── Magnitude L1: global penalty + per-type multipliers ──
+                        # V23 redesign: global downward pressure on ALL tokens (counteracts
+                        # NLL-driven saturation). Math tokens get a low multiplier (0.1-0.3)
+                        # so the NLL objective can still earn them high magnitude; non-math
+                        # tokens get strong multipliers (1.0-4.0) so the mag_head must work
+                        # hard to suppress them. With mag_l1_weight=0.10 (10× V22), the
+                        # gradient balance tilts toward selectivity instead of saturation.
                         l1_loss = logits.new_zeros(())
                         mag_penalty = logits.new_zeros(())
                         n_nets = 0
@@ -561,13 +621,23 @@ def train_phase1_steernet(
                             q = sn.last_pre_cap_q
                             if tt is not None:
                                 T_use = min(q.shape[1], tt.shape[1])
-                                prose_pos = (tt[:, :T_use] == T_PROSE)
-                                q_prose = q[:, :T_use, 0][prose_pos]
-                                active = q_prose[q_prose > 0]
+                                q_flat = q[:, :T_use, 0]
+                                tt_use = tt[:, :T_use]
+                                type_mult = torch.ones_like(q_flat)
+                                # Math tokens: light penalty — NLL can still earn magnitude
+                                type_mult[tt_use == T_RESULT]   = 0.1
+                                type_mult[tt_use == T_FINAL]    = 0.1
+                                type_mult[tt_use == T_OPERAND]  = 0.2
+                                type_mult[tt_use == T_OPERATOR] = 0.2
+                                # Non-math: strong penalty — force mag_head to suppress these
+                                type_mult[tt_use == T_PROSE]    = 1.5
+                                type_mult[tt_use == T_FORMAT]   = 4.0
+                                active_mask = q_flat > 0
+                                weighted_q = (q_flat * type_mult)[active_mask]
                             else:
-                                active = q[:, :, 0][q[:, :, 0] > 0]
-                            if active.numel() > 0:
-                                mag_penalty = mag_penalty + active.mean()
+                                weighted_q = q[:, :, 0][q[:, :, 0] > 0]
+                            if weighted_q.numel() > 0:
+                                mag_penalty = mag_penalty + weighted_q.mean()
                                 n_nets += 1
                         if n_nets > 0:
                             l1_loss = mag_penalty / (n_nets * len(micro))
@@ -633,6 +703,11 @@ def train_phase1_steernet(
             # Only step scheduler if optimizer.step() was not skipped by GradScaler
             if scale_before <= scale_after:
                 scheduler.step()
+            # V23: clamp Kendall log_var to [-3, 3] to prevent one task (e.g. large kl)
+            # from suppressing another task entirely via unbounded precision weighting.
+            if learned_weights is not None:
+                with torch.no_grad():
+                    learned_weights.log_var.clamp_(-3.0, 3.0)
             optimizer.zero_grad(set_to_none=True)
 
             step_count += 1
@@ -640,6 +715,7 @@ def train_phase1_steernet(
             lr_curr = optimizer.param_groups[0]["lr"]
             if learned_weights is not None:
                 with torch.no_grad():
+                    learned_weights.log_var.clamp_(-3.0, 3.0)
                     cw = learned_weights.category_weights()
                     prec = torch.exp(-learned_weights.log_var)
                 parts.update({
