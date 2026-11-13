@@ -302,3 +302,31 @@ def test_v22_gate_xavier_init():
     cfg = RSCConfig()
     gate = RSCUsefulnessGate(32, cfg)
     assert gate.fc2.weight.abs().sum() > 0, "fc2.weight should be non-zero (Xavier init)"
+
+
+def test_param_groups_up_weight_decay():
+    """Verify _param_groups assigns correct weight decay to up.weight based on mag_head."""
+    from src.training.trainer import _param_groups
+    import torch.nn as nn
+
+    class DummyModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.steer_nets = nn.ModuleDict({
+                "17": nn.ModuleDict({
+                    "up": nn.Linear(4, 8),
+                    "mag_head": nn.Linear(8, 1),
+                })
+            })
+
+    cfg = RSCConfig(steernet_use_mag_head=True, weight_decay=0.01)
+    assert cfg.use_mag_head is True
+    groups = _param_groups(DummyModel(), cfg)
+    up_group = next(g for g in groups if any(p.shape == (8, 4) for p in g["params"]))
+    assert up_group["weight_decay"] == 0.01
+
+    cfg_no_mag = RSCConfig(steernet_use_mag_head=False, weight_decay=0.01)
+    assert cfg_no_mag.use_mag_head is False
+    groups_no_mag = _param_groups(DummyModel(), cfg_no_mag)
+    up_group_no_mag = next(g for g in groups_no_mag if any(p.shape == (8, 4) for p in g["params"]))
+    assert up_group_no_mag["weight_decay"] == 0.0
