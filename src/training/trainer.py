@@ -108,7 +108,8 @@ def _param_groups(model, cfg: RSCConfig) -> List[Dict[str, Any]]:
     lr = cfg.phase1_lr
     # mag_head controls output scale → up encodes direction only → apply full WD
     # without mag_head → up encodes scale too → no WD (avoid shrinking the signal)
-    up_wd = cfg.weight_decay if cfg.use_mag_head else 0.0
+    has_mag_head = getattr(cfg, "steernet_use_mag_head", getattr(cfg, "use_mag_head", True))
+    up_wd = cfg.weight_decay if has_mag_head else 0.0
     return [
         {"params": decay, "lr": lr, "weight_decay": cfg.weight_decay},
         {"params": no_decay, "lr": lr, "weight_decay": 0.0},

@@ -164,6 +164,10 @@ class RSCConfig:
     generation_repetition_penalty: float = 1.1    # 1.0 = disabled
     generation_no_repeat_ngram: int = 0           # disabled: prompt tokens cause false bans in 2-shot
 
+    @property
+    def use_mag_head(self) -> bool:
+        return self.steernet_use_mag_head
+
     def validate(self) -> None:
         """Reject configurations that violate Phase 1 contracts."""
         if self.steernet_arch != "v5":
