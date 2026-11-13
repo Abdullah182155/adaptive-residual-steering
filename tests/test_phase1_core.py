@@ -21,9 +21,9 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.max_tok_len == 512
     assert cfg.phase1_lr == 1.5e-4
     assert cfg.loss_mode == "typed"
-    assert cfg.train_shot_probs == [0.90, 0.05, 0.05, 0.0, 0.0]
+    assert cfg.train_shot_probs == [0.50, 0.15, 0.20, 0.10, 0.05]  # V23: balanced shot distribution
     assert cfg.shield_policy == "context"
-    assert cfg.mag_l1_weight == 0.03
+    assert cfg.mag_l1_weight == 0.10  # V23: increased from 0.03 to suppress mag_head saturation
     assert cfg.focal_gamma == 2.0
     assert cfg.kl_weight == 0.3
     assert cfg.lambda_result == 0.40
@@ -257,13 +257,13 @@ def test_config_validates_norm_capped():
 
 
 def test_v22_mag_head_enabled_by_default():
-    """V22: mag_head is enabled and amplitude_mode is relative by default."""
+    """V23: mag_head is enabled and amplitude_mode is relative by default."""
     cfg = RSCConfig()
     assert cfg.steernet_use_mag_head is True
     assert cfg.amplitude_mode == "relative"
-    assert cfg.rho_max == 0.10
+    assert cfg.rho_max == 0.04           # V23: reduced from 0.10 — prevents arithmetic plan disruption
     assert cfg.steernet_init_gain == 1.0
-    assert cfg.kl_arithmetic_weight == 0.05
+    assert cfg.kl_arithmetic_weight == 0.15  # V23: increased from 0.05 — stronger arithmetic NLL signal
     assert cfg.on_policy_frac == 0.20
     assert cfg.gate_training_mode == "supervised"
     assert cfg.gate_supervised_temperature == 5.0

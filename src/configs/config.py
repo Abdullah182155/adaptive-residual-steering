@@ -23,7 +23,7 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.10
+    rho_max: float = 0.04  # V23: reduced from 0.10; 2% of hidden norm avoids disrupting correct chains
     mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05; start low so network must earn magnitude
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
@@ -87,25 +87,27 @@ class RSCConfig:
     lambda_prose: float = 0.03
     focal_gamma: float = 2.0
     kl_weight: float = 0.3
-    kl_arithmetic_weight: float = 0.05     # V22: reduced from 0.30; allows arithmetic distribution shift
-    mag_l1_weight: float = 0.03            # V22: raised from 0.01; all token types now penalized
+    kl_arithmetic_weight: float = 0.15     # V23: compromise (V21=0.30, V22=0.05); partial arithmetic anchor prevents plan disruption
+    mag_l1_weight: float = 0.10            # V23: raised from 0.03; 10× stronger pressure forces mag_head to be selective
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
-    train_shot_probs: List[float] = field(default_factory=lambda: [0.90, 0.05, 0.05, 0.0, 0.0])  # V22: 90% 0-shot focus
+    train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])  # V23: balanced 0-4 shot (V22 had 90% 0-shot which killed few-shot generalization)
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.90
     shield_policy: str = "context"
 
     # On-policy training
     on_policy: bool = True
-    on_policy_frac: float = 0.20            # V22: reduced from 0.50 (80min/epoch → 20min)
+    on_policy_frac: float = 0.20            # keep from V22: reduced from 0.50
     on_policy_start_epoch: int = 1
     on_policy_gen_batch: int = 4
-    on_policy_k: int = 4                  # pass@k: samples per question
-    on_policy_temperature: float = 0.7    # sampling temperature for pass@k
-    on_policy_interval: int = 1           # V21: every epoch (was 2)
-    on_policy_gold_fallback: bool = False  # V21: pure rejection sampling (no gold CoT contamination)
+    on_policy_k: int = 2                  # V23: reduced from 4; 43% correct rate makes pass@4 wasteful
+    on_policy_temperature: float = 0.5    # V23: reduced from 0.7; more deterministic → higher correct rate
+    on_policy_interval: int = 1
+    on_policy_gold_fallback: bool = False
+    on_policy_verify_steps: bool = True   # V23: reject completions with provably wrong arithmetic equations
+    on_policy_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])  # V23: match training distribution
 
     # Phase 2 Router
     phase2_lr: float = 5e-5
@@ -130,7 +132,7 @@ class RSCConfig:
     gate_epochs: int = 3               # V20: GRPO converges in 2-3 epochs (was 5)
     gate_l1_weight: float = 0.0        # V20: replaced by gate_entropy_weight (kept for compat)
     gate_rloo_weight: float = 1.0
-    gate_contrastive_weight: float = 1.0
+    gate_contrastive_weight: float = 2.0  # V23: raised from 1.0; stronger type discrimination needed (FINAL=0.218 in V22)
     gate_contrastive_mode: str = "hinge"
     gate_use_task_nll: bool = False
     gate_antisat_weight: float = 0.25

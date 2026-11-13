@@ -184,22 +184,29 @@ def _contrastive_gate_loss(
         t = tt[:, :T_use]
         v = valid[:, :T_use]
 
-        math_mask = v & ((t == T_OPERAND) | (t == T_OPERATOR) | (t == T_RESULT) | (t == T_FINAL))
+        # Separate FINAL from other math tokens: in V22 FINAL alpha=0.218 (target 0.85),
+        # so we apply 2× weight to pull it up more aggressively.
+        final_mask = v & (t == T_FINAL)
+        other_math_mask = v & ((t == T_OPERAND) | (t == T_OPERATOR) | (t == T_RESULT))
         fmt_mask = v & (t == T_FORMAT)
         prose_mask = v & (t == T_PROSE)
 
         if mode == "hinge":
-            if math_mask.any():
-                loss = loss + F.relu(0.85 - a[math_mask]).mean()
+            if other_math_mask.any():
+                loss = loss + F.relu(0.85 - a[other_math_mask]).mean()
+            if final_mask.any():  # 2× weight: FINAL was 0.218 in V22, needs stronger pull
+                loss = loss + 2.0 * F.relu(0.85 - a[final_mask]).mean()
             if fmt_mask.any():
-                loss = loss + F.relu(a[fmt_mask] - 0.15).mean()
+                loss = loss + F.relu(a[fmt_mask] - 0.05).mean()   # tightened: 0.15→0.05 (FORMAT=0.347 in V22)
             if prose_mask.any():
                 loss = loss + F.relu(0.65 - a[prose_mask]).mean()
         else:
-            if math_mask.any():
-                loss = loss + (a[math_mask] - 0.85).pow(2).mean()
+            if other_math_mask.any():
+                loss = loss + (a[other_math_mask] - 0.85).pow(2).mean()
+            if final_mask.any():
+                loss = loss + 2.0 * (a[final_mask] - 0.85).pow(2).mean()
             if fmt_mask.any():
-                loss = loss + (a[fmt_mask] - 0.15).pow(2).mean()
+                loss = loss + (a[fmt_mask] - 0.05).pow(2).mean()   # tightened: 0.15→0.05
             if prose_mask.any():
                 loss = loss + (a[prose_mask] - 0.65).pow(2).mean()
         n_gates += 1
