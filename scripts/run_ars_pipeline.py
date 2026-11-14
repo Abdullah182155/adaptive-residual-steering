@@ -72,7 +72,11 @@ def parse_args(argv=None):
     parser.add_argument("--shots", type=int, nargs="+")
     parser.add_argument("--record", default="experiment_record.json")
     parser.add_argument("--report", action="store_true")
-    parser.add_argument("--arms", default="baseline,fixed")
+    parser.add_argument(
+        "--arms",
+        default="baseline,fixed",
+        help="Comma-separated benchmark arms; steer_only is the isolated Phase 1 arm",
+    )
     parser.add_argument("--ood", default="")
     parser.add_argument("--ood_n", type=int, default=300)
     parser.add_argument("--ood_shots", type=int, nargs="+", default=[0])
@@ -159,6 +163,23 @@ def prepare_dataset_split(dataset, limit: int | None = None):
     return list(dataset[:n])
 
 
+def _load_arm_weights(model, arm: str, cfg: RSCConfig, device: torch.device) -> None:
+    """Load the checkpoint belonging to a benchmark arm before it is evaluated."""
+    if arm in {"baseline", "identity"}:
+        return
+
+    if arm in {"fixed", "steer_only", "random", "router"}:
+        checkpoint = Path(cfg.lora_save_path)
+    elif arm in {"gate", "full"}:
+        checkpoint = Path(cfg.steernet_gated_save_path)
+    else:
+        raise ValueError(f"unsupported benchmark arm: {arm}")
+
+    if not checkpoint.exists():
+        raise FileNotFoundError(f"SteerNet checkpoint for arm '{arm}' not found: {checkpoint}")
+    load_steer_weights(model, str(checkpoint), cfg, device)
+
+
 def run(args) -> int:
     cfg = build_config(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -188,15 +209,14 @@ def run(args) -> int:
     if stage in {"S1R"}:
         print("Running S1R Self-Taught Reasoning (STaR)")
         train_phase1r_star(model, train_data, validation_data, cfg, device, tokenizer=tokenizer)
-    if stage in {"S2", "all"}:
+    if stage == "S2":
         print("Running S2 Phase 2 Router training")
-        if stage == "S2":
-            # Load S1 checkpoint when running S2 standalone
-            checkpoint = Path(cfg.lora_save_path)
-            if checkpoint.exists():
-                load_steer_weights(model, str(checkpoint), cfg, device)
-            else:
-                print(f"[warning] No S1 checkpoint found at {checkpoint}, training router from scratch")
+        # Load S1 checkpoint when running S2 standalone.
+        checkpoint = Path(cfg.lora_save_path)
+        if checkpoint.exists():
+            load_steer_weights(model, str(checkpoint), cfg, device)
+        else:
+            print(f"[warning] No S1 checkpoint found at {checkpoint}, training router from scratch")
         router_result = train_phase2_router(
             model, train_data, validation_data, cfg, device, tokenizer=tokenizer
         )
@@ -205,7 +225,7 @@ def run(args) -> int:
         )
         print(f"Wrote router checkpoint: {cfg.router_save_path}")
 
-    if stage in {"S2B", "all"}:
+    if stage == "S2B":
         print("Running S2B Phase 2B Gate training")
         checkpoint = Path(cfg.lora_save_path)
         if checkpoint.exists():
@@ -242,15 +262,11 @@ def run(args) -> int:
         shots = args.shots or cfg.bench_shots
         arms = [arm.strip() for arm in args.arms.split(",") if arm.strip()]
 
-        # Load gated SteerNet + gate if available
-        if getattr(cfg, "use_gate", False):
+        # Gate modules are only needed for explicitly requested gate arms.
+        if any(arm in {"gate", "full"} for arm in arms):
             import torch.nn as nn_mod
             from src.gating.gate import RSCUsefulnessGate as _Gate
-            gated_sn_path = Path(getattr(cfg, "steernet_gated_save_path", "checkpoints/steernet_gated.pt"))
             gate_ckpt_path = Path(getattr(cfg, "gate_save_path", "checkpoints/gate.pt"))
-            if gated_sn_path.exists():
-                load_steer_weights(model, str(gated_sn_path), cfg, device)
-                print(f"Loaded gated SteerNet: {gated_sn_path}")
             if gate_ckpt_path.exists():
                 hidden_size = model.base_model.config.hidden_size
                 model.gates = nn_mod.ModuleDict({
@@ -264,6 +280,8 @@ def run(args) -> int:
                     return gates_ref[str(target_layers[position])](hidden, delta)
                 model.set_gate_provider(_gate_provider)
                 print(f"Loaded gate: {gate_ckpt_path}")
+            else:
+                raise FileNotFoundError(f"Gate checkpoint for requested gate arm not found: {gate_ckpt_path}")
 
         # Load router checkpoint if "router" arm requested
         router_prefill_fn = None
@@ -285,6 +303,7 @@ def run(args) -> int:
             arms,
             contract,
             router_prefill_fn=router_prefill_fn,
+            arm_setup=lambda arm: _load_arm_weights(model, arm, cfg, device),
         )
         write_record(record, cfg.record_path)
         if args.report:

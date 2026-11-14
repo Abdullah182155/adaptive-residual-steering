@@ -13,17 +13,22 @@ from src.training.trainer import _trim_to_attended_tokens
 
 def test_certified_config_physics_and_decode_policy():
     cfg = RSCConfig()
-    assert cfg.fixed_layers == [8, 11, 13, 15, 17, 19, 20, 21, 22, 24]
-    assert cfg.candidate_layers == [8, 11, 13, 15, 17, 19, 20, 21, 22, 24]
+    assert cfg.fixed_layers == [17, 20, 23, 26]
+    assert cfg.candidate_layers == [8, 11, 13, 15, 17, 19, 20, 21, 22, 23, 24, 26]
     assert cfg.steer_kappa == 0.15
     assert cfg.steer_scale == 0.30
     assert cfg.k_scale_mode == "sqrt"
-    assert cfg.max_tok_len == 512
+    assert cfg.max_tok_len == 768
     assert cfg.phase1_lr == 1.5e-4
     assert cfg.loss_mode == "typed"
     assert cfg.train_shot_probs == [0.50, 0.15, 0.20, 0.10, 0.05]  # V23: balanced shot distribution
-    assert cfg.shield_policy == "context"
-    assert cfg.mag_l1_weight == 0.10  # V23: increased from 0.03 to suppress mag_head saturation
+    assert cfg.shield_policy == "prompt"
+    assert cfg.diversify_prompts is False
+    assert cfg.generation_repetition_penalty == 1.0
+    assert cfg.steernet_use_mag_head is False
+    assert cfg.mag_l1_weight == 0.0
+    assert cfg.s1_answer_weight == 1.0
+    assert cfg.on_policy is False
     assert cfg.focal_gamma == 2.0
     assert cfg.kl_weight == 0.3
     assert cfg.lambda_result == 0.40
@@ -83,11 +88,40 @@ def test_prompt_shielding_keeps_prefill_pristine():
     assert torch.allclose(baseline, shielded, atol=1e-6)
 
 
+def test_prompt_shield_policy_masks_every_prefill_token_except_last():
+    from src.data.prompts import build_prompt_with_shield
+
+    class CharacterTokenizer:
+        def __call__(self, text, return_tensors="pt", return_offsets_mapping=False):
+            ids = torch.arange(1, len(text) + 1).unsqueeze(0)
+            encoded = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            if return_offsets_mapping:
+                encoded["offset_mapping"] = torch.tensor(
+                    [[(idx, idx + 1) for idx in range(len(text))]]
+                )
+            return encoded
+
+    _, encoded, shield = build_prompt_with_shield(
+        CharacterTokenizer(), "What is 2 + 2?", policy="prompt"
+    )
+    assert "offset_mapping" not in encoded
+    assert shield.sum().item() == encoded["input_ids"].shape[1] - 1
+    assert not shield[-1]
+
+
 def test_canonical_and_lenient_answer_extraction():
     assert extract_numeric_answer("Work. #### 12") == 12.0
     assert extract_numeric_answer("Work\nThere are 19 left", lenient=True) == 19.0
     tiers = score_tiers("Final answer: 12", 12.0)
     assert tiers["strict"] and tiers["marker"] and tiers["lenient"]
+
+
+def test_arithmetic_verifier_uses_safe_expression_parser():
+    from src.training.trainer import _verify_arithmetic_steps
+
+    assert _verify_arithmetic_steps("3 * 60 = 180\n180 - 0.3*180 = 126")
+    assert not _verify_arithmetic_steps("540 * 7 = 3000")
+    assert _verify_arithmetic_steps("If x = 4, then the total = 20")
 
 
 def test_s5_contract_records_fixed_route(tmp_path):
@@ -125,7 +159,7 @@ def test_pipeline_cli_smoke_configuration():
             "--s1_epochs",
             "3",
             "--s1_lr",
-            "0.002",
+            "0.00015",
             "--s_fixed",
             "13,20,22",
             "--set",
@@ -136,8 +170,95 @@ def test_pipeline_cli_smoke_configuration():
     )
     cfg = build_config(args)
     assert cfg.phase1_epochs == 3
-    assert cfg.phase1_lr == 0.002
+    assert cfg.phase1_lr == 1.5e-4
     assert cfg.loss_mode == "legacy"
+
+
+def test_phase1_learning_rate_is_locked():
+    import pytest
+
+    with pytest.raises(ValueError, match="phase1_lr is locked at 1.5e-4"):
+        RSCConfig(phase1_lr=2e-4).validate()
+
+    with pytest.raises(ValueError, match="phase1_lr is locked at 1.5e-4"):
+        build_config(parse_args(["--stage", "S1", "--s1_lr", "0.0002"]))
+
+
+def test_benchmark_arms_load_their_own_steernet_checkpoints(tmp_path, monkeypatch):
+    import scripts.run_ars_pipeline as pipeline
+
+    phase1 = tmp_path / "steernet.pt"
+    gated = tmp_path / "steernet_gated.pt"
+    phase1.touch()
+    gated.touch()
+    cfg = SimpleNamespace(
+        lora_save_path=str(phase1),
+        steernet_gated_save_path=str(gated),
+    )
+    loaded = []
+    monkeypatch.setattr(
+        pipeline,
+        "load_steer_weights",
+        lambda model, path, cfg, device: loaded.append(path),
+    )
+
+    pipeline._load_arm_weights(object(), "fixed", cfg, torch.device("cpu"))
+    pipeline._load_arm_weights(object(), "steer_only", cfg, torch.device("cpu"))
+    pipeline._load_arm_weights(object(), "gate", cfg, torch.device("cpu"))
+    pipeline._load_arm_weights(object(), "baseline", cfg, torch.device("cpu"))
+
+    assert loaded == [str(phase1), str(phase1), str(gated)]
+
+
+def test_steer_only_benchmark_arm_isolated_from_gate_and_router():
+    from src.evaluation.benchmark import _configure_arm
+
+    gate_provider = object()
+
+    class Model:
+        def __init__(self):
+            self.cfg = SimpleNamespace(use_gate=True)
+            self.gates = {"17": SimpleNamespace(_freeze_gate=False)}
+            self.calls = []
+            self._gate_provider = gate_provider
+
+        def set_gate_provider(self, provider):
+            self._gate_provider = provider
+            self.calls.append(("gate_provider", provider))
+
+        def set_routing_override(self, *args):
+            self.calls.append(("route", args))
+
+        def set_route_selector(self, selector):
+            self.calls.append(("route_selector", selector))
+
+        def set_intervention_gain(self, gain):
+            self.calls.append(("gain", gain))
+
+        def set_steer_scale(self, scale):
+            self.calls.append(("steer_scale", scale))
+
+        def set_control(self, mode):
+            self.calls.append(("control", mode))
+
+    model = Model()
+    cfg = SimpleNamespace(fixed_layers=[17, 20, 23, 26], use_gate=True)
+    _configure_arm(model, "steer_only", cfg, gate_provider)
+
+    assert cfg.use_gate is False
+    assert model.cfg.use_gate is False
+    assert model._gate_provider is None
+    assert model.gates["17"]._freeze_gate is True
+    assert ("route", ("only", [17, 20, 23, 26])) in model.calls
+    assert ("route_selector", None) in model.calls
+    assert ("steer_scale", 1.0) in model.calls
+    assert ("gain", 1.0) in model.calls
+    assert ("control", None) in model.calls
+
+    _configure_arm(model, "gate", cfg, gate_provider)
+    assert cfg.use_gate is True
+    assert model.cfg.use_gate is True
+    assert model._gate_provider is gate_provider
 
 
 def test_batch_trimming_keeps_auxiliary_masks_aligned():
@@ -256,14 +377,13 @@ def test_config_validates_norm_capped():
     cfg.validate()
 
 
-def test_v22_mag_head_enabled_by_default():
-    """V23: mag_head is enabled and amplitude_mode is relative by default."""
+def test_phase1_uses_identity_magnitude_by_default():
+    """Phase 1 RFT pins the magnitude to one by omitting the magnitude head."""
     cfg = RSCConfig()
-    assert cfg.steernet_use_mag_head is True
+    assert cfg.steernet_use_mag_head is False
     assert cfg.amplitude_mode == "relative"
-    assert cfg.rho_max == 0.08           # V25: 0.04→0.08; restores format compliance lost at 2% amplitude
+    assert cfg.rho_max == 0.08
     assert cfg.steernet_init_gain == 1.0
-    assert cfg.kl_arithmetic_weight == 0.15  # V23: increased from 0.05 — stronger arithmetic NLL signal
     assert cfg.on_policy_frac == 0.20
     assert cfg.gate_training_mode == "supervised"
     assert cfg.gate_supervised_temperature == 5.0

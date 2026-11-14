@@ -11,8 +11,8 @@ class RSCConfig:
     """Certified defaults for fixed-route SteerNet V5 training and deployment."""
 
     model_name: str = "microsoft/phi-2"
-    candidate_layers: List[int] = field(default_factory=lambda: [8, 11, 13, 15, 17, 19, 20, 21, 22, 24])
-    fixed_layers: List[int] = field(default_factory=lambda: [8, 11, 13, 15, 17, 19, 20, 21, 22, 24])
+    candidate_layers: List[int] = field(default_factory=lambda: [8, 11, 13, 15, 17, 19, 20, 21, 22, 23, 24, 26])
+    fixed_layers: List[int] = field(default_factory=lambda: [17, 20, 23, 26])
     steernet_arch: str = "v5"
     objective: str = "nll"
 
@@ -30,7 +30,7 @@ class RSCConfig:
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
     steernet_init_gain: float = 1.0     # V22: direction is unit-normalized; gain only affects feature expressivity
-    steernet_use_mag_head: bool = True   # V22: per-token magnitude via sigmoid(mag_head(x))
+    steernet_use_mag_head: bool = False  # Phase 1 RFT: identity magnitude, m ≡ 1.0
     steernet_use_soft_cap: bool = False  # disabled: rho_max is the single amplitude bound
     steernet_use_conv: bool = True       # causal depthwise convolution; old code had none
     guard_revert_to_k0: bool = True
@@ -48,13 +48,13 @@ class RSCConfig:
     phase1_plateau_min_lr: float = 5e-6
     log_every: int = 20
     n_samples: int = 7473
-    max_tok_len: int = 512
+    max_tok_len: int = 768
     val_split: float = 0.08
-    diversify_prompts: bool = True
+    diversify_prompts: bool = False
     seed: int = 42
 
     # S1 answer-region upweighting — focuses gradient on the answer portion
-    s1_answer_weight: float = 2.0     # V20: upweight final answer region 2× (was 1.0)
+    s1_answer_weight: float = 1.0     # RFT uses uniform token-mean NLL
     s1_answer_region_frac: float = 0.30
 
     # Phase 1C: Contrastive Residual Training
@@ -89,17 +89,17 @@ class RSCConfig:
     focal_gamma: float = 2.0
     kl_weight: float = 0.3
     kl_arithmetic_weight: float = 0.15     # V23: compromise (V21=0.30, V22=0.05); partial arithmetic anchor prevents plan disruption
-    mag_l1_weight: float = 0.10            # V23: raised from 0.03; 10× stronger pressure forces mag_head to be selective
+    mag_l1_weight: float = 0.0             # RFT uses plain NLL and identity magnitude
     steer_amplitude_k: Optional[int] = None
 
     # V2 Multi-Context Training Mixture
     train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])  # V23: balanced 0-4 shot (V22 had 90% 0-shot which killed few-shot generalization)
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.90
-    shield_policy: str = "context"
+    shield_policy: str = "prompt"
 
     # On-policy training
-    on_policy: bool = True
+    on_policy: bool = False
     on_policy_frac: float = 0.20            # keep from V22: reduced from 0.50
     on_policy_start_epoch: int = 1
     on_policy_gen_batch: int = 4
@@ -162,7 +162,7 @@ class RSCConfig:
     bench_shots: List[int] = field(default_factory=lambda: [0, 2, 4])
     generation_max_new_tokens: int = 256
     generation_temperature: float = 0.0
-    generation_repetition_penalty: float = 1.1    # 1.0 = disabled
+    generation_repetition_penalty: float = 1.0    # 1.0 = disabled
     generation_no_repeat_ngram: int = 0           # disabled: prompt tokens cause false bans in 2-shot
 
     @property
@@ -177,6 +177,8 @@ class RSCConfig:
             raise ValueError("Phase 1 supports token-weighted NLL only")
         if not self.fixed_layers:
             raise ValueError("fixed_layers cannot be empty")
+        if abs(self.phase1_lr - 1.5e-4) > 1e-12:
+            raise ValueError("phase1_lr is locked at 1.5e-4")
         if not all(0 <= l < 32 for l in self.fixed_layers):
             raise ValueError("fixed_layers contains out-of-range indices for phi-2 (0–31)")
         if self.candidate_layers and not set(self.fixed_layers).issubset(set(self.candidate_layers)):

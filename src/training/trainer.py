@@ -273,62 +273,59 @@ def load_steer_weights(
 
 
 @torch.no_grad()
-def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=256,
-                              num_return_sequences=1, temperature=0.0, max_prompt_length=512):
-    enc = tokenizer(prompts, return_tensors="pt", truncation=True,
-                    max_length=max_prompt_length, padding=True)
-    inputs = {k: v.to(device) for k, v in enc.items()}
-    model.set_prompt_shield_mask(None)
-    do_sample = (num_return_sequences > 1 or temperature > 0.0)
-    tokens = model.generate(
-        **inputs,
+def _generate_onpolicy_batch(
+    model,
+    tokenizer,
+    prompts,
+    device,
+    max_new_tokens=256,
+    num_return_sequences=1,
+    temperature=0.0,
+    max_prompt_length=1024,
+):
+    """Compatibility wrapper using the shared left-padded generation engine."""
+    from src.evaluation.generation import generate_texts
+
+    return generate_texts(
+        model,
+        tokenizer,
+        list(prompts),
+        device,
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=temperature if do_sample else 1.0,
         num_return_sequences=num_return_sequences,
+        temperature=temperature,
+        top_p=0.95 if temperature > 0 else 1.0,
+        max_prompt_len=max_prompt_length,
+        repetition_penalty=1.0,
     )
-    B = len(prompts)
-    # prompt lengths broadcast across the k sequences per prompt
-    prompt_lens = inputs["attention_mask"].sum(dim=1).repeat_interleave(num_return_sequences)
-    outputs = []
-    for i in range(B * num_return_sequences):
-        plen = int(prompt_lens[i])
-        text = tokenizer.decode(tokens[i, plen:], skip_special_tokens=True)
-        outputs.append(text)
-    return outputs  # length = B * num_return_sequences, grouped as [prompt0_k0, prompt0_k1, ..., prompt1_k0, ...]
 
 
 def _verify_arithmetic_steps(completion: str, tol: float = 0.02) -> bool:
-    """Return False if any explicit 'A op B = C' equation in the completion has a wrong RHS.
+    """Reject explicit arithmetic equations with a provably incorrect RHS.
 
-    Catches cases like '540 × 7 = 3780' when the question only asks about one week.
-    Uses eval() with a restricted namespace (no builtins) so it cannot execute arbitrary code.
-    Tolerates relative error <= tol (default 2%) to handle floating-point rounding in GSM8K.
-
-    Only rejects completions with *provably wrong* arithmetic — if the LHS cannot be parsed
-    (e.g. contains a variable), the check is skipped for that equation (conservative).
+    Expressions use the bounded AST evaluator in ``evaluation.chain``; expressions it
+    cannot parse are skipped conservatively.
     """
     import re
+    from src.evaluation.chain import safe_eval_expr
     # Match patterns: optional prefix, then NUMBER [op] NUMBER = NUMBER
     # e.g. "3 * 60 = 180", "180 - 0.3*180 = 108", "5 × 4 = 20"
     _EQ_PAT = re.compile(
         r'([\d\s\+\-\*\/\.\(\)×÷]+)\s*=\s*(-?\d[\d,]*(?:\.\d+)?)'
     )
-    _SAFE_NS: dict = {"__builtins__": {}}
     for m in _EQ_PAT.finditer(completion):
         lhs_raw = m.group(1).replace('×', '*').replace('÷', '/').replace(',', '').strip()
         rhs_raw = m.group(2).replace(',', '')
         # Skip if LHS is just a bare number (e.g. "= 20" at end of "Step 3: 20")
         if re.fullmatch(r'-?\d+(\.\d+)?', lhs_raw):
             continue
-        try:
-            lhs_val = float(eval(lhs_raw, _SAFE_NS))  # noqa: S307 — restricted namespace
-            rhs_val = float(rhs_raw)
-            denom = max(1.0, abs(rhs_val))
-            if abs(lhs_val - rhs_val) > tol * denom:
-                return False  # provably wrong arithmetic step
-        except Exception:
-            pass  # unparseable LHS (variable, complex expr) — skip conservatively
+        lhs_val = safe_eval_expr(lhs_raw)
+        if lhs_val is None:
+            continue
+        rhs_val = float(rhs_raw)
+        denom = max(1.0, abs(rhs_val))
+        if abs(lhs_val - rhs_val) > tol * denom:
+            return False
     return True
 
 

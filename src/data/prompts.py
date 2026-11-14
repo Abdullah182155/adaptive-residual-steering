@@ -154,9 +154,24 @@ def get_harness_hash() -> str:
 
 
 def build_prompt_with_shield(tokenizer, question: str, n_shot: int = 0, policy: str = "context", **kw):
-    """Return (prompt, enc, shield_mask) with shield_mask covering preface + few-shot exemplars when n_shot > 0."""
+    """Build a prompt and a token mask for the configured prefill shield policy."""
     prompt = build_prompt_unified(question, n_shot=n_shot, **kw)
     tail = f"Question: {question}\nAnswer: Let's think step by step.\n"
+    if policy == "prompt":
+        try:
+            enc = tokenizer(prompt, return_tensors="pt", return_offsets_mapping=True)
+            offsets = enc.pop("offset_mapping")[0]
+            attention_mask = enc.get("attention_mask", torch.ones_like(enc["input_ids"]))[0].bool()
+            shield = attention_mask & offsets[:, 1].gt(offsets[:, 0])
+        except (TypeError, NotImplementedError):
+            enc = tokenizer(prompt, return_tensors="pt")
+            attention_mask = enc.get("attention_mask", torch.ones_like(enc["input_ids"]))[0].bool()
+            shield = attention_mask.clone()
+        attended = attention_mask.nonzero(as_tuple=False).flatten()
+        if attended.numel():
+            shield[attended[-1]] = False
+        return prompt, enc, shield
+
     if n_shot > 0 and policy != "none" and prompt.endswith(tail):
         c_q = len(prompt) - len(tail)
         try:
