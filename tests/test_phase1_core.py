@@ -22,7 +22,9 @@ def test_certified_config_physics_and_decode_policy():
     assert cfg.phase1_lr == 1.5e-4
     assert cfg.loss_mode == "typed"
     assert cfg.train_shot_probs == [0.50, 0.15, 0.20, 0.10, 0.05]  # V23: balanced shot distribution
-    assert cfg.shield_policy == "context"
+    assert cfg.shield_policy == "prompt"
+    assert cfg.diversify_prompts is False
+    assert cfg.generation_repetition_penalty == 1.0
     assert cfg.mag_l1_weight == 0.10  # V23: increased from 0.03 to suppress mag_head saturation
     assert cfg.focal_gamma == 2.0
     assert cfg.kl_weight == 0.3
@@ -90,6 +92,14 @@ def test_canonical_and_lenient_answer_extraction():
     assert tiers["strict"] and tiers["marker"] and tiers["lenient"]
 
 
+def test_arithmetic_verifier_uses_safe_expression_parser():
+    from src.training.trainer import _verify_arithmetic_steps
+
+    assert _verify_arithmetic_steps("3 * 60 = 180\n180 - 0.3*180 = 126")
+    assert not _verify_arithmetic_steps("540 * 7 = 3000")
+    assert _verify_arithmetic_steps("If x = 4, then the total = 20")
+
+
 def test_s5_contract_records_fixed_route(tmp_path):
     cfg = RSCConfig()
     rows = [{"input_ids": torch.tensor([1, 2]), "attention_mask": torch.tensor([1, 1])}]
@@ -125,7 +135,7 @@ def test_pipeline_cli_smoke_configuration():
             "--s1_epochs",
             "3",
             "--s1_lr",
-            "0.002",
+            "0.00015",
             "--s_fixed",
             "13,20,22",
             "--set",
@@ -136,8 +146,43 @@ def test_pipeline_cli_smoke_configuration():
     )
     cfg = build_config(args)
     assert cfg.phase1_epochs == 3
-    assert cfg.phase1_lr == 0.002
+    assert cfg.phase1_lr == 1.5e-4
     assert cfg.loss_mode == "legacy"
+
+
+def test_phase1_learning_rate_is_locked():
+    import pytest
+
+    with pytest.raises(ValueError, match="phase1_lr is locked at 1.5e-4"):
+        RSCConfig(phase1_lr=2e-4).validate()
+
+    with pytest.raises(ValueError, match="phase1_lr is locked at 1.5e-4"):
+        build_config(parse_args(["--stage", "S1", "--s1_lr", "0.0002"]))
+
+
+def test_benchmark_arms_load_their_own_steernet_checkpoints(tmp_path, monkeypatch):
+    import scripts.run_ars_pipeline as pipeline
+
+    phase1 = tmp_path / "steernet.pt"
+    gated = tmp_path / "steernet_gated.pt"
+    phase1.touch()
+    gated.touch()
+    cfg = SimpleNamespace(
+        lora_save_path=str(phase1),
+        steernet_gated_save_path=str(gated),
+    )
+    loaded = []
+    monkeypatch.setattr(
+        pipeline,
+        "load_steer_weights",
+        lambda model, path, cfg, device: loaded.append(path),
+    )
+
+    pipeline._load_arm_weights(object(), "fixed", cfg, torch.device("cpu"))
+    pipeline._load_arm_weights(object(), "gate", cfg, torch.device("cpu"))
+    pipeline._load_arm_weights(object(), "baseline", cfg, torch.device("cpu"))
+
+    assert loaded == [str(phase1), str(gated)]
 
 
 def test_batch_trimming_keeps_auxiliary_masks_aligned():

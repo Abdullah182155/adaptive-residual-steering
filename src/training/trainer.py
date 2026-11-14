@@ -299,36 +299,31 @@ def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=2
 
 
 def _verify_arithmetic_steps(completion: str, tol: float = 0.02) -> bool:
-    """Return False if any explicit 'A op B = C' equation in the completion has a wrong RHS.
+    """Reject explicit arithmetic equations with a provably incorrect RHS.
 
-    Catches cases like '540 × 7 = 3780' when the question only asks about one week.
-    Uses eval() with a restricted namespace (no builtins) so it cannot execute arbitrary code.
-    Tolerates relative error <= tol (default 2%) to handle floating-point rounding in GSM8K.
-
-    Only rejects completions with *provably wrong* arithmetic — if the LHS cannot be parsed
-    (e.g. contains a variable), the check is skipped for that equation (conservative).
+    Expressions use the bounded AST evaluator in ``evaluation.chain``; expressions it
+    cannot parse are skipped conservatively.
     """
     import re
+    from src.evaluation.chain import safe_eval_expr
     # Match patterns: optional prefix, then NUMBER [op] NUMBER = NUMBER
     # e.g. "3 * 60 = 180", "180 - 0.3*180 = 108", "5 × 4 = 20"
     _EQ_PAT = re.compile(
         r'([\d\s\+\-\*\/\.\(\)×÷]+)\s*=\s*(-?\d[\d,]*(?:\.\d+)?)'
     )
-    _SAFE_NS: dict = {"__builtins__": {}}
     for m in _EQ_PAT.finditer(completion):
         lhs_raw = m.group(1).replace('×', '*').replace('÷', '/').replace(',', '').strip()
         rhs_raw = m.group(2).replace(',', '')
         # Skip if LHS is just a bare number (e.g. "= 20" at end of "Step 3: 20")
         if re.fullmatch(r'-?\d+(\.\d+)?', lhs_raw):
             continue
-        try:
-            lhs_val = float(eval(lhs_raw, _SAFE_NS))  # noqa: S307 — restricted namespace
-            rhs_val = float(rhs_raw)
-            denom = max(1.0, abs(rhs_val))
-            if abs(lhs_val - rhs_val) > tol * denom:
-                return False  # provably wrong arithmetic step
-        except Exception:
-            pass  # unparseable LHS (variable, complex expr) — skip conservatively
+        lhs_val = safe_eval_expr(lhs_raw)
+        if lhs_val is None:
+            continue
+        rhs_val = float(rhs_raw)
+        denom = max(1.0, abs(rhs_val))
+        if abs(lhs_val - rhs_val) > tol * denom:
+            return False
     return True
 
 

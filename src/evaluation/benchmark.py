@@ -184,6 +184,7 @@ def run_benchmark(
     contract: Dict[str, object] | None = None,
     suite: str = "gsm8k",
     router_prefill_fn=None,
+    arm_setup=None,
 ) -> Dict[str, object]:
     """Run greedy paired baseline/fixed evaluation and return a serializable record."""
     # Ensure SteerNet dropout is off during generation (SteerNet starts in train mode).
@@ -201,6 +202,8 @@ def run_benchmark(
         for arm in arms:
             if arm not in {"baseline", "fixed", "identity", "random", "router", "gate", "full"}:
                 raise ValueError(f"unsupported benchmark arm: {arm}")
+            if arm_setup is not None:
+                arm_setup(arm)
 
             if arm == "baseline":
                 model.set_routing_override("none", cfg.fixed_layers)

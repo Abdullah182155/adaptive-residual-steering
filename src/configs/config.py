@@ -50,7 +50,7 @@ class RSCConfig:
     n_samples: int = 7473
     max_tok_len: int = 512
     val_split: float = 0.08
-    diversify_prompts: bool = True
+    diversify_prompts: bool = False
     seed: int = 42
 
     # S1 answer-region upweighting — focuses gradient on the answer portion
@@ -96,7 +96,7 @@ class RSCConfig:
     train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])  # V23: balanced 0-4 shot (V22 had 90% 0-shot which killed few-shot generalization)
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.90
-    shield_policy: str = "context"
+    shield_policy: str = "prompt"
 
     # On-policy training
     on_policy: bool = True
@@ -162,7 +162,7 @@ class RSCConfig:
     bench_shots: List[int] = field(default_factory=lambda: [0, 2, 4])
     generation_max_new_tokens: int = 256
     generation_temperature: float = 0.0
-    generation_repetition_penalty: float = 1.1    # 1.0 = disabled
+    generation_repetition_penalty: float = 1.0    # 1.0 = disabled
     generation_no_repeat_ngram: int = 0           # disabled: prompt tokens cause false bans in 2-shot
 
     @property
@@ -177,6 +177,8 @@ class RSCConfig:
             raise ValueError("Phase 1 supports token-weighted NLL only")
         if not self.fixed_layers:
             raise ValueError("fixed_layers cannot be empty")
+        if abs(self.phase1_lr - 1.5e-4) > 1e-12:
+            raise ValueError("phase1_lr is locked at 1.5e-4")
         if not all(0 <= l < 32 for l in self.fixed_layers):
             raise ValueError("fixed_layers contains out-of-range indices for phi-2 (0–31)")
         if self.candidate_layers and not set(self.fixed_layers).issubset(set(self.candidate_layers)):
