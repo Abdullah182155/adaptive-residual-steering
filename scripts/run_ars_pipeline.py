@@ -72,7 +72,11 @@ def parse_args(argv=None):
     parser.add_argument("--shots", type=int, nargs="+")
     parser.add_argument("--record", default="experiment_record.json")
     parser.add_argument("--report", action="store_true")
-    parser.add_argument("--arms", default="baseline,fixed")
+    parser.add_argument(
+        "--arms",
+        default="baseline,fixed",
+        help="Comma-separated benchmark arms; steer_only is the isolated Phase 1 arm",
+    )
     parser.add_argument("--ood", default="")
     parser.add_argument("--ood_n", type=int, default=300)
     parser.add_argument("--ood_shots", type=int, nargs="+", default=[0])
@@ -164,7 +168,7 @@ def _load_arm_weights(model, arm: str, cfg: RSCConfig, device: torch.device) -> 
     if arm in {"baseline", "identity"}:
         return
 
-    if arm in {"fixed", "random", "router"}:
+    if arm in {"fixed", "steer_only", "random", "router"}:
         checkpoint = Path(cfg.lora_save_path)
     elif arm in {"gate", "full"}:
         checkpoint = Path(cfg.steernet_gated_save_path)

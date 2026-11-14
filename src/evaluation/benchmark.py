@@ -37,6 +37,77 @@ def _set_gate_mode(model, enabled: bool) -> None:
             gate._freeze_gate_value = 1.0
 
 
+def _configure_arm(model, arm: str, cfg, gate_provider=None) -> None:
+    """Set routing, gain, and gate state explicitly for one benchmark arm."""
+    gate_enabled = arm in {"gate", "full"}
+    if hasattr(cfg, "use_gate"):
+        cfg.use_gate = gate_enabled
+    if hasattr(model, "set_gate_provider"):
+        model.set_gate_provider(gate_provider if gate_enabled else None)
+    if hasattr(model, "cfg"):
+        model.cfg.use_gate = gate_enabled
+
+    if arm == "baseline":
+        model.set_routing_override("none", cfg.fixed_layers)
+        if hasattr(model, "set_route_selector"):
+            model.set_route_selector(None)
+        if hasattr(model, "set_steer_scale"):
+            model.set_steer_scale(1.0)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        if hasattr(model, "set_control"):
+            model.set_control(None)
+        _set_gate_mode(model, enabled=False)
+    elif arm == "identity":
+        model.set_routing_override("only", cfg.fixed_layers)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(0.0)
+        if hasattr(model, "set_control"):
+            model.set_control(None)
+        _set_gate_mode(model, enabled=False)
+    elif arm in {"fixed", "steer_only"}:
+        # Pure Phase 1 steering: pinned weights, static route, unit scale/gain,
+        # and no gate provider or route selector can influence the arm.
+        model.set_routing_override("only", cfg.fixed_layers)
+        if hasattr(model, "set_route_selector"):
+            model.set_route_selector(None)
+        if hasattr(model, "set_steer_scale"):
+            model.set_steer_scale(1.0)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        if hasattr(model, "set_control"):
+            model.set_control(None)
+        _set_gate_mode(model, enabled=False)
+    elif arm == "random":
+        model.set_routing_override("only", cfg.fixed_layers)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        if hasattr(model, "set_control"):
+            model.set_control("random")
+        _set_gate_mode(model, enabled=False)
+    elif arm == "router":
+        model.set_routing_override(None)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        if hasattr(model, "set_control"):
+            model.set_control(None)
+        _set_gate_mode(model, enabled=False)
+    elif arm == "gate":
+        model.set_routing_override("only", cfg.fixed_layers)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        if hasattr(model, "set_control"):
+            model.set_control(None)
+        _set_gate_mode(model, enabled=True)
+    elif arm == "full":
+        model.set_routing_override(None)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        if hasattr(model, "set_control"):
+            model.set_control(None)
+        _set_gate_mode(model, enabled=True)
+
+
 @torch.no_grad()
 def _generate(
     model,
@@ -146,7 +217,7 @@ def run_benchmark(
     router_prefill_fn=None,
     arm_setup=None,
 ) -> Dict[str, object]:
-    """Run greedy paired baseline/fixed evaluation and return a serializable record."""
+    """Run greedy paired baseline and steering evaluations into a serializable record."""
     # Ensure SteerNet dropout is off during generation (SteerNet starts in train mode).
     model.eval()
     rows = list(rows)
@@ -157,66 +228,17 @@ def run_benchmark(
         "shots": {},
     }
     shield_policy = getattr(cfg, "shield_policy", "context")
+    # Keep the configured provider available for gate/full arms after any
+    # baseline or pure-steering arm explicitly detaches it.
+    gate_provider = getattr(model, "_gate_provider", None)
     for n_shot in shots:
         arm_results: Dict[str, List[Dict[str, object]]] = {}
         for arm in arms:
-            if arm not in {"baseline", "fixed", "identity", "random", "router", "gate", "full"}:
+            if arm not in {"baseline", "fixed", "steer_only", "identity", "random", "router", "gate", "full"}:
                 raise ValueError(f"unsupported benchmark arm: {arm}")
             if arm_setup is not None:
                 arm_setup(arm)
-
-            if arm == "baseline":
-                model.set_routing_override("none", cfg.fixed_layers)
-                if hasattr(model, "set_intervention_gain"):
-                    model.set_intervention_gain(1.0)
-                if hasattr(model, "set_control"):
-                    model.set_control(None)
-                _set_gate_mode(model, enabled=False)
-            elif arm == "identity":
-                model.set_routing_override("only", cfg.fixed_layers)
-                if hasattr(model, "set_intervention_gain"):
-                    model.set_intervention_gain(0.0)
-                if hasattr(model, "set_control"):
-                    model.set_control(None)
-                _set_gate_mode(model, enabled=False)
-            elif arm == "fixed":
-                model.set_routing_override("only", cfg.fixed_layers)
-                if hasattr(model, "set_intervention_gain"):
-                    model.set_intervention_gain(1.0)
-                if hasattr(model, "set_control"):
-                    model.set_control(None)
-                _set_gate_mode(model, enabled=False)
-            elif arm == "random":
-                model.set_routing_override("only", cfg.fixed_layers)
-                if hasattr(model, "set_intervention_gain"):
-                    model.set_intervention_gain(1.0)
-                if hasattr(model, "set_control"):
-                    model.set_control("random")
-                _set_gate_mode(model, enabled=False)
-            elif arm == "router":
-                # Router arm: use installed route_selector; no gate
-                model.set_routing_override(None)
-                if hasattr(model, "set_intervention_gain"):
-                    model.set_intervention_gain(1.0)
-                if hasattr(model, "set_control"):
-                    model.set_control(None)
-                _set_gate_mode(model, enabled=False)
-            elif arm == "gate":
-                # Gate arm: fixed layers with learned per-token gate; no router
-                model.set_routing_override("only", cfg.fixed_layers)
-                if hasattr(model, "set_intervention_gain"):
-                    model.set_intervention_gain(1.0)
-                if hasattr(model, "set_control"):
-                    model.set_control(None)
-                _set_gate_mode(model, enabled=True)
-            elif arm == "full":
-                # Full arm: router selects layers + gate applies per-token weights
-                model.set_routing_override(None)
-                if hasattr(model, "set_intervention_gain"):
-                    model.set_intervention_gain(1.0)
-                if hasattr(model, "set_control"):
-                    model.set_control(None)
-                _set_gate_mode(model, enabled=True)
+            _configure_arm(model, arm, cfg, gate_provider)
 
             results = []
             progress = tqdm(rows, desc=f"{suite} {n_shot}-shot {arm}", leave=False)
@@ -248,7 +270,7 @@ def run_benchmark(
                     guard.get("rel_max", 0.0)
                 ) > float(cap)
                 if (
-                    arm in {"fixed", "random", "gate"}
+                    arm in {"fixed", "steer_only", "random", "gate"}
                     and cfg.guard_revert_to_k0
                     and (guard_trip or guard.get("nonfinite", False))
                 ):
@@ -312,31 +334,35 @@ def run_benchmark(
         shot_record: Dict[str, object] = {
             arm: _summary(values) for arm, values in arm_results.items()
         }
-        if "baseline" in arm_results and "fixed" in arm_results:
-            paired_stats = _paired_counts(arm_results["baseline"], arm_results["fixed"])
-            shot_record["paired"] = paired_stats
-            shot_record["paired"]["mcnemar_p_value"] = mcnemar_exact(
+        paired_arm = next(
+            (name for name in ("steer_only", "fixed") if name in arm_results), None
+        )
+        if "baseline" in arm_results and paired_arm is not None:
+            paired_stats = _paired_counts(arm_results["baseline"], arm_results[paired_arm])
+            paired_key = "paired_steer_only" if paired_arm == "steer_only" else "paired"
+            shot_record[paired_key] = paired_stats
+            shot_record[paired_key]["mcnemar_p_value"] = mcnemar_exact(
                 paired_stats["fixed_wins"], paired_stats["fixed_losses"]
             )
             identical = sum(
                 baseline["text"] == fixed["text"]
-                for baseline, fixed in zip(arm_results["baseline"], arm_results["fixed"])
+                for baseline, fixed in zip(arm_results["baseline"], arm_results[paired_arm])
             )
-            shot_record["paired"]["identical_text_rate"] = identical / max(len(rows), 1)
-            shot_record["paired"]["null_intervention_warning"] = (
-                shot_record["paired"]["identical_text_rate"] > 0.95
+            shot_record[paired_key]["identical_text_rate"] = identical / max(len(rows), 1)
+            shot_record[paired_key]["null_intervention_warning"] = (
+                shot_record[paired_key]["identical_text_rate"] > 0.95
             )
             # Add failure classification taxonomy for discordant questions
             taxonomy_counts: Dict[str, int] = {}
-            for row, b_res, f_res in zip(rows, arm_results["baseline"], arm_results["fixed"]):
+            for row, b_res, f_res in zip(rows, arm_results["baseline"], arm_results[paired_arm]):
                 cls_tag = classify_outcome(b_res, f_res, _gold(row["answer"]), question=row["question"])
                 taxonomy_counts[cls_tag] = taxonomy_counts.get(cls_tag, 0) + 1
-            shot_record["paired"]["taxonomy"] = taxonomy_counts
+            shot_record[paired_key]["taxonomy"] = taxonomy_counts
 
             # Save paired generation file for diagnostics and legacy tools: report/generations/{suite}_{n_shot}shot.jsonl
             paired_rows = [
-                {"question": row["question"], "gold": row["answer"], "baseline": b, "fixed": f}
-                for row, b, f in zip(rows, arm_results["baseline"], arm_results["fixed"])
+                {"question": row["question"], "gold": row["answer"], "baseline": b, paired_arm: f}
+                for row, b, f in zip(rows, arm_results["baseline"], arm_results[paired_arm])
             ]
             paired_output_path = generation_dir / f"{suite}_{n_shot}shot.jsonl"
             paired_output_path.write_text(
@@ -371,7 +397,7 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
         "|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for shots, result in record["shots"].items():
-        for arm in ("baseline", "identity", "fixed", "random"):
+        for arm in ("baseline", "identity", "fixed", "steer_only", "random"):
             if arm not in result:
                 continue
             summary = result[arm]
@@ -383,8 +409,11 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
                 f"| {shots} | {arm} | {strict_acc:.2f}% | {marker_acc:.2f}% | "
                 f"{lenient_acc:.2f}% | {fmt_rate:.1f}% | {summary['guard_trip_rate']:.3f} | {summary['nonfinite_count']} |"
             )
-        if "paired" in result:
-            paired = result["paired"]
+        paired_key = next(
+            (key for key in ("paired_steer_only", "paired") if key in result), None
+        )
+        if paired_key is not None:
+            paired = result[paired_key]
             p_val = paired.get("mcnemar_p_value", 1.0)
             p_str = f"{p_val:.4f}" if p_val >= 0.0001 else f"{p_val:.2e}"
             ident = paired.get("identical_text_rate", 0.0) * 100.0
@@ -393,7 +422,8 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
             lines.extend(
                 [
                     "",
-                    f"{shots}-shot paired fixed vs baseline: {paired['fixed_wins']} wins, {paired['fixed_losses']} losses, {paired['ties']} ties. "
+                    f"{shots}-shot paired {('steer_only' if paired_key == 'paired_steer_only' else 'fixed')} vs baseline: "
+                    f"{paired['fixed_wins']} wins, {paired['fixed_losses']} losses, {paired['ties']} ties. "
                     f"Delta={delta_pp:+.2f} pp, 95% CI=[{ci[0]:+.2f}, {ci[1]:+.2f}], McNemar p={p_str}, identical text={ident:.1f}%.",
                     "",
                 ]

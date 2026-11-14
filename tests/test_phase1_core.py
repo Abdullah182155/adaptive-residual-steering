@@ -203,10 +203,62 @@ def test_benchmark_arms_load_their_own_steernet_checkpoints(tmp_path, monkeypatc
     )
 
     pipeline._load_arm_weights(object(), "fixed", cfg, torch.device("cpu"))
+    pipeline._load_arm_weights(object(), "steer_only", cfg, torch.device("cpu"))
     pipeline._load_arm_weights(object(), "gate", cfg, torch.device("cpu"))
     pipeline._load_arm_weights(object(), "baseline", cfg, torch.device("cpu"))
 
-    assert loaded == [str(phase1), str(gated)]
+    assert loaded == [str(phase1), str(phase1), str(gated)]
+
+
+def test_steer_only_benchmark_arm_isolated_from_gate_and_router():
+    from src.evaluation.benchmark import _configure_arm
+
+    gate_provider = object()
+
+    class Model:
+        def __init__(self):
+            self.cfg = SimpleNamespace(use_gate=True)
+            self.gates = {"17": SimpleNamespace(_freeze_gate=False)}
+            self.calls = []
+            self._gate_provider = gate_provider
+
+        def set_gate_provider(self, provider):
+            self._gate_provider = provider
+            self.calls.append(("gate_provider", provider))
+
+        def set_routing_override(self, *args):
+            self.calls.append(("route", args))
+
+        def set_route_selector(self, selector):
+            self.calls.append(("route_selector", selector))
+
+        def set_intervention_gain(self, gain):
+            self.calls.append(("gain", gain))
+
+        def set_steer_scale(self, scale):
+            self.calls.append(("steer_scale", scale))
+
+        def set_control(self, mode):
+            self.calls.append(("control", mode))
+
+    model = Model()
+    cfg = SimpleNamespace(fixed_layers=[17, 20, 23, 26], use_gate=True)
+    _configure_arm(model, "steer_only", cfg, gate_provider)
+
+    assert cfg.use_gate is False
+    assert model.cfg.use_gate is False
+    assert model._gate_provider is None
+    assert model.gates["17"]._freeze_gate is True
+    assert ("route", ("only", [17, 20, 23, 26])) in model.calls
+    assert ("route_selector", None) in model.calls
+    assert ("steer_scale", 1.0) in model.calls
+    assert ("gain", 1.0) in model.calls
+    assert ("control", None) in model.calls
+
+    _configure_arm(model, "gate", cfg, gate_provider)
+    assert cfg.use_gate is True
+    assert model.cfg.use_gate is True
+    assert model._gate_provider is gate_provider
 
 
 def test_batch_trimming_keeps_auxiliary_masks_aligned():
