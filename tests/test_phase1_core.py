@@ -261,7 +261,7 @@ def test_v22_mag_head_enabled_by_default():
     cfg = RSCConfig()
     assert cfg.steernet_use_mag_head is True
     assert cfg.amplitude_mode == "relative"
-    assert cfg.rho_max == 0.04           # V23: reduced from 0.10 — prevents arithmetic plan disruption
+    assert cfg.rho_max == 0.08           # V25: 0.04→0.08; restores format compliance lost at 2% amplitude
     assert cfg.steernet_init_gain == 1.0
     assert cfg.kl_arithmetic_weight == 0.15  # V23: increased from 0.05 — stronger arithmetic NLL signal
     assert cfg.on_policy_frac == 0.20
