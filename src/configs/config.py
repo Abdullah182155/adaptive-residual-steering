@@ -23,7 +23,8 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.04  # V23: reduced from 0.10; 2% of hidden norm avoids disrupting correct chains
+    rho_max: float = 0.08  # V25: 0.04→0.08; V24 at 0.04 gave 2% amplitude → format rate dropped to 48%
+                           # 0.08 restores ~4% amplitude on OPERAND/OPERATOR while RESULT/FINAL stay suppressed by high L1
     mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05; start low so network must earn magnitude
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
