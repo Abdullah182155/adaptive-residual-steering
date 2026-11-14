@@ -5,7 +5,6 @@ import torch
 import pytest
 
 from src.data.dataset import annotate_char_types, token_types_from_offsets
-from src.evaluation.benchmark import AnswerStop, STOP_RE
 from src.evaluation.chain import (
     audit_chain,
     classify_outcome,
@@ -71,45 +70,6 @@ def test_loss_is_bounded_and_finite():
     assert torch.isfinite(logits.grad).all()
     # Upper bound on gradient norm is sqrt(2) * sum(lambdas) = sqrt(2) * 1.0 ~ 1.414
     assert logits.grad.norm().item() < (2**0.5) * 1.05
-
-
-def test_answer_stop_does_not_truncate_complete_numbers():
-    """Verify that AnswerStop does not prematurely fire on the first digit of multi-digit numbers."""
-    class DummyTokenizer:
-        def __init__(self):
-            self.text = ""
-
-        def decode(self, ids, skip_special_tokens=True):
-            return self.text
-
-    tok = DummyTokenizer()
-    stop = AnswerStop(tok, prompt_length=5)
-    dummy_ids = torch.zeros((1, 10), dtype=torch.long)
-
-    # Incomplete single digit of multi-digit number without newline: MUST NOT stop
-    tok.text = "Step 1: work\nFinal answer: 1"
-    assert stop(dummy_ids, None) is False
-    assert stop.reason is None
-
-    # Multi-token comma-separated number without newline: MUST NOT stop
-    tok.text = "Step 1: work\nFinal answer: 1,250"
-    assert stop(dummy_ids, None) is False
-    assert stop.reason is None
-
-    # Complete comma-separated number terminated by newline: MUST stop
-    tok.text = "Step 1: work\nFinal answer: 1,250\n"
-    assert stop(dummy_ids, None) is True
-    assert stop.reason == "answer_stop"
-
-    # Complete currency number terminated by newline
-    tok.text = "Step 1: work\nFinal answer: $1,250\n"
-    assert stop(dummy_ids, None) is True
-    assert stop.reason == "answer_stop"
-
-    # Complete #### format terminated by newline
-    tok.text = "Step 1: work\n#### 1,250\n"
-    assert stop(dummy_ids, None) is True
-    assert stop.reason == "answer_stop"
 
 
 def test_chain_audit_arithmetic_verifier():

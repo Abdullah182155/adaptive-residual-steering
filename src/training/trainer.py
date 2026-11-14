@@ -273,29 +273,31 @@ def load_steer_weights(
 
 
 @torch.no_grad()
-def _generate_onpolicy_batch(model, tokenizer, prompts, device, max_new_tokens=256,
-                              num_return_sequences=1, temperature=0.0, max_prompt_length=512):
-    enc = tokenizer(prompts, return_tensors="pt", truncation=True,
-                    max_length=max_prompt_length, padding=True)
-    inputs = {k: v.to(device) for k, v in enc.items()}
-    model.set_prompt_shield_mask(None)
-    do_sample = (num_return_sequences > 1 or temperature > 0.0)
-    tokens = model.generate(
-        **inputs,
+def _generate_onpolicy_batch(
+    model,
+    tokenizer,
+    prompts,
+    device,
+    max_new_tokens=256,
+    num_return_sequences=1,
+    temperature=0.0,
+    max_prompt_length=1024,
+):
+    """Compatibility wrapper using the shared left-padded generation engine."""
+    from src.evaluation.generation import generate_texts
+
+    return generate_texts(
+        model,
+        tokenizer,
+        list(prompts),
+        device,
         max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        temperature=temperature if do_sample else 1.0,
         num_return_sequences=num_return_sequences,
+        temperature=temperature,
+        top_p=0.95 if temperature > 0 else 1.0,
+        max_prompt_len=max_prompt_length,
+        repetition_penalty=1.0,
     )
-    B = len(prompts)
-    # prompt lengths broadcast across the k sequences per prompt
-    prompt_lens = inputs["attention_mask"].sum(dim=1).repeat_interleave(num_return_sequences)
-    outputs = []
-    for i in range(B * num_return_sequences):
-        plen = int(prompt_lens[i])
-        text = tokenizer.decode(tokens[i, plen:], skip_special_tokens=True)
-        outputs.append(text)
-    return outputs  # length = B * num_return_sequences, grouped as [prompt0_k0, prompt0_k1, ..., prompt1_k0, ...]
 
 
 def _verify_arithmetic_steps(completion: str, tol: float = 0.02) -> bool:

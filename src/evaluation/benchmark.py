@@ -5,50 +5,18 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
 from tqdm.auto import tqdm
-from transformers import StoppingCriteria, StoppingCriteriaList
-
-from src.data.prompts import build_prompt_with_shield
-from src.evaluation.answers import extract_numeric_answer, score_tiers, should_stop_on_repeat
+from src.evaluation.answers import extract_numeric_answer, score_tiers
+from src.evaluation.generation import build_prompts, generate_batch
 from src.evaluation.chain import (
     audit_chain,
     classify_outcome,
     paired_bootstrap_ci,
     stop_pattern,
 )
-
-
-# Only "Final answer" and "####" are unambiguous final-answer markers.
-# "The answer is" and "So the result is" also appear in INTERMEDIATE steps
-# (e.g. "Step 2: So the result is 24 apples.") — including them here causes
-# premature stopping before the actual final answer is written.
-STOP_RE = re.compile(
-    r"(?:Final answer|####)\s*[:$-]?\s*\$?[-+]?[\d,]+(?:\.\d+)?[^\n]*\n"
-)
-
-
-class AnswerStop(StoppingCriteria):
-    """Stop greedy decoding after an answer marker or repeated continuation."""
-
-    def __init__(self, tokenizer, prompt_length: int):
-        self.tokenizer = tokenizer
-        self.prompt_length = prompt_length
-        self.reason: Optional[str] = None
-
-    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        text = self.tokenizer.decode(input_ids[0, self.prompt_length :], skip_special_tokens=True)
-        m = STOP_RE.search(text)
-        if m:
-            self.reason = "answer_stop"
-            return True
-        if should_stop_on_repeat(text):
-            self.reason = "repeat_stop"
-            return True
-        return False
 
 
 def _gold(value) -> float:
@@ -77,45 +45,37 @@ def _generate(
     n_shot: int,
     device: torch.device,
     max_new_tokens: int,
-    policy: str = "context",
+    policy: str = "prompt",
     route_prefill_fn=None,
     temperature: float = 0.0,
-    repetition_penalty: float = 1.1,
-    no_repeat_ngram_size: int = 6,
+    repetition_penalty: float = 1.0,
+    no_repeat_ngram_size: int = 0,
     **prompt_kw,
 ) -> Tuple[str, Dict[str, Any]]:
-    prompt, enc, shield = build_prompt_with_shield(tokenizer, question, n_shot=n_shot, policy=policy, **prompt_kw)
-    inputs = {k: v.to(device) for k, v in enc.items()}
-    if bool(shield.any()):
-        model.set_prompt_shield_mask(shield.unsqueeze(0).to(device))
-    else:
-        model.set_prompt_shield_mask(None)
-    # Router arm: compute route from prompt hidden states BEFORE generation.
-    # This fixes the race condition where _prepare_forward fires before probe hook.
-    if route_prefill_fn is not None:
-        route_prefill_fn(inputs["input_ids"], inputs["attention_mask"])
-    stop = AnswerStop(tokenizer, inputs["input_ids"].shape[1])
-    do_sample = temperature > 0.0
-    try:
-        gen_kwargs: Dict[str, Any] = dict(
-            max_new_tokens=max_new_tokens,
-            do_sample=do_sample,
-            stopping_criteria=StoppingCriteriaList([stop]),
-        )
-        if do_sample:
-            gen_kwargs["temperature"] = temperature
-        if repetition_penalty > 1.0:
-            gen_kwargs["repetition_penalty"] = repetition_penalty
-        if no_repeat_ngram_size > 0:
-            gen_kwargs["no_repeat_ngram_size"] = no_repeat_ngram_size
-        tokens = model.generate(**inputs, **gen_kwargs)
-    finally:
-        model.set_prompt_shield_mask(None)
-    prompt_tokens = inputs["input_ids"].shape[1]
-    n_new = tokens.shape[1] - prompt_tokens
-    text = tokenizer.decode(tokens[0, prompt_tokens:], skip_special_tokens=True)
-    reason = stop.reason or ("max_new_tokens" if n_new >= max_new_tokens else "eos")
-    return text, {"stop_reason": reason, "n_new_tokens": n_new}
+    prompts, shields = build_prompts(
+        tokenizer,
+        [question],
+        [int(prompt_kw.get("question_idx", 0))],
+        n_shot,
+        policy=policy,
+    )
+    result = generate_batch(
+        model,
+        tokenizer,
+        prompts,
+        device,
+        prompt_shields=shields,
+        max_new_tokens=max_new_tokens,
+        temperature=temperature,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+        max_prompt_len=max(getattr(getattr(model, "cfg", None), "max_tok_len", 768), 1024),
+        route_prefill_fn=route_prefill_fn,
+    )[0]
+    return result.text, {
+        "stop_reason": result.stop_reason,
+        "n_new_tokens": result.n_new_tokens,
+    }
 
 
 def _score(text: str, gold: float) -> Dict[str, bool]:

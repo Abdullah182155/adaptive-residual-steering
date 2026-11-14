@@ -13,19 +13,22 @@ from src.training.trainer import _trim_to_attended_tokens
 
 def test_certified_config_physics_and_decode_policy():
     cfg = RSCConfig()
-    assert cfg.fixed_layers == [8, 11, 13, 15, 17, 19, 20, 21, 22, 24]
-    assert cfg.candidate_layers == [8, 11, 13, 15, 17, 19, 20, 21, 22, 24]
+    assert cfg.fixed_layers == [17, 20, 23, 26]
+    assert cfg.candidate_layers == [8, 11, 13, 15, 17, 19, 20, 21, 22, 23, 24, 26]
     assert cfg.steer_kappa == 0.15
     assert cfg.steer_scale == 0.30
     assert cfg.k_scale_mode == "sqrt"
-    assert cfg.max_tok_len == 512
+    assert cfg.max_tok_len == 768
     assert cfg.phase1_lr == 1.5e-4
     assert cfg.loss_mode == "typed"
     assert cfg.train_shot_probs == [0.50, 0.15, 0.20, 0.10, 0.05]  # V23: balanced shot distribution
     assert cfg.shield_policy == "prompt"
     assert cfg.diversify_prompts is False
     assert cfg.generation_repetition_penalty == 1.0
-    assert cfg.mag_l1_weight == 0.10  # V23: increased from 0.03 to suppress mag_head saturation
+    assert cfg.steernet_use_mag_head is False
+    assert cfg.mag_l1_weight == 0.0
+    assert cfg.s1_answer_weight == 1.0
+    assert cfg.on_policy is False
     assert cfg.focal_gamma == 2.0
     assert cfg.kl_weight == 0.3
     assert cfg.lambda_result == 0.40
@@ -83,6 +86,27 @@ def test_prompt_shielding_keeps_prefill_pristine():
         model.set_prompt_shield_mask(torch.ones_like(input_ids, dtype=torch.bool))
         shielded = model(input_ids=input_ids, attention_mask=mask).logits
     assert torch.allclose(baseline, shielded, atol=1e-6)
+
+
+def test_prompt_shield_policy_masks_every_prefill_token_except_last():
+    from src.data.prompts import build_prompt_with_shield
+
+    class CharacterTokenizer:
+        def __call__(self, text, return_tensors="pt", return_offsets_mapping=False):
+            ids = torch.arange(1, len(text) + 1).unsqueeze(0)
+            encoded = {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+            if return_offsets_mapping:
+                encoded["offset_mapping"] = torch.tensor(
+                    [[(idx, idx + 1) for idx in range(len(text))]]
+                )
+            return encoded
+
+    _, encoded, shield = build_prompt_with_shield(
+        CharacterTokenizer(), "What is 2 + 2?", policy="prompt"
+    )
+    assert "offset_mapping" not in encoded
+    assert shield.sum().item() == encoded["input_ids"].shape[1] - 1
+    assert not shield[-1]
 
 
 def test_canonical_and_lenient_answer_extraction():
@@ -301,14 +325,13 @@ def test_config_validates_norm_capped():
     cfg.validate()
 
 
-def test_v22_mag_head_enabled_by_default():
-    """V23: mag_head is enabled and amplitude_mode is relative by default."""
+def test_phase1_uses_identity_magnitude_by_default():
+    """Phase 1 RFT pins the magnitude to one by omitting the magnitude head."""
     cfg = RSCConfig()
-    assert cfg.steernet_use_mag_head is True
+    assert cfg.steernet_use_mag_head is False
     assert cfg.amplitude_mode == "relative"
-    assert cfg.rho_max == 0.08           # V25: 0.04→0.08; restores format compliance lost at 2% amplitude
+    assert cfg.rho_max == 0.08
     assert cfg.steernet_init_gain == 1.0
-    assert cfg.kl_arithmetic_weight == 0.15  # V23: increased from 0.05 — stronger arithmetic NLL signal
     assert cfg.on_policy_frac == 0.20
     assert cfg.gate_training_mode == "supervised"
     assert cfg.gate_supervised_temperature == 5.0
