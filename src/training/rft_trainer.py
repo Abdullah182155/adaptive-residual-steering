@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
+from tqdm import tqdm
 
 from src.evaluation.answers import score_tiers
 from src.evaluation.generation import build_prompts, generate_batch
@@ -196,6 +198,14 @@ def train_phase1_rft(
         batches = _epoch_batches(lengths, cfg.batch_size, epoch, cfg.seed)
         loss_sum = 0.0
         optimizer_steps = 0
+        progress = tqdm(
+            total=len(batches),
+            desc=f"RFT epoch {epoch + 1}/{epochs}",
+            unit="batch",
+            file=sys.stdout,
+            disable=False,
+            mininterval=0.5,
+        )
         for window_start in range(0, len(batches), cfg.grad_accum):
             window = batches[window_start : window_start + cfg.grad_accum]
             micro_batches = [
@@ -221,6 +231,12 @@ def train_phase1_rft(
                     loss = _plain_nll_sum(logits, batch["labels"]) / token_count
                 scaler.scale(loss).backward()
                 loss_sum += float(loss.detach())
+                progress.update(1)
+                progress.set_postfix(
+                    nll=f"{float(loss.detach()):.4f}",
+                    updates=optimizer_steps,
+                )
+                sys.stdout.flush()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.steer_nets.parameters(), cfg.clip_grad)
             scaler.step(optimizer)
@@ -229,6 +245,7 @@ def train_phase1_rft(
             state["step"] += 1
             scheduler.step()
             optimizer_steps += 1
+        progress.close()
 
         current_flags, diagnostics = evaluate_generation(
             model, tokenizer, eval_rows, cfg, target_device, n_shot=0, steered=True

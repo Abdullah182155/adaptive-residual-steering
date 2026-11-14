@@ -5,10 +5,11 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import sys
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from src.evaluation.answers import extract_numeric_answer, score_tiers
 from src.evaluation.generation import build_prompts, generate_batch
 from src.evaluation.chain import (
@@ -241,7 +242,15 @@ def run_benchmark(
             _configure_arm(model, arm, cfg, gate_provider)
 
             results = []
-            progress = tqdm(rows, desc=f"{suite} {n_shot}-shot {arm}", leave=False)
+            progress = tqdm(
+                rows,
+                desc=f"{suite} {n_shot}-shot {arm}",
+                unit="question",
+                leave=True,
+                file=sys.stdout,
+                disable=False,
+                mininterval=0.5,
+            )
             for row_idx, row in enumerate(progress):
                 if hasattr(model, "set_control") and arm == "random":
                     model.set_control("random", seed=row_idx)
@@ -311,6 +320,7 @@ def run_benchmark(
                     }
                 )
                 progress.set_postfix(correct=sum(item["lenient"] for item in results))
+                sys.stdout.flush()
             arm_results[arm] = results
 
             # Save individual arm generation file: report/generations/{suite}_{n_shot}shot_{arm}.jsonl

@@ -103,3 +103,37 @@ def test_rft_runner_exposes_explicit_stages_and_two_t4_sharding():
     assert args.stage == "collect"
     assert args.shard == 1
     assert args.n_shards == 2
+
+
+def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypatch):
+    import scripts.run_rft_pipeline as runner
+
+    class Split(list):
+        def with_format(self, _format):
+            return self
+
+    class Model:
+        def set_routing_override(self, *_args):
+            return None
+
+    rows = [{"question": f"Question {index}", "answer": "1"} for index in range(30)]
+    observed = {}
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runner, "build_model", lambda _cfg, _device: (Model(), object()))
+    monkeypatch.setattr(
+        runner, "gsm8k_to_cot", lambda _tokenizer, _cfg: (Split(rows), Split(rows))
+    )
+
+    def fake_equivalence(_model, _tokenizer, selected_rows, _device, _cfg, **kwargs):
+        observed["n"] = kwargs["n"]
+        return {"n": kwargs["n"], "passed": True}
+
+    monkeypatch.setattr(runner, "equivalence_test", fake_equivalence)
+    args = parse_args(
+        ["--stage", "equivalence", "--n_questions", "10", "--output_dir", str(tmp_path)]
+    )
+
+    result = runner.run(args)
+
+    assert observed["n"] == 10
+    assert result["n"] == 10

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import re
+import sys
 from typing import Any, Optional, Sequence
 
 import torch
+from tqdm import tqdm
 from transformers import LogitsProcessor, LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
 
 from src.data.prompts import build_prompt_with_shield
@@ -363,46 +365,67 @@ def equivalence_test(
     max_new_tokens = getattr(cfg, "generation_max_new_tokens", 256)
     max_prompt_len = getattr(cfg, "max_tok_len", 768)
     one_at_a_time: list[str] = []
-    for index, row in enumerate(selected):
-        prompt, shields = build_prompts(
-            tokenizer, [row["question"]], [index], 0, policy=policy
-        )
-        one_at_a_time.extend(
-            generate_texts(
-                model,
-                tokenizer,
-                prompt,
-                device,
-                prompt_shields=shields,
-                max_new_tokens=max_new_tokens,
-                max_prompt_len=max_prompt_len,
-                repetition_penalty=1.0,
+    with tqdm(
+        total=len(selected),
+        desc="Equivalence batch-1",
+        unit="question",
+        file=sys.stdout,
+        disable=False,
+        mininterval=0.5,
+    ) as progress:
+        for index, row in enumerate(selected):
+            prompt, shields = build_prompts(
+                tokenizer, [row["question"]], [index], 0, policy=policy
             )
-        )
+            one_at_a_time.extend(
+                generate_texts(
+                    model,
+                    tokenizer,
+                    prompt,
+                    device,
+                    prompt_shields=shields,
+                    max_new_tokens=max_new_tokens,
+                    max_prompt_len=max_prompt_len,
+                    repetition_penalty=1.0,
+                )
+            )
+            progress.update(1)
+            sys.stdout.flush()
 
     batched: list[str] = []
-    for start in range(0, len(selected), batch_size):
-        batch_rows = selected[start : start + batch_size]
-        indices = list(range(start, start + len(batch_rows)))
-        prompts, shields = build_prompts(
-            tokenizer,
-            [row["question"] for row in batch_rows],
-            indices,
-            0,
-            policy=policy,
-        )
-        batched.extend(
-            generate_texts(
-                model,
+    n_batches = (len(selected) + batch_size - 1) // batch_size
+    with tqdm(
+        total=n_batches,
+        desc=f"Equivalence batched (B={batch_size})",
+        unit="batch",
+        file=sys.stdout,
+        disable=False,
+        mininterval=0.5,
+    ) as progress:
+        for start in range(0, len(selected), batch_size):
+            batch_rows = selected[start : start + batch_size]
+            indices = list(range(start, start + len(batch_rows)))
+            prompts, shields = build_prompts(
                 tokenizer,
-                prompts,
-                device,
-                prompt_shields=shields,
-                max_new_tokens=max_new_tokens,
-                max_prompt_len=max_prompt_len,
-                repetition_penalty=1.0,
+                [row["question"] for row in batch_rows],
+                indices,
+                0,
+                policy=policy,
             )
-        )
+            batched.extend(
+                generate_texts(
+                    model,
+                    tokenizer,
+                    prompts,
+                    device,
+                    prompt_shields=shields,
+                    max_new_tokens=max_new_tokens,
+                    max_prompt_len=max_prompt_len,
+                    repetition_penalty=1.0,
+                )
+            )
+            progress.update(1)
+            sys.stdout.flush()
 
     golds = [
         float(str(row.get("final_num", row.get("answer"))).replace(",", "").replace("$", "").strip())

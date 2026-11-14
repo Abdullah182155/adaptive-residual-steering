@@ -6,9 +6,11 @@ import json
 import random
 import re
 from pathlib import Path
+import sys
 from typing import Any, Optional, Sequence
 
 import torch
+from tqdm import tqdm
 
 from src.data.prompts import build_prompt_with_shield
 from src.evaluation.answers import score_tiers
@@ -87,6 +89,8 @@ def collect_rft_data(
     max_prompt_len: int = 768,
     shield_policy: str = "prompt",
     compare_greedy: bool = False,
+    progress_desc: str = "RFT rollout collection",
+    progress_position: int = 0,
 ) -> dict[str, Any]:
     """Sample 2/4-shot completions and persist every question's scored rollouts.
 
@@ -106,8 +110,18 @@ def collect_rft_data(
     model.eval()
     model.set_routing_override("none")
     hooks_context = model.hooks_disabled() if hasattr(model, "hooks_disabled") else torch.no_grad()
+    progress = tqdm(
+        indices,
+        total=len(indices),
+        desc=progress_desc,
+        unit="question",
+        position=progress_position,
+        file=sys.stdout,
+        disable=False,
+        mininterval=0.5,
+    )
     with output_file.open("w", encoding="utf-8") as stream, hooks_context:
-        for index in indices:
+        for index in progress:
             row = rows[index]
             question = row["question"]
             gold_raw = row.get("final_num", row.get("answer"))
@@ -175,12 +189,12 @@ def collect_rft_data(
             stream.write(json.dumps(record, ensure_ascii=False) + "\n")
             stream.flush()
             n_questions += 1
-            if n_questions % 25 == 0:
-                print(
-                    f"[rft-collect] {n_questions}/{len(indices)} questions; "
-                    f"pass@{k}={sampled_correct / n_questions:.1%}",
-                    flush=True,
-                )
+            progress.set_postfix(
+                pass_at_k=f"{sampled_correct / n_questions:.1%}",
+                positive_rate=f"{strict_correct / max(sampled_total, 1):.1%}",
+            )
+            sys.stdout.flush()
+    progress.close()
 
     stats = {
         "n": n_questions,
@@ -196,7 +210,7 @@ def collect_rft_data(
         stats["pass_at_k_delta_vs_greedy_pp"] = 100 * (
             stats["pass_at_k_lenient"] - stats["greedy_lenient_accuracy"]
         )
-    print(f"[rft-collect] {stats}")
+    print(f"[rft-collect] {stats}", flush=True)
     return stats
 
 
