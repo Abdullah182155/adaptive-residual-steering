@@ -163,7 +163,14 @@ def _contrastive_gate_loss(
     labels: torch.Tensor,
     mode: str = "hinge",
 ) -> torch.Tensor:
-    """Push gate alpha UP on math tokens and DOWN on format tokens.
+    """Push gate alpha toward per-type targets that align with supervised advantage.
+
+    Token-type targets (V24):
+      OPERAND/OPERATOR → 0.85  (steering improves plan and operand context)
+      RESULT           → unconstrained (let supervised advantage determine level)
+      FINAL            → 0.0   (suppress: steering on answer tokens causes arithmetic errors)
+      FORMAT           → 0.05  (suppress: baseline already handles output format)
+      PROSE            → 0.65  (moderate: plan description benefits from steering)
 
     mode="hinge": ReLU one-sided — zero gradient once target is met.
     mode="mse": symmetric MSE (old behavior).
@@ -184,29 +191,39 @@ def _contrastive_gate_loss(
         t = tt[:, :T_use]
         v = valid[:, :T_use]
 
-        # Separate FINAL from other math tokens: in V22 FINAL alpha=0.218 (target 0.85),
-        # so we apply 2× weight to pull it up more aggressively.
+        # V24 redesign — gate targets aligned with supervised advantage signal:
+        #   OPERAND/OPERATOR → push to 0.85 (steering helps plan/operand selection)
+        #   RESULT           → unconstrained (let supervised loss find optimal level)
+        #   FINAL            → push to 0.0  (steering hurts: arithmetic regression)
+        #   FORMAT           → push to 0.05 (suppress: baseline handles format in 2-shot)
+        #   PROSE            → push to 0.65 (moderate: plan description benefits)
+        #
+        # V23 bug: FINAL was pushed to 0.85 (wrong direction — fighting supervised loss,
+        # which trains toward 0 because advantage is negative on FINAL tokens).
+        # Result: FINAL alpha decreased 0.218→0.176 instead of increasing. Fixed here.
+        op_mask    = v & ((t == T_OPERAND) | (t == T_OPERATOR))
         final_mask = v & (t == T_FINAL)
-        other_math_mask = v & ((t == T_OPERAND) | (t == T_OPERATOR) | (t == T_RESULT))
-        fmt_mask = v & (t == T_FORMAT)
+        fmt_mask   = v & (t == T_FORMAT)
         prose_mask = v & (t == T_PROSE)
+        # T_RESULT intentionally excluded from contrastive: supervised loss determines level.
 
         if mode == "hinge":
-            if other_math_mask.any():
-                loss = loss + F.relu(0.85 - a[other_math_mask]).mean()
-            if final_mask.any():  # 2× weight: FINAL was 0.218 in V22, needs stronger pull
-                loss = loss + 2.0 * F.relu(0.85 - a[final_mask]).mean()
+            if op_mask.any():
+                loss = loss + F.relu(0.85 - a[op_mask]).mean()
+            if final_mask.any():
+                # 2× weight: suppress FINAL steering — causes arithmetic errors on answer tokens
+                loss = loss + 2.0 * F.relu(a[final_mask] - 0.10).mean()
             if fmt_mask.any():
-                loss = loss + F.relu(a[fmt_mask] - 0.05).mean()   # tightened: 0.15→0.05 (FORMAT=0.347 in V22)
+                loss = loss + F.relu(a[fmt_mask] - 0.05).mean()
             if prose_mask.any():
                 loss = loss + F.relu(0.65 - a[prose_mask]).mean()
         else:
-            if other_math_mask.any():
-                loss = loss + (a[other_math_mask] - 0.85).pow(2).mean()
+            if op_mask.any():
+                loss = loss + (a[op_mask] - 0.85).pow(2).mean()
             if final_mask.any():
-                loss = loss + 2.0 * (a[final_mask] - 0.85).pow(2).mean()
+                loss = loss + 2.0 * (a[final_mask] - 0.0).pow(2).mean()
             if fmt_mask.any():
-                loss = loss + (a[fmt_mask] - 0.05).pow(2).mean()   # tightened: 0.15→0.05
+                loss = loss + (a[fmt_mask] - 0.05).pow(2).mean()
             if prose_mask.any():
                 loss = loss + (a[prose_mask] - 0.65).pow(2).mean()
         n_gates += 1

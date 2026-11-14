@@ -129,7 +129,7 @@ class RSCConfig:
     gate_init_alpha: float = 0.25
     gate_use_global_context: bool = False
     gate_lr: float = 1e-4
-    gate_epochs: int = 3               # V20: GRPO converges in 2-3 epochs (was 5)
+    gate_epochs: int = 5               # V24: raised from 3 — gate needs more epochs after FINAL target inversion
     gate_l1_weight: float = 0.0        # V20: replaced by gate_entropy_weight (kept for compat)
     gate_rloo_weight: float = 1.0
     gate_contrastive_weight: float = 2.0  # V23: raised from 1.0; stronger type discrimination needed (FINAL=0.218 in V22)

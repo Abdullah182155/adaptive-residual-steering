@@ -625,12 +625,20 @@ def train_phase1_steernet(
                                 q_flat = q[:, :T_use, 0]
                                 tt_use = tt[:, :T_use]
                                 type_mult = torch.ones_like(q_flat)
-                                # Math tokens: light penalty — NLL can still earn magnitude
-                                type_mult[tt_use == T_RESULT]   = 0.1
-                                type_mult[tt_use == T_FINAL]    = 0.1
-                                type_mult[tt_use == T_OPERAND]  = 0.2
-                                type_mult[tt_use == T_OPERATOR] = 0.2
-                                # Non-math: strong penalty — force mag_head to suppress these
+                                # V24 redesign of type multipliers:
+                                # OPERAND/OPERATOR → 0.0: let NLL maximize magnitude freely
+                                #   (high amplitude on PLAN tokens improves approach selection)
+                                # RESULT           → 3.0: suppress magnitude on = tokens
+                                #   (high amplitude corrupts the specific numeric output)
+                                # FINAL            → 5.0: suppress magnitude on answer tokens
+                                #   (highest priority: arithmetic errors on FINAL = wrong answer)
+                                # PROSE/FORMAT: keep existing — these are suppressed to prevent
+                                #   the mag_head from saturating on non-math tokens.
+                                type_mult[tt_use == T_OPERAND]  = 0.0
+                                type_mult[tt_use == T_OPERATOR] = 0.0
+                                type_mult[tt_use == T_RESULT]   = 3.0
+                                type_mult[tt_use == T_FINAL]    = 5.0
+                                # Non-math: moderate pressure (baseline already handles these)
                                 type_mult[tt_use == T_PROSE]    = 1.5
                                 type_mult[tt_use == T_FORMAT]   = 4.0
                                 active_mask = q_flat > 0
