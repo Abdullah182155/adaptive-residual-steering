@@ -110,6 +110,21 @@ def test_rft_stage_question_count_is_optional_for_stage_specific_defaults():
 
     assert args.n_questions is None
     assert not args.gate0_nonblocking
+    assert not args.allow_low_yield
+
+
+def test_smoke_collection_can_continue_with_low_yield_but_records_quality():
+    import pytest
+    import scripts.run_rft_pipeline as runner
+
+    stats = {"positive_sample_rate": 0.0}
+    runner._enforce_collection_yield(stats, allow_low_yield=True)
+
+    assert stats["minimum_yield_passed"] is False
+    assert stats["low_yield_allowed"] is True
+
+    with pytest.raises(RuntimeError, match="yield is below 15%"):
+        runner._enforce_collection_yield({"positive_sample_rate": 0.0})
 
 
 def test_gate0_uses_requested_sample_and_allows_diagnostic_smoke_mode(tmp_path, monkeypatch):
