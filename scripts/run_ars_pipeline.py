@@ -120,7 +120,13 @@ def build_config(args) -> RSCConfig:
 
 
 def build_model(cfg, device):
-    """Load Phi-2 with an explicit padding ID for recent Transformers releases."""
+    """Load frozen Phi-2, optionally selecting an HF attention backend for probes."""
+    attention_backend = os.environ.get("ARS_ATTENTION_IMPLEMENTATION", "").strip().lower()
+    if attention_backend and attention_backend not in {"eager", "sdpa"}:
+        raise ValueError(
+            "ARS_ATTENTION_IMPLEMENTATION must be 'eager', 'sdpa', or unset; "
+            f"got {attention_backend!r}"
+        )
     tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -129,11 +135,21 @@ def build_model(cfg, device):
     model_config = AutoConfig.from_pretrained(cfg.model_name, trust_remote_code=True)
     model_config.pad_token_id = tokenizer.pad_token_id
     dtype = torch.float16 if device.type == "cuda" else torch.float32
+    load_kwargs = {
+        "config": model_config,
+        "dtype": dtype,
+        "trust_remote_code": True,
+    }
+    if attention_backend:
+        load_kwargs["attn_implementation"] = attention_backend
+    print(
+        "[model] attention implementation: "
+        f"{attention_backend or 'transformers default'}",
+        flush=True,
+    )
     backbone = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
-        config=model_config,
-        dtype=dtype,
-        trust_remote_code=True,
+        **load_kwargs,
     ).to(device)
     model = Phi2WithRSC(backbone, cfg, device)
     # SteerNet modules start in train() mode (nn.Module default).
