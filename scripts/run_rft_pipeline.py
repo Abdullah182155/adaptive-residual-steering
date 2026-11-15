@@ -30,7 +30,12 @@ def parse_args(argv=None):
         choices=("equivalence", "gate0", "collect", "train", "all"),
         default="equivalence",
     )
-    parser.add_argument("--n_questions", type=int, default=2000)
+    parser.add_argument(
+        "--n_questions",
+        type=int,
+        default=2000,
+        help="question count for collection; equivalence uses this as its capped probe size",
+    )
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--shard", type=int, default=0)
@@ -84,6 +89,7 @@ def _gate0(model, tokenizer, train_rows, cfg, device, output_dir, k, temperature
         max_prompt_len=cfg.max_tok_len,
         shield_policy=cfg.shield_policy,
         compare_greedy=True,
+        progress_desc=f"Gate 0 pass@{k}",
     )
     stats["passed"] = (
         stats["n"] >= 1
@@ -135,7 +141,13 @@ def run(args) -> dict | None:
     if args.stage in {"equivalence", "all"}:
         model.set_routing_override("none", cfg.fixed_layers)
         result = equivalence_test(
-            model, tokenizer, dev_rows, device, cfg, n=min(100, len(dev_rows)), batch_size=2
+            model,
+            tokenizer,
+            dev_rows,
+            device,
+            cfg,
+            n=min(args.n_questions, len(dev_rows)),
+            batch_size=2,
         )
         _write_json(equivalence_path, result)
         if not result["passed"]:
@@ -168,6 +180,8 @@ def run(args) -> dict | None:
             max_new_tokens=200,
             max_prompt_len=cfg.max_tok_len,
             shield_policy=cfg.shield_policy,
+            progress_desc=f"RFT shard {args.shard}/{args.n_shards}",
+            progress_position=args.shard,
         )
         if collect_stats["positive_sample_rate"] < 0.15:
             raise RuntimeError(
