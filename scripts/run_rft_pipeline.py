@@ -33,8 +33,16 @@ def parse_args(argv=None):
     parser.add_argument(
         "--n_questions",
         type=int,
-        default=2000,
-        help="question count for collection; equivalence uses this as its capped probe size",
+        default=None,
+        help=(
+            "question count for the selected stage (defaults: Gate 0=60, "
+            "equivalence=100, collection=2000)"
+        ),
+    )
+    parser.add_argument(
+        "--gate0_nonblocking",
+        action="store_true",
+        help="record Gate 0 quality without aborting when its threshold is missed",
     )
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.7)
@@ -73,8 +81,21 @@ def _write_json(path: Path, value: dict) -> None:
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
 
 
-def _gate0(model, tokenizer, train_rows, cfg, device, output_dir, k, temperature):
-    indices = random.Random(cfg.seed).sample(range(len(train_rows)), min(60, len(train_rows)))
+def _gate0(
+    model,
+    tokenizer,
+    train_rows,
+    cfg,
+    device,
+    output_dir,
+    k,
+    temperature,
+    n_questions=60,
+    nonblocking=False,
+):
+    indices = random.Random(cfg.seed).sample(
+        range(len(train_rows)), min(n_questions, len(train_rows))
+    )
     rollout_path = output_dir / "gate0.jsonl"
     stats = collect_rft_data(
         model,
@@ -91,26 +112,43 @@ def _gate0(model, tokenizer, train_rows, cfg, device, output_dir, k, temperature
         compare_greedy=True,
         progress_desc=f"Gate 0 pass@{k}",
     )
-    stats["passed"] = (
+    quality_gate_passed = (
         stats["n"] >= 1
         and stats["pass_at_k_lenient"] >= 0.70
         and stats["pass_at_k_delta_vs_greedy_pp"] > 0
     )
+    stats["quality_gate_passed"] = quality_gate_passed
+    stats["nonblocking"] = bool(nonblocking)
+    stats["passed"] = quality_gate_passed or nonblocking
     _write_json(output_dir / "gate0_stats.json", stats)
     if not stats["passed"]:
         raise RuntimeError(
             "Gate 0 failed: sampled pass@k must reach 70% and beat paired greedy accuracy"
         )
+    if nonblocking and not quality_gate_passed:
+        print(
+            "Gate 0 quality threshold was not met; continuing because "
+            "--gate0_nonblocking is enabled.",
+            flush=True,
+        )
     return stats
 
 
 def run(args) -> dict | None:
-    if args.n_questions < 1 or args.k < 1 or args.n_shards < 1:
+    if (
+        (args.n_questions is not None and args.n_questions < 1)
+        or args.k < 1
+        or args.n_shards < 1
+    ):
         raise ValueError("n_questions, k, and n_shards must be positive")
     if not 0 <= args.shard < args.n_shards:
         raise ValueError("shard must satisfy 0 <= shard < n_shards")
     if args.stage == "all" and args.n_shards != 1:
         raise ValueError("--stage all runs a single collection shard; use separate collect/train stages for sharding")
+
+    equivalence_questions = args.n_questions or 100
+    gate0_questions = args.n_questions or 60
+    collection_questions = args.n_questions or 2000
 
     cfg = RSCConfig()
     cfg.fixed_layers = list(STAGE1_ROUTE)
@@ -146,7 +184,7 @@ def run(args) -> dict | None:
             dev_rows,
             device,
             cfg,
-            n=min(args.n_questions, len(dev_rows)),
+            n=min(equivalence_questions, len(dev_rows)),
             batch_size=2,
         )
         _write_json(equivalence_path, result)
@@ -157,13 +195,22 @@ def run(args) -> dict | None:
 
     if args.stage in {"gate0", "all"}:
         gate0_stats = _gate0(
-            model, tokenizer, train_rows, cfg, device, output_dir, args.k, args.temperature
+            model,
+            tokenizer,
+            train_rows,
+            cfg,
+            device,
+            output_dir,
+            args.k,
+            args.temperature,
+            n_questions=gate0_questions,
+            nonblocking=args.gate0_nonblocking,
         )
         if args.stage == "gate0":
             return gate0_stats
 
     if args.stage in {"collect", "all"}:
-        count = 2000 if args.stage == "all" else args.n_questions
+        count = collection_questions
         sampled_order = random.Random(cfg.seed).sample(
             range(len(train_rows)), min(count, len(train_rows))
         )

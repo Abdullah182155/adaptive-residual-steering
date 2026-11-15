@@ -105,6 +105,75 @@ def test_rft_runner_exposes_explicit_stages_and_two_t4_sharding():
     assert args.n_shards == 2
 
 
+def test_rft_stage_question_count_is_optional_for_stage_specific_defaults():
+    args = parse_args(["--stage", "gate0"])
+
+    assert args.n_questions is None
+    assert not args.gate0_nonblocking
+
+
+def test_gate0_uses_requested_sample_and_allows_diagnostic_smoke_mode(tmp_path, monkeypatch):
+    import scripts.run_rft_pipeline as runner
+
+    observed = {}
+
+    def fake_collect(_model, _tokenizer, _rows, _device, **kwargs):
+        observed["indices"] = kwargs["indices"]
+        return {
+            "n": len(kwargs["indices"]),
+            "pass_at_k_lenient": 0.4,
+            "pass_at_k_delta_vs_greedy_pp": -5.0,
+            "greedy_lenient_accuracy": 0.45,
+        }
+
+    monkeypatch.setattr(runner, "collect_rft_data", fake_collect)
+    stats = runner._gate0(
+        object(),
+        object(),
+        list(range(20)),
+        SimpleNamespace(seed=7, max_tok_len=768, shield_policy="prompt"),
+        torch.device("cpu"),
+        tmp_path,
+        k=2,
+        temperature=0.7,
+        n_questions=6,
+        nonblocking=True,
+    )
+
+    assert len(observed["indices"]) == 6
+    assert stats["quality_gate_passed"] is False
+    assert stats["passed"] is True
+    assert stats["nonblocking"] is True
+
+
+def test_gate0_strict_mode_still_fails_when_quality_threshold_is_missed(tmp_path, monkeypatch):
+    import pytest
+    import scripts.run_rft_pipeline as runner
+
+    monkeypatch.setattr(
+        runner,
+        "collect_rft_data",
+        lambda *_args, **_kwargs: {
+            "n": 1,
+            "pass_at_k_lenient": 0.5,
+            "pass_at_k_delta_vs_greedy_pp": 0.0,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="Gate 0 failed"):
+        runner._gate0(
+            object(),
+            object(),
+            [0],
+            SimpleNamespace(seed=1, max_tok_len=768, shield_policy="prompt"),
+            torch.device("cpu"),
+            tmp_path,
+            k=2,
+            temperature=0.7,
+            n_questions=1,
+        )
+
+
 def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypatch):
     import scripts.run_rft_pipeline as runner
 
