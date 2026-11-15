@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 import sys
-from typing import Any, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 from tqdm import tqdm
@@ -34,6 +34,8 @@ class GenerationResult:
     stop_reason: str
     n_new_tokens: int
     first_token_id: Optional[int] = None
+    prompt_width: int = 0
+    token_ids: tuple[int, ...] = ()
 
 
 class _StopTracker:
@@ -301,6 +303,8 @@ def generate_batch(
                 stop_reason=reason,
                 n_new_tokens=end,
                 first_token_id=int(generated[0]) if generated.numel() else None,
+                prompt_width=prompt_width,
+                token_ids=tuple(int(token_id) for token_id in generated[:end].tolist()),
             )
         )
     return results
@@ -444,6 +448,30 @@ def equivalence_test(
         for index, (one_text, batch_text) in enumerate(zip(one_texts, batch_texts))
         if one_text != batch_text
     ]
+
+    def first_divergence(
+        one_result: GenerationResult, batch_result: GenerationResult
+    ) -> tuple[Optional[int], Optional[int], Optional[int]]:
+        for token_index, (one_token, batch_token) in enumerate(
+            zip(one_result.token_ids, batch_result.token_ids)
+        ):
+            if one_token != batch_token:
+                return token_index, one_token, batch_token
+        if len(one_result.token_ids) != len(batch_result.token_ids):
+            token_index = min(len(one_result.token_ids), len(batch_result.token_ids))
+            one_token = (
+                one_result.token_ids[token_index]
+                if token_index < len(one_result.token_ids)
+                else None
+            )
+            batch_token = (
+                batch_result.token_ids[token_index]
+                if token_index < len(batch_result.token_ids)
+                else None
+            )
+            return token_index, one_token, batch_token
+        return None, None, None
+
     identity = 1 - len(mismatch_indices) / len(selected)
     delta_pp = 100 * (acc_batch - acc_one)
     result = {
@@ -454,20 +482,17 @@ def equivalence_test(
         "string_identity": identity,
         "n_string_mismatches": len(mismatch_indices),
         "mismatch_examples": [
-            {
-                "row_index": index,
-                "question": str(selected[index]["question"])[:300],
-                "batch1_text": one_texts[index][:500],
-                "batched_text": batch_texts[index][:500],
-                "batch1_first_token_id": one_at_a_time[index].first_token_id,
-                "batched_first_token_id": batched[index].first_token_id,
-                "batch1_stop_reason": one_at_a_time[index].stop_reason,
-                "batched_stop_reason": batched[index].stop_reason,
-                "batch1_new_tokens": one_at_a_time[index].n_new_tokens,
-                "batched_new_tokens": batched[index].n_new_tokens,
-                "batch1_lenient": bool(one_scores[index]["lenient"]),
-                "batched_lenient": bool(batch_scores[index]["lenient"]),
-            }
+            _mismatch_example(
+                index,
+                selected,
+                one_texts,
+                batch_texts,
+                one_at_a_time,
+                batched,
+                one_scores,
+                batch_scores,
+                first_divergence,
+            )
             for index in mismatch_indices[:5]
         ],
         "passed": abs(delta_pp) <= 1.5 and identity >= 0.90,
@@ -477,3 +502,42 @@ def equivalence_test(
         f"delta={delta_pp:+.2f}pp identity={identity:.1%} passed={result['passed']}"
     )
     return result
+
+
+def _mismatch_example(
+    index: int,
+    rows: Sequence[dict],
+    one_texts: Sequence[str],
+    batch_texts: Sequence[str],
+    one_results: Sequence[GenerationResult],
+    batch_results: Sequence[GenerationResult],
+    one_scores: Sequence[dict],
+    batch_scores: Sequence[dict],
+    first_divergence: Callable[
+        [GenerationResult, GenerationResult],
+        tuple[Optional[int], Optional[int], Optional[int]],
+    ],
+) -> dict[str, Any]:
+    """Build a compact per-question diagnostic for generation differences."""
+    one_result = one_results[index]
+    batch_result = batch_results[index]
+    divergence_index, one_token, batch_token = first_divergence(one_result, batch_result)
+    return {
+        "row_index": index,
+        "question": str(rows[index]["question"])[:300],
+        "batch1_text": one_texts[index][:500],
+        "batched_text": batch_texts[index][:500],
+        "batch1_first_token_id": one_result.first_token_id,
+        "batched_first_token_id": batch_result.first_token_id,
+        "first_divergent_token_index": divergence_index,
+        "batch1_divergent_token_id": one_token,
+        "batched_divergent_token_id": batch_token,
+        "batch1_prompt_width": one_result.prompt_width,
+        "batched_prompt_width": batch_result.prompt_width,
+        "batch1_stop_reason": one_result.stop_reason,
+        "batched_stop_reason": batch_result.stop_reason,
+        "batch1_new_tokens": one_result.n_new_tokens,
+        "batched_new_tokens": batch_result.n_new_tokens,
+        "batch1_lenient": bool(one_scores[index]["lenient"]),
+        "batched_lenient": bool(batch_scores[index]["lenient"]),
+    }
