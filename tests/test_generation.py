@@ -179,3 +179,6 @@ def test_equivalence_report_includes_examples_for_string_mismatches(monkeypatch)
     assert result["mismatch_examples"][0]["row_index"] == 1
     assert result["mismatch_examples"][0]["batch1_text"] == "A"
     assert result["mismatch_examples"][0]["batched_text"] == "BC"
+    assert result["mismatch_examples"][0]["first_divergent_token_index"] == 0
+    assert result["mismatch_examples"][0]["batch1_divergent_token_id"] == 2
+    assert result["mismatch_examples"][0]["batched_divergent_token_id"] == 3
