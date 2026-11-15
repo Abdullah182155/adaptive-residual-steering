@@ -44,6 +44,11 @@ def parse_args(argv=None):
         action="store_true",
         help="record Gate 0 quality without aborting when its threshold is missed",
     )
+    parser.add_argument(
+        "--allow_low_yield",
+        action="store_true",
+        help="allow low positive-sample yield for smoke collection runs",
+    )
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--shard", type=int, default=0)
@@ -79,6 +84,25 @@ def _require_equivalence(path: Path) -> dict:
 def _write_json(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+
+
+def _enforce_collection_yield(stats: dict, allow_low_yield: bool = False) -> None:
+    """Record and enforce the positive-completion yield gate for an RFT shard."""
+    yield_passed = stats["positive_sample_rate"] >= 0.15
+    stats["minimum_yield_passed"] = yield_passed
+    stats["low_yield_allowed"] = bool(allow_low_yield)
+    if yield_passed:
+        return
+    if allow_low_yield:
+        print(
+            "RFT positive-sample yield is below 15%; continuing because "
+            "--allow_low_yield is enabled for this smoke run.",
+            flush=True,
+        )
+        return
+    raise RuntimeError(
+        "RFT collection yield is below 15%; inspect Gate 0 and strict acceptance before training"
+    )
 
 
 def _gate0(
@@ -230,10 +254,7 @@ def run(args) -> dict | None:
             progress_desc=f"RFT shard {args.shard}/{args.n_shards}",
             progress_position=args.shard,
         )
-        if collect_stats["positive_sample_rate"] < 0.15:
-            raise RuntimeError(
-                "RFT collection yield is below 15%; inspect Gate 0 and strict acceptance before training"
-            )
+        _enforce_collection_yield(collect_stats, allow_low_yield=args.allow_low_yield)
         _write_json(output_dir / f"shard{args.shard}_stats.json", collect_stats)
         if args.stage == "collect":
             return collect_stats
