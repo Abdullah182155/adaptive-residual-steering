@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 from pathlib import Path
@@ -33,6 +34,36 @@ def _plain_nll_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         ignore_index=-100,
         reduction="sum",
     )
+
+
+def _run_rft_window(
+    model: torch.nn.Module,
+    train_rows: Sequence[dict[str, torch.Tensor]],
+    microbatches: Sequence[Sequence[int]],
+    token_count: int,
+    device: torch.device,
+    scaler: torch.amp.GradScaler,
+) -> float:
+    """Run one accumulation window while materializing only one GPU batch at a time."""
+    window_loss = 0.0
+    for indices in microbatches:
+        batch, extras = _prepare([train_rows[index] for index in indices], device)
+        model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
+        with torch.autocast(
+            device_type=device.type,
+            enabled=device.type == "cuda",
+        ):
+            logits = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                use_cache=False,
+            ).logits
+            loss = _plain_nll_sum(logits, batch["labels"]) / token_count
+        scaler.scale(loss).backward()
+        window_loss += float(loss.detach())
+        del loss, logits, batch, extras
+    model.set_prompt_shield_mask(None)
+    return window_loss
 
 
 @torch.no_grad()
@@ -218,35 +249,55 @@ def train_phase1_rft(
         )
         for window_start in range(0, len(batches), cfg.grad_accum):
             window = batches[window_start : window_start + cfg.grad_accum]
-            micro_batches = [
-                _prepare([train_rows[index] for index in batch_indices], target_device)
-                for batch_indices in window
-            ]
             token_count = sum(
-                int(batch["labels"][:, 1:].ne(-100).sum())
-                for batch, _ in micro_batches
+                int(train_rows[index]["labels"][1:].ne(-100).sum())
+                for batch_indices in window
+                for index in batch_indices
             )
             if token_count == 0:
                 raise ValueError("RFT batch window has no completion tokens")
-            for batch, extras in micro_batches:
-                model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
-                with torch.autocast(
-                    device_type=target_device.type,
-                    enabled=target_device.type == "cuda",
-                ):
-                    logits = model(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                    ).logits
-                    loss = _plain_nll_sum(logits, batch["labels"]) / token_count
-                scaler.scale(loss).backward()
-                loss_sum += float(loss.detach())
-                progress.update(1)
-                progress.set_postfix(
-                    nll=f"{float(loss.detach()):.4f}",
-                    updates=optimizer_steps,
+            try:
+                window_loss = _run_rft_window(
+                    model,
+                    train_rows,
+                    window,
+                    token_count,
+                    target_device,
+                    scaler,
                 )
-                sys.stdout.flush()
+            except torch.cuda.OutOfMemoryError:
+                # A single unusually long pair can exceed the T4 activation peak.
+                # Discard this partial accumulation window and replay its examples
+                # individually, preserving token-mean normalization and effective batch.
+                optimizer.zero_grad(set_to_none=True)
+                model.set_prompt_shield_mask(None)
+                model.reset_steernet_cache()
+                gc.collect()
+                if target_device.type == "cuda":
+                    torch.cuda.empty_cache()
+                singleton_microbatches = [
+                    [index] for batch_indices in window for index in batch_indices
+                ]
+                print(
+                    "[rft] CUDA OOM in paired microbatch; replaying this accumulation "
+                    f"window as {len(singleton_microbatches)} single-example batches",
+                    flush=True,
+                )
+                window_loss = _run_rft_window(
+                    model,
+                    train_rows,
+                    singleton_microbatches,
+                    token_count,
+                    target_device,
+                    scaler,
+                )
+            loss_sum += window_loss
+            progress.update(len(window))
+            progress.set_postfix(
+                nll=f"{window_loss:.4f}",
+                updates=optimizer_steps,
+            )
+            sys.stdout.flush()
             scaler.unscale_(optimizer)
             if not any(parameter.grad is not None for parameter in trainable_parameters):
                 raise RuntimeError(
