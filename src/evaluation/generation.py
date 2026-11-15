@@ -259,10 +259,6 @@ def generate_batch(
         "num_return_sequences": num_return_sequences,
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": stop_ids,
-        # Guard half-precision sampling against non-finite model logits. Gate 0
-        # evaluates sample quality afterward, so sanitization cannot silently
-        # make an invalid run pass its quality threshold.
-        "remove_invalid_values": temperature > 0,
         "logits_processor": processors,
         "stopping_criteria": stopping,
     }
