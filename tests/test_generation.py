@@ -130,6 +130,29 @@ def test_sampling_can_return_multiple_sequences_for_one_prompt():
     assert [result.text for result in results] == ["A", "BC"]
 
 
+def test_sampling_removes_nonfinite_model_logits_before_multinomial():
+    class CapturingModel(TinyGenerationModel):
+        def __init__(self):
+            super().__init__()
+            self.generate_kwargs = {}
+
+        def generate(self, *args, **kwargs):
+            self.generate_kwargs.update(kwargs)
+            return super().generate(*args, **kwargs)
+
+    model = CapturingModel()
+    generate_batch(
+        model,
+        TinyTokenizer(),
+        ["one prompt"],
+        "cpu",
+        num_return_sequences=2,
+        temperature=0.7,
+    )
+
+    assert model.generate_kwargs["remove_invalid_values"] is True
+
+
 def test_equivalence_harness_checks_paired_accuracy_and_identity(monkeypatch):
     import src.evaluation.generation as generation
 
