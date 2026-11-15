@@ -198,7 +198,12 @@ def run(args) -> dict | None:
     model, tokenizer = build_model(cfg, device)
     raw_train, raw_dev = gsm8k_to_cot(tokenizer, cfg)
     train_rows = prepare_dataset_split(raw_train.with_format(None))
-    dev_rows = prepare_dataset_split(raw_dev.with_format(None), limit=100)
+    dev_limit = (
+        max(100, equivalence_questions)
+        if args.stage in {"equivalence", "all"}
+        else 100
+    )
+    dev_rows = prepare_dataset_split(raw_dev.with_format(None), limit=dev_limit)
 
     if args.stage in {"equivalence", "all"}:
         model.set_routing_override("none", cfg.fixed_layers)
@@ -213,7 +218,12 @@ def run(args) -> dict | None:
         )
         _write_json(equivalence_path, result)
         if not result["passed"]:
-            raise RuntimeError("batched generation failed the Phase 1 equivalence thresholds")
+            raise RuntimeError(
+                "batched generation failed Phase 1 equivalence thresholds; "
+                f"n={result['n']} delta={result['delta_lenient_pp']:+.2f}pp "
+                f"identity={result['string_identity']:.1%}; inspect "
+                f"{equivalence_path} mismatch_examples"
+            )
         if args.stage == "equivalence":
             return result
 

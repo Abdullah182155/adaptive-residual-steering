@@ -33,6 +33,7 @@ class GenerationResult:
     text: str
     stop_reason: str
     n_new_tokens: int
+    first_token_id: Optional[int] = None
 
 
 class _StopTracker:
@@ -299,6 +300,7 @@ def generate_batch(
                 text=truncate_completion(text),
                 stop_reason=reason,
                 n_new_tokens=end,
+                first_token_id=int(generated[0]) if generated.numel() else None,
             )
         )
     return results
@@ -364,7 +366,7 @@ def equivalence_test(
     policy = getattr(cfg, "shield_policy", "prompt")
     max_new_tokens = getattr(cfg, "generation_max_new_tokens", 256)
     max_prompt_len = getattr(cfg, "max_tok_len", 768)
-    one_at_a_time: list[str] = []
+    one_at_a_time: list[GenerationResult] = []
     with tqdm(
         total=len(selected),
         desc="Equivalence batch-1",
@@ -378,7 +380,7 @@ def equivalence_test(
                 tokenizer, [row["question"]], [index], 0, policy=policy
             )
             one_at_a_time.extend(
-                generate_texts(
+                generate_batch(
                     model,
                     tokenizer,
                     prompt,
@@ -392,7 +394,7 @@ def equivalence_test(
             progress.update(1)
             sys.stdout.flush()
 
-    batched: list[str] = []
+    batched: list[GenerationResult] = []
     n_batches = (len(selected) + batch_size - 1) // batch_size
     with tqdm(
         total=n_batches,
@@ -413,7 +415,7 @@ def equivalence_test(
                 policy=policy,
             )
             batched.extend(
-                generate_texts(
+                generate_batch(
                     model,
                     tokenizer,
                     prompts,
@@ -431,9 +433,18 @@ def equivalence_test(
         float(str(row.get("final_num", row.get("answer"))).replace(",", "").replace("$", "").strip())
         for row in selected
     ]
-    acc_one = sum(score_tiers(text, gold)["lenient"] for text, gold in zip(one_at_a_time, golds)) / len(selected)
-    acc_batch = sum(score_tiers(text, gold)["lenient"] for text, gold in zip(batched, golds)) / len(selected)
-    identity = sum(a == b for a, b in zip(one_at_a_time, batched)) / len(selected)
+    one_texts = [result.text for result in one_at_a_time]
+    batch_texts = [result.text for result in batched]
+    one_scores = [score_tiers(text, gold) for text, gold in zip(one_texts, golds)]
+    batch_scores = [score_tiers(text, gold) for text, gold in zip(batch_texts, golds)]
+    acc_one = sum(score["lenient"] for score in one_scores) / len(selected)
+    acc_batch = sum(score["lenient"] for score in batch_scores) / len(selected)
+    mismatch_indices = [
+        index
+        for index, (one_text, batch_text) in enumerate(zip(one_texts, batch_texts))
+        if one_text != batch_text
+    ]
+    identity = 1 - len(mismatch_indices) / len(selected)
     delta_pp = 100 * (acc_batch - acc_one)
     result = {
         "n": len(selected),
@@ -441,6 +452,24 @@ def equivalence_test(
         "batched_lenient_accuracy": 100 * acc_batch,
         "delta_lenient_pp": delta_pp,
         "string_identity": identity,
+        "n_string_mismatches": len(mismatch_indices),
+        "mismatch_examples": [
+            {
+                "row_index": index,
+                "question": str(selected[index]["question"])[:300],
+                "batch1_text": one_texts[index][:500],
+                "batched_text": batch_texts[index][:500],
+                "batch1_first_token_id": one_at_a_time[index].first_token_id,
+                "batched_first_token_id": batched[index].first_token_id,
+                "batch1_stop_reason": one_at_a_time[index].stop_reason,
+                "batched_stop_reason": batched[index].stop_reason,
+                "batch1_new_tokens": one_at_a_time[index].n_new_tokens,
+                "batched_new_tokens": batched[index].n_new_tokens,
+                "batch1_lenient": bool(one_scores[index]["lenient"]),
+                "batched_lenient": bool(batch_scores[index]["lenient"]),
+            }
+            for index in mismatch_indices[:5]
+        ],
         "passed": abs(delta_pp) <= 1.5 and identity >= 0.90,
     }
     print(

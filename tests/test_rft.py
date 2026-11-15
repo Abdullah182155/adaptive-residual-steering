@@ -189,6 +189,86 @@ def test_gate0_strict_mode_still_fails_when_quality_threshold_is_missed(tmp_path
         )
 
 
+def test_rft_training_restores_steering_route_after_baseline_evaluation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import torch.nn as nn
+    import src.training.rft_trainer as trainer
+
+    class FakeRFTModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+            class FakeSteerNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.use_mag_head = False
+                    self.adapter = nn.Parameter(torch.tensor([0.1, -0.1, 0.2, -0.2]))
+
+            self.base_model = nn.Linear(1, 1)
+            for parameter in self.base_model.parameters():
+                parameter.requires_grad = False
+            self.steer_nets = nn.ModuleDict({"17": FakeSteerNet()})
+            self.route = "only"
+            self.training_routes = []
+
+        def set_routing_override(self, mode, _layers):
+            self.route = mode
+
+        def set_prompt_shield_mask(self, _mask):
+            pass
+
+        def forward(self, input_ids, attention_mask):
+            self.training_routes.append(self.route)
+            logits = self.steer_nets["17"].adapter.view(1, 1, -1).expand(
+                input_ids.shape[0], input_ids.shape[1], -1
+            )
+            return SimpleNamespace(logits=logits)
+
+    model = FakeRFTModel()
+    cfg = SimpleNamespace(
+        validate=lambda: None,
+        fixed_layers=[17, 20, 23, 26],
+        use_gate=False,
+        steernet_use_mag_head=False,
+        phase1_lr=1.5e-4,
+        weight_decay=0.0,
+        batch_size=1,
+        grad_accum=1,
+        seed=0,
+        phase1_warmup_frac=0.1,
+        phase1_min_lr_frac=0.1,
+        clip_grad=1.0,
+        report_dir=str(tmp_path),
+        lora_save_path=str(tmp_path / "steernet.pt"),
+    )
+    train_row = {
+        "input_ids": torch.tensor([1, 2, 3]),
+        "attention_mask": torch.tensor([1, 1, 1]),
+        "labels": torch.tensor([-100, 2, 3]),
+    }
+
+    def fake_evaluate(_model, _tokenizer, _rows, _cfg, _device, *, steered, **_kwargs):
+        _model.set_routing_override("only" if steered else "none", cfg.fixed_layers)
+        return [False], {"lenient_accuracy": 0.0, "mean_tokens": 1.0}
+
+    monkeypatch.setattr(trainer, "evaluate_generation", fake_evaluate)
+    monkeypatch.setattr(trainer, "_epoch_batches", lambda *_args: [[0]])
+    monkeypatch.setattr(trainer, "_save_rft_checkpoint", lambda *_args: None)
+
+    trainer.train_phase1_rft(
+        model,
+        [train_row],
+        [{"question": "q", "answer": "1"}],
+        cfg,
+        "cpu",
+        object(),
+        epochs=1,
+        save_path=str(tmp_path / "steernet.pt"),
+    )
+
+    assert model.training_routes == ["only"]
+
+
 def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypatch):
     import scripts.run_rft_pipeline as runner
 
@@ -200,7 +280,7 @@ def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypat
         def set_routing_override(self, *_args):
             return None
 
-    rows = [{"question": f"Question {index}", "answer": "1"} for index in range(30)]
+    rows = [{"question": f"Question {index}", "answer": "1"} for index in range(150)]
     observed = {}
     monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(runner, "build_model", lambda _cfg, _device: (Model(), object()))
@@ -214,10 +294,10 @@ def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypat
 
     monkeypatch.setattr(runner, "equivalence_test", fake_equivalence)
     args = parse_args(
-        ["--stage", "equivalence", "--n_questions", "10", "--output_dir", str(tmp_path)]
+        ["--stage", "equivalence", "--n_questions", "120", "--output_dir", str(tmp_path)]
     )
 
     result = runner.run(args)
 
-    assert observed["n"] == 10
-    assert result["n"] == 10
+    assert observed["n"] == 120
+    assert result["n"] == 120
