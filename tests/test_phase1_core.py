@@ -184,6 +184,57 @@ def test_phase1_learning_rate_is_locked():
         build_config(parse_args(["--stage", "S1", "--s1_lr", "0.0002"]))
 
 
+def test_build_model_forwards_explicit_attention_backend(monkeypatch):
+    import scripts.run_ars_pipeline as pipeline
+
+    calls = {}
+
+    class Tokenizer:
+        pad_token = "<pad>"
+        pad_token_id = 0
+        eos_token = "<eos>"
+
+    class Backbone:
+        def to(self, _device):
+            return self
+
+    class WrappedModel:
+        def eval(self):
+            return self
+
+    monkeypatch.setenv("ARS_ATTENTION_IMPLEMENTATION", "eager")
+    monkeypatch.setattr(
+        pipeline.AutoTokenizer,
+        "from_pretrained",
+        lambda *args, **kwargs: Tokenizer(),
+    )
+    monkeypatch.setattr(
+        pipeline.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(pad_token_id=None),
+    )
+
+    def load_backbone(*args, **kwargs):
+        calls.update(kwargs)
+        return Backbone()
+
+    monkeypatch.setattr(pipeline.AutoModelForCausalLM, "from_pretrained", load_backbone)
+    monkeypatch.setattr(pipeline, "Phi2WithRSC", lambda *args, **kwargs: WrappedModel())
+
+    pipeline.build_model(RSCConfig(), torch.device("cpu"))
+
+    assert calls["attn_implementation"] == "eager"
+
+
+def test_build_model_rejects_unsupported_attention_backend(monkeypatch):
+    import pytest
+    import scripts.run_ars_pipeline as pipeline
+
+    monkeypatch.setenv("ARS_ATTENTION_IMPLEMENTATION", "flash")
+    with pytest.raises(ValueError, match="ARS_ATTENTION_IMPLEMENTATION"):
+        pipeline.build_model(RSCConfig(), torch.device("cpu"))
+
+
 def test_benchmark_arms_load_their_own_steernet_checkpoints(tmp_path, monkeypatch):
     import scripts.run_ars_pipeline as pipeline
 
