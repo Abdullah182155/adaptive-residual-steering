@@ -153,3 +153,29 @@ def test_equivalence_harness_checks_paired_accuracy_and_identity(monkeypatch):
     assert result["passed"]
     assert result["delta_lenient_pp"] == 0
     assert result["string_identity"] == 1
+
+
+def test_equivalence_report_includes_examples_for_string_mismatches(monkeypatch):
+    import src.evaluation.generation as generation
+
+    monkeypatch.setattr(
+        generation,
+        "build_prompts",
+        lambda tokenizer, questions, question_indices, n_shot, policy: (
+            ["prompt"] * len(questions),
+            [None] * len(questions),
+        ),
+    )
+    result = equivalence_test(
+        TinyGenerationModel(vary=True),
+        TinyTokenizer(),
+        [{"question": "q1", "final_num": "0"}, {"question": "q2", "final_num": "0"}],
+        "cpu",
+        n=2,
+        batch_size=2,
+    )
+
+    assert result["n_string_mismatches"] == 1
+    assert result["mismatch_examples"][0]["row_index"] == 1
+    assert result["mismatch_examples"][0]["batch1_text"] == "A"
+    assert result["mismatch_examples"][0]["batched_text"] == "BC"

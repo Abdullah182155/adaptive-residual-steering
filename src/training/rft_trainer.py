@@ -152,6 +152,13 @@ def train_phase1_rft(
         raise ValueError("Phi-2 backbone must remain fully frozen during RFT")
     if any(network.use_mag_head for network in model.steer_nets.values()):
         raise ValueError("SteerNet magnitude heads must be disabled for Phase 1 RFT")
+    trainable_parameters = [
+        parameter
+        for parameter in model.steer_nets.parameters()
+        if parameter.requires_grad
+    ]
+    if not trainable_parameters:
+        raise ValueError("Phase 1 RFT requires trainable SteerNet parameters")
 
     target_device = torch.device(device)
     model.set_routing_override("only", cfg.fixed_layers)
@@ -167,6 +174,9 @@ def train_phase1_rft(
     baseline_2shot_flags, baseline_2shot_metrics = evaluate_generation(
         model, tokenizer, eval_rows, cfg, target_device, n_shot=2, steered=False
     )
+    # Baseline evaluation disables steering; restore the training route before
+    # the first loss forward so adapter parameters remain connected to the graph.
+    model.set_routing_override("only", cfg.fixed_layers)
     optimizer = torch.optim.AdamW(
         _param_groups(model, cfg), betas=(0.9, 0.999), eps=1e-6
     )
@@ -238,6 +248,11 @@ def train_phase1_rft(
                 )
                 sys.stdout.flush()
             scaler.unscale_(optimizer)
+            if not any(parameter.grad is not None for parameter in trainable_parameters):
+                raise RuntimeError(
+                    "RFT produced no gradients for trainable SteerNet parameters; "
+                    "verify that the fixed steering route is active"
+                )
             torch.nn.utils.clip_grad_norm_(model.steer_nets.parameters(), cfg.clip_grad)
             scaler.step(optimizer)
             scaler.update()
