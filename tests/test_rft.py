@@ -301,3 +301,50 @@ def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypat
 
     assert observed["n"] == 120
     assert result["n"] == 120
+
+
+def test_equivalence_nonblocking_records_failed_smoke_gate(tmp_path, monkeypatch):
+    import scripts.run_rft_pipeline as runner
+
+    class Split(list):
+        def with_format(self, _format):
+            return self
+
+    class Model:
+        def set_routing_override(self, *_args):
+            return None
+
+    rows = [{"question": "Question", "answer": "1"}]
+    monkeypatch.setattr(runner.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(runner, "build_model", lambda _cfg, _device: (Model(), object()))
+    monkeypatch.setattr(
+        runner, "gsm8k_to_cot", lambda _tokenizer, _cfg: (Split(rows), Split(rows))
+    )
+    monkeypatch.setattr(
+        runner,
+        "equivalence_test",
+        lambda *_args, **_kwargs: {
+            "n": 1,
+            "delta_lenient_pp": 0.0,
+            "string_identity": 0.0,
+            "passed": False,
+        },
+    )
+
+    result = runner.run(
+        parse_args(
+            [
+                "--stage",
+                "equivalence",
+                "--n_questions",
+                "1",
+                "--equivalence_nonblocking",
+                "--output_dir",
+                str(tmp_path),
+            ]
+        )
+    )
+
+    assert result["quality_gate_passed"] is False
+    assert result["nonblocking"] is True
+    assert result["passed"] is True

@@ -45,6 +45,11 @@ def parse_args(argv=None):
         help="record Gate 0 quality without aborting when its threshold is missed",
     )
     parser.add_argument(
+        "--equivalence_nonblocking",
+        action="store_true",
+        help="record small-sample equivalence quality without aborting a smoke run",
+    )
+    parser.add_argument(
         "--allow_low_yield",
         action="store_true",
         help="allow low positive-sample yield for smoke collection runs",
@@ -216,6 +221,10 @@ def run(args) -> dict | None:
             n=min(equivalence_questions, len(dev_rows)),
             batch_size=2,
         )
+        quality_gate_passed = bool(result["passed"])
+        result["quality_gate_passed"] = quality_gate_passed
+        result["nonblocking"] = bool(args.equivalence_nonblocking)
+        result["passed"] = quality_gate_passed or args.equivalence_nonblocking
         _write_json(equivalence_path, result)
         if not result["passed"]:
             raise RuntimeError(
@@ -223,6 +232,12 @@ def run(args) -> dict | None:
                 f"n={result['n']} delta={result['delta_lenient_pp']:+.2f}pp "
                 f"identity={result['string_identity']:.1%}; inspect "
                 f"{equivalence_path} mismatch_examples"
+            )
+        if args.equivalence_nonblocking and not quality_gate_passed:
+            print(
+                "Generation equivalence thresholds were not met; continuing "
+                "because --equivalence_nonblocking is enabled for this smoke run.",
+                flush=True,
             )
         if args.stage == "equivalence":
             return result
