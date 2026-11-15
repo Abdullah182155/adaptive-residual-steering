@@ -45,9 +45,9 @@ def parse_args(argv=None):
         help="record Gate 0 quality without aborting when its threshold is missed",
     )
     parser.add_argument(
-        "--equivalence_nonblocking",
+        "--strict_equivalence",
         action="store_true",
-        help="record small-sample equivalence quality without aborting a smoke run",
+        help="block generation stages when batched equivalence thresholds fail",
     )
     parser.add_argument(
         "--allow_low_yield",
@@ -81,7 +81,7 @@ def _require_equivalence(path: Path) -> dict:
             f"generation equivalence result not found at {path}; run --stage equivalence first"
         )
     result = json.loads(path.read_text(encoding="utf-8"))
-    if not result.get("passed", False):
+    if not result.get("quality_gate_passed", result.get("passed", False)):
         raise RuntimeError("generation equivalence failed; refusing collection or training")
     return result
 
@@ -195,7 +195,7 @@ def run(args) -> dict | None:
         raise RuntimeError("Phase 1 RFT expects a CUDA runtime such as Kaggle T4")
     output_dir = Path(args.output_dir)
     equivalence_path = output_dir / "generation_equivalence.json"
-    if args.stage in {"gate0", "collect", "train"}:
+    if args.strict_equivalence and args.stage in {"gate0", "collect", "train"}:
         _require_equivalence(equivalence_path)
     if args.stage in {"collect", "train"}:
         _require_gate0(output_dir / "gate0_stats.json")
@@ -223,21 +223,21 @@ def run(args) -> dict | None:
         )
         quality_gate_passed = bool(result["passed"])
         result["quality_gate_passed"] = quality_gate_passed
-        result["nonblocking"] = bool(args.equivalence_nonblocking)
-        result["passed"] = quality_gate_passed or args.equivalence_nonblocking
+        result["used_for_session1_gate"] = bool(args.strict_equivalence)
         _write_json(equivalence_path, result)
-        if not result["passed"]:
+        if not quality_gate_passed:
+            print(
+                "Batched equivalence thresholds were not met. Session 1 uses "
+                "single-question generation; this result is diagnostic unless "
+                "--strict_equivalence is enabled.",
+                flush=True,
+            )
+        if not quality_gate_passed and args.strict_equivalence:
             raise RuntimeError(
                 "batched generation failed Phase 1 equivalence thresholds; "
                 f"n={result['n']} delta={result['delta_lenient_pp']:+.2f}pp "
                 f"identity={result['string_identity']:.1%}; inspect "
                 f"{equivalence_path} mismatch_examples"
-            )
-        if args.equivalence_nonblocking and not quality_gate_passed:
-            print(
-                "Generation equivalence thresholds were not met; continuing "
-                "because --equivalence_nonblocking is enabled for this smoke run.",
-                flush=True,
             )
         if args.stage == "equivalence":
             return result

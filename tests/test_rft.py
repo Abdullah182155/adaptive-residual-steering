@@ -303,7 +303,9 @@ def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypat
     assert result["n"] == 120
 
 
-def test_equivalence_nonblocking_records_failed_smoke_gate(tmp_path, monkeypatch):
+def test_equivalence_failure_is_diagnostic_unless_strict_mode(tmp_path, monkeypatch):
+    import json
+    import pytest
     import scripts.run_rft_pipeline as runner
 
     class Split(list):
@@ -331,20 +333,24 @@ def test_equivalence_nonblocking_records_failed_smoke_gate(tmp_path, monkeypatch
         },
     )
 
-    result = runner.run(
-        parse_args(
-            [
-                "--stage",
-                "equivalence",
-                "--n_questions",
-                "1",
-                "--equivalence_nonblocking",
-                "--output_dir",
-                str(tmp_path),
-            ]
-        )
-    )
+    arguments = [
+        "--stage",
+        "equivalence",
+        "--n_questions",
+        "1",
+        "--output_dir",
+        str(tmp_path),
+    ]
+    result_path = tmp_path / "generation_equivalence.json"
+    with pytest.raises(RuntimeError, match="equivalence thresholds"):
+        runner.run(parse_args(arguments + ["--strict_equivalence"]))
 
+    strict_result = json.loads(result_path.read_text(encoding="utf-8"))
+    assert strict_result["quality_gate_passed"] is False
+    assert strict_result["used_for_session1_gate"] is True
+    assert strict_result["passed"] is False
+
+    result = runner.run(parse_args(arguments))
     assert result["quality_gate_passed"] is False
-    assert result["nonblocking"] is True
-    assert result["passed"] is True
+    assert result["used_for_session1_gate"] is False
+    assert result["passed"] is False
