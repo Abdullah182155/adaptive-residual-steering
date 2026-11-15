@@ -217,7 +217,7 @@ def test_rft_training_restores_steering_route_after_baseline_evaluation(tmp_path
         def set_prompt_shield_mask(self, _mask):
             pass
 
-        def forward(self, input_ids, attention_mask):
+        def forward(self, input_ids, attention_mask, use_cache=False):
             self.training_routes.append(self.route)
             logits = self.steer_nets["17"].adapter.view(1, 1, -1).expand(
                 input_ids.shape[0], input_ids.shape[1], -1
@@ -267,6 +267,91 @@ def test_rft_training_restores_steering_route_after_baseline_evaluation(tmp_path
     )
 
     assert model.training_routes == ["only"]
+
+
+def test_rft_retries_oom_accumulation_window_with_single_examples(tmp_path, monkeypatch):
+    import torch.nn as nn
+    import src.training.rft_trainer as trainer
+
+    class FakeRFTModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+
+            class FakeSteerNet(nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self.use_mag_head = False
+                    self.adapter = nn.Parameter(torch.tensor([0.1, -0.1, 0.2, -0.2]))
+
+            self.base_model = nn.Linear(1, 1)
+            for parameter in self.base_model.parameters():
+                parameter.requires_grad = False
+            self.steer_nets = nn.ModuleDict({"17": FakeSteerNet()})
+            self.forward_batch_sizes = []
+
+        def set_routing_override(self, *_args):
+            pass
+
+        def set_prompt_shield_mask(self, _mask):
+            pass
+
+        def reset_steernet_cache(self):
+            pass
+
+        def forward(self, input_ids, attention_mask, use_cache=False):
+            self.forward_batch_sizes.append(input_ids.shape[0])
+            if input_ids.shape[0] > 1:
+                raise torch.cuda.OutOfMemoryError("synthetic paired-batch peak")
+            logits = self.steer_nets["17"].adapter.view(1, 1, -1).expand(
+                input_ids.shape[0], input_ids.shape[1], -1
+            )
+            return SimpleNamespace(logits=logits)
+
+    model = FakeRFTModel()
+    cfg = SimpleNamespace(
+        validate=lambda: None,
+        fixed_layers=[17, 20, 23, 26],
+        use_gate=False,
+        steernet_use_mag_head=False,
+        phase1_lr=1.5e-4,
+        weight_decay=0.0,
+        batch_size=2,
+        grad_accum=1,
+        seed=0,
+        phase1_warmup_frac=0.1,
+        phase1_min_lr_frac=0.1,
+        clip_grad=1.0,
+        report_dir=str(tmp_path),
+        lora_save_path=str(tmp_path / "steernet.pt"),
+    )
+    rows = [
+        {
+            "input_ids": torch.tensor([1, 2, 3]),
+            "attention_mask": torch.tensor([1, 1, 1]),
+            "labels": torch.tensor([-100, 2, 3]),
+        }
+        for _ in range(2)
+    ]
+
+    def fake_evaluate(_model, _tokenizer, _rows, _cfg, _device, *, steered, **_kwargs):
+        return [False], {"lenient_accuracy": 0.0, "mean_tokens": 1.0}
+
+    monkeypatch.setattr(trainer, "evaluate_generation", fake_evaluate)
+    monkeypatch.setattr(trainer, "_epoch_batches", lambda *_args: [[0, 1]])
+    monkeypatch.setattr(trainer, "_save_rft_checkpoint", lambda *_args: None)
+
+    trainer.train_phase1_rft(
+        model,
+        rows,
+        [{"question": "q", "answer": "1"}],
+        cfg,
+        "cpu",
+        object(),
+        epochs=1,
+        save_path=str(tmp_path / "steernet.pt"),
+    )
+
+    assert model.forward_batch_sizes == [2, 1, 1]
 
 
 def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypatch):
