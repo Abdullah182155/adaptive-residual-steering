@@ -12,6 +12,7 @@ import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
+import random
 from pathlib import Path
 import sys
 import traceback
@@ -69,6 +70,7 @@ def parse_args(argv=None):
     parser.add_argument("--calib_sel_n", type=int)
     parser.add_argument("--contract")
     parser.add_argument("--n_test", type=int)
+    parser.add_argument("--test_seed", type=int, default=42)
     parser.add_argument("--shots", type=int, nargs="+")
     parser.add_argument("--record", default="experiment_record.json")
     parser.add_argument("--report", action="store_true")
@@ -158,14 +160,27 @@ def build_model(cfg, device):
     return model, tokenizer
 
 
-def load_benchmark_rows(limit):
+def load_benchmark_rows(limit: int | None, seed: int = 42) -> list[dict[str, object]]:
+    """Load a deterministic shuffled GSM8K test subset and preserve source indices."""
     dataset = load_dataset("openai/gsm8k", "main", split="test")
-    if limit is not None:
-        dataset = dataset.select(range(min(limit, len(dataset))))
+    total = len(dataset)
+    sample_size = total if limit is None else min(limit, total)
+    if sample_size < 1:
+        raise ValueError("benchmark sample size must be positive")
+    source_indices = list(range(total))
+    if sample_size < total:
+        source_indices = random.Random(seed).sample(source_indices, sample_size)
+    dataset = dataset.select(source_indices)
     rows = []
-    for example in dataset:
+    for source_index, example in zip(source_indices, dataset):
         answer = example["answer"].split("####")[-1].strip()
-        rows.append({"question": example["question"], "answer": answer})
+        rows.append(
+            {
+                "question": example["question"],
+                "answer": answer,
+                "source_index": source_index,
+            }
+        )
     return rows
 
 
@@ -312,7 +327,7 @@ def run(args) -> int:
         record = run_benchmark(
             model,
             tokenizer,
-            load_benchmark_rows(args.n_test),
+            load_benchmark_rows(args.n_test, seed=args.test_seed),
             cfg,
             device,
             shots,
@@ -320,6 +335,7 @@ def run(args) -> int:
             contract,
             router_prefill_fn=router_prefill_fn,
             arm_setup=lambda arm: _load_arm_weights(model, arm, cfg, device),
+            test_seed=args.test_seed,
         )
         write_record(record, cfg.record_path)
         if args.report:

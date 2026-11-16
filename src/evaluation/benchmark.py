@@ -217,6 +217,7 @@ def run_benchmark(
     suite: str = "gsm8k",
     router_prefill_fn=None,
     arm_setup=None,
+    test_seed: int | None = None,
 ) -> Dict[str, object]:
     """Run greedy paired baseline and steering evaluations into a serializable record."""
     # Ensure SteerNet dropout is off during generation (SteerNet starts in train mode).
@@ -226,6 +227,10 @@ def run_benchmark(
         "model": cfg.model_name,
         "route": list(cfg.fixed_layers),
         "suite": suite,
+        "test_seed": test_seed,
+        "test_source_indices": [
+            int(row.get("source_index", index)) for index, row in enumerate(rows)
+        ],
         "shots": {},
     }
     shield_policy = getattr(cfg, "shield_policy", "context")
@@ -330,6 +335,7 @@ def run_benchmark(
             arm_records = [
                 {
                     "idx": i,
+                    "source_index": int(row.get("source_index", i)),
                     "question": row["question"],
                     "gold": row["answer"],
                     **res,
@@ -371,8 +377,16 @@ def run_benchmark(
 
             # Save paired generation file for diagnostics and legacy tools: report/generations/{suite}_{n_shot}shot.jsonl
             paired_rows = [
-                {"question": row["question"], "gold": row["answer"], "baseline": b, paired_arm: f}
-                for row, b, f in zip(rows, arm_results["baseline"], arm_results[paired_arm])
+                {
+                    "source_index": int(row.get("source_index", i)),
+                    "question": row["question"],
+                    "gold": row["answer"],
+                    "baseline": b,
+                    paired_arm: f,
+                }
+                for i, (row, b, f) in enumerate(
+                    zip(rows, arm_results["baseline"], arm_results[paired_arm])
+                )
             ]
             paired_output_path = generation_dir / f"{suite}_{n_shot}shot.jsonl"
             paired_output_path.write_text(
