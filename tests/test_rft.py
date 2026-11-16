@@ -105,6 +105,28 @@ def test_rft_runner_exposes_explicit_stages_and_two_t4_sharding():
     assert args.n_shards == 2
 
 
+def test_rft_runner_can_train_v2_from_existing_shards_without_collection(tmp_path):
+    args = parse_args([
+        "--stage", "train",
+        "--steernet_arch", "v2",
+        "--skip_collection",
+        "--rollout_dir", str(tmp_path),
+        "--norm_calibration", str(tmp_path / "norms.json"),
+    ])
+
+    assert args.stage == "train"
+    assert args.steernet_arch == "v2"
+    assert args.skip_collection is True
+    assert args.rollout_dir == str(tmp_path)
+
+
+def test_rft_rollout_shard_flags_do_not_trigger_collection_by_default():
+    args = parse_args(["--stage", "train", "--rollout_dir", "saved-rollouts"])
+
+    assert not args.skip_collection
+    assert args.rollout_dir == "saved-rollouts"
+
+
 def test_rft_stage_question_count_is_optional_for_stage_specific_defaults():
     args = parse_args(["--stage", "gate0"])
 

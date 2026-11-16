@@ -9,7 +9,7 @@ import weakref
 import torch
 import torch.nn as nn
 
-from src.steering.steernet import SteerNet, load_layer_norms
+from src.steering.steernet import SteerNet, SteerNetV2, load_layer_norms
 
 
 RouteSelector = Callable[[int, torch.device], torch.BoolTensor]
@@ -41,28 +41,45 @@ class Phi2WithRSC(nn.Module):
         if hidden_size is None:
             raise ValueError("backbone config does not expose hidden_size or n_embd")
 
-        norms = load_layer_norms(cfg.layer_norms_calibration)
-        self.steer_nets = nn.ModuleDict(
-            {
-                str(layer): SteerNet(
-                    hidden_dim=hidden_size,
-                    rank=cfg.lora_rank,
-                    lora_alpha=cfg.lora_alpha,
-                    dropout=cfg.lora_dropout,
-                    kappa=cfg.steer_kappa,
-                    amplitude_mode=getattr(cfg, "amplitude_mode", "relative"),
-                    rho_max=getattr(cfg, "rho_max", 0.04),
-                    layer_norms=norms,
-                    layer_idx=layer,
-                    mag_head_init_bias=getattr(cfg, "mag_head_init_bias", -3.0),
-                    init_gain=getattr(cfg, "steernet_init_gain", 1.0),
-                    use_mag_head=getattr(cfg, "steernet_use_mag_head", True),
-                    use_soft_cap=getattr(cfg, "steernet_use_soft_cap", True),
-                    use_causal_conv=getattr(cfg, "steernet_use_conv", True),
-                ).to(self.device)
-                for layer in self.target_layers
-            }
+        norms = load_layer_norms(
+            cfg.layer_norms_calibration,
+            statistic=getattr(cfg, "steernet_norm_stat", "median_norm"),
         )
+        if getattr(cfg, "steernet_arch", "v5") == "v2":
+            self.steer_nets = nn.ModuleDict(
+                {
+                    str(layer): SteerNetV2(
+                        hidden_dim=hidden_size,
+                        rank=cfg.lora_rank,
+                        rho_max=cfg.rho_max,
+                        layer_norm_ref=norms.get(layer, 0.0),
+                        layer_idx=layer,
+                    ).to(self.device)
+                    for layer in self.target_layers
+                }
+            )
+        else:
+            self.steer_nets = nn.ModuleDict(
+                {
+                    str(layer): SteerNet(
+                        hidden_dim=hidden_size,
+                        rank=cfg.lora_rank,
+                        lora_alpha=cfg.lora_alpha,
+                        dropout=cfg.lora_dropout,
+                        kappa=cfg.steer_kappa,
+                        amplitude_mode=getattr(cfg, "amplitude_mode", "relative"),
+                        rho_max=getattr(cfg, "rho_max", 0.04),
+                        layer_norms=norms,
+                        layer_idx=layer,
+                        mag_head_init_bias=getattr(cfg, "mag_head_init_bias", -3.0),
+                        init_gain=getattr(cfg, "steernet_init_gain", 1.0),
+                        use_mag_head=getattr(cfg, "steernet_use_mag_head", True),
+                        use_soft_cap=getattr(cfg, "steernet_use_soft_cap", True),
+                        use_causal_conv=getattr(cfg, "steernet_use_conv", True),
+                    ).to(self.device)
+                    for layer in self.target_layers
+                }
+            )
 
         self._hook_handles = []
         self._hooks_disabled = False

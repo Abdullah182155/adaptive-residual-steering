@@ -14,6 +14,7 @@ class RSCConfig:
     candidate_layers: List[int] = field(default_factory=lambda: [8, 11, 13, 15, 17, 19, 20, 21, 22, 23, 24, 26])
     fixed_layers: List[int] = field(default_factory=lambda: [17, 20, 23, 26])
     steernet_arch: str = "v5"
+    steernet_norm_stat: str = "median_norm"
     objective: str = "nll"
 
     lora_rank: int = 32
@@ -165,18 +166,40 @@ class RSCConfig:
     generation_repetition_penalty: float = 1.0    # 1.0 = disabled
     generation_no_repeat_ngram: int = 0           # disabled: prompt tokens cause false bans in 2-shot
 
+    def __post_init__(self) -> None:
+        """Apply the locked V_REDESIGN preset when callers select architecture V2."""
+        if self.steernet_arch == "v2":
+            self.fixed_layers = [12, 15, 18, 21]
+            self.candidate_layers = sorted(set(self.candidate_layers) | set(self.fixed_layers))
+            self.lora_rank = 16
+            self.rho_max = 0.10
+            self.steernet_norm_stat = "p99_norm"
+            self.steernet_use_mag_head = False
+            self.steernet_use_conv = False
+
     @property
     def use_mag_head(self) -> bool:
         return self.steernet_use_mag_head
 
     def validate(self) -> None:
-        """Reject configurations that violate Phase 1 contracts."""
-        if self.steernet_arch != "v5":
-            raise ValueError("Phase 1 supports SteerNet V5 only")
+        """Reject configurations that violate the selected session contracts."""
+        if self.steernet_arch not in {"v5", "v2"}:
+            raise ValueError("steernet_arch must be 'v5' or 'v2'")
         if self.objective != "nll":
             raise ValueError("Phase 1 supports token-weighted NLL only")
         if not self.fixed_layers:
             raise ValueError("fixed_layers cannot be empty")
+        if self.steernet_arch == "v2":
+            if self.fixed_layers != [12, 15, 18, 21]:
+                raise ValueError("Session 2 SteerNetV2 route is locked to [12, 15, 18, 21]")
+            if self.lora_rank != 16:
+                raise ValueError("Session 2 SteerNetV2 rank is locked at 16")
+            if abs(self.rho_max - 0.10) > 1e-12:
+                raise ValueError("Session 2 SteerNetV2 rho_max is locked at 0.10")
+            if self.steernet_use_mag_head or self.steernet_use_conv:
+                raise ValueError("Session 2 SteerNetV2 disables magnitude and convolution")
+            if self.steernet_norm_stat != "p99_norm":
+                raise ValueError("Session 2 SteerNetV2 requires p99_norm calibration")
         if abs(self.phase1_lr - 1.5e-4) > 1e-12:
             raise ValueError("phase1_lr is locked at 1.5e-4")
         if not all(0 <= l < 32 for l in self.fixed_layers):

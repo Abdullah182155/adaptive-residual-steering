@@ -58,7 +58,7 @@ def parse_args(argv=None):
         choices=("S1", "S1C", "S1R", "S2", "S2B", "S5", "bench", "all", "train", "calibrate", "router", "gate"),
         default="all",
     )
-    parser.add_argument("--steernet_arch", choices=("v5",), default="v5")
+    parser.add_argument("--steernet_arch", choices=("v5", "v2"), default="v5")
     parser.add_argument("--objective", choices=("nll",), default="nll")
     parser.add_argument("--s1_epochs", type=int)
     parser.add_argument("--s1_lr", type=float)
@@ -95,6 +95,14 @@ def parse_args(argv=None):
 
 def build_config(args) -> RSCConfig:
     cfg = RSCConfig(steernet_arch=args.steernet_arch, objective=args.objective)
+    if args.steernet_arch == "v2":
+        cfg.fixed_layers = [12, 15, 18, 21]
+        cfg.candidate_layers = sorted(set(cfg.candidate_layers) | set(cfg.fixed_layers))
+        cfg.lora_rank = 16
+        cfg.rho_max = 0.10
+        cfg.steernet_norm_stat = "p99_norm"
+        cfg.steernet_use_mag_head = False
+        cfg.steernet_use_conv = False
     values = {
         "phase1_epochs": args.s1_epochs,
         "phase1_lr": args.s1_lr,

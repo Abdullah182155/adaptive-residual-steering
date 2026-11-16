@@ -219,6 +219,19 @@ def test_benchmark_cli_has_reproducible_test_seed():
     assert parse_args(["--stage", "bench", "--test_seed", "7"]).test_seed == 7
 
 
+def test_phase2_v2_config_has_locked_architecture_values():
+    args = parse_args(["--stage", "bench", "--steernet_arch", "v2"])
+    cfg = build_config(args)
+
+    assert cfg.steernet_arch == "v2"
+    assert cfg.fixed_layers == [12, 15, 18, 21]
+    assert cfg.lora_rank == 16
+    assert cfg.rho_max == 0.10
+    assert cfg.steernet_norm_stat == "p99_norm"
+    assert not cfg.steernet_use_mag_head
+    assert not cfg.steernet_use_conv
+
+
 def test_phase1_learning_rate_is_locked():
     import pytest
 

@@ -1,4 +1,4 @@
-"""Run Gate 0, split RFT collection, and Phase 1 RFT training on GSM8K."""
+"""Run RFT collection or train V5/V2 adapters from existing GSM8K rollouts."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from src.training.rft_trainer import train_phase1_rft
 
 
 STAGE1_ROUTE = [17, 20, 23, 26]
+STAGE2_ROUTE = [12, 15, 18, 21]
 
 
 def parse_args(argv=None):
@@ -59,6 +60,17 @@ def parse_args(argv=None):
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--n_shards", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--steernet_arch", choices=("v5", "v2"), default="v5")
+    parser.add_argument(
+        "--skip_collection",
+        action="store_true",
+        help="train only from existing rollout shards; never start rollout generation",
+    )
+    parser.add_argument(
+        "--rollout_dir",
+        help="directory containing existing shard0.jsonl and shard1.jsonl",
+    )
+    parser.add_argument("--norm_calibration")
     parser.add_argument("--output_dir", default="report/rft")
     parser.add_argument("--checkpoint", default="checkpoints/steernet.pt")
     return parser.parse_args(argv)
@@ -174,14 +186,25 @@ def run(args) -> dict | None:
         raise ValueError("shard must satisfy 0 <= shard < n_shards")
     if args.stage == "all" and args.n_shards != 1:
         raise ValueError("--stage all runs a single collection shard; use separate collect/train stages for sharding")
+    if args.skip_collection and args.stage != "train":
+        raise ValueError("--skip_collection is only valid with --stage train")
 
     equivalence_questions = args.n_questions or 100
     gate0_questions = args.n_questions or 60
     collection_questions = args.n_questions or 2000
 
-    cfg = RSCConfig()
-    cfg.fixed_layers = list(STAGE1_ROUTE)
-    cfg.candidate_layers = sorted(set(cfg.candidate_layers) | set(STAGE1_ROUTE))
+    cfg = RSCConfig(steernet_arch=args.steernet_arch)
+    route = STAGE2_ROUTE if args.steernet_arch == "v2" else STAGE1_ROUTE
+    cfg.fixed_layers = list(route)
+    cfg.candidate_layers = sorted(set(cfg.candidate_layers) | set(route))
+    if args.steernet_arch == "v2":
+        cfg.lora_rank = 16
+        cfg.rho_max = 0.10
+        cfg.steernet_norm_stat = "p99_norm"
+        cfg.steernet_use_conv = False
+        if args.norm_calibration is None:
+            raise ValueError("Session 2 V2 training requires --norm_calibration from p99 calibration")
+        cfg.layer_norms_calibration = args.norm_calibration
     cfg.steernet_use_mag_head = False
     cfg.mag_l1_weight = 0.0
     cfg.s1_answer_weight = 1.0
@@ -189,15 +212,51 @@ def run(args) -> dict | None:
     cfg.use_gate = False
     cfg.max_tok_len = 768
     cfg.validate()
+    print(
+        f"[rft] architecture={cfg.steernet_arch} route={cfg.fixed_layers} "
+        f"rank={cfg.lora_rank} rho_max={cfg.rho_max} norm_stat={cfg.steernet_norm_stat}",
+        flush=True,
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         raise RuntimeError("Phase 1 RFT expects a CUDA runtime such as Kaggle T4")
     output_dir = Path(args.output_dir)
+    rollout_source_dir = Path(args.rollout_dir) if args.rollout_dir else output_dir
+    if args.skip_collection:
+        required_shards = [
+            rollout_source_dir / "shard0.jsonl",
+            rollout_source_dir / "shard1.jsonl",
+        ]
+        missing = [str(path) for path in required_shards if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(
+                "Session 2 is configured to reuse Session 1 data and will not collect "
+                f"new rollouts; missing files: {missing}"
+            )
+        if any(path.stat().st_size == 0 for path in required_shards):
+            raise ValueError("existing RFT rollout shards must not be empty")
+        if args.steernet_arch == "v2":
+            calibration_path = Path(args.norm_calibration)
+            if not calibration_path.is_file():
+                raise FileNotFoundError(
+                    f"Session 2 p99 norm calibration file not found: {calibration_path}"
+                )
+            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+            calibrated_layers = calibration.get("layers", {})
+            missing_p99 = [
+                str(layer)
+                for layer in STAGE2_ROUTE
+                if "p99_norm" not in calibrated_layers.get(str(layer), {})
+            ]
+            if missing_p99:
+                raise ValueError(
+                    f"p99 calibration is missing Session 2 layers: {missing_p99}"
+                )
     equivalence_path = output_dir / "generation_equivalence.json"
     if args.strict_equivalence and args.stage in {"gate0", "collect", "train"}:
         _require_equivalence(equivalence_path)
-    if args.stage in {"collect", "train"}:
+    if args.stage == "collect" or (args.stage == "train" and not args.skip_collection):
         _require_gate0(output_dir / "gate0_stats.json")
 
     model, tokenizer = build_model(cfg, device)
@@ -285,9 +344,19 @@ def run(args) -> dict | None:
             return collect_stats
 
     if args.stage in {"train", "all"}:
-        shard_files = sorted(output_dir.glob("shard*.jsonl"))
+        source_dir = rollout_source_dir
+        shard_files = sorted(source_dir.glob("shard*.jsonl"))
         if not shard_files:
-            raise FileNotFoundError(f"no RFT rollout shards found in {output_dir}")
+            raise FileNotFoundError(f"no RFT rollout shards found in {source_dir}")
+        if args.skip_collection:
+            required_shards = {"shard0.jsonl", "shard1.jsonl"}
+            found_shards = {path.name for path in shard_files}
+            missing_shards = sorted(required_shards - found_shards)
+            if missing_shards:
+                raise FileNotFoundError(
+                    f"--skip_collection requires the existing two Session 1 shards; "
+                    f"missing {missing_shards} in {source_dir}"
+                )
         rft_rows, row_stats = build_rft_rows(
             shard_files,
             tokenizer,

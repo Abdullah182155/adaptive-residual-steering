@@ -24,6 +24,7 @@ from src.training.trainer import (
 )
 
 _STAGE1_ROUTE = [17, 20, 23, 26]
+_STAGE2_ROUTE = [12, 15, 18, 21]
 
 
 def _plain_nll_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -206,17 +207,19 @@ def train_phase1_rft(
     cfg.validate()
     if not train_rows:
         raise ValueError("train_rows cannot be empty")
-    if list(cfg.fixed_layers) != _STAGE1_ROUTE:
-        raise ValueError(f"Phase 1 RFT route is locked to {_STAGE1_ROUTE}")
+    steernet_arch = getattr(cfg, "steernet_arch", "v5")
+    expected_route = _STAGE2_ROUTE if steernet_arch == "v2" else _STAGE1_ROUTE
+    if list(cfg.fixed_layers) != expected_route:
+        raise ValueError(f"{steernet_arch} RFT route is locked to {expected_route}")
     if cfg.use_gate:
         raise ValueError("Phase 1 RFT requires use_gate=False")
-    if cfg.steernet_use_mag_head:
+    if getattr(cfg, "steernet_use_mag_head", False):
         raise ValueError("Phase 1 RFT pins magnitude to identity (m=1.0)")
     if epochs < 1:
         raise ValueError("epochs must be positive")
     if any(parameter.requires_grad for parameter in model.base_model.parameters()):
         raise ValueError("Phi-2 backbone must remain fully frozen during RFT")
-    if any(network.use_mag_head for network in model.steer_nets.values()):
+    if any(getattr(network, "use_mag_head", False) for network in model.steer_nets.values()):
         raise ValueError("SteerNet magnitude heads must be disabled for Phase 1 RFT")
     trainable_parameters = [
         parameter

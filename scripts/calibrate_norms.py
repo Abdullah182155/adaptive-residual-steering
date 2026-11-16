@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import json
+import random
 import time
 import sys
 import os
@@ -27,6 +28,37 @@ from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM
 from tqdm.auto import tqdm
 import numpy as np
 from datasets import load_dataset
+
+
+def load_calibration_questions(
+    n_samples: int,
+    *,
+    rollout_files: List[str] | None = None,
+    seed: int = 42,
+) -> List[str]:
+    """Select unique prompts from saved RFT shards or GSM8K train, never test."""
+    if n_samples < 1:
+        raise ValueError("n_samples must be positive")
+    if rollout_files:
+        questions = []
+        seen = set()
+        for file_name in rollout_files:
+            with Path(file_name).open(encoding="utf-8") as stream:
+                for line in stream:
+                    question = json.loads(line).get("question")
+                    if question and question not in seen:
+                        seen.add(question)
+                        questions.append(question)
+        if len(questions) < n_samples:
+            raise ValueError(
+                f"rollout shards contain {len(questions)} unique questions; "
+                f"need {n_samples} for norm calibration"
+            )
+        return random.Random(seed).sample(questions, n_samples)
+
+    dataset = load_dataset("openai/gsm8k", "main", split="train")
+    questions = [row["question"] for row in dataset]
+    return random.Random(seed).sample(questions, min(n_samples, len(questions)))
 
 
 def collect_layer_norms(
@@ -134,7 +166,7 @@ def compute_calibration_stats(
     for layer in candidate_layers:
         norms = np.array(layer_norms[layer])
         if len(norms) == 0:
-            continue
+            raise ValueError(f"No norm samples were collected for layer {layer}")
         
         median_norm = np.median(norms)
         mean_norm = np.mean(norms)
@@ -160,10 +192,16 @@ def main():
     parser = argparse.ArgumentParser(description="Calibrate per-layer norms for steering envelope")
     parser.add_argument("--model", default="microsoft/phi-2", help="Model name or path")
     parser.add_argument("--n_samples", type=int, default=500, help="Number of samples")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--rollout_files",
+        nargs="+",
+        help="Reuse question prompts from existing RFT shard JSONL files",
+    )
     parser.add_argument("--output", default="norms_calibration.json", help="Output JSON path")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
-    parser.add_argument("--candidate_layers", nargs="+", type=int, default=[13, 15, 18, 20, 22])
-    parser.add_argument("--max_length", type=int, default=512, help="Max token length (should match max_tok_len)")
+    parser.add_argument("--candidate_layers", nargs="+", type=int, default=[12, 15, 18, 21])
+    parser.add_argument("--max_length", type=int, default=768, help="Max token length (should match max_tok_len)")
     args = parser.parse_args()
     
     device = torch.device(args.device)
@@ -175,8 +213,14 @@ def main():
     model_config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     model_config.pad_token_id = tokenizer.pad_token_id
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, config=model_config, trust_remote_code=True
+        args.model,
+        config=model_config,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        attn_implementation="sdpa",
     ).to(device)
+    for parameter in model.parameters():
+        parameter.requires_grad = False
     
     # Identify sink tokens (common non-content tokens)
     sink_tokens = set()
@@ -188,14 +232,16 @@ def main():
     print(f"Sink tokens: {sink_tokens}")
     print(f"Candidate layers: {args.candidate_layers}")
     
-    # Load GSM8K for calibration prompts
-    print(f"Loading {args.n_samples} GSM8K questions for calibration")
-    ds = load_dataset("openai/gsm8k", "main", split="test").shuffle(seed=42)
-    ds = ds.select(range(min(args.n_samples, len(ds))))
-    
-    # Build prompts (0-shot for calibration)
+    print(f"Loading {args.n_samples} prompts for norm calibration")
+    questions = load_calibration_questions(
+        args.n_samples,
+        rollout_files=args.rollout_files,
+        seed=args.seed,
+    )
+
+    # Build 0-shot prompts from training questions or the existing RFT shards.
     from src.data.prompts import build_prompt_unified
-    prompts = [build_prompt_unified(ex["question"], n_shot=0, include_preface=False) for ex in ds]
+    prompts = [build_prompt_unified(question, n_shot=0, include_preface=False) for question in questions]
     
     print("Collecting layer norms...")
     start_time = time.time()
@@ -209,6 +255,8 @@ def main():
     # Add metadata
     stats["metadata"]["model"] = args.model
     stats["metadata"]["n_prompts"] = len(prompts)
+    stats["metadata"]["source"] = "rft_rollout_questions" if args.rollout_files else "gsm8k_train"
+    stats["metadata"]["seed"] = args.seed
     stats["metadata"]["elapsed_seconds"] = elapsed
     stats["metadata"]["candidate_layers"] = args.candidate_layers
     

@@ -344,6 +344,76 @@ class SteerNet(nn.Module):
         self._pre_cap_generator.manual_seed(0)
 
 
+# The Session 2 adapter intentionally has no convolution, residual mid layer, or
+# learned magnitude head; its cap references the calibrated per-layer p99 norm.
+class SteerNetV2(nn.Module):
+    """Zero-initialized low-rank adapter with a differentiable p99 norm cap."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        rank: int = 16,
+        rho_max: float = 0.10,
+        layer_norm_ref: float = 1.0,
+        layer_idx: int = 0,
+    ) -> None:
+        super().__init__()
+        if hidden_dim < 1 or rank < 1:
+            raise ValueError("hidden_dim and rank must be positive")
+        if rho_max <= 0 or layer_norm_ref <= 0:
+            raise ValueError("rho_max and layer_norm_ref must be positive")
+        self.rank = int(rank)
+        self.rho_max = float(rho_max)
+        self.layer_norm_ref = float(layer_norm_ref)
+        self.layer_idx = int(layer_idx)
+        self.down_proj = nn.Linear(hidden_dim, rank, bias=False)
+        self.activation = nn.GELU()
+        self.up_proj = nn.Linear(rank, hidden_dim, bias=False)
+        nn.init.kaiming_uniform_(self.down_proj.weight, a=5**0.5)
+        nn.init.zeros_(self.up_proj.weight)
+        self.telemetry = True
+        self._pre_cap_max = 0.0
+        self._pre_cap_n = 0
+
+    def reset_cache(self) -> None:
+        """Keep a uniform wrapper interface; V2 has no recurrent adapter cache."""
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        active_k: Optional[torch.Tensor] = None,
+        is_decode: bool = False,
+        injection_mask: Optional[torch.BoolTensor] = None,
+    ) -> torch.Tensor:
+        """Produce a differentiably capped residual update for hidden states."""
+        del active_k
+        hidden = h.float()
+        delta = self.up_proj(self.activation(self.down_proj(hidden)))
+        pre_cap_norm = delta.norm(dim=-1, keepdim=True)
+        cap = self.rho_max * self.layer_norm_ref
+        scale = (cap / pre_cap_norm.clamp_min(torch.finfo(pre_cap_norm.dtype).eps)).clamp(max=1.0)
+        delta = delta * scale
+
+        if position_ids is not None:
+            delta = delta * position_ids.ne(0).unsqueeze(-1).to(delta.dtype)
+        elif not is_decode and delta.shape[1] > 0:
+            delta = delta.clone()
+            delta[:, 0] = 0
+        if injection_mask is not None:
+            delta = delta * injection_mask.unsqueeze(-1).to(delta.dtype)
+
+        if self.telemetry and not self.training and pre_cap_norm.numel():
+            self._pre_cap_max = max(self._pre_cap_max, float(pre_cap_norm.detach().max()))
+            self._pre_cap_n += pre_cap_norm.numel()
+        return delta
+
+    def reset_pre_cap_stats(self) -> None:
+        """Reset lightweight pre-cap telemetry counters."""
+        self._pre_cap_max = 0.0
+        self._pre_cap_n = 0
+
+
 # The explicit compatibility alias preserves old checkpoints while imports use
 # the stable publication-quality ``SteerNet`` name.
 RSCSteerNetV5 = SteerNet
@@ -364,8 +434,11 @@ DEFAULT_PHI2_LAYER_NORMS: Dict[int, float] = {
 }
 
 
-def load_layer_norms(calibration_path: Optional[str] = None) -> Dict[int, float]:
-    """Load per-layer N_l values from calibration JSON, or fall back to certified phi-2 defaults."""
+def load_layer_norms(
+    calibration_path: Optional[str] = None,
+    statistic: str = "median_norm",
+) -> Dict[int, float]:
+    """Load calibrated per-layer references without substituting another statistic."""
     import json
     import os
 
@@ -383,9 +456,9 @@ def load_layer_norms(calibration_path: Optional[str] = None) -> Dict[int, float]
 
         layer_norms = {}
         for layer, stats in data.get("layers", {}).items():
-            if isinstance(stats, dict) and "median_norm" in stats:
-                layer_norms[int(layer)] = float(stats["median_norm"])
-            elif isinstance(stats, (int, float)):
+            if isinstance(stats, dict) and statistic in stats:
+                layer_norms[int(layer)] = float(stats[statistic])
+            elif statistic == "median_norm" and isinstance(stats, (int, float)):
                 layer_norms[int(layer)] = float(stats)
 
         return layer_norms
