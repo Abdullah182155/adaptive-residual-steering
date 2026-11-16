@@ -270,6 +270,7 @@ def test_rft_training_restores_steering_route_after_baseline_evaluation(tmp_path
 
 
 def test_rft_retries_oom_accumulation_window_with_single_examples(tmp_path, monkeypatch):
+    import sys
     import torch.nn as nn
     import src.training.rft_trainer as trainer
 
@@ -339,6 +340,12 @@ def test_rft_retries_oom_accumulation_window_with_single_examples(tmp_path, monk
     monkeypatch.setattr(trainer, "evaluate_generation", fake_evaluate)
     monkeypatch.setattr(trainer, "_epoch_batches", lambda *_args: [[0, 1]])
     monkeypatch.setattr(trainer, "_save_rft_checkpoint", lambda *_args: None)
+    exception_state_at_cleanup = []
+    monkeypatch.setattr(
+        trainer.gc,
+        "collect",
+        lambda: exception_state_at_cleanup.append(sys.exc_info()[0]),
+    )
 
     trainer.train_phase1_rft(
         model,
@@ -352,6 +359,7 @@ def test_rft_retries_oom_accumulation_window_with_single_examples(tmp_path, monk
     )
 
     assert model.forward_batch_sizes == [2, 1, 1]
+    assert exception_state_at_cleanup == [None]
 
 
 def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypatch):

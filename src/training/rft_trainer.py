@@ -66,6 +66,26 @@ def _run_rft_window(
     return window_loss
 
 
+def _attempt_rft_window(
+    model: torch.nn.Module,
+    train_rows: Sequence[dict[str, torch.Tensor]],
+    microbatches: Sequence[Sequence[int]],
+    token_count: int,
+    device: torch.device,
+    scaler: torch.amp.GradScaler,
+) -> tuple[Optional[float], bool]:
+    """Catch OOM in a short-lived frame so its traceback releases GPU tensors."""
+    try:
+        return (
+            _run_rft_window(
+                model, train_rows, microbatches, token_count, device, scaler
+            ),
+            False,
+        )
+    except torch.cuda.OutOfMemoryError:
+        return None, True
+
+
 @torch.no_grad()
 def evaluate_generation(
     model,
@@ -256,19 +276,18 @@ def train_phase1_rft(
             )
             if token_count == 0:
                 raise ValueError("RFT batch window has no completion tokens")
-            try:
-                window_loss = _run_rft_window(
-                    model,
-                    train_rows,
-                    window,
-                    token_count,
-                    target_device,
-                    scaler,
-                )
-            except torch.cuda.OutOfMemoryError:
+            window_loss, paired_oom = _attempt_rft_window(
+                model,
+                train_rows,
+                window,
+                token_count,
+                target_device,
+                scaler,
+            )
+            if paired_oom:
                 # A single unusually long pair can exceed the T4 activation peak.
                 # Discard this partial accumulation window and replay its examples
-                # individually, preserving token-mean normalization and effective batch.
+                # individually after the failed forward/backward traceback is gone.
                 optimizer.zero_grad(set_to_none=True)
                 model.set_prompt_shield_mask(None)
                 model.reset_steernet_cache()
@@ -283,7 +302,7 @@ def train_phase1_rft(
                     f"window as {len(singleton_microbatches)} single-example batches",
                     flush=True,
                 )
-                window_loss = _run_rft_window(
+                window_loss, singleton_oom = _attempt_rft_window(
                     model,
                     train_rows,
                     singleton_microbatches,
@@ -291,6 +310,11 @@ def train_phase1_rft(
                     target_device,
                     scaler,
                 )
+                if singleton_oom:
+                    raise torch.cuda.OutOfMemoryError(
+                        "RFT still exceeds CUDA memory with single-example microbatches"
+                    )
+            assert window_loss is not None
             loss_sum += window_loss
             progress.update(len(window))
             progress.set_postfix(
