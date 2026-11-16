@@ -265,6 +265,8 @@ def train_phase1_rft(
     )
 
     best_delta = float("-inf")
+    best_epoch: Optional[int] = None
+    best_length_ratio: Optional[float] = None
     best_state = None
     history: list[dict[str, Any]] = []
     for epoch in range(epochs):
@@ -370,29 +372,41 @@ def train_phase1_rft(
             int(current) - int(baseline)
             for current, baseline in zip(current_flags, baseline_flags)
         ) / len(baseline_flags)
-        length_ok = diagnostics["mean_tokens"] >= 0.8 * baseline_metrics["mean_tokens"]
+        baseline_mean_tokens = baseline_metrics["mean_tokens"]
+        length_ratio = (
+            diagnostics["mean_tokens"] / baseline_mean_tokens
+            if baseline_mean_tokens > 0
+            else 1.0
+        )
+        length_ok = length_ratio >= 0.8
         row = {
             "epoch": epoch + 1,
             "mean_window_nll": loss_sum / max(optimizer_steps, 1),
             "delta_lenient_pp": delta_pp,
             "length_ok": length_ok,
+            "completion_length_ratio": length_ratio,
             **diagnostics,
         }
         history.append(row)
         print(
             f"[rft] epoch={epoch + 1}/{epochs} nll={row['mean_window_nll']:.4f} "
             f"delta={delta_pp:+.2f}pp mean_tokens={diagnostics['mean_tokens']:.1f} "
-            f"length_ok={length_ok}"
+            f"length_ratio={length_ratio:.2f} length_ok={length_ok}"
         )
-        if length_ok and delta_pp > best_delta:
+        # Generation stops as soon as a valid final answer is produced, so shorter
+        # correct completions are not evidence of collapse. Keep length as a
+        # diagnostic and select the checkpoint by the paired primary metric.
+        if delta_pp > best_delta:
             best_delta = delta_pp
+            best_epoch = epoch + 1
+            best_length_ratio = length_ratio
             best_state = {
                 name: value.detach().cpu().clone()
                 for name, value in model.steer_nets.state_dict().items()
             }
 
     if best_state is None:
-        raise RuntimeError("no RFT checkpoint met the 0.8x completion-length veto")
+        raise RuntimeError("RFT completed without a selectable validation checkpoint")
     model.steer_nets.load_state_dict(best_state)
     if target_device.type == "cuda" and hasattr(model.base_model, "gradient_checkpointing_disable"):
         model.base_model.gradient_checkpointing_disable()
@@ -407,7 +421,9 @@ def train_phase1_rft(
     ) / len(baseline_2shot_flags)
     result = {
         "route": list(cfg.fixed_layers),
+        "selected_epoch": best_epoch,
         "best_delta_lenient_pp": best_delta,
+        "selected_completion_length_ratio": best_length_ratio,
         "baseline_0shot": baseline_metrics,
         "baseline_2shot": baseline_2shot_metrics,
         "selected_2shot": two_shot_metrics,

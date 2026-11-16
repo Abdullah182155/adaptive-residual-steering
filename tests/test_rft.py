@@ -249,13 +249,19 @@ def test_rft_training_restores_steering_route_after_baseline_evaluation(tmp_path
 
     def fake_evaluate(_model, _tokenizer, _rows, _cfg, _device, *, steered, **_kwargs):
         _model.set_routing_override("only" if steered else "none", cfg.fixed_layers)
-        return [False], {"lenient_accuracy": 0.0, "mean_tokens": 1.0}
+        return (
+            [True] if steered else [False],
+            {
+                "lenient_accuracy": 100.0 if steered else 0.0,
+                "mean_tokens": 50.0 if steered else 100.0,
+            },
+        )
 
     monkeypatch.setattr(trainer, "evaluate_generation", fake_evaluate)
     monkeypatch.setattr(trainer, "_epoch_batches", lambda *_args: [[0]])
     monkeypatch.setattr(trainer, "_save_rft_checkpoint", lambda *_args: None)
 
-    trainer.train_phase1_rft(
+    result = trainer.train_phase1_rft(
         model,
         [train_row],
         [{"question": "q", "answer": "1"}],
@@ -267,6 +273,9 @@ def test_rft_training_restores_steering_route_after_baseline_evaluation(tmp_path
     )
 
     assert model.training_routes == ["only"]
+    assert result["history"][0]["length_ok"] is False
+    assert result["selected_epoch"] == 1
+    assert result["best_delta_lenient_pp"] == 100.0
 
 
 def test_rft_retries_oom_accumulation_window_with_single_examples(tmp_path, monkeypatch):
