@@ -362,6 +362,27 @@ def test_rft_retries_oom_accumulation_window_with_single_examples(tmp_path, monk
     assert exception_state_at_cleanup == [None]
 
 
+def test_rft_activates_checkpoint_layers_without_enabling_backbone_dropout():
+    import torch.nn as nn
+    from src.training.rft_trainer import _enable_checkpointing_without_dropout
+
+    class CheckpointLayer(nn.Module):
+        gradient_checkpointing = True
+
+        def __init__(self):
+            super().__init__()
+            self.dropout = nn.Dropout(0.5)
+
+    layer = CheckpointLayer()
+    layer.train()
+
+    active = _enable_checkpointing_without_dropout(layer)
+
+    assert active == 1
+    assert layer.training is True
+    assert layer.dropout.training is False
+
+
 def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypatch):
     import scripts.run_rft_pipeline as runner
 

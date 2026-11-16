@@ -86,6 +86,21 @@ def _attempt_rft_window(
         return None, True
 
 
+def _enable_checkpointing_without_dropout(backbone: torch.nn.Module) -> int:
+    """Keep the frozen backbone deterministic while activating its checkpointed layers."""
+    backbone.eval()
+    checkpointed_modules = [
+        module
+        for module in backbone.modules()
+        if bool(getattr(module, "gradient_checkpointing", False))
+    ]
+    # Transformers only checkpoints layers whose own training flag is true.
+    # Flip that flag without recursively enabling dropout in their children.
+    for module in checkpointed_modules:
+        module.training = True
+    return len(checkpointed_modules)
+
+
 @torch.no_grad()
 def evaluate_generation(
     model,
@@ -254,7 +269,18 @@ def train_phase1_rft(
     history: list[dict[str, Any]] = []
     for epoch in range(epochs):
         model.train()
-        model.base_model.eval()
+        checkpointed_modules = _enable_checkpointing_without_dropout(model.base_model)
+        if target_device.type == "cuda" and checkpointed_modules == 0:
+            raise RuntimeError(
+                "CUDA RFT requires active gradient-checkpointed backbone layers; "
+                "the installed Transformers model exposes none"
+            )
+        if epoch == 0 and target_device.type == "cuda":
+            print(
+                f"[rft] gradient checkpointing active on {checkpointed_modules} "
+                "backbone module(s); backbone dropout remains disabled",
+                flush=True,
+            )
         optimizer.zero_grad(set_to_none=True)
         batches = _epoch_batches(lengths, cfg.batch_size, epoch, cfg.seed)
         loss_sum = 0.0
