@@ -174,6 +174,51 @@ def test_pipeline_cli_smoke_configuration():
     assert cfg.loss_mode == "legacy"
 
 
+def test_benchmark_subset_is_shuffled_and_repeatable(monkeypatch):
+    import scripts.run_ars_pipeline as pipeline
+
+    class FakeDataset:
+        def __init__(self, examples):
+            self.examples = list(examples)
+
+        def __len__(self):
+            return len(self.examples)
+
+        def select(self, indices):
+            return FakeDataset([self.examples[index] for index in indices])
+
+        def __iter__(self):
+            return iter(self.examples)
+
+    examples = [
+        {"question": f"question {index}", "answer": f"work #### {index}"}
+        for index in range(12)
+    ]
+    monkeypatch.setattr(
+        pipeline,
+        "load_dataset",
+        lambda *_args, **_kwargs: FakeDataset(examples),
+    )
+
+    first = pipeline.load_benchmark_rows(8, seed=123)
+    repeated = pipeline.load_benchmark_rows(8, seed=123)
+    other_seed = pipeline.load_benchmark_rows(8, seed=124)
+    source_indices = [row["source_index"] for row in first]
+
+    assert source_indices == [row["source_index"] for row in repeated]
+    assert source_indices != [row["source_index"] for row in other_seed]
+    assert len(set(source_indices)) == 8
+    assert source_indices != list(range(8))
+    assert all(row["answer"] == str(row["source_index"]) for row in first)
+
+
+def test_benchmark_cli_has_reproducible_test_seed():
+    from scripts.run_ars_pipeline import parse_args
+
+    assert parse_args(["--stage", "bench"]).test_seed == 42
+    assert parse_args(["--stage", "bench", "--test_seed", "7"]).test_seed == 7
+
+
 def test_phase1_learning_rate_is_locked():
     import pytest
 
