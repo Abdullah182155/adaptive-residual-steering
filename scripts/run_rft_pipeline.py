@@ -70,6 +70,11 @@ def parse_args(argv=None):
         "--rollout_dir",
         help="directory containing existing shard0.jsonl and shard1.jsonl",
     )
+    parser.add_argument(
+        "--allow_partial_rollouts",
+        action="store_true",
+        help="when resuming, train from any non-empty existing shard if another shard failed",
+    )
     parser.add_argument("--norm_calibration")
     parser.add_argument("--output_dir", default="report/rft")
     parser.add_argument("--checkpoint", default="checkpoints/steernet.pt")
@@ -229,12 +234,15 @@ def run(args) -> dict | None:
             rollout_source_dir / "shard1.jsonl",
         ]
         missing = [str(path) for path in required_shards if not path.is_file()]
-        if missing:
+        available = [path for path in required_shards if path.is_file() and path.stat().st_size > 0]
+        if missing and not (args.allow_partial_rollouts and available):
             raise FileNotFoundError(
                 "Session 2 is configured to reuse Session 1 data and will not collect "
                 f"new rollouts; missing files: {missing}"
             )
-        if any(path.stat().st_size == 0 for path in required_shards):
+        if not available:
+            raise ValueError("at least one non-empty RFT rollout shard is required")
+        if any(path.exists() and path.stat().st_size == 0 for path in required_shards):
             raise ValueError("existing RFT rollout shards must not be empty")
         if args.steernet_arch == "v2":
             calibration_path = Path(args.norm_calibration)
@@ -346,13 +354,19 @@ def run(args) -> dict | None:
     if args.stage in {"train", "all"}:
         source_dir = rollout_source_dir
         shard_files = sorted(source_dir.glob("shard*.jsonl"))
+        if args.allow_partial_rollouts:
+            shard_files = [
+                path for path in shard_files
+                if path.stat().st_size > 0
+                and (source_dir / f"{path.stem}_stats.json").is_file()
+            ]
         if not shard_files:
             raise FileNotFoundError(f"no RFT rollout shards found in {source_dir}")
         if args.skip_collection:
             required_shards = {"shard0.jsonl", "shard1.jsonl"}
             found_shards = {path.name for path in shard_files}
             missing_shards = sorted(required_shards - found_shards)
-            if missing_shards:
+            if missing_shards and not args.allow_partial_rollouts:
                 raise FileNotFoundError(
                     f"--skip_collection requires the existing two Session 1 shards; "
                     f"missing {missing_shards} in {source_dir}"

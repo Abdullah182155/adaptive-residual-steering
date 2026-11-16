@@ -110,6 +110,7 @@ def test_rft_runner_can_train_v2_from_existing_shards_without_collection(tmp_pat
         "--stage", "train",
         "--steernet_arch", "v2",
         "--skip_collection",
+        "--allow_partial_rollouts",
         "--rollout_dir", str(tmp_path),
         "--norm_calibration", str(tmp_path / "norms.json"),
     ])
@@ -117,6 +118,7 @@ def test_rft_runner_can_train_v2_from_existing_shards_without_collection(tmp_pat
     assert args.stage == "train"
     assert args.steernet_arch == "v2"
     assert args.skip_collection is True
+    assert args.allow_partial_rollouts is True
     assert args.rollout_dir == str(tmp_path)
 
 
