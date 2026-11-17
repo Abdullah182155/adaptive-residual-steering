@@ -385,11 +385,23 @@ class SteerNetV2(nn.Module):
         active_k: Optional[torch.Tensor] = None,
         is_decode: bool = False,
         injection_mask: Optional[torch.BoolTensor] = None,
+        gain: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Produce a differentiably capped residual update for hidden states."""
         del active_k
         hidden = h.float()
         delta = self.up_proj(self.activation(self.down_proj(hidden)))
+        if gain is not None:
+            scale = torch.as_tensor(gain, device=delta.device, dtype=delta.dtype)
+            if scale.ndim == 1:
+                if scale.shape[0] != delta.shape[0]:
+                    raise ValueError("per-example gain must match the batch dimension")
+                scale = scale.view(-1, 1, 1)
+            elif scale.ndim == 2 and scale.shape == delta.shape[:2]:
+                scale = scale.unsqueeze(-1)
+            if not torch.isfinite(scale).all() or bool((scale < 0).any()):
+                raise ValueError("gain must contain finite non-negative values")
+            delta = delta * scale
         pre_cap_norm = delta.norm(dim=-1, keepdim=True)
         cap = self.rho_max * self.layer_norm_ref
         scale = (cap / pre_cap_norm.clamp_min(torch.finfo(pre_cap_norm.dtype).eps)).clamp(max=1.0)

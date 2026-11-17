@@ -92,6 +92,7 @@ class Phi2WithRSC(nn.Module):
         self._pending_shield_mask: Optional[torch.Tensor] = None
         self._active_shield_mask: Optional[torch.Tensor] = None
         self._gain: float = 1.0
+        self._route_gains: Optional[torch.Tensor] = None
         self._control: Optional[str] = None
         self._control_seed: int = 0
         self._control_gen: Optional[torch.Generator] = None
@@ -231,12 +232,16 @@ class Phi2WithRSC(nn.Module):
             if amp_k is not None
             else routing_k.to(hidden_float.dtype)
         )
-        delta = steer_net(
-            hidden_float,
-            active_k=active_k,
-            is_decode=self._is_decode_step,
-            injection_mask=valid_mask,
-        )
+        route_gain = self._route_gain_for(hidden_float)
+        steer_kwargs = {
+            "active_k": active_k,
+            "is_decode": self._is_decode_step,
+            "injection_mask": valid_mask,
+        }
+        if isinstance(steer_net, SteerNetV2):
+            delta = steer_net(hidden_float, gain=route_gain, **steer_kwargs)
+        else:
+            delta = steer_net(hidden_float, **steer_kwargs)
         gate = self._gate_multiplier(position, hidden_float, delta)
         injected = delta * selection * gate * self._effective_scale()
         injected = injected * valid_mask.unsqueeze(-1).to(injected.dtype)
@@ -286,6 +291,16 @@ class Phi2WithRSC(nn.Module):
         )
         return float(base * getattr(self, "_gain", 1.0))
 
+    def _route_gain_for(self, hidden: torch.Tensor) -> Optional[torch.Tensor]:
+        if self._route_gains is None:
+            return None
+        gains = self._route_gains.to(device=hidden.device, dtype=hidden.dtype)
+        if gains.ndim == 0:
+            return gains
+        if gains.ndim != 1 or gains.shape[0] != hidden.shape[0]:
+            raise ValueError("route gains must be a scalar or one value per example")
+        return gains
+
     def _record_guard(
         self, delta: torch.Tensor, hidden: torch.Tensor, valid_mask: torch.BoolTensor
     ) -> None:
@@ -302,6 +317,17 @@ class Phi2WithRSC(nn.Module):
 
     def set_intervention_gain(self, gain: float) -> None:
         self._gain = float(gain)
+        self._route_gains = None
+
+    def set_route_gains(self, gains: Optional[torch.Tensor]) -> None:
+        """Set per-example V2 gains; the V2 module applies them before its norm cap."""
+        if gains is None:
+            self._route_gains = None
+            return
+        values = torch.as_tensor(gains).detach()
+        if not torch.isfinite(values).all() or bool((values < 0).any()):
+            raise ValueError("route gains must be finite and non-negative")
+        self._route_gains = values
 
     def set_control(self, mode: Optional[str], seed: int = 0) -> None:
         self._control, self._control_seed, self._control_gen = mode, int(seed), None

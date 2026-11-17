@@ -31,6 +31,20 @@ def test_v2_norm_cap_is_per_token_and_differentiable():
     assert torch.isfinite(hidden.grad).all()
 
 
+def test_v2_gain_is_applied_before_the_relative_norm_cap():
+    network = SteerNetV2(hidden_dim=4, rank=2, rho_max=0.10, layer_norm_ref=10.0)
+    with torch.no_grad():
+        network.down_proj.weight.fill_(0.1)
+        network.up_proj.weight.fill_(0.01)
+    hidden = torch.ones(2, 3, 4)
+
+    unit = network(hidden, is_decode=True, gain=torch.tensor([1.0, 1.0]))
+    doubled = network(hidden, is_decode=True, gain=torch.tensor([2.0, 2.0]))
+
+    assert torch.allclose(doubled, unit * 2.0, atol=1e-6)
+    assert torch.all(doubled.norm(dim=-1) <= 1.0 + 1e-6)
+
+
 def test_v2_shields_prefill_sink_and_honors_prompt_mask():
     network = SteerNetV2(hidden_dim=8, rank=2, layer_norm_ref=5.0)
     with torch.no_grad():
