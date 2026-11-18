@@ -247,6 +247,10 @@ def run_benchmark(
             _configure_arm(model, arm, cfg, gate_provider)
 
             results = []
+            router_route_counts: Dict[str, int] = {}
+            router_k_counts: Dict[str, int] = {}
+            router_layer_counts: Dict[str, int] = {}
+            router_alpha_counts: Dict[str, int] = {}
             progress = tqdm(
                 rows,
                 desc=f"{suite} {n_shot}-shot {arm}",
@@ -274,6 +278,26 @@ def run_benchmark(
                     repetition_penalty=getattr(cfg, "generation_repetition_penalty", 1.1),
                     no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
                 )
+                selected_route: List[int] = []
+                selected_alpha = 1.0
+                if arm == "router" and hasattr(model, "current_routes"):
+                    routes_now = model.current_routes()
+                    if routes_now:
+                        selected_route = [int(layer) for layer in routes_now[0]]
+                    gains = getattr(model, "_route_gains", None)
+                    if gains is not None:
+                        gains = torch.as_tensor(gains).detach().flatten()
+                        if gains.numel():
+                            selected_alpha = float(gains[0].cpu())
+                    route_key = "+".join(map(str, selected_route)) if selected_route else "k0"
+                    router_route_counts[route_key] = router_route_counts.get(route_key, 0) + 1
+                    k_key = str(len(selected_route))
+                    router_k_counts[k_key] = router_k_counts.get(k_key, 0) + 1
+                    for layer in selected_route:
+                        key = str(layer)
+                        router_layer_counts[key] = router_layer_counts.get(key, 0) + 1
+                    alpha_key = str(selected_alpha)
+                    router_alpha_counts[alpha_key] = router_alpha_counts.get(alpha_key, 0) + 1
                 guard = dict(model.guard_state)
                 cap = (
                     None
@@ -322,6 +346,9 @@ def run_benchmark(
                         "nonfinite": bool(guard.get("nonfinite", False)),
                         "car": audit["car"],
                         "eaa": audit["eaa"],
+                        "selected_layers": selected_route if arm == "router" else None,
+                        "selected_k": len(selected_route) if arm == "router" else None,
+                        "selected_alpha": selected_alpha if arm == "router" else None,
                     }
                 )
                 progress.set_postfix(correct=sum(item["lenient"] for item in results))
@@ -350,6 +377,13 @@ def run_benchmark(
         shot_record: Dict[str, object] = {
             arm: _summary(values) for arm, values in arm_results.items()
         }
+        if "router" in arm_results:
+            shot_record["router_route_usage"] = {
+                "route_counts": router_route_counts,
+                "k_counts": router_k_counts,
+                "layer_counts": router_layer_counts,
+                "alpha_counts": router_alpha_counts,
+            }
         paired_arm = next(
             (name for name in ("steer_only", "fixed") if name in arm_results), None
         )

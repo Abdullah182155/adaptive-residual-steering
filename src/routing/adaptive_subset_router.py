@@ -87,19 +87,23 @@ class AdaptiveSubsetRouter(nn.Module):
         self, hidden: torch.Tensor, prompt_mask: torch.BoolTensor
     ) -> torch.Tensor:
         """Pool only valid prompt positions, excluding padding and completions."""
+        return self.encode_pooled(self.raw_prompt_pool(hidden, prompt_mask))
+
+    @staticmethod
+    def raw_prompt_pool(
+        hidden: torch.Tensor, prompt_mask: torch.BoolTensor
+    ) -> torch.Tensor:
+        """Mean-pool prompt states before the trainable router encoder."""
         if hidden.ndim != 3 or prompt_mask.shape != hidden.shape[:2]:
             raise ValueError("hidden must be (batch, time, dim) with a matching mask")
         mask = prompt_mask.to(device=hidden.device, dtype=hidden.dtype)
         count = mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-        pooled = (hidden * mask.unsqueeze(-1)).sum(dim=1) / count
-        return self.prompt_encoder(pooled.float())
+        return (hidden * mask.unsqueeze(-1)).sum(dim=1) / count
 
-    def forward(
-        self, hidden: torch.Tensor, prompt_mask: torch.BoolTensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return per-layer utilities, pair synergy, k logits, and alpha logits."""
-        pooled = self.pool_prompt(hidden, prompt_mask)
-        layer_ids = torch.arange(self.n_candidates, device=hidden.device)
+    def encode_pooled(self, pooled: torch.Tensor):
+        """Return route heads from pre-pooled prompt representations."""
+        pooled = self.prompt_encoder(pooled.float())
+        layer_ids = torch.arange(self.n_candidates, device=pooled.device)
         embeddings = self.layer_embedding(layer_ids).unsqueeze(0)
         depths = self.depth_embedding(self.layer_depths[:, None]).unsqueeze(0)
         tokens = pooled[:, None, :] + embeddings + depths
@@ -109,11 +113,16 @@ class AdaptiveSubsetRouter(nn.Module):
         queries = self.synergy_query(joint)
         synergy = torch.bmm(queries, joint.transpose(1, 2)) / (joint.shape[-1] ** 0.5)
         synergy = 0.5 * (synergy + synergy.transpose(1, 2))
-        diagonal = torch.eye(self.n_candidates, device=hidden.device, dtype=torch.bool)
+        diagonal = torch.eye(self.n_candidates, device=pooled.device, dtype=torch.bool)
         synergy = synergy.masked_fill(diagonal.unsqueeze(0), 0.0)
-
         summary = joint.mean(dim=1) + pooled
         return utilities, synergy, self.k_head(summary), self.alpha_head(summary)
+
+    def forward(
+        self, hidden: torch.Tensor, prompt_mask: torch.BoolTensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return per-layer utilities, pair synergy, k logits, and alpha logits."""
+        return self.encode_pooled(self.raw_prompt_pool(hidden, prompt_mask))
 
     @torch.no_grad()
     def choose(

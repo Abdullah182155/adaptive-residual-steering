@@ -41,7 +41,13 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--epochs", type=int, default=2)
     parser.add_argument("--max_questions", type=int, default=2000)
     parser.add_argument("--max_rows_per_question", type=int, default=2)
-    parser.add_argument("--max_router_rows", type=int, default=512)
+    parser.add_argument("--max_router_rows", type=int, default=128)
+    parser.add_argument("--route_cost", type=float, default=0.01)
+    parser.add_argument("--route_examples_per_layer", type=int, default=256)
+    parser.add_argument("--screen_validation_rows", type=int, default=24)
+    parser.add_argument("--max_pair_routes", type=int, default=12)
+    parser.add_argument("--max_triple_routes", type=int, default=8)
+    parser.add_argument("--max_quad_routes", type=int, default=6)
     parser.add_argument("--bench_n", type=int, default=800)
     parser.add_argument("--bench_seed", type=int, default=42)
     parser.add_argument("--shots", type=int, nargs="+", default=[0, 2])
@@ -160,7 +166,7 @@ def run(args) -> int:
         rollouts = _load_rollouts(args)
         _apply_norm_refs(model, args.norm_calibration)
         _load_v2_weights(model, args.v2_checkpoint, args.v2_norm_calibration)
-        train_rows, _validation_rows, stats = build_adaptive_rft_splits(
+        train_rows, validation_rows, stats = build_adaptive_rft_splits(
             rollouts,
             tokenizer,
             cfg,
@@ -171,11 +177,17 @@ def run(args) -> int:
         result = train_adaptive_steering_bank(
             model,
             train_rows,
+            validation_rows,
             cfg,
             device,
             epochs=args.epochs,
             save_path=args.bank_checkpoint,
             seed=args.seed,
+            route_examples_per_layer=args.route_examples_per_layer,
+            screen_validation_rows=args.screen_validation_rows,
+            max_pair_routes=args.max_pair_routes,
+            max_triple_routes=args.max_triple_routes,
+            max_quad_routes=args.max_quad_routes,
         )
         print(json.dumps({"data": stats, "training": result}, default=str), flush=True)
         return 0
@@ -183,7 +195,7 @@ def run(args) -> int:
     if args.stage == "train_router":
         rollouts = _load_rollouts(args)
         _apply_norm_refs(model, args.norm_calibration)
-        _load_bank(model, args.bank_checkpoint)
+        bank_state = _load_bank(model, args.bank_checkpoint)
         train_rows, validation_rows, stats = build_adaptive_rft_splits(
             rollouts,
             tokenizer,
@@ -203,6 +215,8 @@ def run(args) -> int:
             probe_layer=min(candidates) - 1,
             seed=args.seed,
             max_train_rows=args.max_router_rows,
+            route_cost=args.route_cost,
+            route_catalog=bank_state.get("curriculum", {}).get("catalog"),
         )
         print(json.dumps({"data": stats, "training": {k: v for k, v in result.items() if k != "router"}}, default=str), flush=True)
         return 0
