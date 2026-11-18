@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import torch
@@ -149,7 +150,12 @@ def test_adaptive_router_can_learn_from_route_catalog_oracle_labels(tmp_path):
         route_catalog=[[], [0], [1], [0, 1]],
     )
     saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    report_path = tmp_path / "session3_router_training.json"
+    assert report_path.is_file()
+    training_report = json.loads(report_path.read_text(encoding="utf-8"))
     assert result["teacher_labels"]["rows"] == 2
     assert saved["route_catalog"][0] == []
     assert saved["alpha_values"] == [1.0, 1.5, 2.0]
+    assert training_report["teacher_data"]["rows"] == 2
+    assert training_report["route_cost"] == 0.01
     assert result["history"][0]["optimizer_steps"] == 2

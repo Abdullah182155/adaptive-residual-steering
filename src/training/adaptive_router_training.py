@@ -418,6 +418,20 @@ def train_adaptive_router(
                 validation_limit=validation_limit,
             )
             result["teacher_data"] = teacher_stats
+            report_path = Path(save_path).with_name("session3_router_training.json")
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+            report = {
+                key: value for key, value in result.items() if key != "router"
+            }
+            report.update({
+                "route_cost": float(route_cost),
+                "alpha_values": list(router.alpha_values),
+                "route_catalog": [list(route) for route in route_catalog],
+            })
+            temporary = report_path.with_suffix(report_path.suffix + ".tmp")
+            temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(report_path)
+            result["training_report"] = str(report_path)
             return result
         finally:
             probe.close()
