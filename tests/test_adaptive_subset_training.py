@@ -89,6 +89,8 @@ def test_adaptive_bank_trains_variable_subsets_and_saves_route_metadata(tmp_path
     assert saved["frozen_backbone"] is True
     assert saved["curriculum"]["catalog"][0] == []
     assert "singletons" in saved["curriculum"]["stages"]
+    assert 0.0 < saved["curriculum"]["k0_validation_nll"] < 10.0
+    assert saved["curriculum"]["stages"]["pairs"]["candidates"]
     assert model.base_model.embedding.weight.grad is None
     assert saved["steer_nets"]["0.up_proj.weight"].abs().sum() > 0
 
@@ -153,9 +155,26 @@ def test_adaptive_router_can_learn_from_route_catalog_oracle_labels(tmp_path):
     report_path = tmp_path / "session3_router_training.json"
     assert report_path.is_file()
     training_report = json.loads(report_path.read_text(encoding="utf-8"))
+    teacher_targets = torch.load(
+        tmp_path / "session3_route_teacher_targets.pt", map_location="cpu", weights_only=True
+    )
     assert result["teacher_labels"]["rows"] == 2
     assert saved["route_catalog"][0] == []
+    assert saved["router_type"] == "catalog_value"
+    assert saved["format"] == "ars_catalog_router_v2"
     assert saved["alpha_values"] == [1.0, 1.5, 2.0]
+    assert teacher_targets["action_scores"].shape == (2, len(saved["action_catalog"]))
     assert training_report["teacher_data"]["rows"] == 2
     assert training_report["route_cost"] == 0.01
-    assert result["history"][0]["optimizer_steps"] == 2
+    assert training_report["action_count"] == len(saved["action_catalog"])
+    assert result["history"][0]["optimizer_steps"] == 1
+
+    from src.training.adaptive_router_training import load_adaptive_router
+
+    loaded, prefill, probe = load_adaptive_router(model, checkpoint, torch.device("cpu"))
+    assert loaded.action_catalog == tuple(
+        (tuple(action["route"]), action["alpha"]) for action in saved["action_catalog"]
+    )
+    prefill(row["input_ids"].unsqueeze(0), row["attention_mask"].unsqueeze(0))
+    assert model.route is not None and model.route.shape == (1, len(model.target_layers))
+    probe.close()

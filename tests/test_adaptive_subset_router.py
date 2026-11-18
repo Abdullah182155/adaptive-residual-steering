@@ -1,6 +1,10 @@
 import torch
 
-from src.routing.adaptive_subset_router import AdaptiveSubsetRouter, sample_route_actions
+from src.routing.adaptive_subset_router import (
+    AdaptiveSubsetRouter,
+    RouteValueRouter,
+    sample_route_actions,
+)
 
 
 def _router() -> AdaptiveSubsetRouter:
@@ -81,3 +85,28 @@ def test_no_steering_action_does_not_train_irrelevant_alpha_choice():
 
     assert decision.k.tolist() == [0]
     assert router.alpha_head.weight.grad is None or torch.count_nonzero(router.alpha_head.weight.grad) == 0
+
+
+def test_route_value_router_scores_full_catalog_and_can_choose_k0():
+    router = RouteValueRouter(
+        candidate_layers=[8, 12, 15, 18],
+        route_catalog=[[8], [12, 18]],
+        hidden_dim=16,
+        max_active_layers=4,
+        alpha_values=(1.0, 1.5, 2.0),
+        router_dim=16,
+    ).eval()
+    with torch.no_grad():
+        for parameter in router.parameters():
+            parameter.zero_()
+
+    hidden = torch.randn(2, 5, 16)
+    prompt_mask = torch.tensor([[True, True, True, False, False], [True] * 5])
+    scores = router(hidden, prompt_mask)
+    decision = router.choose(hidden, prompt_mask)
+
+    assert scores.shape == (2, 7)
+    assert router.action_catalog[0] == ((), 1.0)
+    assert decision.k.tolist() == [0, 0]
+    assert not decision.mask.any()
+    assert decision.alpha.tolist() == [1.0, 1.0]

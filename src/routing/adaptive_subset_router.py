@@ -152,6 +152,107 @@ class AdaptiveSubsetRouter(nn.Module):
         return RouteDecision(mask=mask, k=k, alpha=alpha)
 
 
+class RouteValueRouter(nn.Module):
+    """Predict a prompt-conditioned score for every catalog route action."""
+
+    def __init__(
+        self,
+        candidate_layers: Sequence[int],
+        route_catalog: Sequence[Sequence[int]],
+        hidden_dim: int = 2560,
+        max_active_layers: int = 4,
+        alpha_values: Sequence[float] = (1.0, 1.5, 2.0),
+        router_dim: int = 128,
+    ) -> None:
+        super().__init__()
+        self.candidate_layers = tuple(int(layer) for layer in candidate_layers)
+        self.max_active_layers = int(max_active_layers)
+        self.alpha_values = tuple(float(value) for value in alpha_values)
+        routes = [tuple(int(layer) for layer in route) for route in route_catalog]
+        if () not in routes:
+            routes.insert(0, ())
+        if not routes or len(set(routes)) != len(routes):
+            raise ValueError("route_catalog must contain unique routes")
+        if any(
+            len(route) > self.max_active_layers
+            or not set(route).issubset(self.candidate_layers)
+            for route in routes
+        ):
+            raise ValueError("route_catalog contains an invalid candidate-layer subset")
+        if not self.alpha_values or any(not 1.0 <= alpha <= 2.0 for alpha in self.alpha_values):
+            raise ValueError("alpha_values must lie in [1, 2]")
+
+        self.route_catalog = tuple(routes)
+        self.action_catalog = tuple(
+            (route, alpha)
+            for route in routes
+            for alpha in ((1.0,) if not route else self.alpha_values)
+        )
+        self.prompt_encoder = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, router_dim),
+            nn.GELU(),
+            nn.LayerNorm(router_dim),
+        )
+        action_features = []
+        for route, alpha in self.action_catalog:
+            layer_mask = [float(layer in route) for layer in self.candidate_layers]
+            action_features.append(
+                layer_mask + [len(route) / self.max_active_layers, (alpha - 1.0)]
+            )
+        self.register_buffer("action_features", torch.tensor(action_features, dtype=torch.float32))
+        self.action_encoder = nn.Sequential(
+            nn.Linear(len(self.candidate_layers) + 2, router_dim),
+            nn.GELU(),
+            nn.LayerNorm(router_dim),
+        )
+        self.action_score = nn.Sequential(
+            nn.Linear(router_dim * 2, router_dim),
+            nn.GELU(),
+            nn.Linear(router_dim, 1),
+        )
+
+    @staticmethod
+    def raw_prompt_pool(hidden: torch.Tensor, prompt_mask: torch.BoolTensor) -> torch.Tensor:
+        """Mean-pool valid prompt tokens, excluding padding and completions."""
+        return AdaptiveSubsetRouter.raw_prompt_pool(hidden, prompt_mask)
+
+    def score_pooled(self, pooled_prompt: torch.Tensor) -> torch.Tensor:
+        """Predict the cost-adjusted completion score for every route action."""
+        prompt = self.prompt_encoder(pooled_prompt.float())
+        action = self.action_encoder(self.action_features)
+        prompt = prompt[:, None, :].expand(-1, action.shape[0], -1)
+        action = action[None, :, :].expand(prompt.shape[0], -1, -1)
+        return self.action_score(torch.cat((prompt, action), dim=-1)).squeeze(-1)
+
+    def forward(self, hidden: torch.Tensor, prompt_mask: torch.BoolTensor) -> torch.Tensor:
+        """Score the catalog using prompt-position hidden states only."""
+        pooled = self.raw_prompt_pool(hidden, prompt_mask)
+        return self.score_pooled(pooled)
+
+    @torch.no_grad()
+    def choose(self, hidden: torch.Tensor, prompt_mask: torch.BoolTensor) -> RouteDecision:
+        """Choose the lowest predicted-score route, including the k=0 action."""
+        scores = self(hidden, prompt_mask)
+        action_indices = scores.argmin(dim=-1).tolist()
+        mask = torch.zeros(
+            hidden.shape[0], len(self.candidate_layers), dtype=torch.bool, device=hidden.device
+        )
+        k_values = []
+        alpha_values = []
+        for batch_index, action_index in enumerate(action_indices):
+            route, alpha = self.action_catalog[action_index]
+            k_values.append(len(route))
+            alpha_values.append(alpha)
+            for layer in route:
+                mask[batch_index, self.candidate_layers.index(layer)] = True
+        return RouteDecision(
+            mask=mask,
+            k=torch.tensor(k_values, dtype=torch.long, device=hidden.device),
+            alpha=torch.tensor(alpha_values, dtype=hidden.dtype, device=hidden.device),
+        )
+
+
 def sample_route_actions(
     router: AdaptiveSubsetRouter,
     hidden: torch.Tensor,

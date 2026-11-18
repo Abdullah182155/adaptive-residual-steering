@@ -14,7 +14,11 @@ import torch.nn.functional as F
 from torch import nn
 from tqdm import tqdm
 
-from src.routing.adaptive_subset_router import AdaptiveSubsetRouter, sample_route_actions
+from src.routing.adaptive_subset_router import (
+    AdaptiveSubsetRouter,
+    RouteValueRouter,
+    sample_route_actions,
+)
 from src.training.adaptive_subset_training import _prepare
 
 
@@ -54,7 +58,16 @@ def _save_router_checkpoint(
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     torch.save(
         {
-            "format": "ars_adaptive_router_v1",
+            "format": (
+                "ars_catalog_router_v2"
+                if isinstance(router, RouteValueRouter)
+                else "ars_adaptive_router_v1"
+            ),
+            "router_type": (
+                "catalog_value"
+                if isinstance(router, RouteValueRouter)
+                else "factorized_subset"
+            ),
             "candidate_layers": list(router.candidate_layers),
             "probe_layer": int(probe_layer),
             "max_active_layers": router.max_active_layers,
@@ -62,6 +75,10 @@ def _save_router_checkpoint(
             "router": router.state_dict(),
             "best_validation_nll": float(best_val_nll),
             "route_catalog": [list(route) for route in route_catalog],
+            "action_catalog": [
+                {"route": list(route), "alpha": float(alpha)}
+                for route, alpha in router.action_catalog
+            ] if isinstance(router, RouteValueRouter) else [],
         },
         temporary,
     )
@@ -142,7 +159,7 @@ def _build_oracle_targets(
         routes.insert(0, ())
     if not routes or any(not set(route).issubset(candidates) or len(route) > 4 for route in routes):
         raise ValueError("route catalog contains an invalid candidate-layer subset")
-    alpha_values = tuple(router.alpha_values)
+    actions = tuple(router.action_catalog)
     route_indices = list(range(min(len(rows), row_limit)))
     targets: list[dict[str, Any]] = []
     k_counts: Counter[int] = Counter()
@@ -150,7 +167,7 @@ def _build_oracle_targets(
     layer_counts: Counter[int] = Counter()
     alpha_counts: Counter[str] = Counter()
 
-    forward_count = sum(1 if not route else len(alpha_values) for route in routes)
+    forward_count = len(actions)
     progress = tqdm(
         total=len(route_indices) * (forward_count + 1),
         desc="Score route teacher",
@@ -178,20 +195,21 @@ def _build_oracle_targets(
         best_score = float("inf")
         best_route: tuple[int, ...] = ()
         best_alpha = 1.0
-        for route in routes:
-            alpha_candidates = (1.0,) if not route else alpha_values
+        action_scores: list[float] = []
+        for route, alpha in actions:
             route_mask = torch.tensor(
                 [[layer in route for layer in candidates]], dtype=torch.bool, device=device
             )
-            for alpha in alpha_candidates:
-                alpha_tensor = torch.tensor([alpha], dtype=torch.float32, device=device)
-                nll = _score_action(model, row, route_mask, alpha_tensor, device, prompt_shield)
-                progress.update(1)
-                score = float(nll.mean()) + route_cost * len(route)
-                if score < best_score:
-                    best_score, best_route, best_alpha = score, route, alpha
+            alpha_tensor = torch.tensor([alpha], dtype=torch.float32, device=device)
+            nll = _score_action(model, row, route_mask, alpha_tensor, device, prompt_shield)
+            progress.update(1)
+            score = float(nll.mean()) + route_cost * len(route)
+            action_scores.append(score)
+            if score < best_score:
+                best_score, best_route, best_alpha = score, route, alpha
         target = {
             "pooled_prompt": pooled,
+            "action_scores": torch.tensor(action_scores, dtype=torch.float32),
             "route": best_route,
             "k": len(best_route),
             "alpha": best_alpha,
@@ -217,23 +235,14 @@ def _build_oracle_targets(
         "layer_counts": {str(layer): layer_counts[layer] for layer in candidates},
         "alpha_counts": dict(alpha_counts),
         "catalog_routes": [list(route) for route in routes],
+        "catalog_actions": [
+            {"route": list(route), "alpha": float(alpha)} for route, alpha in actions
+        ],
     }
 
 
-def _balanced_binary_loss(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Average positive and negative binary losses without class-count bias."""
-    positive = target.bool()
-    negative = ~positive
-    terms = []
-    if bool(positive.any()):
-        terms.append(F.softplus(-logits[positive]).mean())
-    if bool(negative.any()):
-        terms.append(F.softplus(logits[negative]).mean())
-    return torch.stack(terms).mean() if terms else logits.sum() * 0.0
-
-
 def _train_router_from_oracle(
-    router: AdaptiveSubsetRouter,
+    router: RouteValueRouter,
     targets: Sequence[dict[str, Any]],
     validation_rows: Sequence[dict[str, torch.Tensor]],
     model,
@@ -249,6 +258,13 @@ def _train_router_from_oracle(
 ) -> dict[str, Any]:
     optimizer = torch.optim.AdamW(router.parameters(), lr=5e-5, weight_decay=0.01)
     target_device = torch.device(device)
+    prompt_features = torch.stack([item["pooled_prompt"] for item in targets]).to(target_device)
+    teacher_scores = torch.stack([item["action_scores"] for item in targets]).to(target_device)
+    if teacher_scores.shape[1] != len(router.action_catalog):
+        raise ValueError("oracle action scores do not match the route action catalog")
+    teacher_center = teacher_scores.mean(dim=1, keepdim=True)
+    teacher_scale = teacher_scores.std(dim=1, keepdim=True, unbiased=False).clamp_min(1e-4)
+    teacher_targets = (teacher_scores - teacher_center) / teacher_scale
     history: list[dict[str, Any]] = []
     best_state = None
     best_val_nll = float("inf")
@@ -267,50 +283,35 @@ def _train_router_from_oracle(
         router.train()
         order = list(range(len(targets)))
         random.Random(seed + epoch).shuffle(order)
-        progress = tqdm(order, desc=f"Router supervised epoch {epoch + 1}/{epochs}",
-                        unit="example", file=sys.stdout, mininterval=0.5)
+        batches = [order[start : start + 16] for start in range(0, len(order), 16)]
+        progress = tqdm(
+            batches,
+            desc=f"Route-value router epoch {epoch + 1}/{epochs}",
+            unit="batch",
+            file=sys.stdout,
+            mininterval=0.5,
+        )
         losses = []
-        for index in progress:
-            target = targets[index]
-            pooled = target["pooled_prompt"].to(target_device).unsqueeze(0)
-            route = tuple(target["route"])
-            target_mask = torch.tensor(
-                [[layer in route for layer in router.candidate_layers]],
-                dtype=torch.bool, device=target_device,
-            )
-            target_k = torch.tensor([len(route)], dtype=torch.long, device=target_device)
-            alpha_index = min(
-                range(len(router.alpha_values)),
-                key=lambda i: abs(router.alpha_values[i] - float(target["alpha"])),
-            )
-            target_alpha = torch.tensor([alpha_index], dtype=torch.long, device=target_device)
+        for indices in progress:
+            index_tensor = torch.tensor(indices, dtype=torch.long, device=target_device)
+            pooled = prompt_features.index_select(0, index_tensor)
+            target = teacher_targets.index_select(0, index_tensor)
             optimizer.zero_grad(set_to_none=True)
-            utilities, synergy, k_logits, alpha_logits = router.encode_pooled(pooled)
-            k_loss = F.cross_entropy(k_logits, target_k)
-            layer_loss = _balanced_binary_loss(utilities, target_mask)
-            if len(route) >= 2:
-                synergy_target = target_mask.unsqueeze(2) & target_mask.unsqueeze(1)
-                off_diagonal = ~torch.eye(
-                    router.n_candidates, dtype=torch.bool, device=target_device
-                ).unsqueeze(0)
-                synergy_loss = _balanced_binary_loss(
-                    synergy.masked_select(off_diagonal),
-                    synergy_target.masked_select(off_diagonal),
-                )
-            else:
-                synergy_loss = synergy.sum() * 0.0
-            alpha_loss = (
-                F.cross_entropy(alpha_logits, target_alpha)
-                if route else alpha_logits.sum() * 0.0
+            predicted = router.score_pooled(pooled)
+            regression_loss = F.smooth_l1_loss(predicted, target)
+            teacher_distribution = F.softmax(-target / 0.5, dim=-1)
+            student_log_distribution = F.log_softmax(-predicted / 0.5, dim=-1)
+            preference_loss = F.kl_div(
+                student_log_distribution, teacher_distribution, reduction="batchmean"
             )
-            loss = k_loss + layer_loss + 0.25 * synergy_loss + 0.5 * alpha_loss
+            loss = regression_loss + 0.5 * preference_loss
             if not torch.isfinite(loss):
                 continue
             loss.backward()
             torch.nn.utils.clip_grad_norm_(router.parameters(), 1.0)
             optimizer.step()
             losses.append(float(loss.detach()))
-            progress.set_postfix(loss=f"{losses[-1]:.4f}", k=len(route))
+            progress.set_postfix(loss=f"{losses[-1]:.4f}")
         progress.close()
         val_nll = _evaluate_router_nll(
             model, router, validation_rows, probe, target_device, validation_limit
@@ -320,6 +321,8 @@ def _train_router_from_oracle(
             "supervised_loss": sum(losses) / max(len(losses), 1),
             "validation_nll": val_nll,
             "optimizer_steps": len(losses),
+            "training_rows": len(targets),
+            "scored_route_actions": len(router.action_catalog),
             "teacher_k_counts": {str(k): k_counts[k] for k in range(5)},
             "teacher_route_counts": dict(route_counts),
             "teacher_layer_counts": {str(layer): layer_counts[layer] for layer in router.candidate_layers},
@@ -371,14 +374,23 @@ def train_adaptive_router(
         raise ValueError("the router probe layer must remain outside the steering candidates")
 
     target_device = torch.device(device)
-    oracle_alphas = (1.0, 1.5, 2.0) if route_catalog is not None else (1.0, 1.25, 1.5, 1.75, 2.0)
-    router = AdaptiveSubsetRouter(
-        candidate_layers=candidate_layers,
-        hidden_dim=int(model.base_model.config.hidden_size),
-        n_backbone_layers=len(model._layers),
-        max_active_layers=4,
-        alpha_values=oracle_alphas,
-    ).to(target_device)
+    oracle_alphas = (1.0, 1.5, 2.0)
+    if route_catalog is not None:
+        router = RouteValueRouter(
+            candidate_layers=candidate_layers,
+            route_catalog=route_catalog,
+            hidden_dim=int(model.base_model.config.hidden_size),
+            max_active_layers=4,
+            alpha_values=oracle_alphas,
+        ).to(target_device)
+    else:
+        router = AdaptiveSubsetRouter(
+            candidate_layers=candidate_layers,
+            hidden_dim=int(model.base_model.config.hidden_size),
+            n_backbone_layers=len(model._layers),
+            max_active_layers=4,
+            alpha_values=(1.0, 1.25, 1.5, 1.75, 2.0),
+        ).to(target_device)
     for parameter in model.base_model.parameters():
         parameter.requires_grad_(False)
     for parameter in model.steer_nets.parameters():
@@ -403,6 +415,22 @@ def train_adaptive_router(
                 route_cost=route_cost,
                 row_limit=max_train_rows,
             )
+            target_path = Path(save_path).with_name("session3_route_teacher_targets.pt")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_payload = {
+                "format": "ars_route_value_targets_v1",
+                "candidate_layers": list(candidate_layers),
+                "action_catalog": [
+                    {"route": list(route), "alpha": float(alpha)}
+                    for route, alpha in router.action_catalog
+                ],
+                "route_cost": float(route_cost),
+                "pooled_prompts": torch.stack([item["pooled_prompt"] for item in targets]),
+                "action_scores": torch.stack([item["action_scores"] for item in targets]),
+            }
+            target_temporary = target_path.with_suffix(target_path.suffix + ".tmp")
+            torch.save(target_payload, target_temporary)
+            target_temporary.replace(target_path)
             result = _train_router_from_oracle(
                 router,
                 targets,
@@ -427,6 +455,8 @@ def train_adaptive_router(
                 "route_cost": float(route_cost),
                 "alpha_values": list(router.alpha_values),
                 "route_catalog": [list(route) for route in route_catalog],
+                "action_count": len(router.action_catalog),
+                "teacher_target_file": str(target_path),
             })
             temporary = report_path.with_suffix(report_path.suffix + ".tmp")
             temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
@@ -569,13 +599,31 @@ def load_adaptive_router(model, checkpoint_path: str | Path, device):
     candidates = tuple(int(value) for value in checkpoint["candidate_layers"])
     if candidates != tuple(model.target_layers):
         raise ValueError("router candidate layers do not match the model's steering bank")
-    router = AdaptiveSubsetRouter(
-        candidate_layers=candidates,
-        hidden_dim=int(model.base_model.config.hidden_size),
-        n_backbone_layers=len(model._layers),
-        max_active_layers=int(checkpoint["max_active_layers"]),
-        alpha_values=checkpoint["alpha_values"],
-    ).to(target_device)
+    if checkpoint.get("router_type") == "catalog_value":
+        action_catalog = checkpoint.get("action_catalog", [])
+        route_catalog = list(dict.fromkeys(
+            tuple(int(layer) for layer in action["route"]) for action in action_catalog
+        ))
+        router = RouteValueRouter(
+            candidate_layers=candidates,
+            route_catalog=route_catalog,
+            hidden_dim=int(model.base_model.config.hidden_size),
+            max_active_layers=int(checkpoint["max_active_layers"]),
+            alpha_values=checkpoint["alpha_values"],
+        ).to(target_device)
+        expected_actions = [
+            {"route": list(route), "alpha": float(alpha)} for route, alpha in router.action_catalog
+        ]
+        if action_catalog != expected_actions:
+            raise ValueError("router checkpoint action catalog ordering is inconsistent")
+    else:
+        router = AdaptiveSubsetRouter(
+            candidate_layers=candidates,
+            hidden_dim=int(model.base_model.config.hidden_size),
+            n_backbone_layers=len(model._layers),
+            max_active_layers=int(checkpoint["max_active_layers"]),
+            alpha_values=checkpoint["alpha_values"],
+        ).to(target_device)
     router.load_state_dict(checkpoint["router"])
     router.eval()
     probe = _Probe(model._layers[int(checkpoint["probe_layer"])])

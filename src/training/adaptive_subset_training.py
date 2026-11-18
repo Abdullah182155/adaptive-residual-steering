@@ -222,7 +222,7 @@ def train_adaptive_steering_bank(
                         use_cache=False,
                     ).logits
                     nll = _nll_sum(logits, row["labels"])
-                token_count = int(row["labels"][1:].ne(-100).sum())
+                token_count = int(row["labels"][:, 1:].ne(-100).sum())
                 nll_total += float(nll.float())
                 token_total += token_count
                 del nll, logits, row, extras
@@ -260,6 +260,7 @@ def train_adaptive_steering_bank(
 
     pair_candidates = candidate_routes(candidates, 2)
     pairs = screen_and_select("pair_screen", pair_candidates, k=2, limit=max_pair_routes)
+    trained_pairs = list(pairs)
     train_routes(pairs, "pairs", max(64, route_examples_per_layer * 2 // 3))
     pair_scores = score_routes(pairs, "pairs_after_joint_training")
     pairs = select_routes_by_depth(
@@ -267,6 +268,7 @@ def train_adaptive_steering_bank(
         k=2, per_bucket=4, limit=max_pair_routes,
     )
     curriculum["stages"]["pairs"] = {
+        "candidates": [list(route) for route in trained_pairs],
         "selected": [list(route) for route in pairs],
         "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in pair_scores},
     }
@@ -274,6 +276,7 @@ def train_adaptive_steering_bank(
 
     triple_candidates = candidate_routes(candidates, 3, selected_routes=pairs)
     triples = screen_and_select("triple_screen", triple_candidates, k=3, limit=max_triple_routes)
+    trained_triples = list(triples)
     train_routes(triples, "triples", max(48, route_examples_per_layer // 2))
     triple_scores = score_routes(triples, "triples_after_joint_training")
     triples = select_routes_by_depth(
@@ -281,6 +284,7 @@ def train_adaptive_steering_bank(
         k=3, per_bucket=3, limit=max_triple_routes,
     )
     curriculum["stages"]["triples"] = {
+        "candidates": [list(route) for route in trained_triples],
         "selected": [list(route) for route in triples],
         "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in triple_scores},
     }
@@ -288,6 +292,7 @@ def train_adaptive_steering_bank(
 
     quad_candidates = candidate_routes(candidates, 4, selected_routes=triples)
     quads = screen_and_select("quad_screen", quad_candidates, k=4, limit=max_quad_routes)
+    trained_quads = list(quads)
     train_routes(quads, "quads", max(32, route_examples_per_layer // 3))
     quad_scores = score_routes(quads, "quads_after_joint_training")
     quads = select_routes_by_depth(
@@ -295,6 +300,7 @@ def train_adaptive_steering_bank(
         k=4, per_bucket=2, limit=max_quad_routes,
     )
     curriculum["stages"]["quads"] = {
+        "candidates": [list(route) for route in trained_quads],
         "selected": [list(route) for route in quads],
         "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in quad_scores},
     }
