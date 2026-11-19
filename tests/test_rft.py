@@ -105,6 +105,29 @@ def test_rft_runner_exposes_explicit_stages_and_two_t4_sharding():
     assert args.n_shards == 2
 
 
+def test_rft_cli_exposes_fresh_training_mix_and_safe_microbatch_controls():
+    args = parse_args([
+        "--stage", "train", "--batch_size", "1", "--grad_accum", "32",
+        "--train_shot_weights", "0.5", "0.3", "0.2",
+        "--diversify_prompt_templates",
+    ])
+
+    assert args.batch_size == 1
+    assert args.grad_accum == 32
+    assert args.train_shot_weights == [0.5, 0.3, 0.2]
+    assert args.diversify_prompt_templates
+
+
+def test_rft_cli_exposes_heldout_alpha_sweep():
+    args = parse_args([
+        "--stage", "alpha_sweep", "--steernet_arch", "v2",
+        "--alpha_values", "0", "0.5", "1.0",
+    ])
+
+    assert args.stage == "alpha_sweep"
+    assert args.alpha_values == [0.0, 0.5, 1.0]
+
+
 def test_rft_runner_can_train_v2_from_existing_shards_without_collection(tmp_path):
     args = parse_args([
         "--stage", "train",

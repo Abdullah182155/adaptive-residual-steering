@@ -132,6 +132,7 @@ PHASE1_EXECUTION_CHECKLIST.md
 *.jpeg
 *.svg
 *.ipynb
+!notebooks/kaggle_ars_fixed_steering_fresh.ipynb
 *.tmp
 *.bak
 

@@ -78,6 +78,23 @@ def _configure_arm(model, arm: str, cfg, gate_provider=None) -> None:
         if hasattr(model, "set_control"):
             model.set_control(None)
         _set_gate_mode(model, enabled=False)
+    elif arm.startswith("steer_gain:"):
+        try:
+            gain = float(arm.split(":", 1)[1])
+        except ValueError as error:
+            raise ValueError(f"invalid steering gain arm: {arm}") from error
+        if not math.isfinite(gain) or gain < 0:
+            raise ValueError("steering gain must be finite and nonnegative")
+        model.set_routing_override("only", cfg.fixed_layers)
+        if hasattr(model, "set_route_selector"):
+            model.set_route_selector(None)
+        if hasattr(model, "set_steer_scale"):
+            model.set_steer_scale(1.0)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        if hasattr(model, "set_intervention_gains"):
+            model.set_intervention_gains(torch.tensor([gain], dtype=torch.float32))
+        _set_gate_mode(model, enabled=False)
     elif arm == "random":
         model.set_routing_override("only", cfg.fixed_layers)
         if hasattr(model, "set_intervention_gain"):
@@ -121,6 +138,7 @@ def _generate(
     temperature: float = 0.0,
     repetition_penalty: float = 1.0,
     no_repeat_ngram_size: int = 0,
+    template_id: int = 0,
     **prompt_kw,
 ) -> Tuple[str, Dict[str, Any]]:
     prompts, shields = build_prompts(
@@ -129,6 +147,7 @@ def _generate(
         [int(prompt_kw.get("question_idx", 0))],
         n_shot,
         policy=policy,
+        template_ids=[template_id],
     )
     result = generate_batch(
         model,
@@ -239,7 +258,7 @@ def run_benchmark(
     for n_shot in shots:
         arm_results: Dict[str, List[Dict[str, object]]] = {}
         for arm in arms:
-            if arm not in {"baseline", "fixed", "steer_only", "identity", "random", "router", "gate", "full"}:
+            if arm not in {"baseline", "fixed", "steer_only", "identity", "random", "router", "gate", "full"} and not arm.startswith("steer_gain:"):
                 raise ValueError(f"unsupported benchmark arm: {arm}")
             if arm_setup is not None:
                 arm_setup(arm)
@@ -263,6 +282,10 @@ def run_benchmark(
                 if hasattr(model, "set_control") and arm == "random":
                     model.set_control("random", seed=row_idx)
 
+                selected_alpha = (
+                    float(arm.split(":", 1)[1]) if arm.startswith("steer_gain:") else 1.0
+                )
+
                 text, meta = _generate(
                     model,
                     tokenizer,
@@ -276,9 +299,9 @@ def run_benchmark(
                     temperature=getattr(cfg, "generation_temperature", 0.0),
                     repetition_penalty=getattr(cfg, "generation_repetition_penalty", 1.1),
                     no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
+                    template_id=row_idx % 3 if getattr(cfg, "diversify_prompts", False) else 0,
                 )
                 selected_route: List[int] = []
-                selected_alpha = 1.0
                 if arm == "router" and hasattr(model, "current_routes"):
                     routes_now = model.current_routes()
                     if routes_now:
@@ -307,7 +330,7 @@ def run_benchmark(
                     guard.get("rel_max", 0.0)
                 ) > float(cap)
                 if (
-                    arm in {"fixed", "steer_only", "random", "gate"}
+                    (arm in {"fixed", "steer_only", "random", "gate"} or arm.startswith("steer_gain:"))
                     and cfg.guard_revert_to_k0
                     and (guard_trip or guard.get("nonfinite", False))
                 ):
@@ -324,6 +347,7 @@ def run_benchmark(
                         temperature=getattr(cfg, "generation_temperature", 0.0),
                         repetition_penalty=getattr(cfg, "generation_repetition_penalty", 1.1),
                         no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
+                        template_id=row_idx % 3 if getattr(cfg, "diversify_prompts", False) else 0,
                     )
                     model.set_routing_override("only", cfg.fixed_layers)
 
@@ -347,7 +371,7 @@ def run_benchmark(
                         "eaa": audit["eaa"],
                         "selected_layers": selected_route if arm == "router" else None,
                         "selected_k": len(selected_route) if arm == "router" else None,
-                        "selected_alpha": selected_alpha if arm == "router" else None,
+                        "selected_alpha": selected_alpha if (arm == "router" or arm.startswith("steer_gain:")) else None,
                     }
                 )
                 progress.set_postfix(correct=sum(item["lenient"] for item in results))
@@ -357,7 +381,8 @@ def run_benchmark(
             # Save individual arm generation file: report/generations/{suite}_{n_shot}shot_{arm}.jsonl
             generation_dir = Path(cfg.report_dir) / "generations"
             generation_dir.mkdir(parents=True, exist_ok=True)
-            arm_output_path = generation_dir / f"{suite}_{n_shot}shot_{arm}.jsonl"
+            safe_arm_name = arm.replace(":", "_")
+            arm_output_path = generation_dir / f"{suite}_{n_shot}shot_{safe_arm_name}.jsonl"
             arm_records = [
                 {
                     "idx": i,
@@ -386,9 +411,15 @@ def run_benchmark(
         paired_arm = next(
             (name for name in ("steer_only", "fixed") if name in arm_results), None
         )
+        if paired_arm is None:
+            paired_arm = next((name for name in arms if name.startswith("steer_gain:")), None)
         if "baseline" in arm_results and paired_arm is not None:
             paired_stats = _paired_counts(arm_results["baseline"], arm_results[paired_arm])
-            paired_key = "paired_steer_only" if paired_arm == "steer_only" else "paired"
+            paired_key = (
+                "paired_steer_only" if paired_arm == "steer_only"
+                else "paired_" + paired_arm.replace(":", "_") if paired_arm.startswith("steer_gain:")
+                else "paired"
+            )
             shot_record[paired_key] = paired_stats
             shot_record[paired_key]["mcnemar_p_value"] = mcnemar_exact(
                 paired_stats["fixed_wins"], paired_stats["fixed_losses"]
@@ -426,6 +457,38 @@ def run_benchmark(
                 "".join(json.dumps(item) + "\n" for item in paired_rows),
                 encoding="utf-8",
             )
+
+        # Every calibrated intensity gets its own paired result against the same
+        # baseline rows; do not leave secondary gains with summary-only metrics.
+        if "baseline" in arm_results:
+            for gain_arm in (name for name in arms if name.startswith("steer_gain:")):
+                paired = _paired_counts(arm_results["baseline"], arm_results[gain_arm])
+                key = "paired_" + gain_arm.replace(":", "_")
+                paired["mcnemar_p_value"] = mcnemar_exact(
+                    paired["fixed_wins"], paired["fixed_losses"]
+                )
+                paired["identical_text_rate"] = sum(
+                    base["text"] == steered["text"]
+                    for base, steered in zip(arm_results["baseline"], arm_results[gain_arm])
+                ) / max(len(rows), 1)
+                shot_record[key] = paired
+                gain_suffix = gain_arm.replace(":", "_")
+                gain_pairs = [
+                    {
+                        "source_index": int(row.get("source_index", index)),
+                        "question": row["question"],
+                        "gold": row["answer"],
+                        "baseline": baseline,
+                        gain_arm: steered,
+                    }
+                    for index, (row, baseline, steered) in enumerate(
+                        zip(rows, arm_results["baseline"], arm_results[gain_arm])
+                    )
+                ]
+                (generation_dir / f"{suite}_{n_shot}shot_{gain_suffix}_paired.jsonl").write_text(
+                    "".join(json.dumps(item) + "\n" for item in gain_pairs),
+                    encoding="utf-8",
+                )
 
         # Paired stats: baseline vs router (when both present)
         if "baseline" in arm_results and "router" in arm_results:

@@ -93,6 +93,7 @@ class Phi2WithRSC(nn.Module):
         self._active_shield_mask: Optional[torch.Tensor] = None
         self._gain: float = 1.0
         self._route_gains: Optional[torch.Tensor] = None
+        self._intervention_gains: Optional[torch.Tensor] = None
         self._control: Optional[str] = None
         self._control_seed: int = 0
         self._control_gen: Optional[torch.Generator] = None
@@ -244,6 +245,9 @@ class Phi2WithRSC(nn.Module):
             delta = steer_net(hidden_float, **steer_kwargs)
         gate = self._gate_multiplier(position, hidden_float, delta)
         injected = delta * selection * gate * self._effective_scale()
+        intensity = self._intensity_for(hidden_float)
+        if intensity is not None:
+            injected = injected * intensity.view(-1, 1, 1)
         injected = injected * valid_mask.unsqueeze(-1).to(injected.dtype)
         if self._control == "random":
             if self._control_gen is None:
@@ -301,6 +305,17 @@ class Phi2WithRSC(nn.Module):
             raise ValueError("route gains must be a scalar or one value per example")
         return gains
 
+    def _intensity_for(self, hidden: torch.Tensor) -> Optional[torch.Tensor]:
+        """Return post-cap per-example intervention scales for the active batch."""
+        if self._intervention_gains is None:
+            return None
+        gains = self._intervention_gains.to(device=hidden.device, dtype=hidden.dtype)
+        if gains.ndim == 0:
+            return gains.expand(hidden.shape[0])
+        if gains.ndim != 1 or gains.shape[0] != hidden.shape[0]:
+            raise ValueError("intervention gains must be scalar or one value per example")
+        return gains
+
     def _record_guard(
         self, delta: torch.Tensor, hidden: torch.Tensor, valid_mask: torch.BoolTensor
     ) -> None:
@@ -318,6 +333,23 @@ class Phi2WithRSC(nn.Module):
     def set_intervention_gain(self, gain: float) -> None:
         self._gain = float(gain)
         self._route_gains = None
+        self._intervention_gains = None
+
+    def set_intervention_gains(self, gains: Optional[torch.Tensor]) -> None:
+        """Set post-cap intensity, allowing each batch item its own nonnegative scale.
+
+        Applying intensity after SteerNet's norm cap keeps its meaning stable:
+        zero disables steering, one preserves the learned bounded residual, and
+        values between zero and one attenuate that residual without changing its
+        direction or the configured route.
+        """
+        if gains is None:
+            self._intervention_gains = None
+            return
+        values = torch.as_tensor(gains).detach()
+        if not torch.isfinite(values).all() or bool((values < 0).any()):
+            raise ValueError("intervention gains must be finite and non-negative")
+        self._intervention_gains = values
 
     def set_route_gains(self, gains: Optional[torch.Tensor]) -> None:
         """Set per-example V2 gains; the V2 module applies them before its norm cap."""

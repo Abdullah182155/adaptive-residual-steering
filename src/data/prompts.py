@@ -82,13 +82,22 @@ V5_EXEMPLARS = [
 
 PREFACE = "Solve each problem step by step. Write every step on its own line as \"Step N: ...\" and finish with \"Final answer: <number>\"."
 
+# Meaning-preserving wording variants used only when a run explicitly enables
+# prompt diversification. The answer contract and exemplar/completion structure
+# remain shared across variants.
+PROMPT_PREFACES = (
+    PREFACE,
+    "Work through the math problem one step at a time. Put each step on its own line as \"Step N: ...\" and end with \"Final answer: <number>\".",
+    "Solve the problem with a clear sequence of calculations. Use one line per \"Step N: ...\" and finish with \"Final answer: <number>\".",
+)
+
 # Exemplar set seed for reproducibility
 EXEMPLAR_SEED = 42
 
 
 def _get_harness_hash() -> str:
     """Compute hash of (preface + exemplars + builder source) for harness validation."""
-    source = f"{PREFACE}{str(V5_EXEMPLARS)}{EXEMPLAR_SEED}"
+    source = f"{PROMPT_PREFACES}{str(V5_EXEMPLARS)}{EXEMPLAR_SEED}"
     return hashlib.sha256(source.encode()).hexdigest()[:16]
 
 
@@ -100,6 +109,7 @@ def build_prompt_unified(
     exemplar_set: str = "v5",
     include_preface: bool = True,
     question_idx: Optional[int] = None,
+    template_id: int = 0,
 ) -> str:
     """
     Unified prompt builder for training, evaluation, and sampling.
@@ -121,7 +131,9 @@ def build_prompt_unified(
         exemplars = V5_EXEMPLARS if exemplar_set == "v5" else LEGACY_GSM8K_EXEMPLARS
 
     if preface is None:
-        preface = PREFACE
+        if not 0 <= template_id < len(PROMPT_PREFACES):
+            raise ValueError(f"template_id must be in [0, {len(PROMPT_PREFACES) - 1}]")
+        preface = PROMPT_PREFACES[template_id]
 
     if question_idx is not None and n_shot > 0 and n_shot < len(exemplars):
         start = question_idx % len(exemplars)

@@ -20,7 +20,8 @@ from src.data.dataset import gsm8k_to_cot
 from src.evaluation.generation import equivalence_test
 from src.models.loading import load_frozen_phi2 as build_model
 from src.training.rft_collect import build_rft_rows, collect_rft_data
-from src.training.rft_trainer import train_phase1_rft
+from src.training.rft_trainer import evaluate_generation, train_phase1_rft
+from src.training.trainer import load_steer_weights
 
 
 STAGE1_ROUTE = [17, 20, 23, 26]
@@ -31,7 +32,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--stage",
-        choices=("equivalence", "gate0", "collect", "train", "all"),
+        choices=("equivalence", "gate0", "collect", "train", "alpha_sweep", "all"),
         default="equivalence",
     )
     parser.add_argument(
@@ -63,6 +64,21 @@ def parse_args(argv=None):
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--n_shards", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--batch_size", type=int, default=None, help="RFT micro-batch size")
+    parser.add_argument("--grad_accum", type=int, default=None, help="RFT gradient accumulation steps")
+    parser.add_argument(
+        "--train_shot_weights",
+        type=float,
+        nargs=3,
+        default=(0.60, 0.25, 0.15),
+        metavar=("ZERO_SHOT", "TWO_SHOT", "FOUR_SHOT"),
+        help="sampling weights for 0/2/4-shot RFT rows",
+    )
+    parser.add_argument(
+        "--diversify_prompt_templates",
+        action="store_true",
+        help="cycle through meaning-equivalent prompt instructions during RFT row building",
+    )
     parser.add_argument("--steernet_arch", choices=("v5", "v2"), default="v5")
     parser.add_argument(
         "--skip_collection",
@@ -81,6 +97,10 @@ def parse_args(argv=None):
     parser.add_argument("--norm_calibration")
     parser.add_argument("--output_dir", default="report/rft")
     parser.add_argument("--checkpoint", default="checkpoints/steernet.pt")
+    parser.add_argument(
+        "--alpha_values", type=float, nargs="+", default=[0.0, 0.5, 0.75, 1.0, 1.25],
+        help="post-cap steering intensities for held-out 0/2-shot calibration",
+    )
     return parser.parse_args(argv)
 
 
@@ -202,6 +222,7 @@ def run(args) -> dict | None:
     collection_questions = args.n_questions or 2000
 
     cfg = RSCConfig(steernet_arch=args.steernet_arch)
+    cfg.diversify_prompts = bool(args.diversify_prompt_templates)
     route = STAGE2_ROUTE if args.steernet_arch == "v2" else STAGE1_ROUTE
     cfg.fixed_layers = list(route)
     cfg.candidate_layers = sorted(set(cfg.candidate_layers) | set(route))
@@ -219,6 +240,14 @@ def run(args) -> dict | None:
     cfg.on_policy = False
     cfg.use_gate = False
     cfg.max_tok_len = 768
+    if args.batch_size is not None:
+        if args.batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        cfg.batch_size = args.batch_size
+    if args.grad_accum is not None:
+        if args.grad_accum < 1:
+            raise ValueError("grad_accum must be positive")
+        cfg.grad_accum = args.grad_accum
     cfg.validate()
     print(
         f"[rft] architecture={cfg.steernet_arch} route={cfg.fixed_layers} "
@@ -230,6 +259,9 @@ def run(args) -> dict | None:
     if device.type != "cuda":
         raise RuntimeError("Phase 1 RFT expects a CUDA runtime such as Kaggle T4")
     output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cfg.report_dir = str(output_dir)
+    cfg.checkpoint_dir = str(output_dir / "checkpoints")
     rollout_source_dir = Path(args.rollout_dir) if args.rollout_dir else output_dir
     if args.skip_collection:
         required_shards = [
@@ -276,9 +308,51 @@ def run(args) -> dict | None:
     dev_limit = (
         max(100, equivalence_questions)
         if args.stage in {"equivalence", "all"}
+        else max(300, args.n_questions or 300)
+        if args.stage == "alpha_sweep"
         else 100
     )
     dev_rows = prepare_dataset_split(raw_dev.with_format(None), limit=dev_limit)
+
+    if args.stage == "alpha_sweep":
+        if not Path(args.checkpoint).is_file():
+            raise FileNotFoundError(f"trained checkpoint not found: {args.checkpoint}")
+        if not args.alpha_values or any(not torch.isfinite(torch.tensor(value)) or value < 0 for value in args.alpha_values):
+            raise ValueError("alpha_values must be finite and nonnegative")
+        load_steer_weights(model, args.checkpoint, cfg, device)
+        # RFT checkpoint selection uses the first 100 validation rows; keep
+        # intensity calibration on a disjoint segment of the same held-out split.
+        count = min(args.n_questions or 200, max(0, len(dev_rows) - 100))
+        calibration_rows = dev_rows[100 : 100 + count]
+        if not calibration_rows:
+            raise ValueError("alpha calibration requires held-out rows beyond the RFT selection slice")
+        result = {"n": len(calibration_rows), "alpha_values": args.alpha_values, "shots": {}}
+        for n_shot in (0, 2):
+            baseline_flags, baseline_metrics = evaluate_generation(
+                model, tokenizer, calibration_rows, cfg, device,
+                n_shot=n_shot, batch_size=1, steered=False,
+            )
+            entries = []
+            for alpha in args.alpha_values:
+                flags, metrics = evaluate_generation(
+                    model, tokenizer, calibration_rows, cfg, device,
+                    n_shot=n_shot, batch_size=1, steered=True,
+                    intervention_gain=alpha,
+                )
+                delta = 100 * sum(
+                    int(current) - int(base)
+                    for current, base in zip(flags, baseline_flags)
+                ) / len(baseline_flags)
+                entries.append({"alpha": alpha, **metrics, "paired_delta_lenient_pp": delta})
+            best = max(entries, key=lambda item: (item["paired_delta_lenient_pp"], -item["alpha"]))
+            result["shots"][str(n_shot)] = {
+                "baseline": baseline_metrics,
+                "candidates": entries,
+                "selected_alpha": best["alpha"],
+            }
+        _write_json(Path(args.output_dir) / "alpha_calibration.json", result)
+        print(json.dumps(result, indent=2), flush=True)
+        return result
 
     if args.stage in {"equivalence", "all"}:
         model.set_routing_override("none", cfg.fixed_layers)
@@ -380,11 +454,13 @@ def run(args) -> dict | None:
             cfg,
             max_length=cfg.max_tok_len,
             seed=cfg.seed,
+            shot_weights=args.train_shot_weights,
+            diversify_prompt_templates=args.diversify_prompt_templates,
         )
         rows_path = Path(cfg.checkpoint_dir) / "rft_rows.pt"
         rows_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({"rows": rft_rows, "stats": row_stats}, rows_path)
-        return train_phase1_rft(
+        result = train_phase1_rft(
             model,
             rft_rows,
             dev_rows,
@@ -394,6 +470,14 @@ def run(args) -> dict | None:
             epochs=args.epochs,
             save_path=args.checkpoint,
         )
+        result["rft_rows"] = row_stats
+        result["training_data"] = {
+            "rollout_files": [str(path) for path in shard_files],
+            "shot_weights": list(args.train_shot_weights),
+            "prompt_templates_diversified": args.diversify_prompt_templates,
+        }
+        _write_json(output_dir / "rft_training_result.json", result)
+        return result
     return None
 
 

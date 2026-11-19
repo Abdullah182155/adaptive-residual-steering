@@ -222,6 +222,7 @@ def tokenize_rft_example(
     *,
     question_index: int = 0,
     n_shot: int = 0,
+    template_id: int = 0,
     max_length: Optional[int] = None,
 ) -> Optional[dict[str, torch.Tensor]]:
     """Tokenize completion-only targets, shrinking demonstrations without truncation."""
@@ -237,6 +238,7 @@ def tokenize_rft_example(
                 n_shot=active_shots,
                 policy=policy,
                 question_idx=question_index,
+                template_id=template_id,
             )
             text = prompt + completion.strip()
             encoded = tokenizer(
@@ -297,13 +299,25 @@ def build_rft_rows(
     max_rows_per_question: int = 3,
     max_length: int = 768,
     seed: int = 0,
-) -> tuple[list[dict[str, torch.Tensor]], dict[str, int]]:
-    """Build mixed 0/2/4-shot training rows from verified positive rollouts only."""
+    shot_weights: Sequence[float] = (0.60, 0.25, 0.15),
+    diversify_prompt_templates: bool = False,
+) -> tuple[list[dict[str, torch.Tensor]], dict[str, Any]]:
+    """Build verified RFT rows with configurable shot mix and safe template diversity."""
     if max_rows_per_question < 1:
         raise ValueError("max_rows_per_question must be positive")
+    if len(shot_weights) != 3 or any(weight < 0 for weight in shot_weights) or sum(shot_weights) <= 0:
+        raise ValueError("shot_weights must contain three nonnegative 0/2/4-shot weights")
     rng = random.Random(seed)
     rows: list[dict[str, torch.Tensor]] = []
-    stats = {"questions": 0, "questions_with_positive": 0, "rows": 0}
+    stats = {
+        "questions": 0,
+        "questions_with_positive": 0,
+        "rows": 0,
+        "shot_counts": {"0": 0, "2": 0, "4": 0},
+        "template_counts": {"0": 0, "1": 0, "2": 0},
+        "shot_weights": list(map(float, shot_weights)),
+        "prompt_templates_diversified": bool(diversify_prompt_templates),
+    }
     for shard_path in shard_files:
         with Path(shard_path).open(encoding="utf-8") as stream:
             for line in stream:
@@ -320,7 +334,12 @@ def build_rft_rows(
                 candidates = list(unique.values())
                 rng.shuffle(candidates)
                 for completion in candidates[:max_rows_per_question]:
-                    n_shot = rng.choices([0, 2, 4], weights=[0.60, 0.25, 0.15])[0]
+                    n_shot = rng.choices([0, 2, 4], weights=shot_weights)[0]
+                    template_id = (
+                        (int(record["question_index"]) + len(rows)) % 3
+                        if diversify_prompt_templates
+                        else 0
+                    )
                     row = tokenize_rft_example(
                         tokenizer,
                         record["question"],
@@ -328,11 +347,14 @@ def build_rft_rows(
                         cfg,
                         question_index=int(record["question_index"]),
                         n_shot=n_shot,
+                        template_id=template_id,
                         max_length=max_length,
                     )
                     if row is not None:
                         rows.append(row)
                         stats["rows"] += 1
+                        stats["shot_counts"][str(n_shot)] += 1
+                        stats["template_counts"][str(template_id)] += 1
     if not rows:
         raise ValueError("no verified positive RFT rows were produced")
     print(f"[rft-rows] {stats}")

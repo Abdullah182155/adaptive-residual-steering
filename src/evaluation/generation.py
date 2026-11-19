@@ -132,19 +132,25 @@ def build_prompts(
     question_indices: Sequence[int],
     n_shot: int,
     policy: str = "prompt",
+    template_ids: Optional[Sequence[int]] = None,
 ) -> tuple[list[str], list[Optional[torch.Tensor]]]:
     """Build prompts and matching prefill shield masks for a batch of questions."""
     if len(questions) != len(question_indices):
         raise ValueError("questions and question_indices must have matching lengths")
+    if template_ids is None:
+        template_ids = [0] * len(questions)
+    if len(template_ids) != len(questions):
+        raise ValueError("template_ids must have one entry per question")
     prompts: list[str] = []
     shields: list[Optional[torch.Tensor]] = []
-    for question, index in zip(questions, question_indices):
+    for question, index, template_id in zip(questions, question_indices, template_ids):
         prompt, _, shield = build_prompt_with_shield(
             tokenizer,
             question,
             n_shot=n_shot,
             policy=policy,
             question_idx=index,
+            template_id=int(template_id),
         )
         prompts.append(prompt)
         shields.append(shield if bool(shield.any()) else None)

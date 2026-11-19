@@ -152,7 +152,7 @@ def _load_arm_weights(model, arm: str, cfg: RSCConfig, device: torch.device) -> 
     if arm in {"baseline", "identity"}:
         return
 
-    if arm in {"fixed", "steer_only", "random", "router"}:
+    if arm in {"fixed", "steer_only", "random", "router"} or arm.startswith("steer_gain:"):
         checkpoint = Path(cfg.lora_save_path)
     elif arm in {"gate", "full"}:
         checkpoint = Path(cfg.steernet_gated_save_path)

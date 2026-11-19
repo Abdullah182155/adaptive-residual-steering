@@ -442,6 +442,49 @@ def test_wrapper_preserves_single_element_tuple_outputs():
     assert steered[0].shape == (1, 10, 8)
 
 
+def test_wrapper_applies_per_example_intensity_after_steernet_cap():
+    from types import SimpleNamespace
+    from transformers import LlamaConfig, LlamaForCausalLM
+    from src.steering.steernet import SteerNet
+
+    cfg = SimpleNamespace(
+        fixed_layers=[0], lora_rank=4, lora_alpha=32.0, lora_dropout=0.0,
+        steer_kappa=0.1, layer_norms_calibration="", prompt_shielding=False,
+        steer_scale=0.30, amplitude_mode="relative",
+    )
+    backbone = LlamaForCausalLM(
+        LlamaConfig(
+            vocab_size=32, hidden_size=8, intermediate_size=16,
+            num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2,
+        )
+    ).eval()
+    model = Phi2WithRSC(backbone, cfg, torch.device("cpu")).eval()
+    model._selection = torch.tensor([[True]])
+    model._attention_mask = torch.ones(1, 4, dtype=torch.bool)
+    hidden = torch.randn(1, 4, 8)
+    steer = SteerNet(hidden_dim=8, rank=4, kappa=0.1, init_gain=0.1, dropout=0.0).eval()
+
+    model.set_intervention_gains(torch.tensor([0.0]))
+    zero = model._apply_steering(0, steer, hidden)
+    model.set_intervention_gains(torch.tensor([1.0]))
+    full = model._apply_steering(0, steer, hidden)
+    model.set_intervention_gains(torch.tensor([0.5]))
+    half = model._apply_steering(0, steer, hidden)
+
+    full_delta = full - hidden
+    assert torch.allclose(zero, hidden)
+    assert torch.allclose(half - hidden, full_delta * 0.5, atol=1e-6)
+
+
+def test_prompt_template_variants_preserve_answer_contract():
+    from src.data.prompts import PROMPT_PREFACES, build_prompt_unified
+
+    prompts = [build_prompt_unified("What is 3 + 4?", template_id=i) for i in range(3)]
+    assert len(set(PROMPT_PREFACES)) == 3
+    assert len(set(prompts)) == 3
+    assert all(prompt.endswith("Question: What is 3 + 4?\nAnswer: Let's think step by step.\n") for prompt in prompts)
+
+
 def test_steernet_norm_capped_below_ceiling():
     """V21: When MLP output is small (init), scale=1.0 — no capping."""
     net = SteerNet(hidden_dim=8, rank=4, kappa=0.08, amplitude_mode="norm_capped",

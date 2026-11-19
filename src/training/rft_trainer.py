@@ -24,6 +24,7 @@ from src.training.checkpoints import checkpoint_metadata
 
 _STAGE1_ROUTE = [17, 20, 23, 26]
 _STAGE2_ROUTE = [12, 15, 18, 21]
+_FEW_SHOT_SELECTION_TOLERANCE_PP = 2.0
 
 
 def _plain_nll_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -113,6 +114,7 @@ def evaluate_generation(
     batch_size: int = 2,
     limit: Optional[int] = None,
     steered: bool,
+    intervention_gain: float = 1.0,
 ) -> tuple[list[bool], dict[str, float]]:
     """Evaluate paired greedy generations and return lenient flags and diagnostics."""
     selected = list(rows[:limit] if limit is not None else rows)
@@ -120,11 +122,17 @@ def evaluate_generation(
         raise ValueError("generation evaluation requires at least one row")
     model.eval()
     model.set_routing_override("only" if steered else "none", cfg.fixed_layers)
+    if hasattr(model, "set_intervention_gain"):
+        model.set_intervention_gain(1.0)
     flags: list[bool] = []
     strict: list[bool] = []
     lengths: list[int] = []
     for start in range(0, len(selected), batch_size):
         batch_rows = selected[start : start + batch_size]
+        if steered and hasattr(model, "set_intervention_gains"):
+            model.set_intervention_gains(
+                torch.full((len(batch_rows),), float(intervention_gain), dtype=torch.float32)
+            )
         indices = list(range(start, start + len(batch_rows)))
         prompts, shields = build_prompts(
             tokenizer,
@@ -132,6 +140,11 @@ def evaluate_generation(
             indices,
             n_shot,
             policy=cfg.shield_policy,
+            template_ids=(
+                [index % 3 for index in indices]
+                if getattr(cfg, "diversify_prompts", False)
+                else None
+            ),
         )
         results = generate_batch(
             model,
@@ -267,6 +280,9 @@ def train_phase1_rft(
     )
 
     best_delta = float("-inf")
+    best_2shot_delta = float("-inf")
+    best_selection_score = float("-inf")
+    best_selection_feasible = False
     best_epoch: Optional[int] = None
     best_length_ratio: Optional[float] = None
     best_state = None
@@ -374,6 +390,13 @@ def train_phase1_rft(
             int(current) - int(baseline)
             for current, baseline in zip(current_flags, baseline_flags)
         ) / len(baseline_flags)
+        current_2shot_flags, two_shot_diagnostics = evaluate_generation(
+            model, tokenizer, eval_rows, cfg, target_device, n_shot=2, steered=True
+        )
+        delta_2shot_pp = 100 * sum(
+            int(current) - int(baseline)
+            for current, baseline in zip(current_2shot_flags, baseline_2shot_flags)
+        ) / len(baseline_2shot_flags)
         baseline_mean_tokens = baseline_metrics["mean_tokens"]
         length_ratio = (
             diagnostics["mean_tokens"] / baseline_mean_tokens
@@ -385,21 +408,36 @@ def train_phase1_rft(
             "epoch": epoch + 1,
             "mean_window_nll": loss_sum / max(optimizer_steps, 1),
             "delta_lenient_pp": delta_pp,
+            "delta_2shot_lenient_pp": delta_2shot_pp,
             "length_ok": length_ok,
             "completion_length_ratio": length_ratio,
             **diagnostics,
+            "two_shot_mean_tokens": two_shot_diagnostics["mean_tokens"],
         }
         history.append(row)
         print(
             f"[rft] epoch={epoch + 1}/{epochs} nll={row['mean_window_nll']:.4f} "
             f"delta={delta_pp:+.2f}pp mean_tokens={diagnostics['mean_tokens']:.1f} "
-            f"length_ratio={length_ratio:.2f} length_ok={length_ok}"
+            f"length_ratio={length_ratio:.2f} length_ok={length_ok} "
+            f"delta_2shot={delta_2shot_pp:+.2f}pp"
         )
         # Generation stops as soon as a valid final answer is produced, so shorter
         # correct completions are not evidence of collapse. Keep length as a
         # diagnostic and select the checkpoint by the paired primary metric.
-        if delta_pp > best_delta:
+        # Prefer 0-shot gains while rejecting checkpoints with a material
+        # few-shot regression; if every epoch violates the tolerance, choose
+        # the best combined score and surface that fact in the run report.
+        feasible = delta_2shot_pp >= -_FEW_SHOT_SELECTION_TOLERANCE_PP
+        selection_score = delta_pp if feasible else delta_pp + min(delta_2shot_pp, 0.0)
+        should_select = (
+            (feasible and not best_selection_feasible)
+            or (feasible == best_selection_feasible and selection_score > best_selection_score)
+        )
+        if should_select:
+            best_selection_score = selection_score
+            best_selection_feasible = feasible
             best_delta = delta_pp
+            best_2shot_delta = delta_2shot_pp
             best_epoch = epoch + 1
             best_length_ratio = length_ratio
             best_state = {
@@ -425,6 +463,9 @@ def train_phase1_rft(
         "route": list(cfg.fixed_layers),
         "selected_epoch": best_epoch,
         "best_delta_lenient_pp": best_delta,
+        "selected_2shot_delta_lenient_pp": best_2shot_delta,
+        "selected_2shot_noninferiority_passed": best_2shot_delta >= -_FEW_SHOT_SELECTION_TOLERANCE_PP,
+        "selection_2shot_tolerance_pp": _FEW_SHOT_SELECTION_TOLERANCE_PP,
         "selected_completion_length_ratio": best_length_ratio,
         "baseline_0shot": baseline_metrics,
         "baseline_2shot": baseline_2shot_metrics,
