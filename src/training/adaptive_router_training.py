@@ -19,7 +19,7 @@ from src.routing.adaptive_subset_router import (
     RouteValueRouter,
     sample_route_actions,
 )
-from src.training.adaptive_subset_training import _prepare
+from src.training.batching import prepare_batch as _prepare
 
 
 class _Probe:

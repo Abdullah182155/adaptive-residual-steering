@@ -24,7 +24,7 @@ def collect_star_completions(
     """Generate k completions per question; return correct ones and hard questions."""
     from src.data.prompts import build_prompt_unified
     from src.evaluation.answers import score_tiers
-    from src.training.trainer import _generate_onpolicy_batch
+    from src.training.on_policy import generate_onpolicy_batch as _generate_onpolicy_batch
     import random
 
     rng = random.Random(cfg.seed + 777)
@@ -118,7 +118,7 @@ def rationalize_hard_questions(
 
     from src.data.prompts import build_prompt_unified
     from src.evaluation.answers import score_tiers
-    from src.training.trainer import _generate_onpolicy_batch
+    from src.training.on_policy import generate_onpolicy_batch as _generate_onpolicy_batch
 
     gc_was_on = getattr(model.base_model, "is_gradient_checkpointing", False)
     if gc_was_on and hasattr(model.base_model, "gradient_checkpointing_disable"):
@@ -197,14 +197,13 @@ def train_phase1r_star(
     tokenizer,
 ) -> Dict[str, Any]:
     """Phase 1R: Self-Taught Reasoning via rejection sampling + rationalization."""
-    from src.training.trainer import (
-        evaluate_typed,
-        save_steer_weights,
-        _param_groups,
-        _prepare,
-        _lr_lambda,
-        _epoch_batches,
-        _tokenize_onpolicy,
+    from src.training.checkpoints import save_steer_weights
+    from src.training.metrics import evaluate_typed
+    from src.training.on_policy import tokenize_onpolicy as _tokenize_onpolicy
+    from src.training.batching import prepare_batch as _prepare, epoch_batches as _epoch_batches
+    from src.training.optimization import (
+        steering_parameter_groups as _param_groups,
+        warmup_cosine_lr as _lr_lambda,
     )
 
     print("=" * 60)

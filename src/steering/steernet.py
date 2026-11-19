@@ -1,6 +1,5 @@
 """SteerNet V5: capped causal residual adapters for fixed-route ARS."""
 
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F

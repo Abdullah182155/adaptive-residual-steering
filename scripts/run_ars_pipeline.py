@@ -1,27 +1,17 @@
-"""Kaggle entry point for calibration, S1 training, S5, and GSM8K evaluation."""
+"""Compatibility CLI for fixed-route, optional routing/gating, and evaluation stages."""
 
 from __future__ import annotations
 
-# ── MUST be first: set before any torch/transformers import initialises CUDA ──
-# setup_quiet_logging() (below) imports transformers which imports torch, so
-# PYTORCH_CUDA_ALLOC_CONF must be in the environment before that call.
-# expandable_segments:True lets the allocator satisfy fragmented-memory
-# requests without needing a single contiguous free block — fixes OOM when
-# 100+ MiB is reserved-but-unallocated and a 30-40 MiB allocation fails.
-import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-
 import argparse
-import random
 from pathlib import Path
 import sys
 import traceback
+from typing import Any
 
-# ── Silence HF weight-loading bars and INFO spam BEFORE importing transformers ──
 _verbosity = "verbose" if "--verbose" in sys.argv else "quiet"
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from src.utils.logging_utils import setup_quiet_logging
-setup_quiet_logging(level=_verbosity)
+from src.utils.runtime import configure_pipeline_runtime
+configure_pipeline_runtime(verbose=_verbosity == "verbose")
 
 import torch
 from datasets import load_dataset
@@ -29,6 +19,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from src.configs.config import RSCConfig, apply_overrides
 from src.data.dataset import gsm8k_to_cot
+from src.data.benchmark import load_gsm8k_test_rows, materialize_dataset_split
 from src.deploy.calibrate import (
     apply_contract,
     load_contract,
@@ -37,6 +28,7 @@ from src.deploy.calibrate import (
 )
 from src.evaluation.benchmark import run_benchmark, write_record, write_report
 from src.models.wrapper import Phi2WithRSC
+from src.models.loading import build_frozen_phi2
 from src.training.trainer import load_steer_weights, train_phase1_steernet
 from src.training.contrastive import train_phase1c_contrastive
 from src.training.star import train_phase1r_star
@@ -129,77 +121,30 @@ def build_config(args) -> RSCConfig:
     return cfg
 
 
-def build_model(cfg, device):
-    """Load frozen Phi-2, optionally selecting an HF attention backend for probes."""
-    attention_backend = os.environ.get("ARS_ATTENTION_IMPLEMENTATION", "").strip().lower()
-    if attention_backend and attention_backend not in {"eager", "sdpa"}:
-        raise ValueError(
-            "ARS_ATTENTION_IMPLEMENTATION must be 'eager', 'sdpa', or unset; "
-            f"got {attention_backend!r}"
-        )
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.pad_token_id is None:
-        raise ValueError("the tokenizer does not provide an EOS or padding token ID")
-    model_config = AutoConfig.from_pretrained(cfg.model_name, trust_remote_code=True)
-    model_config.pad_token_id = tokenizer.pad_token_id
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
-    load_kwargs = {
-        "config": model_config,
-        "dtype": dtype,
-        "trust_remote_code": True,
-    }
-    if attention_backend:
-        load_kwargs["attn_implementation"] = attention_backend
-    print(
-        "[model] attention implementation: "
-        f"{attention_backend or 'transformers default'}",
-        flush=True,
+def build_model(
+    cfg: RSCConfig, device: torch.device
+) -> tuple[torch.nn.Module, Any]:
+    """Compatibility entry point for constructing the frozen Phi-2 model."""
+    return build_frozen_phi2(
+        cfg,
+        device,
+        tokenizer_loader=AutoTokenizer,
+        config_loader=AutoConfig,
+        model_loader=AutoModelForCausalLM,
+        wrapper_factory=Phi2WithRSC,
     )
-    backbone = AutoModelForCausalLM.from_pretrained(
-        cfg.model_name,
-        **load_kwargs,
-    ).to(device)
-    model = Phi2WithRSC(backbone, cfg, device)
-    # SteerNet modules start in train() mode (nn.Module default).
-    # Switch to eval so dropout is off outside of explicit training loops.
-    model.eval()
-    return model, tokenizer
 
 
 def load_benchmark_rows(limit: int | None, seed: int = 42) -> list[dict[str, object]]:
-    """Load a deterministic shuffled GSM8K test subset and preserve source indices."""
-    dataset = load_dataset("openai/gsm8k", "main", split="test")
-    total = len(dataset)
-    sample_size = total if limit is None else min(limit, total)
-    if sample_size < 1:
-        raise ValueError("benchmark sample size must be positive")
-    source_indices = list(range(total))
-    if sample_size < total:
-        source_indices = random.Random(seed).sample(source_indices, sample_size)
-    dataset = dataset.select(source_indices)
-    rows = []
-    for source_index, example in zip(source_indices, dataset):
-        answer = example["answer"].split("####")[-1].strip()
-        rows.append(
-            {
-                "question": example["question"],
-                "answer": answer,
-                "source_index": source_index,
-            }
-        )
-    return rows
+    """Compatibility entry point for deterministic GSM8K test sampling."""
+    return load_gsm8k_test_rows(limit, seed=seed, dataset_loader=load_dataset)
 
 
-def prepare_dataset_split(dataset, limit: int | None = None):
-    """Materialize a dataset split into a list of row dicts."""
-    total = len(dataset)
-    n = min(limit, total) if limit is not None else total
-    if hasattr(dataset, "select"):
-        selected = dataset.select(range(n))
-        return [selected[i] for i in range(n)]
-    return list(dataset[:n])
+def prepare_dataset_split(
+    dataset: Any, limit: int | None = None
+) -> list[dict[str, object]]:
+    """Compatibility entry point for ordered dataset materialization."""
+    return materialize_dataset_split(dataset, limit=limit)
 
 
 def _load_arm_weights(model, arm: str, cfg: RSCConfig, device: torch.device) -> None:

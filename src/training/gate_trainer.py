@@ -1,16 +1,4 @@
-"""Phase 2B: Gate training — V19 overhaul.
-
-V18 changes (architecture):
-- Task NLL removed from gate loss (overwhelmed contrastive)
-- Hinge contrastive replaces MSE
-- Anti-saturation loss
-- RLOO baseline=0.0, answer_weight=1.0
-- Per-layer LR scaling
-
-V19 changes (methods):
-- Generation-based accuracy reward every N steps (teacher-forced NLL ≠ accuracy)
-- Checkpoint selection by NLL improvement (val_nll_base - val_nll_gate), not absolute NLL
-"""
+"""Optional gate training and checkpoint loading for legacy ARS experiments."""
 
 from __future__ import annotations
 
@@ -27,13 +15,10 @@ import torch.nn.functional as F
 from src.configs.config import RSCConfig
 from src.gating.gate import RSCUsefulnessGate
 from src.routing.rloo import per_example_answer_nll_weighted
-from src.training.losses import T_FORMAT, T_OPERAND, T_OPERATOR, T_PROSE, T_RESULT, T_FINAL
-from src.training.trainer import (
-    _epoch_batches,
-    _generate_onpolicy_batch,
-    _prepare,
-    save_steer_weights,
-)
+from src.training.losses import T_FORMAT, T_OPERAND, T_OPERATOR, T_PROSE, T_FINAL
+from src.training.batching import epoch_batches as _epoch_batches, prepare_batch as _prepare
+from src.training.checkpoints import save_steer_weights
+from src.training.on_policy import generate_onpolicy_batch as _generate_onpolicy_batch
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

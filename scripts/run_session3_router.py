@@ -8,19 +8,21 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
-import torch
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+from src.utils.runtime import configure_pipeline_runtime
+configure_pipeline_runtime()
+
+import torch
 
 from src.configs.config import RSCConfig
+from src.data.benchmark import load_gsm8k_test_rows as load_benchmark_rows
 from src.evaluation.benchmark import run_benchmark, write_record, write_report
+from src.models.loading import load_frozen_phi2 as build_model
 from src.steering.steernet import load_layer_norms
 from src.training.adaptive_data import build_adaptive_rft_splits
 from src.training.adaptive_router_training import load_adaptive_router, train_adaptive_router
 from src.training.adaptive_subset_training import train_adaptive_steering_bank
-from src.training.rft_collect import build_rft_rows
-from scripts.run_ars_pipeline import build_model, load_benchmark_rows
 
 
 V2_ROUTE = (12, 15, 18, 21)

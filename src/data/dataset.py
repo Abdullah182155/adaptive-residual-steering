@@ -4,19 +4,17 @@ from __future__ import annotations
 
 import random
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from datasets import load_dataset
 
 from src.configs.config import RSCConfig
-from src.data.prompts import PREFACE, V5_EXEMPLARS, build_prompt_unified
+from src.data.prompts import V5_EXEMPLARS, build_prompt_unified
 from src.training.losses import (
     T_FINAL,
-    T_FORMAT,
     T_NONE,
     T_OPERAND,
     T_OPERATOR,
-    T_PROSE,
     T_RESULT,
     annotate_char_types,
     token_types_from_offsets,

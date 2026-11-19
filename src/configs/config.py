@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
-from typing import Any, Dict, List, Optional
+from typing import Any, List, Optional
 
 
 @dataclass
@@ -47,7 +47,6 @@ class RSCConfig:
     phase1_plateau_factor: float = 0.5
     phase1_plateau_patience: int = 3
     phase1_plateau_min_lr: float = 5e-6
-    log_every: int = 20
     n_samples: int = 7473
     max_tok_len: int = 768
     val_split: float = 0.08
@@ -59,7 +58,6 @@ class RSCConfig:
     s1_answer_region_frac: float = 0.30
 
     # Phase 1C: Contrastive Residual Training
-    contrastive_phase: bool = False
     contrastive_epochs: int = 3
     contrastive_lr: float = 5e-5
     contrastive_weight: float = 1.0

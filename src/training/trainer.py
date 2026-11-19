@@ -1,485 +1,53 @@
-"""Fixed-route SteerNet V5 trainer for ARS Phase 1 with V2 typed reasoning loss."""
+"""Fixed-route SteerNet training utilities and the legacy typed Phase 1 trainer."""
 
 from __future__ import annotations
 
-from collections import defaultdict
-import contextlib
 import gc
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict
 
 import torch
-import torch.nn.functional as F
-
 
 from src.configs.config import RSCConfig
+from src.training.batching import (
+    extract_batch_rows as _extract_batch_rows,
+    epoch_batches as _epoch_batches,
+    prepare_batch as _prepare,
+    trim_to_attended_tokens as _trim_to_attended_tokens,
+)
+from src.training.optimization import (
+    steering_parameter_groups as _param_groups,
+    warmup_cosine_lr as _lr_lambda,
+)
+from src.training.on_policy import (
+    collect_onpolicy_data,
+    generate_onpolicy_batch as _generate_onpolicy_batch,
+    tokenize_onpolicy as _tokenize_onpolicy,
+    verify_arithmetic_steps as _verify_arithmetic_steps,
+)
+from src.training.checkpoints import checkpoint_metadata, load_steer_weights, save_steer_weights
+from src.training.metrics import (
+    _validate_generation,
+    evaluate_loss,
+    evaluate_loss_with_hooks,
+    evaluate_typed,
+)
+
 from src.training.losses import (
     LearnedLossWeights,
     T_FINAL,
     T_FORMAT,
-    T_NONE,
     T_OPERAND,
     T_OPERATOR,
     T_PROSE,
     T_RESULT,
-    annotate_char_types,
-    lambdas,
     target_weights,
-    token_types_from_offsets,
     token_weighted_nll,
     typed_objective,
     window_counts,
 )
-
-
-def _stack_batch(rows: List[dict], device: torch.device) -> Dict[str, torch.Tensor]:
-    """Move the standard token tensors for a contiguous batch to a device."""
-    return {
-        name: torch.stack([row[name] for row in rows]).to(device)
-        for name in ("input_ids", "attention_mask", "labels")
-        if name in rows[0]
-    }
-
-
-def _extract_batch_rows(data, offset: int, batch_size: int) -> List[dict]:
-    """Extract a batch of sample dicts from either a list or a dataset object."""
-    if isinstance(data, list):
-        return data[offset : offset + batch_size]
-    end = min(offset + batch_size, len(data))
-    return [data[i] for i in range(offset, end)]
-
-
-def _trim_to_attended_tokens(
-    batch: Dict[str, torch.Tensor],
-    extras: Dict[str, torch.Tensor] | None = None,
-) -> tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
-    """Drop all-padding columns while preserving every aligned auxiliary mask."""
-    extras = extras or {}
-    attention_mask = batch["attention_mask"].bool()
-    live_columns = attention_mask.any(dim=0).nonzero(as_tuple=False).flatten()
-    if live_columns.numel() == 0:
-        raise ValueError("batch contains no attended tokens")
-    start = int(live_columns.min())
-    stop = int(live_columns.max()) + 1
-    trimmed_batch = {name: value[:, start:stop] for name, value in batch.items()}
-    trimmed_extras = {
-        name: value[:, start:stop]
-        for name, value in extras.items()
-        if value.ndim >= 2 and (value.shape[1] == attention_mask.shape[1] or value.shape[-1] == attention_mask.shape[-1])
-    }
-    return trimmed_batch, trimmed_extras
-
-
-def _prepare(rows: List[dict], device: torch.device):
-    batch = {
-        name: torch.stack([row[name] for row in rows]).to(device)
-        for name in ("input_ids", "attention_mask", "labels")
-        if name in rows[0]
-    }
-    extras = {
-        name: torch.stack([row[name] for row in rows]).to(device)
-        for name in ("prompt_shield_mask", "token_types", "calc_mask", "neg_ids")
-        if name in rows[0]
-    }
-    return _trim_to_attended_tokens(batch, extras)
-
-
-def _param_groups(model, cfg: RSCConfig) -> List[Dict[str, Any]]:
-    """Configure optimizer parameter groups: exclude LayerNorms and scale-invariant up from weight decay.
-
-    When mag_head is active it controls the output scale, so up.weight encodes pure
-    direction and benefits from full weight decay to prevent norm collapse.
-    When mag_head is off, up.weight IS the scale, so we zero-out its decay.
-    """
-    decay, no_decay, up = [], [], []
-    for name, p in model.steer_nets.named_parameters():
-        if not p.requires_grad:
-            continue
-        if name.endswith("up.weight"):
-            up.append(p)
-        elif name.endswith("mag_head.bias"):
-            decay.append(p)  # L2 prevents bias from growing unbounded → keeps sigmoid < 1
-        elif p.ndim >= 2 and ".conv." not in name:
-            decay.append(p)
-        else:
-            no_decay.append(p)
-    lr = cfg.phase1_lr
-    # mag_head controls output scale → up encodes direction only → apply full WD
-    # without mag_head → up encodes scale too → no WD (avoid shrinking the signal)
-    has_mag_head = getattr(cfg, "steernet_use_mag_head", getattr(cfg, "use_mag_head", True))
-    up_wd = cfg.weight_decay if has_mag_head else 0.0
-    return [
-        {"params": decay, "lr": lr, "weight_decay": cfg.weight_decay},
-        {"params": no_decay, "lr": lr, "weight_decay": 0.0},
-        {"params": up, "lr": lr, "weight_decay": up_wd},
-    ]
-
-
-def _lr_lambda(step: int, total: int, warm: int, floor: float) -> float:
-    """Linear warmup followed by cosine decay to floor."""
-    if step < warm:
-        return (step + 1) / max(warm, 1)
-    prog = (step - warm) / max(1, total - warm)
-    return floor + (1.0 - floor) * 0.5 * (1.0 + math.cos(math.pi * prog))
-
-
-def _epoch_batches(lengths: List[int], bs: int, epoch: int, seed: int, mega: int = 16) -> List[List[int]]:
-    """Dynamic length-bucketing in mega-chunks followed by batch shuffle."""
-    g = torch.Generator().manual_seed(seed + epoch)
-    order = torch.randperm(len(lengths), generator=g).tolist()
-    batches = []
-    for i in range(0, len(order), bs * mega):
-        chunk = sorted(order[i : i + bs * mega], key=lambda j: lengths[j])
-        batches += [chunk[k : k + bs] for k in range(0, len(chunk), bs)]
-    return [batches[i] for i in torch.randperm(len(batches), generator=g).tolist()]
-
-
-@torch.no_grad()
-def evaluate_typed(
-    model, rows: Iterable[dict], device: torch.device, cfg: RSCConfig, steered: bool = True
-) -> Dict[str, float]:
-    """Compute per-category NLL, critical loss, and top-1 accuracy on result tokens."""
-    row_list = [rows[i] for i in range(len(rows))] if hasattr(rows, "select") else list(rows)
-    if not row_list:
-        return {"crit": 0.0, "result_top1": 0.0, "validation_nll": 0.0}
-    model.eval()
-    s = defaultdict(float)
-    n = defaultdict(int)
-    hit = defaultdict(int)
-    ctx = contextlib.nullcontext() if steered else model.hooks_disabled()
-    bs = max(1, getattr(cfg, "batch_size", 2))
-    with ctx:
-        for start in range(0, len(row_list), bs):
-            chunk = row_list[start : start + bs]
-            batch, extras = _prepare(chunk, device)
-            model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
-            logits = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).logits
-            sel = batch["labels"][:, 1:].ne(-100)
-            if not sel.any():
-                continue
-            z = logits[:, :-1][sel].float()
-            y = batch["labels"][:, 1:][sel]
-            c = extras["token_types"][:, 1:][sel] if "token_types" in extras else torch.zeros_like(y)
-            nll = F.cross_entropy(z, y, reduction="none")
-            ok = z.argmax(-1).eq(y)
-            for cid in c.unique().tolist():
-                m = c == cid
-                s[cid] += float(nll[m].sum())
-                n[cid] += int(m.sum())
-                hit[cid] += int(ok[m].sum())
-
-    out = {f"nll_{c}": s[c] / max(n[c], 1) for c in n if n[c]}
-    lam_map = lambdas(cfg)
-    out["crit"] = sum(lam * out.get(f"nll_{c}", 0.0) for c, lam in lam_map.items())
-    rn = n[T_RESULT] + n[T_FINAL]
-    out["result_top1"] = (hit[T_RESULT] + hit[T_FINAL]) / max(rn, 1)
-    total_tokens = sum(n.values())
-    total_nll = sum(s.values())
-    out["validation_nll"] = total_nll / max(total_tokens, 1)
-    return out
-
-
-@torch.no_grad()
-def evaluate_loss(model, rows: Iterable[dict], device: torch.device) -> float:
-    """Return validation NLL for backward compatibility."""
-    cfg = getattr(model, "cfg", RSCConfig())
-    typed = evaluate_typed(model, rows, device, cfg, steered=True)
-    return float(typed.get("validation_nll", typed.get("crit", 0.0)))
-
-
-def evaluate_loss_with_hooks(model, rows, device: torch.device, enabled: bool) -> float:
-    context = torch.enable_grad() if enabled else model.hooks_disabled()
-    with context:
-        return evaluate_loss(model, rows, device)
-
-
-@torch.no_grad()
-def _validate_generation(model, tokenizer, rows, device, cfg, n=50):
-    """Generate on val questions, compute lenient accuracy for checkpoint selection."""
-    from src.data.prompts import build_prompt_unified
-    from src.evaluation.answers import score_tiers
-
-    model.eval()
-    model.set_routing_override("only", cfg.fixed_layers)
-
-    gc_on = getattr(model.base_model, "is_gradient_checkpointing", False)
-    if gc_on and hasattr(model.base_model, "gradient_checkpointing_disable"):
-        model.base_model.gradient_checkpointing_disable()
-
-    correct, total = 0, 0
-    gen_bs = max(1, getattr(cfg, "on_policy_gen_batch", 1))
-    sample = rows[: min(n, len(rows))]
-    for i in range(0, len(sample), gen_bs):
-        batch_rows = sample[i : i + gen_bs]
-        prompts = [build_prompt_unified(r["question"], n_shot=0) for r in batch_rows]
-        texts = _generate_onpolicy_batch(
-            model, tokenizer, prompts, device,
-            max_new_tokens=256, temperature=0.0,
-        )
-        for r, text in zip(batch_rows, texts):
-            try:
-                gold_val = float(
-                    str(r.get("final_num", "")).replace(",", "").replace("$", "").strip()
-                )
-            except (ValueError, TypeError):
-                continue
-            total += 1
-            if score_tiers(text, gold_val).get("lenient", False):
-                correct += 1
-
-    if gc_on and hasattr(model.base_model, "gradient_checkpointing_enable"):
-        model.base_model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-
-    acc = correct / max(total, 1)
-    print(f"  [gen-val] {correct}/{total} = {100 * acc:.1f}% lenient (0-shot)")
-    return acc
-
-
-def checkpoint_metadata(cfg: RSCConfig) -> Dict[str, Any]:
-    return {
-        "steernet_arch": cfg.steernet_arch,
-        "route": list(cfg.fixed_layers),
-        "rank": cfg.lora_rank,
-        "rho_max": cfg.rho_max,
-        "norm_stat": cfg.steernet_norm_stat,
-        "steer_scale": cfg.steer_scale,
-        "steer_kappa": cfg.steer_kappa,
-        "k_scale_mode": cfg.k_scale_mode,
-        "loss_mode": cfg.loss_mode,
-    }
-
-
-def save_steer_weights(model, path: str, cfg: RSCConfig) -> None:
-    """Persist Phase 1 adapter state with enough metadata to reject mismatches."""
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "metadata": checkpoint_metadata(cfg),
-            "steer_nets": model.steer_nets.state_dict(),
-        },
-        path,
-    )
-
-
-def load_steer_weights(
-    model, path: str, cfg: RSCConfig, device: Optional[torch.device] = None
-) -> Dict[str, Any]:
-    state = torch.load(path, map_location=device or "cpu", weights_only=True)
-    metadata = state["metadata"]
-    if metadata.get("steernet_arch", "v5") != cfg.steernet_arch:
-        raise ValueError("checkpoint SteerNet architecture does not match the active config")
-    if metadata["route"] != list(cfg.fixed_layers):
-        raise ValueError("checkpoint route does not match the active fixed route")
-    if metadata.get("rank", cfg.lora_rank) != cfg.lora_rank:
-        raise ValueError("checkpoint SteerNet rank does not match the active config")
-    model.steer_nets.load_state_dict(state["steer_nets"])
-    return metadata
-
-
-@torch.no_grad()
-def _generate_onpolicy_batch(
-    model,
-    tokenizer,
-    prompts,
-    device,
-    max_new_tokens=256,
-    num_return_sequences=1,
-    temperature=0.0,
-    max_prompt_length=1024,
-):
-    """Compatibility wrapper using the shared left-padded generation engine."""
-    from src.evaluation.generation import generate_texts
-
-    return generate_texts(
-        model,
-        tokenizer,
-        list(prompts),
-        device,
-        max_new_tokens=max_new_tokens,
-        num_return_sequences=num_return_sequences,
-        temperature=temperature,
-        top_p=0.95 if temperature > 0 else 1.0,
-        max_prompt_len=max_prompt_length,
-        repetition_penalty=1.0,
-    )
-
-
-def _verify_arithmetic_steps(completion: str, tol: float = 0.02) -> bool:
-    """Reject explicit arithmetic equations with a provably incorrect RHS.
-
-    Expressions use the bounded AST evaluator in ``evaluation.chain``; expressions it
-    cannot parse are skipped conservatively.
-    """
-    import re
-    from src.evaluation.chain import safe_eval_expr
-    # Match patterns: optional prefix, then NUMBER [op] NUMBER = NUMBER
-    # e.g. "3 * 60 = 180", "180 - 0.3*180 = 108", "5 × 4 = 20"
-    _EQ_PAT = re.compile(
-        r'([\d\s\+\-\*\/\.\(\)×÷]+)\s*=\s*(-?\d[\d,]*(?:\.\d+)?)'
-    )
-    for m in _EQ_PAT.finditer(completion):
-        lhs_raw = m.group(1).replace('×', '*').replace('÷', '/').replace(',', '').strip()
-        rhs_raw = m.group(2).replace(',', '')
-        # Skip if LHS is just a bare number (e.g. "= 20" at end of "Step 3: 20")
-        if re.fullmatch(r'-?\d+(\.\d+)?', lhs_raw):
-            continue
-        lhs_val = safe_eval_expr(lhs_raw)
-        if lhs_val is None:
-            continue
-        rhs_val = float(rhs_raw)
-        denom = max(1.0, abs(rhs_val))
-        if abs(lhs_val - rhs_val) > tol * denom:
-            return False
-    return True
-
-
-def _tokenize_onpolicy(tokenizer, question, completion, cfg, n_shot=0):
-    from src.data.prompts import build_prompt_with_shield
-    prompt_text, enc_full, shield_mask = build_prompt_with_shield(
-        tokenizer, question, n_shot=n_shot, policy=getattr(cfg, "shield_policy", "context")
-    )
-    full_text = prompt_text + completion
-    target_start = len(prompt_text)
-
-    enc = tokenizer(full_text, truncation=True, max_length=cfg.max_tok_len,
-                    padding="max_length", return_offsets_mapping=True)
-
-    ids, offsets, am = enc["input_ids"], enc["offset_mapping"], enc["attention_mask"]
-    labels = [tid if (m and e > s and s >= target_start) else -100
-              for tid, (s, e), m in zip(ids, offsets, am)]
-    # Compute shield mask aligned to the full tokenization
-    shield_char_end = target_start if n_shot > 0 else 0
-    shield = [1 if (m and e > 0 and e <= shield_char_end) else 0
-              for (s, e), m in zip(offsets, am)]
-    char_labels = annotate_char_types(full_text, target_start)
-    tt = token_types_from_offsets(full_text, char_labels, offsets)
-    tt = [t if l != -100 else T_NONE for t, l in zip(tt, labels)]
-    calc = [1 if t in (T_OPERAND, T_OPERATOR, T_RESULT, T_FINAL) else 0 for t in tt]
-
-    return {
-        "input_ids": torch.tensor(ids),
-        "attention_mask": torch.tensor(am),
-        "labels": torch.tensor(labels),
-        "prompt_shield_mask": torch.tensor(shield),
-        "token_types": torch.tensor(tt),
-        "calc_mask": torch.tensor(calc),
-    }
-
-
-@torch.no_grad()
-def collect_onpolicy_data(model, tokenizer, rows, device, cfg, epoch=0):
-    import random
-    from src.evaluation.answers import extract_numeric_answer, score_tiers
-
-    orig_indices = [i for i, r in enumerate(rows) if "question" in r]
-    n_gen = max(1, int(len(orig_indices) * cfg.on_policy_frac))
-    perm = torch.randperm(
-        len(orig_indices), generator=torch.Generator().manual_seed(cfg.seed + epoch)
-    )[:n_gen].tolist()
-    indices = [orig_indices[j] for j in perm]
-
-    from src.data.prompts import build_prompt_unified
-
-    rng = random.Random(cfg.seed + epoch + 1000)
-    questions = [rows[i]["question"] for i in indices]
-    golds = [rows[i]["final_num"] for i in indices]
-    gold_cots = [rows[i].get("answer", "") for i in indices]
-    # V23: use dedicated on_policy_shot_probs if set, else fall back to train_shot_probs.
-    # This ensures on-policy distribution matches the training mixture (V22 had a 60/20/20
-    # hardcode that diverged from the 90/5/5 training mix, hurting few-shot generalisation).
-    _op_probs = getattr(cfg, "on_policy_shot_probs", None) or cfg.train_shot_probs
-    _op_choices = list(range(len(_op_probs)))
-    shot_counts = [rng.choices(_op_choices, weights=_op_probs)[0] for _ in questions]
-    prompts = [
-        build_prompt_unified(q, n_shot=ns) for q, ns in zip(questions, shot_counts)
-    ]
-
-    gc_enabled = getattr(model.base_model, "is_gradient_checkpointing", False)
-    if gc_enabled and hasattr(model.base_model, "gradient_checkpointing_disable"):
-        model.base_model.gradient_checkpointing_disable()
-
-    model.eval()
-    model.set_routing_override("only", cfg.fixed_layers)
-
-    # Pass@k: generate k completions per question
-    on_policy_k = getattr(cfg, "on_policy_k", 1)
-    on_policy_temperature = getattr(cfg, "on_policy_temperature", 0.0)
-
-    completions_flat: List[str] = []
-    gen_bs = cfg.on_policy_gen_batch
-    total_batches = math.ceil(len(prompts) / gen_bs)
-    for bi, i in enumerate(range(0, len(prompts), gen_bs)):
-        batch = prompts[i : i + gen_bs]
-        completions_flat.extend(
-            _generate_onpolicy_batch(
-                model, tokenizer, batch, device,
-                num_return_sequences=on_policy_k,
-                temperature=on_policy_temperature,
-                max_prompt_length=cfg.max_tok_len,
-            )
-        )
-        if (bi + 1) % 25 == 0 or (bi + 1) == total_batches:
-            print(f"  on-policy gen: {bi + 1}/{total_batches} batches", flush=True)
-
-    if gc_enabled and hasattr(model.base_model, "gradient_checkpointing_enable"):
-        model.base_model.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
-
-    # completions_flat is grouped: [q0_k0, q0_k1, ..., q1_k0, q1_k1, ...]
-    # For each question: keep first correct completion, or fall back to gold CoT
-    new_rows: List[Dict[str, Any]] = []
-    n_tried = 0
-    n_correct = 0
-    n_gold_fallback = 0
-    n_step_rejected = 0
-    for qi, (q, gold, gold_cot, ns) in enumerate(zip(questions, golds, gold_cots, shot_counts)):
-        try:
-            gold_num = float(str(gold).replace(",", "").replace("$", "").strip())
-        except (ValueError, AttributeError):
-            continue
-        base = qi * on_policy_k
-        found = False
-        for ki in range(on_policy_k):
-            n_tried += 1
-            comp = completions_flat[base + ki]
-            scored = score_tiers(comp, gold_num)
-            if scored["lenient"]:
-                # V23: reject completions with provably wrong arithmetic steps
-                # e.g. "540 × 7 = 3780" on a question that only asks about one week.
-                # This prevents bad reasoning chains from poisoning on-policy data.
-                if getattr(cfg, "on_policy_verify_steps", True) and not _verify_arithmetic_steps(comp):
-                    n_step_rejected += 1
-                    continue
-                n_correct += 1
-                row = _tokenize_onpolicy(tokenizer, q, comp, cfg, n_shot=ns)
-                row["question"] = q
-                row["final_num"] = gold
-                new_rows.append(row)
-                found = True
-                break
-        if not found and gold_cot and getattr(cfg, "on_policy_gold_fallback", True):
-            row = _tokenize_onpolicy(tokenizer, q, gold_cot, cfg, n_shot=ns)
-            row["question"] = q
-            row["final_num"] = gold
-            new_rows.append(row)
-            n_gold_fallback += 1
-
-    print(
-        f"[on-policy] {n_gen} questions × {on_policy_k} samples = {n_tried} tried "
-        f"→ {n_correct} correct ({100 * n_correct / max(n_gen, 1):.1f}%)"
-        f"{f', {n_step_rejected} step-rejected' if n_step_rejected else ''}"
-        f" + {n_gold_fallback} gold fallback → {len(new_rows)} new rows"
-    )
-
-    model.train()
-    model.base_model.eval()
-    return new_rows
-
 
 def train_phase1_steernet(
     model, train_data, eval_data, cfg: RSCConfig, device: torch.device,

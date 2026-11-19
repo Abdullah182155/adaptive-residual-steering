@@ -50,7 +50,7 @@ def test_causal_convolution_dirac_initialization_and_cache_priming():
 def test_steernet_clamps_using_active_route_size():
     network = SteerNet(8, rank=4, layer_idx=13, layer_norms={13: 10.0}, kappa=0.04)
     delta = network(torch.randn(2, 4, 8), active_k=torch.tensor([3, 3]))
-    assert float(delta.norm(dim=-1).max()) <= 0.04 * 10.0 / (3**0.5) + 1e-5
+    assert float(delta.norm(dim=-1).max().detach()) <= 0.04 * 10.0 / (3**0.5) + 1e-5
 
 
 def test_prompt_shielding_keeps_prefill_pristine():

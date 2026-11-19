@@ -16,13 +16,10 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
-
 from src.configs.config import RSCConfig
 from src.routing.router import JointLayerRouter
 from src.routing.rloo import compute_router_rloo_loss, per_example_answer_nll

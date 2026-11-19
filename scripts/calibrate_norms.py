@@ -13,9 +13,8 @@ import json
 import random
 import time
 import sys
-import os
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 # ── Silence HF weight-loading bars and INFO spam BEFORE importing transformers ──
 _repo_root = Path(__file__).resolve().parents[1]

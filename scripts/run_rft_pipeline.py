@@ -8,14 +8,17 @@ import random
 from pathlib import Path
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from src.utils.runtime import configure_pipeline_runtime
+configure_pipeline_runtime()
+
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from scripts.run_ars_pipeline import build_model, prepare_dataset_split
 from src.configs.config import RSCConfig
+from src.data.benchmark import materialize_dataset_split as prepare_dataset_split
 from src.data.dataset import gsm8k_to_cot
 from src.evaluation.generation import equivalence_test
+from src.models.loading import load_frozen_phi2 as build_model
 from src.training.rft_collect import build_rft_rows, collect_rft_data
 from src.training.rft_trainer import train_phase1_rft
 

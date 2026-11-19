@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import random
 import sys
 from pathlib import Path
@@ -14,7 +13,7 @@ from tqdm import tqdm
 
 from src.training.route_curriculum import candidate_routes, select_routes_by_depth
 from src.training.rft_trainer import _enable_checkpointing_without_dropout
-from src.training.trainer import _prepare
+from src.training.batching import prepare_batch as _prepare
 
 
 def _nll_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:

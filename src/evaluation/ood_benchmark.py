@@ -8,16 +8,15 @@ Uses batched generation for speed.
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import torch
 from tqdm.auto import tqdm
 
 from src.data.prompts import build_prompt_unified
-from src.evaluation.answers import cut_continuation, extract_numeric_answer, score_tiers
-from src.evaluation.chain import audit_chain, paired_bootstrap_ci, mcnemar_one_sided
+from src.evaluation.answers import cut_continuation, score_tiers
+from src.evaluation.chain import paired_bootstrap_ci, mcnemar_one_sided
 from src.evaluation.ood import (
     extract_mcq_answer,
     format_mcq_question,

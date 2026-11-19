@@ -15,13 +15,12 @@ from tqdm import tqdm
 
 from src.evaluation.answers import score_tiers
 from src.evaluation.generation import build_prompts, generate_batch
-from src.training.trainer import (
-    _epoch_batches,
-    _lr_lambda,
-    _param_groups,
-    _prepare,
-    checkpoint_metadata,
+from src.training.batching import prepare_batch as _prepare, epoch_batches as _epoch_batches
+from src.training.optimization import (
+    steering_parameter_groups as _param_groups,
+    warmup_cosine_lr as _lr_lambda,
 )
+from src.training.checkpoints import checkpoint_metadata
 
 _STAGE1_ROUTE = [17, 20, 23, 26]
 _STAGE2_ROUTE = [12, 15, 18, 21]

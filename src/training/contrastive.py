@@ -11,24 +11,21 @@ import gc
 import math
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import torch
 import torch.nn.functional as F
 
 from src.configs.config import RSCConfig
 from src.training.losses import (
-    annotate_char_types,
-    token_types_from_offsets,
     typed_objective,
     window_counts,
-    T_NONE,
 )
 
 
 def _tokenize_pair_item(tokenizer, question, completion, cfg, n_shot=0):
     """Tokenize a question+completion for direction extraction."""
-    from src.training.trainer import _tokenize_onpolicy
+    from src.training.on_policy import tokenize_onpolicy as _tokenize_onpolicy
     return _tokenize_onpolicy(tokenizer, question, completion, cfg, n_shot=n_shot)
 
 
@@ -38,7 +35,7 @@ def collect_contrastive_pairs(
     """Generate greedy completions and collect pairs where the model is wrong."""
     from src.data.prompts import build_prompt_unified
     from src.evaluation.answers import score_tiers
-    from src.training.trainer import _generate_onpolicy_batch
+    from src.training.on_policy import generate_onpolicy_batch as _generate_onpolicy_batch
     import random
 
     rng = random.Random(cfg.seed + 999)
@@ -236,12 +233,12 @@ def train_phase1c_contrastive(
     tokenizer,
 ) -> Dict[str, Any]:
     """Phase 1C: Contrastive Residual Training on hard examples."""
-    from src.training.trainer import (
-        evaluate_typed,
-        save_steer_weights,
-        _param_groups,
-        _prepare,
-        _lr_lambda,
+    from src.training.checkpoints import save_steer_weights
+    from src.training.metrics import evaluate_typed
+    from src.training.batching import prepare_batch as _prepare
+    from src.training.optimization import (
+        steering_parameter_groups as _param_groups,
+        warmup_cosine_lr as _lr_lambda,
     )
 
     print("=" * 60)

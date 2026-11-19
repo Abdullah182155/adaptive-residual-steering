@@ -1,151 +1,80 @@
 # Adaptive Residual Steering (ARS)
 
-**Lightweight residual adapters that steer a frozen LLM toward structured mathematical reasoning — no fine-tuning, no RL from human feedback.**
+ARS trains small residual-stream steering modules for mathematical reasoning while keeping the `microsoft/phi-2` backbone frozen. The repository contains three research sessions, shared data and evaluation code, and Kaggle notebooks for execution.
 
-ARS injects rank-16 causal adapters (SteerNet V5) at selected transformer layers of `microsoft/phi-2` (2.7B) and trains them to improve chain-of-thought accuracy on GSM8K. A learned router then selects per-question layer subsets at inference time.
+## Current execution paths
 
-## Method
+| Session | Purpose | Entry point | Main artifacts |
+|---|---|---|---|
+| Session 1 | Collect verified GSM8K rollouts, train fixed-route SteerNet, and compare steering with baseline | `scripts/run_rft_pipeline.py` and `scripts/run_ars_pipeline.py` | `steernet.pt`, rollout shards, paired benchmark reports |
+| Session 2 | Train or evaluate the V2 fixed route `[12, 15, 18, 21]` using rank 16 and calibrated p99 norms | `scripts/run_rft_pipeline.py` with `--steernet_arch v2` | V2 checkpoint and norm calibration |
+| Session 3 | Train a variable-route steering bank, train a prompt-conditioned route-value router, and compare baseline, fixed V2, and router arms | `scripts/run_session3_router.py` | steering-bank checkpoint, router checkpoint, paired benchmark and diagnostics |
 
-```
-                        ┌──────────┐
-  prompt ──► Phi-2 ──►  │ SteerNet │ ──► ... ──► answer
-             frozen     │ adapters │
-                        └──────────┘
-                     layers selected by
-                     JointLayerRouter
-```
+Session 3 can reuse attached rollout shards and existing V2 artifacts. Its Kaggle notebook also supports collecting rollouts or rebuilding missing V2 artifacts when configured to do so. Notebook configuration cells define the exact paths and execution scale for a run.
 
-**Phase 1 (S1)** — Fixed-route SteerNet training:
-- 10 candidate layers: `[8, 11, 13, 15, 17, 19, 20, 21, 22, 24]`
-- Typed NLL loss with per-category weighting (format, prose, operator, operand, result, final)
-- Learned Kendall uncertainty balancing across NLL, KL-divergence, and L1 objectives
-- On-policy data collection with gold-answer fallback for hard questions
-- Prompt shielding preserves few-shot demonstrations from steering interference
+## Model and invariants
 
-**Phase 2 (S2)** — Per-question adaptive routing:
-- JointLayerRouter with two-pass cross-attention and learned synergy matrix
-- RLOO policy gradient with Cooperative Plackett-Luce subset sampling
-- Selects K layers (2-8) per question based on probe hidden states
-- Synergy-aware greedy inference matches training-time selection
+- Phi-2 parameters remain frozen; training updates steering and routing modules only.
+- Phase 1 uses token-mean NLL on verified positive RFT completions.
+- The Phase 1 learning rate is locked at `1.5e-4`.
+- `steer_only` is the isolated fixed-route steering arm: static layers, no gate provider, no router selection, and unit intervention gain.
+- Session 2 V2 uses route `[12, 15, 18, 21]`, rank 16, `rho_max=0.10`, p99 norm calibration, and no magnitude head or convolution.
+- Session 3 route selection is trained from candidate route scores. Its observed route usage and paired GSM8K metrics are written to the run diagnostics; route diversity is an empirical outcome and should be checked in each report.
 
-## Architecture
+## Repository layout
 
-### SteerNet V5
-
-Each adapter is a rank-16 bottleneck with causal depthwise convolution:
-
-```
-h ──► LayerNorm ──► W_down (D→16) ──► CausalDWConv1d(k=4) ──► GELU ──► W_up (16→D)
-                                                                  │
-                                                           mag_head ──► sigmoid ──► magnitude
-```
-
-- **Relative amplitude**: `delta = rho_max / sqrt(K) * magnitude * ||h_centered|| * direction`
-- **Smooth cap envelope**: `C_l = kappa * N_l` (calibrated per-layer norm bounds)
-- **Position-0 shielding**: no steering on the attention-sink token
-
-### JointLayerRouter
-
-```
-probe_hidden ──► pool ──► [scalars, depth, semantic] ──► Transformer(2-pass)
-                              │                                │
-                              ▼                                ▼
-                         k_head ──► K distribution      utility_head ──► layer scores
-                                                               │
-                                                        synergy_proj ──► S_ij cooperation matrix
-```
-
-## Results
-
-Preliminary results on GSM8K (1000 training examples, 5 epochs, 50 test):
-
-| Condition | Baseline | ARS (Fixed) | Delta |
-|-----------|----------|-------------|-------|
-| 0-shot    | 42.0%    | 52.0%       | **+10.0 pp** |
-| 2-shot    | 56.0%    | 64.0%       | **+8.0 pp** |
-| 4-shot    | 58.0%    | 60.0%       | +2.0 pp |
-
-Format compliance (0-shot): 16% baseline → 76% with ARS.
-
-## Project Structure
-
-```
+```text
 src/
-├── configs/config.py          # RSCConfig dataclass with all hyperparameters
-├── data/
-│   ├── dataset.py             # GSM8K loading, tokenization, multi-context splits
-│   └── prompts.py             # Unified prompt builder with shield masks
-├── models/wrapper.py          # Phi2WithRSC: hooks, routing override, generation
-├── steering/steernet.py       # SteerNet V5 with CausalDWConv1d
-├── routing/
-│   ├── router.py              # JointLayerRouter with synergy-aware inference
-│   └── rloo.py                # RLOO policy gradient with Plackett-Luce sampling
-├── training/
-│   ├── trainer.py             # Phase 1 training loop + on-policy collection
-│   ├── router_trainer.py      # Phase 2 router training + checkpoint loading
-│   └── losses.py              # Typed NLL, focal weighting, Kendall balancing
-├── evaluation/
-│   ├── benchmark.py           # Multi-arm benchmark (baseline/fixed/router)
-│   ├── answers.py             # Numeric answer extraction and scoring
-│   └── diagnostics.py         # Paired plots, training curves, generation viewer
-└── deploy/calibrate.py        # Deployment contract calibration
+├── configs/       Configuration and locked session presets
+├── data/          GSM8K loading, prompt construction, and shielding masks
+├── deploy/        Deployment calibration contracts
+├── evaluation/    Generation, answer scoring, paired benchmarks, OOD evaluation
+├── gating/        Optional gate modules retained for supported legacy experiments
+├── models/        Frozen Phi-2 wrapper and steering hooks
+├── routing/       Fixed and adaptive route-selection models
+├── steering/      SteerNet V5/V2 implementations and norm loading
+├── training/      RFT, fixed-route, on-policy, checkpoint, metric, bank, router, batch, and optimizer utilities
+└── utils/         Logging and CLI runtime setup
 
 scripts/
-├── run_ars_pipeline.py        # Main entry: S1 → S2 → S5 → bench
-└── calibrate_norms.py         # Per-layer norm calibration for cap envelope
+├── calibrate_norms.py        Collect layer norm calibration statistics
+├── run_ars_pipeline.py       Existing fixed-route, gate, router, and benchmark entry point
+├── run_rft_pipeline.py       Session 1/2 equivalence, Gate 0, rollout, and RFT stages
+└── run_session3_router.py   Session 3 steering-bank, router, and benchmark stages
 
 notebooks/
-├── kaggle_ars_runner.ipynb    # End-to-end Kaggle execution notebook
-└── ood_evaluation.ipynb       # Out-of-distribution evaluation (SVAMP, ASDiv, etc.)
+├── kaggle_ars_runner.ipynb             Session 1/2 execution
+├── kaggle_ars_session3_router.ipynb    Session 3 execution and diagnostics
+├── kaggle_ars_equivalence_debug.ipynb  Isolated generation-equivalence experiments
+└── ood_evaluation.ipynb                Out-of-distribution evaluation
 
-tests/                         # 22 unit tests covering core components
+tests/                    Unit and contract tests for supported paths
+docs/                     Architecture, training, and change documentation
 ```
 
-## Quick Start
+## Setup
 
-```bash
-# 1. Install dependencies
-pip install transformers>=4.36.0 datasets>=2.16.0 accelerate>=0.25.0 tqdm
+Install the packages listed in `requirements.txt` in an environment with PyTorch configured for the target hardware. The benchmark and training scripts download Phi-2 and GSM8K through Hugging Face, so the runtime needs access to those artifacts or a populated local cache.
 
-# 2. Calibrate per-layer norms
-python scripts/calibrate_norms.py --output norms_calibration.json \
-    --candidate_layers 8 11 13 15 17 19 20 21 22 24
+Run the repository test suite from the project root:
 
-# 3. Run full pipeline (S1 training → S2 router → S5 calibration → benchmark)
-python scripts/run_ars_pipeline.py --stage all --steernet_arch v5 \
-    --s1_epochs 5 --s1_lr 5e-4 --s1_train_n 7473 \
-    --s_fixed 8,11,13,15,17,19,20,21,22,24
-
-# 4. Run tests
-pytest tests/ -q
+```powershell
+python -m pytest tests/ -x -q
 ```
 
-For Kaggle execution with GPU, use `notebooks/kaggle_ars_runner.ipynb`.
+For Kaggle, open the relevant notebook and run its runtime setup and configuration cells before the session cells. The notebooks print the selected artifact paths, scale settings, phase status, and output directory. Keep generated checkpoints and reports in the run output directory; they are not source files.
 
-## Key Hyperparameters
+## Entry-point stages
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `rho_max` | 0.06 | Maximum relative steering amplitude |
-| `steer_kappa` | 0.04 | Cap envelope coefficient (C_l = kappa * N_l) |
-| `lora_rank` | 16 | SteerNet bottleneck rank |
-| `phase1_epochs` | 5 | S1 training epochs |
-| `kl_weight` | 2.0 | KL divergence penalty (preserves base model on easy inputs) |
-| `focal_gamma` | 1.0 | Focal loss concentration on hard tokens |
-| `router_max_k` | 8 | Maximum layers the router can select |
-| `phase2_epochs` | 3 | S2 router training epochs |
-| `on_policy_start_epoch` | 2 | First epoch for on-policy data collection |
+`scripts/run_rft_pipeline.py` exposes `equivalence`, `gate0`, `collect`, `train`, and `all` stages. Use `--n_questions` and stage-specific options to control probe and collection sizes. `--skip_collection` with `--rollout_dir` reuses existing shards for training; V2 runs also require a compatible p99 norm-calibration file.
 
-## Design Principles
+`scripts/run_session3_router.py` exposes `train_bank`, `train_router`, and `benchmark`. Bank and router training consume the same positive rollout corpus. The benchmark evaluates the fixed V2 arm and, when compatible bank/router artifacts exist, the adaptive router arm on the same deterministic GSM8K subset.
 
-1. **Zero heuristics** — No manual thresholds, no static layer tables. Everything is learned or calibrated.
-2. **Frozen backbone** — The base Phi-2 model is never modified. All steering is additive through the residual stream.
-3. **Relative amplitude** — Steering magnitude scales with the local hidden-state norm, making it resolution-invariant across layers.
-4. **Prompt shielding** — Few-shot demonstrations are protected from steering to prevent format regression in multi-shot settings.
+The existing `scripts/run_ars_pipeline.py` remains the compatibility entry point for fixed-route Phase 1, optional contrastive/STaR experiments, legacy router/gate stages, deployment calibration, GSM8K benchmarking, and OOD runs. Its public imports are also used by the other scripts and tests, so retain them when reorganizing the implementation.
 
-## Citation
+## Research results
 
-This is an active research project. If you use this work, please cite the repository.
+Results are run-specific. Use the paired JSON report generated for the exact run, test subset, seed, and prompt-shot condition when comparing arms. Do not treat a 50-, 400-, or 800-question subset as a full GSM8K test-set result, and do not compare unpaired accuracy values when paired per-question records are available.
 
 ## License
 

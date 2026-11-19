@@ -1,4 +1,4 @@
-"""Paired GSM8K evaluation for baseline and fixed-route ARS."""
+"""Paired GSM8K evaluation for the supported ARS benchmark arms."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from src.evaluation.chain import (
     audit_chain,
     classify_outcome,
     paired_bootstrap_ci,
-    stop_pattern,
 )
 
 

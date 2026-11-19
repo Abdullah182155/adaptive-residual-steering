@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List, Tuple, Optional, Callable
+from typing import List, Callable
 
 class JointLayerRouter(nn.Module):
     """Scores candidate layers JOINTLY using self-attention and derives a trainable K.
