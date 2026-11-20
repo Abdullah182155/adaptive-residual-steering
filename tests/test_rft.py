@@ -439,6 +439,64 @@ def test_rft_activates_checkpoint_layers_without_enabling_backbone_dropout():
     assert layer.dropout.training is False
 
 
+def test_evaluate_generation_clears_per_example_intervention_gain(monkeypatch):
+    from types import SimpleNamespace
+    import torch
+    import src.training.rft_trainer as trainer
+
+    class FakeModel:
+        intervention_gain = None
+
+        def eval(self):
+            return self
+
+        def set_routing_override(self, *_args):
+            pass
+
+        def set_intervention_gain(self, gain):
+            self.intervention_gain = torch.as_tensor(gain)
+
+        def set_intervention_gains(self, gains):
+            self.intervention_gain = torch.as_tensor(gains)
+
+    monkeypatch.setattr(
+        trainer,
+        "build_prompts",
+        lambda _tokenizer, questions, *_args, **_kwargs: (questions, None),
+    )
+    monkeypatch.setattr(
+        trainer,
+        "generate_batch",
+        lambda _model, _tokenizer, prompts, *_args, **_kwargs: [
+            SimpleNamespace(text="#### 1", n_new_tokens=1) for _ in prompts
+        ],
+    )
+
+    model = FakeModel()
+    cfg = SimpleNamespace(
+        fixed_layers=[12, 15, 18, 21],
+        shield_policy="none",
+        diversify_prompts=False,
+        generation_max_new_tokens=8,
+        max_tok_len=32,
+    )
+    rows = [{"question": f"Question {i}", "final_num": "1"} for i in range(3)]
+
+    trainer.evaluate_generation(
+        model,
+        object(),
+        rows,
+        cfg,
+        "cpu",
+        batch_size=2,
+        steered=True,
+        intervention_gain=0.75,
+    )
+
+    assert model.intervention_gain.ndim == 0
+    assert model.intervention_gain.item() == 1.0
+
+
 def test_equivalence_stage_respects_requested_question_count(tmp_path, monkeypatch):
     import scripts.run_rft_pipeline as runner
 

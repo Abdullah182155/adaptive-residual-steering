@@ -172,6 +172,10 @@ def evaluate_generation(
         "strict_accuracy": 100 * sum(strict) / len(strict),
         "mean_tokens": sum(lengths) / len(lengths),
     }
+    # Per-example gains are only valid for the evaluation batch that installed
+    # them. Restore the scalar default before another batch size is used.
+    if hasattr(model, "set_intervention_gain"):
+        model.set_intervention_gain(1.0)
     return flags, metrics
 
 
@@ -288,6 +292,9 @@ def train_phase1_rft(
     best_state = None
     history: list[dict[str, Any]] = []
     for epoch in range(epochs):
+        # Clear any per-example gain left by validation before training forwards.
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
         model.train()
         checkpointed_modules = _enable_checkpointing_without_dropout(model.base_model)
         if target_device.type == "cuda" and checkpointed_modules == 0:
