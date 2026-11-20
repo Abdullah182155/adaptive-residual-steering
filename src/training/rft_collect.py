@@ -221,17 +221,21 @@ def tokenize_rft_example(
     cfg,
     *,
     question_index: int = 0,
+    completion_index: int = 0,
     n_shot: int = 0,
     template_id: int = 0,
     max_length: Optional[int] = None,
-) -> Optional[dict[str, torch.Tensor]]:
+) -> Optional[dict[str, Any]]:
     """Tokenize completion-only targets, shrinking demonstrations without truncation."""
     max_length = int(max_length or cfg.max_tok_len)
     policy = getattr(cfg, "shield_policy", "prompt")
     original_padding_side = tokenizer.padding_side
     tokenizer.padding_side = "right"
     try:
-        for active_shots in range(n_shot, -1, -1):
+        shot_candidates = list(range(n_shot, -1, -2))
+        if not shot_candidates or shot_candidates[-1] != 0:
+            shot_candidates.append(0)
+        for active_shots in shot_candidates:
             prompt, _, _ = build_prompt_with_shield(
                 tokenizer,
                 question,
@@ -285,6 +289,11 @@ def tokenize_rft_example(
                 "attention_mask": torch.tensor(attention, dtype=torch.long),
                 "labels": torch.tensor(labels, dtype=torch.long),
                 "prompt_shield_mask": torch.tensor(shield, dtype=torch.bool),
+                "question_index": int(question_index),
+                "completion_index": int(completion_index),
+                "effective_shots": int(active_shots),
+                "template_id": int(template_id),
+                "prompt_signature": tuple(int(token_id) for token_id in prompt_encoded["input_ids"]),
             }
         return None
     finally:
@@ -301,7 +310,7 @@ def build_rft_rows(
     seed: int = 0,
     shot_weights: Sequence[float] = (0.60, 0.25, 0.15),
     diversify_prompt_templates: bool = False,
-) -> tuple[list[dict[str, torch.Tensor]], dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build verified RFT rows with configurable shot mix and safe template diversity."""
     if max_rows_per_question < 1:
         raise ValueError("max_rows_per_question must be positive")
@@ -333,7 +342,7 @@ def build_rft_rows(
                 stats["questions_with_positive"] += 1
                 candidates = list(unique.values())
                 rng.shuffle(candidates)
-                for completion in candidates[:max_rows_per_question]:
+                for completion_index, completion in enumerate(candidates[:max_rows_per_question]):
                     n_shot = rng.choices([0, 2, 4], weights=shot_weights)[0]
                     template_id = (
                         (int(record["question_index"]) + len(rows)) % 3
@@ -346,6 +355,7 @@ def build_rft_rows(
                         completion,
                         cfg,
                         question_index=int(record["question_index"]),
+                        completion_index=completion_index,
                         n_shot=n_shot,
                         template_id=template_id,
                         max_length=max_length,

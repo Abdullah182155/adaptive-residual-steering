@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -21,7 +22,11 @@ from src.evaluation.benchmark import run_benchmark, write_record, write_report
 from src.models.loading import load_frozen_phi2 as build_model
 from src.steering.steernet import load_layer_norms
 from src.training.adaptive_data import build_adaptive_rft_splits
-from src.training.adaptive_router_training import load_adaptive_router, train_adaptive_router
+from src.training.adaptive_router_training import (
+    load_adaptive_router,
+    select_static_bank_action,
+    train_adaptive_router,
+)
 from src.training.adaptive_subset_training import train_adaptive_steering_bank
 
 
@@ -45,6 +50,8 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--max_rows_per_question", type=int, default=2)
     parser.add_argument("--max_router_rows", type=int, default=128)
     parser.add_argument("--route_cost", type=float, default=0.01)
+    parser.add_argument("--static_screen_questions", type=int, default=16)
+    parser.add_argument("--diversify_prompts", action="store_true")
     parser.add_argument("--route_examples_per_layer", type=int, default=256)
     parser.add_argument("--screen_validation_rows", type=int, default=24)
     parser.add_argument("--max_pair_routes", type=int, default=12)
@@ -71,6 +78,7 @@ def _configure(args):
     cfg.fixed_layers = list(candidates)
     cfg.objective = "nll"
     cfg.use_gate = False
+    cfg.diversify_prompts = bool(args.diversify_prompts)
     cfg.steernet_use_mag_head = False
     cfg.steernet_use_conv = False
     cfg.steer_scale = 1.0
@@ -81,6 +89,14 @@ def _configure(args):
     cfg.layer_norms_calibration = str(args.norm_calibration)
     cfg.report_dir = str(args.output_dir)
     return cfg, candidates
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _load_model(cfg, device):
@@ -149,12 +165,9 @@ def _load_rollouts(args) -> list[Path]:
 
 def run(args) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    has_router_artifacts = (
-        args.bank_checkpoint.is_file()
-        and args.router_checkpoint.is_file()
-        and args.norm_calibration.is_file()
-    )
-    if args.stage == "benchmark" and not has_router_artifacts:
+    has_bank_artifacts = args.bank_checkpoint.is_file() and args.norm_calibration.is_file()
+    has_router_artifacts = has_bank_artifacts and args.router_checkpoint.is_file()
+    if args.stage == "benchmark" and not has_bank_artifacts:
         # Preserve a useful baseline/V2 paired report when adaptive training did
         # not finish; the notebook can still complete and report the missing arm.
         args.candidate_layers = list(V2_ROUTE)
@@ -175,6 +188,7 @@ def run(args) -> int:
             max_questions=args.max_questions,
             max_rows_per_question=args.max_rows_per_question,
             seed=args.seed,
+            diversify_prompt_templates=args.diversify_prompts,
         )
         result = train_adaptive_steering_bank(
             model,
@@ -190,6 +204,7 @@ def run(args) -> int:
             max_pair_routes=args.max_pair_routes,
             max_triple_routes=args.max_triple_routes,
             max_quad_routes=args.max_quad_routes,
+            anchor_routes=[V2_ROUTE],
         )
         print(json.dumps({"data": stats, "training": result}, default=str), flush=True)
         return 0
@@ -205,7 +220,28 @@ def run(args) -> int:
             max_questions=args.max_questions,
             max_rows_per_question=args.max_rows_per_question,
             seed=args.seed,
+            diversify_prompt_templates=args.diversify_prompts,
         )
+        static_action = select_static_bank_action(
+            model,
+            validation_rows,
+            candidates,
+            bank_state.get("curriculum", {}).get("catalog", []),
+            device,
+            route_cost=args.route_cost,
+            max_questions=args.static_screen_questions,
+        )
+        static_action.update({
+            "format": "ars_static_bank_action_v1",
+            "bank_checkpoint": str(args.bank_checkpoint),
+            "bank_sha256": _sha256(args.bank_checkpoint),
+            "candidate_layers": list(candidates),
+            "seed": args.seed,
+        })
+        static_action_path = args.output_dir / "session3_static_bank_action.json"
+        temporary = static_action_path.with_suffix(static_action_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(static_action, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(static_action_path)
         result = train_adaptive_router(
             model,
             train_rows,
@@ -218,6 +254,8 @@ def run(args) -> int:
             seed=args.seed,
             max_train_rows=args.max_router_rows,
             route_cost=args.route_cost,
+            # Hold gain at the bank's training value to isolate route selection.
+            alpha_values=(1.0,),
             route_catalog=bank_state.get("curriculum", {}).get("catalog"),
         )
         print(json.dumps({"data": stats, "training": {k: v for k, v in result.items() if k != "router"}}, default=str), flush=True)
@@ -225,13 +263,28 @@ def run(args) -> int:
 
     if args.stage != "benchmark":
         raise ValueError(f"unknown stage {args.stage}")
-    if has_router_artifacts:
+    static_action = None
+    if has_bank_artifacts:
         _apply_norm_refs(model, args.norm_calibration)
         _load_bank(model, args.bank_checkpoint)
-        router, router_prefill, probe = load_adaptive_router(
-            model, args.router_checkpoint, device
-        )
-        active_arms = ["baseline", "steer_only", "router"]
+        static_action_path = args.output_dir / "session3_static_bank_action.json"
+        if static_action_path.is_file():
+            candidate_action = json.loads(static_action_path.read_text(encoding="utf-8"))
+            if candidate_action.get("bank_sha256") == _sha256(args.bank_checkpoint):
+                static_action = candidate_action
+            else:
+                print("[session3] Ignoring static bank action selected for a different bank checkpoint", flush=True)
+        if has_router_artifacts:
+            router, router_prefill, probe = load_adaptive_router(
+                model, args.router_checkpoint, device
+            )
+        else:
+            router_prefill, probe = None, None
+        active_arms = ["baseline", "steer_only"]
+        if static_action is not None:
+            active_arms.append("static_bank")
+        if has_router_artifacts:
+            active_arms.append("router")
     else:
         router_prefill = None
         probe = None
@@ -242,6 +295,11 @@ def run(args) -> int:
         if arm == "steer_only":
             cfg.fixed_layers = list(V2_ROUTE)
             _load_v2_weights(model, args.v2_checkpoint, args.v2_norm_calibration)
+        elif arm == "static_bank" and static_action is not None:
+            cfg.static_bank_route = list(static_action["route"])
+            cfg.static_bank_alpha = float(static_action["alpha"])
+            cfg.fixed_layers = list(candidates)
+            _load_bank(model, args.bank_checkpoint)
         elif arm == "router":
             cfg.fixed_layers = list(candidates)
             _load_bank(model, args.bank_checkpoint)
@@ -263,10 +321,10 @@ def run(args) -> int:
     record["fixed_v2_route"] = list(V2_ROUTE)
     record["router_candidate_layers"] = list(candidates)
     record["router_checkpoint"] = str(args.router_checkpoint)
+    record["static_bank_action"] = static_action
+    record["static_bank_checkpoint"] = str(args.bank_checkpoint) if static_action else None
     record["fixed_v2_checkpoint"] = str(args.v2_checkpoint)
-    record["router_status"] = (
-        "included" if "router" in active_arms else "not_available_baseline_and_v2_only"
-    )
+    record["router_status"] = "included" if "router" in active_arms else "not_available"
     record_path = args.output_dir / f"session3_gsm8k_{args.bench_n}_seed{args.bench_seed}.json"
     write_record(record, str(record_path))
     write_report(record, str(args.output_dir))

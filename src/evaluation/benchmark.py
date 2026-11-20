@@ -39,6 +39,10 @@ def _set_gate_mode(model, enabled: bool) -> None:
 
 def _configure_arm(model, arm: str, cfg, gate_provider=None) -> None:
     """Set routing, gain, and gate state explicitly for one benchmark arm."""
+    if hasattr(model, "set_route_gains"):
+        model.set_route_gains(None)
+    if hasattr(model, "set_intervention_gains"):
+        model.set_intervention_gains(None)
     gate_enabled = arm in {"gate", "full"}
     if hasattr(cfg, "use_gate"):
         cfg.use_gate = gate_enabled
@@ -75,6 +79,21 @@ def _configure_arm(model, arm: str, cfg, gate_provider=None) -> None:
             model.set_steer_scale(1.0)
         if hasattr(model, "set_intervention_gain"):
             model.set_intervention_gain(1.0)
+        if hasattr(model, "set_control"):
+            model.set_control(None)
+        _set_gate_mode(model, enabled=False)
+    elif arm == "static_bank":
+        route = list(getattr(cfg, "static_bank_route", ()))
+        alpha = float(getattr(cfg, "static_bank_alpha", 1.0))
+        model.set_routing_override("only", route)
+        if hasattr(model, "set_route_selector"):
+            model.set_route_selector(None)
+        if hasattr(model, "set_steer_scale"):
+            model.set_steer_scale(1.0)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        if hasattr(model, "set_route_gains"):
+            model.set_route_gains(alpha)
         if hasattr(model, "set_control"):
             model.set_control(None)
         _set_gate_mode(model, enabled=False)
@@ -194,6 +213,12 @@ def _summary(results: List[Dict[str, object]]) -> Dict[str, float]:
 def _paired_counts(
     baseline: List[Dict[str, object]], fixed: List[Dict[str, object]]
 ) -> Dict[str, Any]:
+    if len(baseline) != len(fixed):
+        raise ValueError(f"paired arms have different row counts: {len(baseline)} vs {len(fixed)}")
+    baseline_ids = [item.get("source_index") for item in baseline]
+    fixed_ids = [item.get("source_index") for item in fixed]
+    if any(value is not None for value in baseline_ids + fixed_ids) and baseline_ids != fixed_ids:
+        raise ValueError("paired arms have different source question IDs or ordering")
     wins = losses = ties = 0
     for control, treatment in zip(baseline, fixed):
         if treatment["lenient"] and not control["lenient"]:
@@ -258,7 +283,7 @@ def run_benchmark(
     for n_shot in shots:
         arm_results: Dict[str, List[Dict[str, object]]] = {}
         for arm in arms:
-            if arm not in {"baseline", "fixed", "steer_only", "identity", "random", "router", "gate", "full"} and not arm.startswith("steer_gain:"):
+            if arm not in {"baseline", "fixed", "steer_only", "identity", "random", "router", "static_bank", "gate", "full"} and not arm.startswith("steer_gain:"):
                 raise ValueError(f"unsupported benchmark arm: {arm}")
             if arm_setup is not None:
                 arm_setup(arm)
@@ -283,7 +308,9 @@ def run_benchmark(
                     model.set_control("random", seed=row_idx)
 
                 selected_alpha = (
-                    float(arm.split(":", 1)[1]) if arm.startswith("steer_gain:") else 1.0
+                    float(arm.split(":", 1)[1]) if arm.startswith("steer_gain:")
+                    else float(getattr(cfg, "static_bank_alpha", 1.0)) if arm == "static_bank"
+                    else 1.0
                 )
 
                 text, meta = _generate(
@@ -302,12 +329,12 @@ def run_benchmark(
                     template_id=row_idx % 3 if getattr(cfg, "diversify_prompts", False) else 0,
                 )
                 selected_route: List[int] = []
-                if arm == "router" and hasattr(model, "current_routes"):
+                if arm in {"router", "static_bank"} and hasattr(model, "current_routes"):
                     routes_now = model.current_routes()
                     if routes_now:
                         selected_route = [int(layer) for layer in routes_now[0]]
                     gains = getattr(model, "_route_gains", None)
-                    if gains is not None:
+                    if gains is not None and arm == "router":
                         gains = torch.as_tensor(gains).detach().flatten()
                         if gains.numel():
                             selected_alpha = float(gains[0].cpu())
@@ -330,7 +357,7 @@ def run_benchmark(
                     guard.get("rel_max", 0.0)
                 ) > float(cap)
                 if (
-                    (arm in {"fixed", "steer_only", "random", "gate"} or arm.startswith("steer_gain:"))
+                    (arm in {"fixed", "steer_only", "random", "static_bank", "gate"} or arm.startswith("steer_gain:"))
                     and cfg.guard_revert_to_k0
                     and (guard_trip or guard.get("nonfinite", False))
                 ):
@@ -349,7 +376,12 @@ def run_benchmark(
                         no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
                         template_id=row_idx % 3 if getattr(cfg, "diversify_prompts", False) else 0,
                     )
-                    model.set_routing_override("only", cfg.fixed_layers)
+                    fallback_layers = (
+                        getattr(cfg, "static_bank_route", [])
+                        if arm == "static_bank"
+                        else cfg.fixed_layers
+                    )
+                    model.set_routing_override("only", fallback_layers)
 
                 gold_num = _gold(row["answer"])
                 scored = _score(text, gold_num)
@@ -358,6 +390,7 @@ def run_benchmark(
                 audit = audit_chain(text, row["question"])
                 results.append(
                     {
+                        "source_index": int(row.get("source_index", row_idx)),
                         **scored,
                         "text": text,
                         "pred_marker": pred_marker,
@@ -369,9 +402,9 @@ def run_benchmark(
                         "nonfinite": bool(guard.get("nonfinite", False)),
                         "car": audit["car"],
                         "eaa": audit["eaa"],
-                        "selected_layers": selected_route if arm == "router" else None,
-                        "selected_k": len(selected_route) if arm == "router" else None,
-                        "selected_alpha": selected_alpha if (arm == "router" or arm.startswith("steer_gain:")) else None,
+                        "selected_layers": selected_route if arm in {"router", "static_bank"} else None,
+                        "selected_k": len(selected_route) if arm in {"router", "static_bank"} else None,
+                        "selected_alpha": selected_alpha if (arm in {"router", "static_bank"} or arm.startswith("steer_gain:")) else None,
                     }
                 )
                 progress.set_postfix(correct=sum(item["lenient"] for item in results))
@@ -491,12 +524,35 @@ def run_benchmark(
                 )
 
         # Paired stats: baseline vs router (when both present)
-        if "baseline" in arm_results and "router" in arm_results:
-            router_paired = _paired_counts(arm_results["baseline"], arm_results["router"])
-            shot_record["paired_router"] = router_paired
-            shot_record["paired_router"]["mcnemar_p_value"] = mcnemar_exact(
-                router_paired["fixed_wins"], router_paired["fixed_losses"]
+        for candidate_arm in ("static_bank", "router"):
+            if "baseline" in arm_results and candidate_arm in arm_results:
+                paired = _paired_counts(arm_results["baseline"], arm_results[candidate_arm])
+                paired["mcnemar_p_value"] = mcnemar_exact(
+                    paired["fixed_wins"], paired["fixed_losses"]
+                )
+                identical = sum(
+                    baseline["text"] == treatment["text"]
+                    for baseline, treatment in zip(arm_results["baseline"], arm_results[candidate_arm])
+                ) / max(len(rows), 1)
+                paired["identical_text_rate"] = identical
+                paired["null_intervention_warning"] = identical > 0.95
+                shot_record[f"paired_{candidate_arm}"] = paired
+            if "steer_only" in arm_results and candidate_arm in arm_results:
+                paired = _paired_counts(arm_results["steer_only"], arm_results[candidate_arm])
+                paired["mcnemar_p_value"] = mcnemar_exact(
+                    paired["fixed_wins"], paired["fixed_losses"]
+                )
+                shot_record[f"{candidate_arm}_vs_fixed_v2"] = paired
+        if "static_bank" in arm_results and "router" in arm_results:
+            paired = _paired_counts(arm_results["static_bank"], arm_results["router"])
+            paired["mcnemar_p_value"] = mcnemar_exact(
+                paired["fixed_wins"], paired["fixed_losses"]
             )
+            paired["identical_text_rate"] = sum(
+                static["text"] == routed["text"]
+                for static, routed in zip(arm_results["static_bank"], arm_results["router"])
+            ) / max(len(rows), 1)
+            shot_record["router_vs_static_bank"] = paired
 
         record["shots"][str(n_shot)] = shot_record
     return record
@@ -517,7 +573,7 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
         "|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for shots, result in record["shots"].items():
-        for arm in ("baseline", "identity", "fixed", "steer_only", "random"):
+        for arm in ("baseline", "identity", "fixed", "steer_only", "static_bank", "router", "random"):
             if arm not in result:
                 continue
             summary = result[arm]
@@ -548,6 +604,30 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
                     "",
                 ]
             )
+        for key, label in (
+            ("paired_static_bank", "static_bank vs baseline"),
+            ("static_bank_vs_fixed_v2", "static_bank vs fixed V2"),
+            ("paired_router", "router vs baseline"),
+            ("router_vs_fixed_v2", "router vs fixed V2"),
+            ("router_vs_static_bank", "router vs validation-selected static bank"),
+        ):
+            if key not in result:
+                continue
+            paired = result[key]
+            ci = paired.get("ci95_pp", [0.0, 0.0])
+            p_val = paired.get("mcnemar_p_value", 1.0)
+            p_str = f"{p_val:.4f}" if p_val >= 0.0001 else f"{p_val:.2e}"
+            lines.append(
+                f"{shots}-shot paired {label}: {paired['fixed_wins']} wins, "
+                f"{paired['fixed_losses']} losses, {paired['ties']} ties; "
+                f"delta={paired.get('delta_pp', 0.0):+.2f} pp, "
+                f"95% CI=[{ci[0]:+.2f}, {ci[1]:+.2f}], McNemar p={p_str}."
+            )
+        if any(key in result for key in (
+            "paired_static_bank", "static_bank_vs_fixed_v2", "paired_router",
+            "router_vs_fixed_v2", "router_vs_static_bank"
+        )):
+            lines.append("")
     report_path = destination / f"REPORT_{suite.upper()}.md"
     content = "\n".join(lines) + "\n"
     report_path.write_text(content, encoding="utf-8")

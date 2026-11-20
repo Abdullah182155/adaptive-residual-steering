@@ -74,6 +74,7 @@ def train_adaptive_steering_bank(
     max_pair_routes: int = 12,
     max_triple_routes: int = 8,
     max_quad_routes: int = 6,
+    anchor_routes: Sequence[Sequence[int]] = (),
 ) -> dict[str, Any]:
     """Curriculum-train singleton, paired, triple, and quad-layer routes.
 
@@ -110,8 +111,13 @@ def train_adaptive_steering_bank(
     if target_device.type == "cuda" and checkpointed_modules == 0:
         raise RuntimeError("CUDA adaptive training requires active gradient checkpointing")
 
-    screen_rows = list(validation_rows[:screen_validation_rows])
-    if not screen_rows:
+    screen_by_question: dict[int, list[dict]] = {}
+    for index, item in enumerate(validation_rows):
+        question_id = int(item.get("question_index", index))
+        screen_by_question.setdefault(question_id, []).append(item)
+    screen_questions = list(screen_by_question.items())[:screen_validation_rows]
+    screen_row_count = sum(len(question_rows) for _, question_rows in screen_questions)
+    if not screen_questions:
         raise ValueError("route screening needs at least one validation row")
     curriculum: dict[str, Any] = {
         "depth_bands": {
@@ -120,6 +126,7 @@ def train_adaptive_steering_bank(
             "late": [layer for layer in candidates if layer >= 22],
         },
         "stages": {},
+        "training_orders": {},
         "k0_validation_nll": None,
     }
     total_examples = 0
@@ -133,14 +140,18 @@ def train_adaptive_steering_bank(
         checkpointed_modules = _enable_checkpointing_without_dropout(model.base_model)
         if target_device.type == "cuda" and checkpointed_modules == 0:
             raise RuntimeError("CUDA adaptive training requires active gradient checkpointing")
+        stage_seed = seed + sum(ord(char) for char in stage)
+        seed_indices = list(range(len(train_rows)))
+        random.Random(stage_seed).shuffle(seed_indices)
+        selected_indices = seed_indices[: min(examples_per_route, len(train_rows))]
+        route_order = list(routes)
+        random.Random(stage_seed + 1).shuffle(route_order)
+        curriculum["training_orders"][stage] = [list(route) for route in route_order]
         progress = tqdm(
-            total=len(routes) * min(examples_per_route, len(train_rows)) * epochs,
+            total=len(route_order) * len(selected_indices) * epochs,
             desc=f"Adaptive bank {stage}", unit="example", file=sys.stdout, mininterval=0.5,
         )
-        for route_index, route in enumerate(routes):
-            seed_indices = list(range(len(train_rows)))
-            random.Random(seed + route_index + len(route) * 1009).shuffle(seed_indices)
-            selected_indices = seed_indices[: min(examples_per_route, len(train_rows))]
+        for route in route_order:
             mask = torch.tensor(
                 [[layer in route for layer in candidates]], dtype=torch.bool, device=target_device
             )
@@ -148,7 +159,7 @@ def train_adaptive_steering_bank(
             model.set_route_gains(torch.ones(1, device=target_device))
             for epoch in range(epochs):
                 order = list(selected_indices)
-                random.Random(seed + route_index * 100 + epoch).shuffle(order)
+                random.Random(stage_seed + epoch).shuffle(order)
                 optimizer.zero_grad(set_to_none=True)
                 for start in range(0, len(order), grad_accum):
                     window = order[start : start + grad_accum]
@@ -193,40 +204,41 @@ def train_adaptive_steering_bank(
     def score_routes(routes: Sequence[tuple[int, ...]], stage: str) -> list[tuple[tuple[int, ...], float]]:
         model.eval()
         scored: list[tuple[tuple[int, ...], float]] = []
-        progress = tqdm(
-            total=(len(routes) + int(() not in routes)) * len(screen_rows), desc=f"Screen routes {stage}",
-            unit="route-example", file=sys.stdout, mininterval=0.5,
-        )
         route_sets = [tuple(route) for route in routes]
         if () not in route_sets:
             route_sets = [(), *route_sets]
+        progress = tqdm(
+            total=len(route_sets) * screen_row_count, desc=f"Screen routes {stage}",
+            unit="route-example", file=sys.stdout, mininterval=0.5,
+        )
         for route in route_sets:
             mask = torch.tensor(
                 [[layer in route for layer in candidates]], dtype=torch.bool, device=target_device
             )
             model.set_routing_override("matrix", mask)
             model.set_route_gains(torch.ones(1, device=target_device))
-            nll_total = 0.0
-            token_total = 0
-            for item in screen_rows:
-                row, extras = _prepare([item], target_device)
-                model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
-                with torch.autocast(
-                    device_type=target_device.type,
-                    enabled=target_device.type == "cuda",
-                ):
-                    logits = model(
-                        input_ids=row["input_ids"],
-                        attention_mask=row["attention_mask"],
-                        use_cache=False,
-                    ).logits
-                    nll = _nll_sum(logits, row["labels"])
-                token_count = int(row["labels"][:, 1:].ne(-100).sum())
-                nll_total += float(nll.float())
-                token_total += token_count
-                del nll, logits, row, extras
-                progress.update(1)
-            scored.append((route, nll_total / max(token_total, 1)))
+            question_scores = []
+            for _, question_rows in screen_questions:
+                completion_scores = []
+                for item in question_rows:
+                    row, extras = _prepare([item], target_device)
+                    model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
+                    with torch.autocast(
+                        device_type=target_device.type,
+                        enabled=target_device.type == "cuda",
+                    ):
+                        logits = model(
+                            input_ids=row["input_ids"],
+                            attention_mask=row["attention_mask"],
+                            use_cache=False,
+                        ).logits
+                        nll = _nll_sum(logits, row["labels"])
+                    token_count = int(row["labels"][:, 1:].ne(-100).sum())
+                    completion_scores.append(float(nll.float()) / max(token_count, 1))
+                    del nll, logits, row, extras
+                    progress.update(1)
+                question_scores.append(sum(completion_scores) / max(len(completion_scores), 1))
+            scored.append((route, sum(question_scores) / max(len(question_scores), 1)))
         progress.close()
         model.set_routing_override("none", candidates)
         model.set_route_gains(None)
@@ -247,6 +259,8 @@ def train_adaptive_steering_bank(
         curriculum["stages"][stage] = {
             "candidates": [list(route) for route in routes],
             "selected": [list(route) for route in selected],
+            "screen_questions": len(screen_questions),
+            "screen_rows": screen_row_count,
             "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in scored},
         }
         return selected
@@ -303,10 +317,27 @@ def train_adaptive_steering_bank(
         "selected": [list(route) for route in quads],
         "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in quad_scores},
     }
-    curriculum["catalog"] = [[], *[list(route) for route in selected_singles],
-                              *[list(route) for route in pairs],
-                              *[list(route) for route in triples],
-                              *[list(route) for route in quads]]
+    catalog = [[], *[list(route) for route in selected_singles],
+               *[list(route) for route in pairs],
+               *[list(route) for route in triples],
+               *[list(route) for route in quads]]
+    normalized_anchors = []
+    for route in anchor_routes:
+        normalized = sorted(set(int(layer) for layer in route))
+        if len(normalized) > 4 or not set(normalized).issubset(candidates):
+            raise ValueError(f"invalid anchor route for adaptive bank: {normalized}")
+        normalized_anchors.append(normalized)
+        if normalized not in catalog:
+            catalog.append(normalized)
+    curriculum["catalog"] = catalog
+    curriculum["anchor_routes"] = [list(route) for route in normalized_anchors]
+    final_scores = score_routes(
+        [tuple(route) for route in catalog], "final_catalog_after_all_training"
+    )
+    curriculum["final_catalog_validation_token_mean_nll"] = {
+        "+".join(map(str, route)) if route else "k0": value
+        for route, value in final_scores
+    }
     _write_bank_checkpoint(model, cfg, candidates, save_path, epochs, curriculum)
     model.set_routing_override("none", candidates)
     model.set_route_gains(None)

@@ -131,10 +131,15 @@ PHASE1_EXECUTION_CHECKLIST.md
 *.jpg
 *.jpeg
 *.svg
+# Temporarily keep experiment notebooks local until the current runs are finalized.
 *.ipynb
-!notebooks/kaggle_ars_fixed_steering_fresh.ipynb
 *.tmp
 *.bak
+
+# Temporary local Phase 2 audit and proposal reports.
+# Remove these entries when the reports are ready to publish.
+/phase2_router_root_cause_audit_consolidated.md
+/proposal_agent*.md
 
 # Allow diagram assets in diagrams/
 !diagrams/
