@@ -108,14 +108,30 @@ def test_rft_runner_exposes_explicit_stages_and_two_t4_sharding():
 def test_rft_cli_exposes_fresh_training_mix_and_safe_microbatch_controls():
     args = parse_args([
         "--stage", "train", "--batch_size", "1", "--grad_accum", "32",
+        "--eval_questions", "8",
         "--train_shot_weights", "0.5", "0.3", "0.2",
         "--diversify_prompt_templates",
     ])
 
     assert args.batch_size == 1
     assert args.grad_accum == 32
+    assert args.eval_questions == 8
     assert args.train_shot_weights == [0.5, 0.3, 0.2]
     assert args.diversify_prompt_templates
+
+
+def test_rft_eval_question_count_defaults_to_100():
+    args = parse_args(["--stage", "train"])
+
+    assert args.eval_questions == 100
+
+
+def test_rft_runner_rejects_nonpositive_eval_question_count():
+    import pytest
+    import scripts.run_rft_pipeline as runner
+
+    with pytest.raises(ValueError, match="eval_questions.*positive"):
+        runner.run(parse_args(["--stage", "train", "--eval_questions", "0"]))
 
 
 def test_rft_cli_exposes_heldout_alpha_sweep():

@@ -115,6 +115,7 @@ def evaluate_generation(
     limit: Optional[int] = None,
     steered: bool,
     intervention_gain: float = 1.0,
+    progress_desc: Optional[str] = None,
 ) -> tuple[list[bool], dict[str, float]]:
     """Evaluate paired greedy generations and return lenient flags and diagnostics."""
     selected = list(rows[:limit] if limit is not None else rows)
@@ -127,6 +128,15 @@ def evaluate_generation(
     flags: list[bool] = []
     strict: list[bool] = []
     lengths: list[int] = []
+    progress = tqdm(
+        total=len(selected),
+        desc=progress_desc or "Generation evaluation",
+        unit="question",
+        file=sys.stdout,
+        disable=progress_desc is None,
+        mininterval=0.5,
+        leave=False,
+    )
     for start in range(0, len(selected), batch_size):
         batch_rows = selected[start : start + batch_size]
         if steered and hasattr(model, "set_intervention_gains"):
@@ -167,6 +177,8 @@ def evaluate_generation(
             flags.append(bool(score["lenient"]))
             strict.append(bool(score["strict"]))
             lengths.append(result.n_new_tokens)
+        progress.update(len(batch_rows))
+    progress.close()
     metrics = {
         "lenient_accuracy": 100 * sum(flags) / len(flags),
         "strict_accuracy": 100 * sum(strict) / len(strict),
@@ -253,11 +265,18 @@ def train_phase1_rft(
         )
 
     eval_rows = list(dev_rows[:dev_limit])
+    print(
+        f"[rft-eval] held-out questions={len(eval_rows)}; "
+        "baseline and checkpoint selection evaluate both 0-shot and 2-shot",
+        flush=True,
+    )
     baseline_flags, baseline_metrics = evaluate_generation(
-        model, tokenizer, eval_rows, cfg, target_device, n_shot=0, steered=False
+        model, tokenizer, eval_rows, cfg, target_device, n_shot=0, steered=False,
+        progress_desc="RFT eval baseline 0-shot",
     )
     baseline_2shot_flags, baseline_2shot_metrics = evaluate_generation(
-        model, tokenizer, eval_rows, cfg, target_device, n_shot=2, steered=False
+        model, tokenizer, eval_rows, cfg, target_device, n_shot=2, steered=False,
+        progress_desc="RFT eval baseline 2-shot",
     )
     # Baseline evaluation disables steering; restore the training route before
     # the first loss forward so adapter parameters remain connected to the graph.
@@ -391,14 +410,16 @@ def train_phase1_rft(
         progress.close()
 
         current_flags, diagnostics = evaluate_generation(
-            model, tokenizer, eval_rows, cfg, target_device, n_shot=0, steered=True
+            model, tokenizer, eval_rows, cfg, target_device, n_shot=0, steered=True,
+            progress_desc=f"RFT eval epoch {epoch + 1} 0-shot",
         )
         delta_pp = 100 * sum(
             int(current) - int(baseline)
             for current, baseline in zip(current_flags, baseline_flags)
         ) / len(baseline_flags)
         current_2shot_flags, two_shot_diagnostics = evaluate_generation(
-            model, tokenizer, eval_rows, cfg, target_device, n_shot=2, steered=True
+            model, tokenizer, eval_rows, cfg, target_device, n_shot=2, steered=True,
+            progress_desc=f"RFT eval epoch {epoch + 1} 2-shot",
         )
         delta_2shot_pp = 100 * sum(
             int(current) - int(baseline)
@@ -460,7 +481,8 @@ def train_phase1_rft(
     checkpoint_path = save_path or cfg.lora_save_path
     _save_rft_checkpoint(model, checkpoint_path, cfg)
     two_shot_flags, two_shot_metrics = evaluate_generation(
-        model, tokenizer, eval_rows, cfg, target_device, n_shot=2, steered=True
+        model, tokenizer, eval_rows, cfg, target_device, n_shot=2, steered=True,
+        progress_desc="RFT eval selected checkpoint 2-shot",
     )
     two_shot_metrics["delta_lenient_pp"] = 100 * sum(
         int(current) - int(baseline)
@@ -468,6 +490,7 @@ def train_phase1_rft(
     ) / len(baseline_2shot_flags)
     result = {
         "route": list(cfg.fixed_layers),
+        "validation_questions": len(eval_rows),
         "selected_epoch": best_epoch,
         "best_delta_lenient_pp": best_delta,
         "selected_2shot_delta_lenient_pp": best_2shot_delta,

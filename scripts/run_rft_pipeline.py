@@ -64,6 +64,15 @@ def parse_args(argv=None):
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--n_shards", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument(
+        "--eval_questions",
+        type=int,
+        default=100,
+        help=(
+            "number of held-out questions used for baseline and per-epoch generation "
+            "evaluation during training (default: 100)"
+        ),
+    )
     parser.add_argument("--batch_size", type=int, default=None, help="RFT micro-batch size")
     parser.add_argument("--grad_accum", type=int, default=None, help="RFT gradient accumulation steps")
     parser.add_argument(
@@ -206,10 +215,11 @@ def _gate0(
 def run(args) -> dict | None:
     if (
         (args.n_questions is not None and args.n_questions < 1)
+        or args.eval_questions < 1
         or args.k < 1
         or args.n_shards < 1
     ):
-        raise ValueError("n_questions, k, and n_shards must be positive")
+        raise ValueError("n_questions, eval_questions, k, and n_shards must be positive")
     if not 0 <= args.shard < args.n_shards:
         raise ValueError("shard must satisfy 0 <= shard < n_shards")
     if args.stage == "all" and args.n_shards != 1:
@@ -305,13 +315,14 @@ def run(args) -> dict | None:
     model, tokenizer = build_model(cfg, device)
     raw_train, raw_dev = gsm8k_to_cot(tokenizer, cfg)
     train_rows = prepare_dataset_split(raw_train.with_format(None))
-    dev_limit = (
-        max(100, equivalence_questions)
-        if args.stage in {"equivalence", "all"}
-        else max(300, args.n_questions or 300)
-        if args.stage == "alpha_sweep"
-        else 100
-    )
+    if args.stage in {"equivalence", "all"}:
+        dev_limit = max(100, equivalence_questions)
+    elif args.stage == "alpha_sweep":
+        dev_limit = max(300, args.n_questions or 300)
+    elif args.stage == "train":
+        dev_limit = args.eval_questions
+    else:
+        dev_limit = 100
     dev_rows = prepare_dataset_split(raw_dev.with_format(None), limit=dev_limit)
 
     if args.stage == "alpha_sweep":
@@ -468,6 +479,7 @@ def run(args) -> dict | None:
             device,
             tokenizer,
             epochs=args.epochs,
+            dev_limit=args.eval_questions,
             save_path=args.checkpoint,
         )
         result["rft_rows"] = row_stats
