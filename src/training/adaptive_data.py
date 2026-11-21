@@ -12,7 +12,8 @@ from src.training.rft_collect import reasoning_key, tokenize_rft_example
 
 
 # Shared objective for static-action and adaptive-router selection.
-TASK_SELECTION_SHOT_WEIGHTS = {0: 0.3, 2: 0.7}
+# The pilot evaluates 0-shot and 2-shot; 4-shot remains weighted for later runs.
+TASK_SELECTION_SHOT_WEIGHTS = {0: 0.7, 2: 0.2, 4: 0.1}
 
 
 def weighted_shot_average(values: Mapping[int, float], metric_name: str) -> tuple[float, str]:
@@ -20,9 +21,12 @@ def weighted_shot_average(values: Mapping[int, float], metric_name: str) -> tupl
     if not values:
         raise ValueError("at least one shot metric is required")
     active = {int(shot): float(value) for shot, value in values.items()}
-    weights = {
-        shot: TASK_SELECTION_SHOT_WEIGHTS.get(shot, 1.0) for shot in active
-    }
+    unsupported = sorted(set(active) - set(TASK_SELECTION_SHOT_WEIGHTS))
+    if unsupported:
+        raise ValueError(f"no task-selection weight is configured for shot counts: {unsupported}")
+    weights = {shot: TASK_SELECTION_SHOT_WEIGHTS[shot] for shot in active}
+    if any(weight < 0.0 for weight in weights.values()) or sum(weights.values()) <= 0.0:
+        raise ValueError("task-selection shot weights must be nonnegative with a positive active sum")
     weight_total = sum(weights.values())
     score = sum(weights[shot] * active[shot] for shot in active) / weight_total
     expression = " + ".join(

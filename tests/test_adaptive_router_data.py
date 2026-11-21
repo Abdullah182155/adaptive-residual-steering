@@ -4,16 +4,31 @@ from types import SimpleNamespace
 import torch
 
 
-def test_weighted_shot_objective_prioritizes_two_shot_and_reports_active_shots():
+def test_weighted_shot_objective_prioritizes_zero_shot_and_reports_active_shots():
     from src.training.adaptive_data import weighted_shot_average
 
-    value, expression = weighted_shot_average({0: 0.5, 2: 1.0}, "accuracy")
-    assert value == 0.85
-    assert expression == "0.3*accuracy_0shot + 0.7*accuracy_2shot"
+    value, expression = weighted_shot_average({0: 0.5, 2: 1.0, 4: 0.0}, "accuracy")
+    assert value == 0.55
+    assert expression == "0.7*accuracy_0shot + 0.2*accuracy_2shot + 0.1*accuracy_4shot"
+
+    pilot_value, pilot_expression = weighted_shot_average({0: 0.5, 2: 1.0}, "accuracy")
+    assert abs(pilot_value - (0.7 * 0.5 + 0.2 * 1.0) / 0.9) < 1e-12
+    assert pilot_expression == "0.777778*accuracy_0shot + 0.222222*accuracy_2shot"
 
     single_value, single_expression = weighted_shot_average({0: 0.5}, "accuracy")
     assert single_value == 0.5
     assert single_expression == "1*accuracy_0shot"
+
+
+def test_weighted_shot_objective_rejects_unconfigured_shot_counts():
+    from src.training.adaptive_data import weighted_shot_average
+
+    try:
+        weighted_shot_average({1: 0.5}, "accuracy")
+    except ValueError as exc:
+        assert "no task-selection weight" in str(exc)
+    else:
+        raise AssertionError("an unconfigured shot count must not silently receive a default weight")
 
 
 def test_preference_pair_shrinks_to_one_shared_prompt_when_lengths_differ(tmp_path, monkeypatch):

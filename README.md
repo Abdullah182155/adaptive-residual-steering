@@ -10,7 +10,7 @@ ARS trains small residual-stream steering modules for mathematical reasoning whi
 | Session 2 | Train or evaluate the V2 fixed route `[12, 15, 18, 21]` using rank 16 and calibrated p99 norms | `scripts/run_rft_pipeline.py` with `--steernet_arch v2` | V2 checkpoint and norm calibration |
 | Session 3 | Train a variable-route steering bank and prompt-conditioned router; compare baseline, fixed V2, validation-selected static bank, and router | `scripts/run_session3_router.py` | steering-bank checkpoint, router checkpoint, paired GSM8K/OOD reports and diagnostics |
 
-Session 3 can reuse attached rollout shards and existing V2 artifacts. Its Kaggle notebook also supports collecting rollouts or rebuilding missing V2 artifacts when configured to do so. Notebook configuration cells define the exact paths and execution scale for a run.
+Session 3's Kaggle notebook starts a fresh run: it collects new rollout shards, bootstraps V2 and the candidate bank, trains the router, then runs the 200-question 0/2-shot four-arm pilot. It does not load attached rollout shards, old checkpoints, or a previous bank. It only resumes shards from the current unique run directory if that same run is restarted. The selection objective weights 0/2/4-shot at 70/20/10 and renormalizes over the shot settings enabled for a run.
 
 ## Model and invariants
 
