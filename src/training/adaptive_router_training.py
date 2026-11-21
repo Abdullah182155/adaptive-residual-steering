@@ -765,13 +765,15 @@ def select_static_bank_action(
         for action_index in candidate_indices:
             route, alpha = actions[action_index]
             if route:
-                route_mask = torch.tensor(
-                    [[layer in route for layer in candidates]], dtype=torch.bool, device=target_device
-                )
-                model.set_routing_override("matrix", route_mask)
+                # The action is static for every prompt in this generation batch.
+                # "only" broadcasts the route to the batch dimension; a one-row
+                # matrix fails when generate_batch receives multiple questions.
+                model.set_routing_override("only", route)
             else:
                 model.set_routing_override("none", candidates)
-            model.set_route_gains(torch.tensor([alpha], dtype=torch.float32, device=target_device))
+            model.set_route_gains(
+                torch.tensor(float(alpha), dtype=torch.float32, device=target_device)
+            )
             per_shot = {}
             for n_shot, (prompts, shields, golds) in prompts_by_shot.items():
                 outputs = generate_batch(

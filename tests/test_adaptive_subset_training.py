@@ -350,6 +350,92 @@ def test_static_action_uses_disjoint_questions_for_screening_and_greedy_selectio
     assert set(screened_questions) == screen_ids
 
 
+def test_static_action_broadcasts_fixed_route_for_greedy_generation_batch(monkeypatch):
+    import src.training.adaptive_router_training as training
+    from src.models.wrapper import Phi2WithRSC
+
+    class RouteMatrixProbe:
+        target_layers = (0, 1, 2, 3)
+
+        def __init__(self):
+            self._routing_override = ("none", None)
+            self._route_matrix = None
+            self._route_gains = None
+
+        def set_routing_override(self, mode, layers):
+            if mode == "matrix":
+                self._route_matrix = torch.as_tensor(layers, dtype=torch.bool)
+                self._routing_override = (mode, None)
+            elif mode == "only":
+                self._route_matrix = None
+                self._routing_override = (mode, set(layers or []))
+            else:
+                self._route_matrix = None
+                self._routing_override = (mode, set(layers or []))
+
+        def set_route_gains(self, gains):
+            self._route_gains = gains
+
+        def set_prompt_shield_mask(self, _mask):
+            pass
+
+    model = RouteMatrixProbe()
+    monkeypatch.setattr(
+        training,
+        "_prepare",
+        lambda items, _device: (
+            {"question_id": items[0]["question_index"]},
+            {"prompt_shield_mask": None},
+        ),
+    )
+    monkeypatch.setattr(training, "_score_action", lambda *_args: torch.tensor([1.0]))
+    monkeypatch.setattr(
+        training,
+        "build_prompts",
+        lambda _tokenizer, questions, _ids, shots, **_kwargs: (
+            [f"{question}|{shots}" for question in questions],
+            [None] * len(questions),
+        ),
+    )
+    generation_batch_sizes = []
+
+    def generate(_model, _tokenizer, prompts, _device, **_kwargs):
+        batch_route = Phi2WithRSC._select_route(
+            _model, len(prompts), torch.device("cpu")
+        )
+        assert batch_route.shape == (len(prompts), len(_model.target_layers))
+        assert torch.equal(batch_route, batch_route[:1].expand_as(batch_route))
+        batch_gains = Phi2WithRSC._route_gain_for(
+            _model, torch.zeros(len(prompts), 2, 4)
+        )
+        assert batch_gains is None or batch_gains.ndim == 0
+        generation_batch_sizes.append(len(prompts))
+        return [SimpleNamespace(text=prompt) for prompt in prompts]
+
+    monkeypatch.setattr(training, "generate_batch", generate)
+    monkeypatch.setattr(training, "score_tiers", lambda *_args: {"lenient": True})
+    rows = [
+        {"question_index": index, "question": f"Q{index}", "gold_answer": "1"}
+        for index in range(6)
+    ]
+
+    training.select_static_bank_action(
+        model,
+        rows,
+        [0, 1, 2, 3],
+        [[], [0], [1]],
+        torch.device("cpu"),
+        alpha_values=(1.0,),
+        max_questions=6,
+        tokenizer=object(),
+        cfg=SimpleNamespace(shield_policy="prompt"),
+        generation_shortlist=2,
+    )
+
+    assert generation_batch_sizes
+    assert all(size == 3 for size in generation_batch_sizes)
+
+
 def test_evenly_spread_sample_covers_sequence_endpoints():
     from src.training.adaptive_data import spread_items
 
