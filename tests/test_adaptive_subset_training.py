@@ -1,4 +1,5 @@
 import json
+import copy
 from types import SimpleNamespace
 
 import torch
@@ -95,6 +96,73 @@ def test_adaptive_bank_trains_variable_subsets_and_saves_route_metadata(tmp_path
     assert saved["steer_nets"]["0.up_proj.weight"].abs().sum() > 0
 
 
+def test_memory_safe_preference_backward_matches_joint_pairwise_gradient():
+    from src.training.adaptive_subset_training import (
+        _backward_pairwise_preference,
+        _nll_sum,
+    )
+
+    positive = {
+        "question_index": 7,
+        "input_ids": torch.tensor([1, 2, 3, 4]),
+        "attention_mask": torch.ones(4, dtype=torch.long),
+        "labels": torch.tensor([-100, -100, 3, 4]),
+        "prompt_shield_mask": torch.tensor([True, True, False, False]),
+    }
+    negative = {
+        **positive,
+        "input_ids": torch.tensor([1, 2, 5, 6]),
+        "labels": torch.tensor([-100, -100, 5, 6]),
+    }
+    pair = {"positive": positive, "negative": negative}
+    initial = _TinySteeringModel()
+
+    def configure(model):
+        model.set_routing_override("matrix", [[True, False, False, False]])
+        model.set_route_gains(torch.ones(1))
+        model.eval()
+
+    joint_model = copy.deepcopy(initial)
+    split_model = copy.deepcopy(initial)
+    configure(joint_model)
+    configure(split_model)
+
+    positive_row = {
+        key: value.unsqueeze(0) for key, value in positive.items()
+        if isinstance(value, torch.Tensor) and key != "question_index"
+    }
+    negative_row = {
+        key: value.unsqueeze(0) for key, value in negative.items()
+        if isinstance(value, torch.Tensor) and key != "question_index"
+    }
+    joint_model.set_prompt_shield_mask(positive_row["prompt_shield_mask"])
+    positive_logits = joint_model(
+        positive_row["input_ids"], positive_row["attention_mask"]
+    ).logits
+    positive_nll = _nll_sum(positive_logits, positive_row["labels"]) / 2
+    joint_model.set_prompt_shield_mask(negative_row["prompt_shield_mask"])
+    negative_logits = joint_model(
+        negative_row["input_ids"], negative_row["attention_mask"]
+    ).logits
+    negative_nll = _nll_sum(negative_logits, negative_row["labels"]) / 2
+    (0.125 * torch.nn.functional.softplus(0.2 + positive_nll - negative_nll)).backward()
+
+    scaler = torch.amp.GradScaler("cuda", enabled=False)
+    _backward_pairwise_preference(
+        split_model, pair, torch.device("cpu"), scaler, weight=0.125
+    )
+
+    joint_parameters = dict(joint_model.named_parameters())
+    split_parameters = dict(split_model.named_parameters())
+    assert joint_parameters.keys() == split_parameters.keys()
+    for name in joint_parameters:
+        expected = joint_parameters[name].grad
+        actual = split_parameters[name].grad
+        assert (expected is None) == (actual is None), name
+        if expected is not None:
+            assert torch.allclose(expected, actual, atol=1e-6, rtol=1e-5), name
+
+
 def test_adaptive_router_policy_trains_and_saves_probe_contract(tmp_path):
     from src.training.adaptive_router_training import train_adaptive_router
 
@@ -178,3 +246,180 @@ def test_adaptive_router_can_learn_from_route_catalog_oracle_labels(tmp_path):
     prefill(row["input_ids"].unsqueeze(0), row["attention_mask"].unsqueeze(0))
     assert model.route is not None and model.route.shape == (1, len(model.target_layers))
     probe.close()
+
+
+def test_router_context_uses_question_token_count_not_full_prompt_length():
+    from src.training.adaptive_router_training import _router_context_features
+
+    features = _router_context_features(
+        {
+            "effective_shots": 2,
+            "prompt_signature": (1, 2, 3, 4, 5, 6),
+            "router_feature_mask": (False, True, True, False, True, False),
+        },
+        "cpu",
+    )
+    assert torch.allclose(features, torch.tensor([[0.5, 3.0 / 256.0]]))
+
+
+def test_static_bank_route_mask_has_one_entry_per_candidate_layer(monkeypatch):
+    import src.training.adaptive_router_training as training
+
+    model = _TinySteeringModel()
+    observed_masks = []
+
+    monkeypatch.setattr(
+        training,
+        "_prepare",
+        lambda items, device: ({"placeholder": torch.tensor([1])}, {"prompt_shield_mask": None}),
+    )
+
+    def capture_score(_model, _row, route_mask, _alpha, _device, _prompt_shield):
+        observed_masks.append(route_mask.detach().cpu().clone())
+        return torch.tensor([1.0])
+
+    monkeypatch.setattr(training, "_score_action", capture_score)
+    training.select_static_bank_action(
+        model,
+        [{"question_index": 1}],
+        [0, 1, 2, 3],
+        [[], [2]],
+        torch.device("cpu"),
+        max_questions=1,
+    )
+    assert any(torch.equal(mask, torch.tensor([[False, False, True, False]])) for mask in observed_masks)
+
+
+def test_static_action_uses_disjoint_questions_for_screening_and_greedy_selection(monkeypatch):
+    import src.training.adaptive_router_training as training
+
+    model = _TinySteeringModel()
+    screened_questions = []
+    greedy_prompts = []
+
+    monkeypatch.setattr(
+        training,
+        "_prepare",
+        lambda items, _device: (
+            {"question_id": items[0]["question_index"]},
+            {"prompt_shield_mask": None},
+        ),
+    )
+
+    def score_action(_model, row, _route, _alpha, _device, _shield):
+        screened_questions.append(row["question_id"])
+        return torch.tensor([1.0])
+
+    monkeypatch.setattr(training, "_score_action", score_action)
+    monkeypatch.setattr(
+        training,
+        "build_prompts",
+        lambda _tokenizer, questions, _ids, shots, **_kwargs: (
+            [f"{question}|{shots}" for question in questions],
+            [None] * len(questions),
+        ),
+    )
+
+    def generate(_model, _tokenizer, prompts, _device, **_kwargs):
+        greedy_prompts.extend(prompts)
+        return [SimpleNamespace(text=prompt) for prompt in prompts]
+
+    monkeypatch.setattr(training, "generate_batch", generate)
+    monkeypatch.setattr(training, "score_tiers", lambda *_args: {"lenient": True})
+    rows = [
+        {"question_index": index, "question": f"Q{index}", "gold_answer": "1"}
+        for index in range(6)
+    ]
+    result = training.select_static_bank_action(
+        model,
+        rows,
+        [0, 1, 2, 3],
+        [[], [0], [1]],
+        torch.device("cpu"),
+        alpha_values=(1.0,),
+        max_questions=6,
+        tokenizer=object(),
+        cfg=SimpleNamespace(shield_policy="prompt"),
+        generation_shortlist=2,
+    )
+    screen_ids = set(result["screen_validation_question_ids"])
+    greedy_ids = {int(prompt.split("|", 1)[0][1:]) for prompt in greedy_prompts}
+    assert screen_ids.isdisjoint(greedy_ids)
+    assert result["independent_static_validation_sets"] is True
+    assert result["greedy_validation_questions"] == 3
+    assert set(screened_questions) == screen_ids
+
+
+def test_evenly_spread_sample_covers_sequence_endpoints():
+    from src.training.adaptive_data import spread_items
+
+    assert spread_items(list(range(10)), 4) == [0, 3, 6, 9]
+
+
+def test_catalog_router_checkpoint_selection_uses_task_accuracy_when_available(tmp_path, monkeypatch):
+    import src.training.adaptive_router_training as training
+
+    model = _TinySteeringModel()
+    positive = {
+        "question_index": 0,
+        "completion_index": 0,
+        "input_ids": torch.tensor([1, 2, 3, 4]),
+        "attention_mask": torch.ones(4, dtype=torch.long),
+        "labels": torch.tensor([-100, -100, 3, 4]),
+        "prompt_shield_mask": torch.tensor([True, True, False, False]),
+    }
+    negative = {
+        **positive,
+        "completion_index": 1,
+        "input_ids": torch.tensor([1, 2, 4, 5]),
+        "labels": torch.tensor([-100, -100, 4, 5]),
+    }
+    pairs = [{"positive": positive, "negative": negative}]
+    observed_validation_ids = []
+    observed_static_action = []
+
+    def evaluate_task(_model, _router, rows, *_args, **kwargs):
+        observed_validation_ids.extend(int(row["question_index"]) for row in rows)
+        observed_static_action.append(kwargs.get("static_action"))
+        return {
+            "validation_task_accuracy_by_shot": {
+                "0": {"paired_delta_pp": 4.0}, "2": {"paired_delta_pp": 2.0}
+            },
+            "validation_task_selection_delta_pp": 2.6,
+            "validation_task_selection_reference": "static_bank",
+            "validation_task_selection_method": "0.3*router_vs_static_bank_0shot + 0.7*router_vs_static_bank_2shot",
+            "validation_task_questions": len(rows),
+        }
+
+    monkeypatch.setattr(training, "_evaluate_router_task_accuracy", evaluate_task)
+    checkpoint = tmp_path / "task_selected_router.pt"
+    other_validation = {**positive, "question_index": 1}
+    result = training.train_adaptive_router(
+        model,
+        [positive],
+        [positive, other_validation],
+        candidate_layers=[0, 1, 2, 3],
+        device=torch.device("cpu"),
+        epochs=1,
+        save_path=checkpoint,
+        probe_layer=4,
+        max_train_rows=1,
+        validation_limit=1,
+        route_catalog=[[], [0], [1], [0, 1]],
+        preference_pairs=pairs,
+        validation_preference_pairs=pairs,
+        tokenizer=object(),
+        cfg=object(),
+        static_action={"route": [0], "alpha": 1.5},
+    )
+    assert result["best_checkpoint_selection_metric"] == (
+        "validation_task_accuracy_delta: 0.3*router_vs_static_bank_0shot + 0.7*router_vs_static_bank_2shot"
+    )
+    assert result["best_checkpoint_selection_value"] == 2.6
+    assert observed_validation_ids == [0, 1]
+    assert observed_static_action == [{"route": [0], "alpha": 1.5}]
+    saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
+    assert saved["checkpoint_selection_metric"] == (
+        "validation_task_accuracy_delta: 0.3*router_vs_static_bank_0shot + 0.7*router_vs_static_bank_2shot"
+    )
+    assert saved["checkpoint_selection_value"] == 2.6

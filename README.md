@@ -8,7 +8,7 @@ ARS trains small residual-stream steering modules for mathematical reasoning whi
 |---|---|---|---|
 | Session 1 | Collect verified GSM8K rollouts, train fixed-route SteerNet, and compare steering with baseline | `scripts/run_rft_pipeline.py` and `scripts/run_ars_pipeline.py` | `steernet.pt`, rollout shards, paired benchmark reports |
 | Session 2 | Train or evaluate the V2 fixed route `[12, 15, 18, 21]` using rank 16 and calibrated p99 norms | `scripts/run_rft_pipeline.py` with `--steernet_arch v2` | V2 checkpoint and norm calibration |
-| Session 3 | Train a variable-route steering bank, train a prompt-conditioned route-value router, and compare baseline, fixed V2, and router arms | `scripts/run_session3_router.py` | steering-bank checkpoint, router checkpoint, paired benchmark and diagnostics |
+| Session 3 | Train a variable-route steering bank and prompt-conditioned router; compare baseline, fixed V2, validation-selected static bank, and router | `scripts/run_session3_router.py` | steering-bank checkpoint, router checkpoint, paired GSM8K/OOD reports and diagnostics |
 
 Session 3 can reuse attached rollout shards and existing V2 artifacts. Its Kaggle notebook also supports collecting rollouts or rebuilding missing V2 artifacts when configured to do so. Notebook configuration cells define the exact paths and execution scale for a run.
 
@@ -19,7 +19,8 @@ Session 3 can reuse attached rollout shards and existing V2 artifacts. Its Kaggl
 - The Phase 1 learning rate is locked at `1.5e-4`.
 - `steer_only` is the isolated fixed-route steering arm: static layers, no gate provider, no router selection, and unit intervention gain.
 - Session 2 V2 uses route `[12, 15, 18, 21]`, rank 16, `rho_max=0.10`, p99 norm calibration, and no magnitude head or convolution.
-- Session 3 route selection is trained from candidate route scores. Its observed route usage and paired GSM8K metrics are written to the run diagnostics; route diversity is an empirical outcome and should be checked in each report.
+- Session 3 trains bank adapters on positive RFT completions plus matched, well-formatted wrong-answer preferences. Bank and router selection use held-out preference data; static-action selection and router checkpoint selection also use greedy answer accuracy. The test benchmark remains separate.
+- Session 3 requires all four arms before the notebook reports a complete GSM8K comparison. It records paired metrics and route usage; route diversity is an empirical outcome and must be interpreted with accuracy.
 
 ## Repository layout
 
@@ -68,7 +69,7 @@ For Kaggle, open the relevant notebook and run its runtime setup and configurati
 
 `scripts/run_rft_pipeline.py` exposes `equivalence`, `gate0`, `collect`, `train`, and `all` stages. Use `--n_questions` and stage-specific options to control probe and collection sizes. `--skip_collection` with `--rollout_dir` reuses existing shards for training; V2 runs also require a compatible p99 norm-calibration file.
 
-`scripts/run_session3_router.py` exposes `train_bank`, `train_router`, and `benchmark`. Bank and router training consume the same positive rollout corpus. The benchmark evaluates the fixed V2 arm and, when compatible bank/router artifacts exist, the adaptive router arm on the same deterministic GSM8K subset.
+`scripts/run_session3_router.py` exposes `train_bank`, `train_router`, and `benchmark`. The bank and router reuse the rollout corpus, splitting questions into separate training, bank-screen, router-validation, and static-action-selection partitions. The benchmark requires baseline, fixed V2, static bank, and router arms when `--require_all_arms` is set. Numeric OOD suites can be requested separately and are reported per suite, even if an OOD source is unavailable.
 
 The existing `scripts/run_ars_pipeline.py` remains the compatibility entry point for fixed-route Phase 1, optional contrastive/STaR experiments, legacy router/gate stages, deployment calibration, GSM8K benchmarking, and OOD runs. Its public imports are also used by the other scripts and tests, so retain them when reorganizing the implementation.
 

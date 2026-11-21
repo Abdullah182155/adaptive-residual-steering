@@ -48,7 +48,21 @@ def candidate_routes(
             and route[1] - route[0] >= 2
         ]
         adjacent = [route for route in all_routes if route[1] - route[0] == 1]
-        return sorted(set(cross_band + adjacent[: max(0, adjacent_probe_limit)]))
+        grouped_adjacent: dict[str, list[tuple[int, ...]]] = {}
+        for route in adjacent:
+            grouped_adjacent.setdefault(depth_band(route[0]), []).append(route)
+        controls = []
+        for band in ("early", "middle", "late"):
+            group = grouped_adjacent.get(band, [])
+            if group and len(controls) < adjacent_probe_limit:
+                controls.append(group[len(group) // 2])
+        if len(controls) < adjacent_probe_limit:
+            remaining = [route for route in adjacent if route not in controls]
+            slots = adjacent_probe_limit - len(controls)
+            if remaining and slots:
+                positions = [round(index * (len(remaining) - 1) / max(slots - 1, 1)) for index in range(slots)]
+                controls.extend(remaining[position] for position in positions)
+        return sorted(set(cross_band + controls))
 
     required_bands = 3 if k == 4 else 2
     previous = [tuple(sorted(int(layer) for layer in route)) for route in selected_routes]

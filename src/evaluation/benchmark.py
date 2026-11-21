@@ -11,7 +11,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 import torch
 from tqdm import tqdm
 from src.evaluation.answers import extract_numeric_answer, score_tiers
-from src.evaluation.generation import build_prompts, generate_batch
+from src.evaluation.generation import build_prompts, build_question_feature_masks, generate_batch
 from src.evaluation.chain import (
     audit_chain,
     classify_outcome,
@@ -168,6 +168,17 @@ def _generate(
         policy=policy,
         template_ids=[template_id],
     )
+    router_feature_kwargs = {}
+    if route_prefill_fn is not None and getattr(route_prefill_fn, "uses_question_features", False):
+        feature_masks = build_question_feature_masks(tokenizer, prompts, [question])
+        question_tokens = int(feature_masks[0].sum())
+        router_feature_kwargs = {
+            "route_feature_masks": feature_masks,
+            "route_context_features": torch.tensor(
+                [[min(max(float(n_shot), 0.0), 4.0) / 4.0, min(question_tokens, 256) / 256.0]],
+                dtype=torch.float32,
+            ),
+        }
     result = generate_batch(
         model,
         tokenizer,
@@ -180,6 +191,7 @@ def _generate(
         no_repeat_ngram_size=no_repeat_ngram_size,
         max_prompt_len=max(getattr(getattr(model, "cfg", None), "max_tok_len", 768), 1024),
         route_prefill_fn=route_prefill_fn,
+        **router_feature_kwargs,
     )[0]
     return result.text, {
         "stop_reason": result.stop_reason,
@@ -567,7 +579,7 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     suite = record.get("suite", "gsm8k")
     lines = [
-        f"# ARS Phase 1 Benchmark - {suite.upper()}",
+        f"# ARS Benchmark - {suite.upper()}",
         "",
         "| Shots | Arm | Strict | Marker | Lenient | Format Rate | Guard trips | Non-finite |",
         "|---:|---|---:|---:|---:|---:|---:|---:|",

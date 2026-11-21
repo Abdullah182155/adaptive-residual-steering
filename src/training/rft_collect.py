@@ -267,6 +267,16 @@ def tokenize_rft_example(
                 for start, end in prompt_encoded["offset_mapping"]
                 if int(end) > int(start)
             ]
+            question_start = prompt.rfind(question)
+            question_end = question_start + len(question) if question_start >= 0 else -1
+            router_feature_mask = tuple(
+                int(question_start >= 0 and int(end) > question_start and int(start) < question_end)
+                for start, end in prompt_encoded["offset_mapping"]
+            )
+            if not any(router_feature_mask):
+                router_feature_mask = tuple(
+                    int(int(end) > int(start)) for start, end in prompt_encoded["offset_mapping"]
+                )
             shield_char_end = prompt_offsets[-1][0] if prompt_offsets and policy == "prompt" else 0
             labels = [
                 int(token_id) if end > start and start >= len(prompt) else -100
@@ -294,6 +304,7 @@ def tokenize_rft_example(
                 "effective_shots": int(active_shots),
                 "template_id": int(template_id),
                 "prompt_signature": tuple(int(token_id) for token_id in prompt_encoded["input_ids"]),
+                "router_feature_mask": router_feature_mask,
             }
         return None
     finally:

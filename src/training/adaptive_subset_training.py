@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from src.training.route_curriculum import candidate_routes, select_routes_by_depth
+from src.training.adaptive_data import spread_items
 from src.training.rft_trainer import _enable_checkpointing_without_dropout
 from src.training.batching import prepare_batch as _prepare
 
@@ -23,6 +24,64 @@ def _nll_sum(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         ignore_index=-100,
         reduction="sum",
     )
+
+
+def _backward_pairwise_preference(model, pair, device, scaler, weight: float) -> None:
+    """Backpropagate both preference sides without retaining two graphs at once.
+
+    The detached negative score gives the positive-side derivative. The negative
+    side is then recomputed and backpropagated with the exact detached coefficient
+    ``-sigmoid(margin)``. This is algebraically the same gradient as a joint
+    ``softplus(margin)`` graph, while keeping only one backward graph alive.
+    """
+    positive_row, positive_extras = _prepare([pair["positive"]], device)
+    negative_row, negative_extras = _prepare([pair["negative"]], device)
+    model.set_prompt_shield_mask(negative_extras.get("prompt_shield_mask"))
+    with torch.no_grad(), torch.autocast(
+        device_type=device.type, enabled=device.type == "cuda"
+    ):
+        negative_logits = model(
+            input_ids=negative_row["input_ids"],
+            attention_mask=negative_row["attention_mask"],
+            use_cache=False,
+        ).logits
+        negative_nll_sum = _nll_sum(negative_logits, negative_row["labels"])
+        negative_token_count = negative_row["labels"][:, 1:].ne(-100).sum().clamp_min(1)
+        negative_nll = negative_nll_sum / negative_token_count
+    del negative_logits, negative_nll_sum
+
+    model.set_prompt_shield_mask(positive_extras.get("prompt_shield_mask"))
+    with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+        positive_logits = model(
+            input_ids=positive_row["input_ids"],
+            attention_mask=positive_row["attention_mask"],
+            use_cache=False,
+        ).logits
+        positive_nll_sum = _nll_sum(positive_logits, positive_row["labels"])
+        positive_token_count = positive_row["labels"][:, 1:].ne(-100).sum().clamp_min(1)
+        positive_nll = positive_nll_sum / positive_token_count
+        positive_loss = weight * F.softplus(0.2 + positive_nll - negative_nll)
+    scaler.scale(positive_loss).backward()
+    negative_coefficient = torch.sigmoid(
+        0.2 + positive_nll.detach() - negative_nll
+    ).detach()
+    del positive_logits, positive_nll_sum, positive_nll, positive_loss
+    del negative_nll, positive_row, positive_extras
+
+    model.set_prompt_shield_mask(negative_extras.get("prompt_shield_mask"))
+    with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
+        negative_logits = model(
+            input_ids=negative_row["input_ids"],
+            attention_mask=negative_row["attention_mask"],
+            use_cache=False,
+        ).logits
+        negative_nll_sum = _nll_sum(negative_logits, negative_row["labels"])
+        negative_token_count = negative_row["labels"][:, 1:].ne(-100).sum().clamp_min(1)
+        negative_nll = negative_nll_sum / negative_token_count
+        negative_loss = -weight * negative_coefficient * negative_nll
+    scaler.scale(negative_loss).backward()
+    del negative_logits, negative_nll_sum, negative_nll, negative_loss
+    del negative_row, negative_extras, negative_coefficient
 
 
 def _write_bank_checkpoint(
@@ -51,6 +110,7 @@ def _write_bank_checkpoint(
             "epoch": int(epoch),
             "phase1_lr": float(cfg.phase1_lr),
             "frozen_backbone": True,
+            "adapter_initialization": "fresh_steernet_v2_zero_up",
             "curriculum": curriculum or {},
         },
         temporary,
@@ -75,6 +135,9 @@ def train_adaptive_steering_bank(
     max_triple_routes: int = 8,
     max_quad_routes: int = 6,
     anchor_routes: Sequence[Sequence[int]] = (),
+    preference_pairs: Sequence[dict[str, Any]] = (),
+    validation_preference_pairs: Sequence[dict[str, Any]] = (),
+    preference_weight: float = 0.25,
 ) -> dict[str, Any]:
     """Curriculum-train singleton, paired, triple, and quad-layer routes.
 
@@ -87,6 +150,8 @@ def train_adaptive_steering_bank(
         raise ValueError("training/validation rows, epochs, and grad_accum must be positive")
     if route_examples_per_layer < 1 or screen_validation_rows < 1:
         raise ValueError("route training and screening sample counts must be positive")
+    if preference_weight < 0:
+        raise ValueError("preference_weight must be nonnegative")
     if any(parameter.requires_grad for parameter in model.base_model.parameters()):
         raise ValueError("Phi-2 must remain frozen while training the steering bank")
     candidates = tuple(model.target_layers)
@@ -96,6 +161,9 @@ def train_adaptive_steering_bank(
         raise ValueError("phase1_lr is locked at 1.5e-4")
 
     target_device = torch.device(device)
+    preference_by_question = {
+        int(pair["positive"]["question_index"]): pair for pair in preference_pairs
+    }
     if target_device.type == "cuda" and hasattr(model.base_model, "gradient_checkpointing_enable"):
         model.base_model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
@@ -115,7 +183,7 @@ def train_adaptive_steering_bank(
     for index, item in enumerate(validation_rows):
         question_id = int(item.get("question_index", index))
         screen_by_question.setdefault(question_id, []).append(item)
-    screen_questions = list(screen_by_question.items())[:screen_validation_rows]
+    screen_questions = spread_items(list(screen_by_question.items()), screen_validation_rows)
     screen_row_count = sum(len(question_rows) for _, question_rows in screen_questions)
     if not screen_questions:
         raise ValueError("route screening needs at least one validation row")
@@ -128,6 +196,13 @@ def train_adaptive_steering_bank(
         "stages": {},
         "training_orders": {},
         "k0_validation_nll": None,
+        "preference_training": {
+            "training_pairs": len(preference_pairs),
+            "validation_pairs": len(validation_preference_pairs),
+            "weight": float(preference_weight),
+            "objective": "positive_token_nll + weighted softplus margin on matched correct/wrong completions",
+            "adapter_initialization": "fresh_steernet_v2_zero_up",
+        },
     }
     total_examples = 0
 
@@ -161,6 +236,7 @@ def train_adaptive_steering_bank(
                 order = list(selected_indices)
                 random.Random(stage_seed + epoch).shuffle(order)
                 optimizer.zero_grad(set_to_none=True)
+                preference_questions_seen: set[int] = set()
                 for start in range(0, len(order), grad_accum):
                     window = order[start : start + grad_accum]
                     tokens_in_window = sum(
@@ -186,6 +262,17 @@ def train_adaptive_steering_bank(
                         if loss.requires_grad:
                             scaler.scale(loss).backward()
                         del loss, nll_sum, logits, row, extras
+                        question_id = int(train_rows[index].get("question_index", index))
+                        pair = preference_by_question.get(question_id)
+                        if pair is not None and question_id not in preference_questions_seen and preference_weight:
+                            preference_questions_seen.add(question_id)
+                            _backward_pairwise_preference(
+                                model,
+                                pair,
+                                target_device,
+                                scaler,
+                                preference_weight / len(window),
+                            )
                         progress.update(1)
                     if any(parameter.grad is not None for parameter in parameters):
                         scaler.unscale_(optimizer)
@@ -245,13 +332,85 @@ def train_adaptive_steering_bank(
         model.set_prompt_shield_mask(None)
         return scored
 
+    @torch.no_grad()
+    def score_preference_routes(
+        routes: Sequence[tuple[int, ...]], stage: str
+    ) -> tuple[list[tuple[tuple[int, ...], float]], dict[str, Any]]:
+        """Score route synergy on held-out, same-prompt correct/wrong pairs."""
+        if not validation_preference_pairs:
+            return [], {"pairs": 0, "accuracy": None}
+        pairs = spread_items(
+            validation_preference_pairs,
+            min(max(screen_validation_rows, 24), len(validation_preference_pairs)),
+        )
+        route_scores: list[tuple[tuple[int, ...], float]] = []
+        per_route: dict[str, dict[str, float]] = {}
+        model.eval()
+        progress = tqdm(
+            total=len(routes) * len(pairs) * 2,
+            desc=f"Preference-screen routes {stage}", unit="pair-forward",
+            file=sys.stdout, mininterval=0.5,
+        )
+        for route in routes:
+            mask = torch.tensor(
+                [[layer in route for layer in candidates]], dtype=torch.bool, device=target_device
+            )
+            model.set_routing_override("matrix", mask)
+            model.set_route_gains(torch.ones(1, device=target_device))
+            pair_losses = []
+            margins = []
+            positive_nlls = []
+            for pair in pairs:
+                scores = {}
+                for key in ("positive", "negative"):
+                    row, extras = _prepare([pair[key]], target_device)
+                    model.set_prompt_shield_mask(extras.get("prompt_shield_mask"))
+                    with torch.autocast(
+                        device_type=target_device.type,
+                        enabled=target_device.type == "cuda",
+                    ):
+                        logits = model(
+                            input_ids=row["input_ids"],
+                            attention_mask=row["attention_mask"],
+                            use_cache=False,
+                        ).logits
+                        nll_sum = _nll_sum(logits, row["labels"])
+                    token_count = int(row["labels"][:, 1:].ne(-100).sum())
+                    scores[key] = float(nll_sum.float()) / max(token_count, 1)
+                    progress.update(1)
+                    del nll_sum, logits, row, extras
+                margin = scores["negative"] - scores["positive"]
+                pair_losses.append(float(F.softplus(torch.tensor(0.2 - margin))))
+                margins.append(margin)
+                positive_nlls.append(scores["positive"])
+            route_score = sum(pair_losses) / len(pair_losses) + 0.1 * sum(positive_nlls) / len(positive_nlls)
+            route_scores.append((tuple(route), route_score))
+            key = "+".join(map(str, route)) if route else "k0"
+            per_route[key] = {
+                "preference_loss": sum(pair_losses) / len(pair_losses),
+                "preference_accuracy": sum(margin > 0 for margin in margins) / len(margins),
+                "mean_positive_minus_negative_nll": -sum(margins) / len(margins),
+            }
+        progress.close()
+        model.set_routing_override("none", candidates)
+        model.set_route_gains(None)
+        model.set_prompt_shield_mask(None)
+        return route_scores, {
+            "pairs": len(pairs),
+            "selection_metric": "pairwise_correct_vs_wrong_completion_loss + 0.1*positive_nll",
+            "per_route": per_route,
+        }
+
     def screen_and_select(
         stage: str, routes: Sequence[tuple[int, ...]], *, k: int, limit: int
     ) -> list[tuple[int, ...]]:
         scored = score_routes(routes, stage)
+        preference_scored, preference_summary = score_preference_routes(routes, stage)
+        selection_scores = preference_scored if preference_scored else scored
         nonempty = [(route, value) for route, value in scored if route]
+        nonempty_selection = [(route, value) for route, value in selection_scores if route]
         selected = select_routes_by_depth(
-            nonempty, k=k, per_bucket=4, limit=limit
+            nonempty_selection, k=k, per_bucket=4, limit=limit
         )
         empty_score = next((value for route, value in scored if not route), None)
         if empty_score is not None:
@@ -262,6 +421,11 @@ def train_adaptive_steering_bank(
             "screen_questions": len(screen_questions),
             "screen_rows": screen_row_count,
             "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in scored},
+            "validation_pairwise": preference_summary,
+            "selection_metric": (
+                preference_summary["selection_metric"] if preference_scored
+                else "positive_completion_token_mean_nll"
+            ),
         }
         return selected
 
@@ -276,14 +440,17 @@ def train_adaptive_steering_bank(
     trained_pairs = list(pairs)
     train_routes(pairs, "pairs", max(64, route_examples_per_layer * 2 // 3))
     pair_scores = score_routes(pairs, "pairs_after_joint_training")
+    pair_preference_scores, pair_preference_summary = score_preference_routes(pairs, "pairs_after_joint_training")
     pairs = select_routes_by_depth(
-        [(route, score) for route, score in pair_scores if route],
+        [(route, score) for route, score in (pair_preference_scores or pair_scores) if route],
         k=2, per_bucket=4, limit=max_pair_routes,
     )
     curriculum["stages"]["pairs"] = {
         "candidates": [list(route) for route in trained_pairs],
         "selected": [list(route) for route in pairs],
         "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in pair_scores},
+        "validation_pairwise": pair_preference_summary,
+        "selection_metric": "pairwise_preference" if pair_preference_scores else "positive_completion_token_mean_nll",
     }
     _write_bank_checkpoint(model, cfg, candidates, save_path, 2, curriculum)
 
@@ -292,14 +459,17 @@ def train_adaptive_steering_bank(
     trained_triples = list(triples)
     train_routes(triples, "triples", max(48, route_examples_per_layer // 2))
     triple_scores = score_routes(triples, "triples_after_joint_training")
+    triple_preference_scores, triple_preference_summary = score_preference_routes(triples, "triples_after_joint_training")
     triples = select_routes_by_depth(
-        [(route, score) for route, score in triple_scores if route],
+        [(route, score) for route, score in (triple_preference_scores or triple_scores) if route],
         k=3, per_bucket=3, limit=max_triple_routes,
     )
     curriculum["stages"]["triples"] = {
         "candidates": [list(route) for route in trained_triples],
         "selected": [list(route) for route in triples],
         "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in triple_scores},
+        "validation_pairwise": triple_preference_summary,
+        "selection_metric": "pairwise_preference" if triple_preference_scores else "positive_completion_token_mean_nll",
     }
     _write_bank_checkpoint(model, cfg, candidates, save_path, 3, curriculum)
 
@@ -308,14 +478,17 @@ def train_adaptive_steering_bank(
     trained_quads = list(quads)
     train_routes(quads, "quads", max(32, route_examples_per_layer // 3))
     quad_scores = score_routes(quads, "quads_after_joint_training")
+    quad_preference_scores, quad_preference_summary = score_preference_routes(quads, "quads_after_joint_training")
     quads = select_routes_by_depth(
-        [(route, score) for route, score in quad_scores if route],
+        [(route, score) for route, score in (quad_preference_scores or quad_scores) if route],
         k=4, per_bucket=2, limit=max_quad_routes,
     )
     curriculum["stages"]["quads"] = {
         "candidates": [list(route) for route in trained_quads],
         "selected": [list(route) for route in quads],
         "validation_token_mean_nll": {"+".join(map(str, route)): value for route, value in quad_scores},
+        "validation_pairwise": quad_preference_summary,
+        "selection_metric": "pairwise_preference" if quad_preference_scores else "positive_completion_token_mean_nll",
     }
     catalog = [[], *[list(route) for route in selected_singles],
                *[list(route) for route in pairs],
@@ -347,4 +520,9 @@ def train_adaptive_steering_bank(
         "route_catalog": curriculum["catalog"],
         "curriculum": curriculum,
         "trained_examples": total_examples,
+        "preference_training": {
+            "pairs_available": len(preference_pairs),
+            "weight": float(preference_weight),
+            "objective": "positive_token_nll + weighted softplus pairwise margin on same-prompt correct/wrong completions",
+        },
     }

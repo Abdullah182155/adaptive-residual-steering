@@ -8,7 +8,10 @@ def test_depth_bands_and_pair_pruning_keep_small_adjacent_control_set():
     assert [depth_band(layer) for layer in (8, 15, 24)] == ["early", "middle", "late"]
     pairs = candidate_routes(LAYERS, 2)
     assert (8, 15) in pairs
-    assert (11, 12) in pairs
+    adjacent = [route for route in pairs if route[1] - route[0] == 1]
+    assert len(adjacent) == 3
+    assert {depth_band(route[0]) for route in adjacent} == {"early", "middle", "late"}
+    assert (11, 12) not in adjacent
     assert (8, 11) not in pairs
     assert len(pairs) < len(LAYERS) * (len(LAYERS) - 1) // 2
 

@@ -1,6 +1,6 @@
 # ARS Architecture
 
-This document describes the implementation currently in `src/` and the three execution sessions. Historical audit reports under the repository root describe earlier experiments and are retained as records; their settings are not current defaults.
+This document describes the implementation currently in `src/` and the three execution sessions. Agent audit reports are transient analysis artifacts; current defaults and behavior are defined by source code, notebook configuration, and maintained documentation.
 
 ## System boundary
 
@@ -25,9 +25,9 @@ frozen Phi-2 ──► selected residual hooks ──► next-token generation
 | 1 | SteerNet V5, rank 32, causal convolution, `rho_max=0.08`, identity magnitude head | Fixed route `[17, 20, 23, 26]` | Train from verified positive RFT completions and compare isolated steering with baseline |
 | 2 | SteerNet V2, rank 16, no convolution, no magnitude head, `rho_max=0.10` | Fixed route `[12, 15, 18, 21]` | Test the redesigned adapter on the same RFT objective |
 | 3 bank | One V2-format adapter per candidate layer, using p99 calibrated layer norms | Variable singleton, pair, triple, or quad subset; `k=0` is the no-intervention action | Learn adapters for multiple routes from Session 1 style rollouts |
-| 3 router | RouteValueRouter over a finite catalog of bank routes and gains | Prompt features select one catalog action per question | Predict route scores learned from teacher-forced route evaluation |
+| 3 router | RouteValueRouter over a finite catalog of bank routes and gains | Question-only features plus shot/length context select one catalog action per question | Predict route scores from matched correct/wrong completion preferences; select checkpoints with held-out paired answer accuracy |
 
-The Session 3 router receives prompt-derived features. Positive completions are used to score candidate actions when building training targets; those completions are not router input features at inference. Route variety is measured in benchmark diagnostics and is not guaranteed by the architecture alone.
+The Session 3 bank starts from fresh adapter weights. It trains on positive completion likelihood and matched, well-formatted wrong-answer comparisons. The router receives question-token features and prompt context; completion tokens are used only to score candidate actions during training and are never router input features at inference. Static-action selection and router checkpoint selection use held-out greedy answer accuracy. Route variety is measured in benchmark diagnostics and is not guaranteed by the architecture alone.
 
 ## SteerNet modules
 
@@ -44,7 +44,7 @@ The repository contains two routing families:
 - `src/routing/router.py` and `src/training/router_trainer.py`: the older JointLayerRouter and RLOO training path exposed by `scripts/run_ars_pipeline.py`.
 - `src/routing/adaptive_subset_router.py` and `src/training/adaptive_router_training.py`: the Session 3 finite-catalog route-value router, trained from measured route scores.
 
-These are separate experiment paths and should not be treated as interchangeable checkpoints. The Session 3 benchmark uses baseline, fixed V2 steering, and the adaptive router when compatible bank and router artifacts are present. It records route usage so a collapsed policy can be detected.
+These are separate experiment paths and should not be treated as interchangeable checkpoints. The Session 3 benchmark can require all four arms: baseline, fixed V2 steering, validation-selected static bank, and adaptive router. It records route usage so a collapsed policy can be detected. Optional numeric OOD benchmarks are separate suites and retain their own completion status.
 
 `src/gating/` and `src/training/gate_trainer.py` implement optional legacy gate experiments. Session 1's `steer_only` arm explicitly removes gate providers and route selectors and applies the fixed adapter route at unit gain.
 

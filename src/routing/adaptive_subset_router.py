@@ -194,6 +194,11 @@ class RouteValueRouter(nn.Module):
             nn.GELU(),
             nn.LayerNorm(router_dim),
         )
+        self.context_encoder = nn.Sequential(
+            nn.Linear(2, router_dim),
+            nn.GELU(),
+            nn.LayerNorm(router_dim),
+        )
         action_features = []
         for route, alpha in self.action_catalog:
             layer_mask = [float(layer in route) for layer in self.candidate_layers]
@@ -217,23 +222,44 @@ class RouteValueRouter(nn.Module):
         """Mean-pool valid prompt tokens, excluding padding and completions."""
         return AdaptiveSubsetRouter.raw_prompt_pool(hidden, prompt_mask)
 
-    def score_pooled(self, pooled_prompt: torch.Tensor) -> torch.Tensor:
+    def score_pooled(
+        self, pooled_prompt: torch.Tensor, context_features: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Predict the cost-adjusted completion score for every route action."""
-        prompt = self.prompt_encoder(pooled_prompt.float())
+        if context_features is None:
+            context_features = torch.zeros(
+                pooled_prompt.shape[0], 2, device=pooled_prompt.device, dtype=torch.float32
+            )
+        context_features = torch.as_tensor(
+            context_features, device=pooled_prompt.device, dtype=torch.float32
+        )
+        if context_features.shape != (pooled_prompt.shape[0], 2):
+            raise ValueError("context_features must have shape (batch, 2)")
+        prompt = self.prompt_encoder(pooled_prompt.float()) + self.context_encoder(context_features)
         action = self.action_encoder(self.action_features)
         prompt = prompt[:, None, :].expand(-1, action.shape[0], -1)
         action = action[None, :, :].expand(prompt.shape[0], -1, -1)
         return self.action_score(torch.cat((prompt, action), dim=-1)).squeeze(-1)
 
-    def forward(self, hidden: torch.Tensor, prompt_mask: torch.BoolTensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden: torch.Tensor,
+        prompt_mask: torch.BoolTensor,
+        context_features: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Score the catalog using prompt-position hidden states only."""
         pooled = self.raw_prompt_pool(hidden, prompt_mask)
-        return self.score_pooled(pooled)
+        return self.score_pooled(pooled, context_features)
 
     @torch.no_grad()
-    def choose(self, hidden: torch.Tensor, prompt_mask: torch.BoolTensor) -> RouteDecision:
+    def choose(
+        self,
+        hidden: torch.Tensor,
+        prompt_mask: torch.BoolTensor,
+        context_features: torch.Tensor | None = None,
+    ) -> RouteDecision:
         """Choose the lowest predicted-score route, including the k=0 action."""
-        scores = self(hidden, prompt_mask)
+        scores = self(hidden, prompt_mask, context_features)
         action_indices = scores.argmin(dim=-1).tolist()
         mask = torch.zeros(
             hidden.shape[0], len(self.candidate_layers), dtype=torch.bool, device=hidden.device

@@ -157,6 +157,26 @@ def build_prompts(
     return prompts, shields
 
 
+def build_question_feature_masks(tokenizer, prompts: Sequence[str], questions: Sequence[str]) -> list[torch.Tensor]:
+    """Mask only question-text tokens, excluding instructions and demonstrations."""
+    if len(prompts) != len(questions):
+        raise ValueError("prompts and questions must have matching lengths")
+    masks = []
+    for prompt, question in zip(prompts, questions):
+        encoded = tokenizer(prompt, truncation=False, padding=False, return_offsets_mapping=True)
+        start = prompt.rfind(question)
+        end = start + len(question) if start >= 0 else -1
+        offsets = encoded["offset_mapping"]
+        mask = [
+            bool(start >= 0 and int(token_end) > start and int(token_start) < end)
+            for token_start, token_end in offsets
+        ]
+        if not any(mask):
+            mask = [int(token_end) > int(token_start) for token_start, token_end in offsets]
+        masks.append(torch.tensor(mask, dtype=torch.bool))
+    return masks
+
+
 def _normalise_stop_ids(tokenizer, stop_token_ids: Optional[Sequence[int]]) -> list[int]:
     raw = stop_token_ids if stop_token_ids is not None else tokenizer.eos_token_id
     if raw is None:
@@ -187,6 +207,8 @@ def generate_batch(
     max_prompt_len: int = 1024,
     stop_token_ids: Optional[Sequence[int]] = None,
     route_prefill_fn=None,
+    route_feature_masks: Optional[Sequence[Optional[torch.Tensor]]] = None,
+    route_context_features: Optional[torch.Tensor | Sequence[Sequence[float]]] = None,
 ) -> list[GenerationResult]:
     """Generate completions with left padding and exact padded-width slicing.
 
@@ -205,6 +227,8 @@ def generate_batch(
         prompt_shields = [None] * len(prompts)
     if len(prompt_shields) != len(prompts):
         raise ValueError("prompt_shields must have one entry per prompt")
+    if route_feature_masks is not None and len(route_feature_masks) != len(prompts):
+        raise ValueError("route_feature_masks must have one entry per prompt")
 
     tokenizer.padding_side = "left"
     if tokenizer.pad_token_id is None:
@@ -226,6 +250,26 @@ def generate_batch(
         )
     target_device = torch.device(device)
     inputs = {key: value.to(target_device) for key, value in encoded.items()}
+    route_feature_batch = None
+    if route_feature_masks is not None:
+        route_feature_batch = torch.zeros_like(inputs["attention_mask"], dtype=torch.bool)
+        attention = inputs["attention_mask"].bool()
+        for row, feature_mask in enumerate(route_feature_masks):
+            if feature_mask is None:
+                route_feature_batch[row] = attention[row]
+                continue
+            mask = torch.as_tensor(feature_mask, dtype=torch.bool).flatten()
+            live_length = int(attention[row].sum())
+            if mask.numel() != live_length:
+                raise ValueError(
+                    f"router feature mask length {mask.numel()} does not match prompt length {live_length}"
+                )
+            route_feature_batch[row, prompt_width - live_length :] = mask.to(target_device)
+    context_batch = None
+    if route_context_features is not None:
+        context_batch = torch.as_tensor(route_context_features, dtype=torch.float32, device=target_device)
+        if context_batch.ndim != 2 or context_batch.shape[0] != len(prompts):
+            raise ValueError("route_context_features must have shape (batch, features)")
     stop_ids = _normalise_stop_ids(tokenizer, stop_token_ids)
     if tokenizer.eos_token_id is None:
         terminal_token_id = stop_ids[0]
@@ -277,7 +321,13 @@ def generate_batch(
 
     try:
         if route_prefill_fn is not None:
-            route_prefill_fn(inputs["input_ids"], inputs["attention_mask"])
+            if route_feature_batch is None and context_batch is None:
+                route_prefill_fn(inputs["input_ids"], inputs["attention_mask"])
+            else:
+                route_prefill_fn(
+                    inputs["input_ids"], inputs["attention_mask"],
+                    route_feature_batch, context_batch,
+                )
         output = model.generate(**generation_kwargs)
     finally:
         if hasattr(model, "set_prompt_shield_mask"):

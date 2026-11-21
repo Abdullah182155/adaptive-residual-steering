@@ -16,6 +16,7 @@ from tqdm.auto import tqdm
 
 from src.data.prompts import build_prompt_unified
 from src.evaluation.answers import cut_continuation, score_tiers
+from src.evaluation.generation import generate_batch
 from src.evaluation.chain import paired_bootstrap_ci, mcnemar_one_sided
 from src.evaluation.ood import (
     extract_mcq_answer,
@@ -32,29 +33,18 @@ def _generate_batch(
     device: torch.device,
     max_new_tokens: int = 256,
 ) -> List[str]:
-    """Generate text for a batch of prompts."""
-    enc = tokenizer(
+    """Use the canonical left-padded generator and exact padded-width slicing."""
+    generated = generate_batch(
+        model,
+        tokenizer,
         prompts,
-        return_tensors="pt",
-        truncation=True,
-        max_length=1024,
-        padding=True,
-    )
-    inputs = {k: v.to(device) for k, v in enc.items()}
-    model.set_prompt_shield_mask(None)
-    tokens = model.generate(
-        **inputs,
+        device,
         max_new_tokens=max_new_tokens,
-        do_sample=False,
-        temperature=0.0,
+        repetition_penalty=1.0,
+        no_repeat_ngram_size=0,
+        max_prompt_len=1024,
     )
-    prompt_lens = inputs["attention_mask"].sum(dim=1)
-    outputs = []
-    for i in range(len(prompts)):
-        plen = int(prompt_lens[i])
-        text = tokenizer.decode(tokens[i, plen:], skip_special_tokens=True)
-        outputs.append(text)
-    return outputs
+    return [result.text for result in generated]
 
 
 def _build_ood_prompt(row: Dict[str, Any], answer_type: str) -> str:
