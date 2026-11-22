@@ -1,4 +1,4 @@
-"""Run RFT collection or train V5/V2 adapters from existing GSM8K rollouts."""
+"""Collect GSM8K rollouts, train fixed steering, and calibrate its strength."""
 
 from __future__ import annotations
 
@@ -21,19 +21,32 @@ from src.data.dataset import gsm8k_to_cot
 from src.evaluation.generation import equivalence_test
 from src.models.loading import load_frozen_phi2 as build_model
 from src.training.rft_collect import build_rft_rows, collect_rft_data
-from src.training.rft_trainer import evaluate_generation, train_phase1_rft
+from src.training.rft_trainer import (
+    evaluate_generation,
+    fit_prompt_strength_controller,
+    train_phase1_rft,
+)
 from src.training.trainer import load_steer_weights
 
 
-STAGE1_ROUTE = [17, 20, 23, 26]
-STAGE2_ROUTE = [12, 15, 18, 21]
+LEGACY_FEATURE_ROUTE = [17, 20, 23, 26]
+FIXED_LOW_RANK_ROUTE = [12, 15, 18, 21]
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--stage",
-        choices=("equivalence", "gate0", "collect", "train", "alpha_sweep", "all"),
+        choices=(
+            "equivalence",
+            "rollout_quality_probe",
+            "gate0",
+            "collect",
+            "train",
+            "strength_teacher",
+            "alpha_sweep",
+            "all",
+        ),
         default="equivalence",
     )
     parser.add_argument(
@@ -41,14 +54,16 @@ def parse_args(argv=None):
         type=int,
         default=None,
         help=(
-            "question count for the selected stage (defaults: Gate 0=60, "
+            "question count for the selected stage (defaults: quality probe=60, "
             "equivalence=100, collection=2000)"
         ),
     )
     parser.add_argument(
+        "--quality_probe_nonblocking",
         "--gate0_nonblocking",
+        dest="quality_probe_nonblocking",
         action="store_true",
-        help="record Gate 0 quality without aborting when its threshold is missed",
+        help="record rollout quality without aborting when its diagnostic threshold is missed",
     )
     parser.add_argument(
         "--strict_equivalence",
@@ -106,7 +121,24 @@ def parse_args(argv=None):
         action="store_true",
         help="cycle through meaning-equivalent prompt instructions during RFT row building",
     )
-    parser.add_argument("--steernet_arch", choices=("v5", "v2"), default="v5")
+    parser.add_argument(
+        "--steering_architecture",
+        "--steernet_arch",
+        dest="steernet_arch",
+        choices=(
+            "legacy_feature_residual",
+            "v5",
+            "fixed_route_low_rank_residual",
+            "v2",
+            "prompt_conditioned_residual",
+        ),
+        default="v5",
+        help=(
+            "adapter architecture; fixed_route_low_rank_residual is the rank-16 "
+            "calibrated fixed-route adapter; prompt_conditioned_residual is the "
+            "rank-32 prompt-conditioned adapter; legacy labels remain accepted"
+        ),
+    )
     parser.add_argument(
         "--skip_collection",
         action="store_true",
@@ -125,21 +157,60 @@ def parse_args(argv=None):
     parser.add_argument("--output_dir", default="report/rft")
     parser.add_argument("--checkpoint", default="checkpoints/steernet.pt")
     parser.add_argument(
+        "--strength_teacher_questions",
+        type=int,
+        default=256,
+        help="training questions used to fit prompt-conditioned steering strength",
+    )
+    parser.add_argument(
+        "--strength_candidates",
+        type=float,
+        nargs="+",
+        default=(0.0, 0.5, 0.75, 1.0, 1.25),
+        help="bounded strengths compared with greedy exact-answer scoring on training questions",
+    )
+    parser.add_argument("--strength_epochs", type=int, default=40)
+    parser.add_argument("--strength_batch_size", type=int, default=32)
+    parser.add_argument(
         "--alpha_values", type=float, nargs="+", default=[0.0, 0.5, 0.75, 1.0, 1.25],
         help="post-cap steering intensities for held-out 0/2-shot calibration",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    architecture_aliases = {
+        "legacy_feature_residual": "v5",
+        "fixed_route_low_rank_residual": "v2",
+    }
+    requested_architecture = args.steernet_arch
+    args.architecture_id = {
+        "legacy_feature_residual": "ars.legacy_feature_residual",
+        "v5": "ars.legacy_feature_residual",
+        "fixed_route_low_rank_residual": "ars.fixed_route_low_rank_residual",
+        "v2": "ars.fixed_route_low_rank_residual",
+        "prompt_conditioned_residual": "ars.prompt_conditioned_residual",
+    }[requested_architecture]
+    args.steernet_arch = architecture_aliases.get(requested_architecture, requested_architecture)
+    # Preserve the former argparse attribute for legacy callers.
+    args.gate0_nonblocking = args.quality_probe_nonblocking
+    if args.stage == "gate0":
+        args.stage = "rollout_quality_probe"
+    return args
 
 
-def _require_gate0(path: Path) -> dict:
+def _require_rollout_quality_probe(path: Path) -> dict:
     if not path.exists():
         raise FileNotFoundError(
-            f"Gate 0 result not found at {path}; run --stage gate0 before RFT training"
+            f"rollout quality probe result not found at {path}; "
+            "run --stage rollout_quality_probe before collection"
         )
     result = json.loads(path.read_text(encoding="utf-8"))
     if not result.get("passed", False):
-        raise RuntimeError("Gate 0 did not pass; refusing to start RFT training")
+        raise RuntimeError("rollout quality probe did not pass; refusing to start collection")
     return result
+
+
+def _require_gate0(path: Path) -> dict:
+    """Compatibility wrapper for checkpoints and callers using the former name."""
+    return _require_rollout_quality_probe(path)
 
 
 def _require_equivalence(path: Path) -> dict:
@@ -173,11 +244,12 @@ def _enforce_collection_yield(stats: dict, allow_low_yield: bool = False) -> Non
         )
         return
     raise RuntimeError(
-        "RFT collection yield is below 15%; inspect Gate 0 and strict acceptance before training"
+            "RFT collection yield is below 15%; inspect the rollout quality probe "
+            "and strict acceptance before training"
     )
 
 
-def _gate0(
+def _run_rollout_quality_probe(
     model,
     tokenizer,
     train_rows,
@@ -192,7 +264,7 @@ def _gate0(
     indices = random.Random(cfg.seed).sample(
         range(len(train_rows)), min(n_questions, len(train_rows))
     )
-    rollout_path = output_dir / "gate0.jsonl"
+    rollout_path = output_dir / "rollout_quality_probe.jsonl"
     stats = collect_rft_data(
         model,
         tokenizer,
@@ -207,7 +279,7 @@ def _gate0(
         shield_policy=cfg.shield_policy,
         compare_greedy=True,
         seed=cfg.seed,
-        progress_desc=f"Gate 0 pass@{k}",
+        progress_desc=f"Rollout quality probe pass@{k}",
     )
     quality_gate_passed = (
         stats["n"] >= 1
@@ -217,18 +289,25 @@ def _gate0(
     stats["quality_gate_passed"] = quality_gate_passed
     stats["nonblocking"] = bool(nonblocking)
     stats["passed"] = quality_gate_passed or nonblocking
+    _write_json(output_dir / "rollout_quality_probe.json", stats)
     _write_json(output_dir / "gate0_stats.json", stats)
     if not stats["passed"]:
         raise RuntimeError(
-            "Gate 0 failed: sampled pass@k must reach 70% and beat paired greedy accuracy"
+            "rollout quality probe failed: sampled pass@k must reach 70% "
+            "and beat paired greedy accuracy"
         )
     if nonblocking and not quality_gate_passed:
         print(
-            "Gate 0 quality threshold was not met; continuing because "
-            "--gate0_nonblocking is enabled.",
+            "Rollout quality threshold was not met; continuing because "
+            "--quality_probe_nonblocking is enabled.",
             flush=True,
         )
     return stats
+
+
+def _gate0(*args, **kwargs):
+    """Compatibility alias for older notebooks calling the former stage name."""
+    return _run_rollout_quality_probe(*args, **kwargs)
 
 
 def run(args) -> dict | None:
@@ -253,7 +332,7 @@ def run(args) -> dict | None:
     ):
         raise ValueError("collection_shot_weights must be three nonnegative values with positive sum")
     if (
-        args.stage in {"gate0", "collect", "all"}
+        args.stage in {"rollout_quality_probe", "collect", "all"}
         and (not math.isfinite(args.temperature) or args.temperature <= 0)
     ) or (
         args.retry_k > 0
@@ -266,24 +345,63 @@ def run(args) -> dict | None:
         raise ValueError("--stage all runs a single collection shard; use separate collect/train stages for sharding")
     if args.skip_collection and args.stage != "train":
         raise ValueError("--skip_collection is only valid with --stage train")
+    if args.stage == "strength_teacher":
+        if args.steernet_arch != "prompt_conditioned_residual":
+            raise ValueError(
+                "--stage strength_teacher requires "
+                "--steering_architecture prompt_conditioned_residual"
+            )
+        if args.strength_teacher_questions < 10:
+            raise ValueError("strength_teacher_questions must be at least 10")
+        if args.strength_epochs < 1 or args.strength_batch_size < 1:
+            raise ValueError("strength_epochs and strength_batch_size must be positive")
+        if len(args.strength_candidates) < 2 or len(set(args.strength_candidates)) != len(args.strength_candidates):
+            raise ValueError("strength_candidates must contain at least two distinct values")
+        if any(
+            not math.isfinite(value) or value < 0 or value > 1.25
+            for value in args.strength_candidates
+        ):
+            raise ValueError("strength_candidates must be finite and within [0, 1.25]")
 
     equivalence_questions = args.n_questions or 100
-    gate0_questions = args.n_questions or 60
+    quality_probe_questions = args.n_questions or 60
     collection_questions = args.n_questions or 2000
 
     cfg = RSCConfig(steernet_arch=args.steernet_arch)
     cfg.diversify_prompts = bool(args.diversify_prompt_templates)
-    route = STAGE2_ROUTE if args.steernet_arch == "v2" else STAGE1_ROUTE
+    route = (
+        FIXED_LOW_RANK_ROUTE
+        if args.steernet_arch in {"v2", "prompt_conditioned_residual"}
+        else LEGACY_FEATURE_ROUTE
+    )
     cfg.fixed_layers = list(route)
     cfg.candidate_layers = sorted(set(cfg.candidate_layers) | set(route))
-    if args.steernet_arch == "v2":
-        cfg.lora_rank = 16
+    if args.steernet_arch in {"v2", "prompt_conditioned_residual"}:
+        cfg.lora_rank = 16 if args.steernet_arch == "v2" else 32
         cfg.rho_max = 0.10
         cfg.steernet_norm_stat = "p99_norm"
         cfg.steernet_use_conv = False
         if args.norm_calibration is None:
-            raise ValueError("Session 2 V2 training requires --norm_calibration from p99 calibration")
+            raise ValueError(
+                "fixed low-rank steering requires --norm_calibration with p99 references"
+            )
         cfg.layer_norms_calibration = args.norm_calibration
+        calibration_path = Path(args.norm_calibration)
+        if not calibration_path.is_file():
+            raise FileNotFoundError(
+                f"p99 norm calibration file not found: {calibration_path}"
+            )
+        calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+        calibrated_layers = calibration.get("layers", {})
+        missing_p99 = [
+            str(layer)
+            for layer in FIXED_LOW_RANK_ROUTE
+            if "p99_norm" not in calibrated_layers.get(str(layer), {})
+        ]
+        if missing_p99:
+            raise ValueError(
+                f"p99 calibration is missing required steering layers: {missing_p99}"
+            )
     cfg.steernet_use_mag_head = False
     cfg.mag_l1_weight = 0.0
     cfg.s1_answer_weight = 1.0
@@ -300,8 +418,10 @@ def run(args) -> dict | None:
         cfg.grad_accum = args.grad_accum
     cfg.validate()
     print(
-        f"[rft] architecture={cfg.steernet_arch} route={cfg.fixed_layers} "
-        f"rank={cfg.lora_rank} rho_max={cfg.rho_max} norm_stat={cfg.steernet_norm_stat}",
+        f"[steering-training] architecture={args.architecture_id} "
+        f"route={cfg.fixed_layers} steering_rank={cfg.lora_rank} "
+        f"strength_head={cfg.steernet_arch == 'prompt_conditioned_residual'} "
+        f"rho_max={cfg.rho_max} norm_reference={cfg.steernet_norm_stat}",
         flush=True,
     )
 
@@ -322,35 +442,23 @@ def run(args) -> dict | None:
         available = [path for path in required_shards if path.is_file() and path.stat().st_size > 0]
         if missing and not (args.allow_partial_rollouts and available):
             raise FileNotFoundError(
-                "Session 2 is configured to reuse Session 1 data and will not collect "
-                f"new rollouts; missing files: {missing}"
+                "fixed-steering training is configured to reuse the supplied rollout "
+                f"shards; missing files: {missing}"
             )
         if not available:
             raise ValueError("at least one non-empty RFT rollout shard is required")
         if any(path.exists() and path.stat().st_size == 0 for path in required_shards):
             raise ValueError("existing RFT rollout shards must not be empty")
-        if args.steernet_arch == "v2":
-            calibration_path = Path(args.norm_calibration)
-            if not calibration_path.is_file():
-                raise FileNotFoundError(
-                    f"Session 2 p99 norm calibration file not found: {calibration_path}"
-                )
-            calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
-            calibrated_layers = calibration.get("layers", {})
-            missing_p99 = [
-                str(layer)
-                for layer in STAGE2_ROUTE
-                if "p99_norm" not in calibrated_layers.get(str(layer), {})
-            ]
-            if missing_p99:
-                raise ValueError(
-                    f"p99 calibration is missing Session 2 layers: {missing_p99}"
-                )
     equivalence_path = output_dir / "generation_equivalence.json"
-    if args.strict_equivalence and args.stage in {"gate0", "collect", "train"}:
+    if args.strict_equivalence and args.stage in {
+        "rollout_quality_probe", "collect", "train"
+    }:
         _require_equivalence(equivalence_path)
     if args.stage == "collect" or (args.stage == "train" and not args.skip_collection):
-        _require_gate0(output_dir / "gate0_stats.json")
+        quality_probe_path = output_dir / "rollout_quality_probe.json"
+        if not quality_probe_path.is_file():
+            quality_probe_path = output_dir / "gate0_stats.json"
+        _require_rollout_quality_probe(quality_probe_path)
 
     model, tokenizer = build_model(cfg, device)
     raw_train, raw_dev = gsm8k_to_cot(tokenizer, cfg)
@@ -369,6 +477,33 @@ def run(args) -> dict | None:
     else:
         dev_limit = 100
     dev_rows = prepare_dataset_split(raw_dev.with_format(None), limit=dev_limit)
+
+    if args.stage == "strength_teacher":
+        checkpoint_path = Path(args.checkpoint)
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"trained steering checkpoint not found: {checkpoint_path}"
+            )
+        load_steer_weights(model, checkpoint_path, cfg, device)
+        report = fit_prompt_strength_controller(
+            model,
+            tokenizer,
+            train_rows,
+            cfg,
+            device,
+            n_questions=args.strength_teacher_questions,
+            candidate_strengths=args.strength_candidates,
+            shot_weights=args.train_shot_weights,
+            epochs=args.strength_epochs,
+            batch_size=args.strength_batch_size,
+            seed=cfg.seed,
+            save_path=checkpoint_path,
+        )
+        report_path = output_dir / "prompt_strength_training.json"
+        _write_json(report_path, report)
+        print(json.dumps(report, indent=2), flush=True)
+        print(f"Saved prompt-strength report: {report_path}", flush=True)
+        return report
 
     if args.stage == "alpha_sweep":
         if not Path(args.checkpoint).is_file():
@@ -442,8 +577,8 @@ def run(args) -> dict | None:
         if args.stage == "equivalence":
             return result
 
-    if args.stage in {"gate0", "all"}:
-        gate0_stats = _gate0(
+    if args.stage in {"rollout_quality_probe", "all"}:
+        quality_probe_stats = _run_rollout_quality_probe(
             model,
             tokenizer,
             train_rows,
@@ -452,11 +587,11 @@ def run(args) -> dict | None:
             output_dir,
             args.k,
             args.temperature,
-            n_questions=gate0_questions,
-            nonblocking=args.gate0_nonblocking,
+            n_questions=quality_probe_questions,
+            nonblocking=args.quality_probe_nonblocking,
         )
-        if args.stage == "gate0":
-            return gate0_stats
+        if args.stage == "rollout_quality_probe":
+            return quality_probe_stats
 
     if args.stage in {"collect", "all"}:
         count = collection_questions
@@ -507,7 +642,7 @@ def run(args) -> dict | None:
             missing_shards = sorted(required_shards - found_shards)
             if missing_shards and not args.allow_partial_rollouts:
                 raise FileNotFoundError(
-                    f"--skip_collection requires the existing two Session 1 shards; "
+                    f"--skip_collection requires the two complete rollout shards; "
                     f"missing {missing_shards} in {source_dir}"
                 )
         rft_rows, row_stats = build_rft_rows(

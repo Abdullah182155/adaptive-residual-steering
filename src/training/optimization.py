@@ -14,9 +14,9 @@ def steering_parameter_groups(model: Any, cfg: RSCConfig) -> list[dict[str, Any]
     for name, parameter in model.steer_nets.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.endswith("up.weight"):
+        if name.endswith(("up.weight", "up_projection.weight")):
             up.append(parameter)
-        elif name.endswith("mag_head.bias"):
+        elif name.endswith(("mag_head.bias", "strength_head.bias")):
             decay.append(parameter)
         elif parameter.ndim >= 2 and ".conv." not in name:
             decay.append(parameter)

@@ -136,7 +136,7 @@ def test_oracle_teacher_keeps_questions_without_preference_pairs(monkeypatch):
     monkeypatch.setattr(
         training,
         "_score_action",
-        lambda _model, _row, route, alpha, _device, _shield: route.float().sum(dim=1) + alpha,
+        lambda _model, _row, route, alpha, _device, _shield, **_kwargs: route.float().sum(dim=1) + alpha,
     )
 
     targets, stats = training._build_oracle_targets(

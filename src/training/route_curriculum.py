@@ -25,46 +25,28 @@ def candidate_routes(
     k: int,
     *,
     selected_routes: Sequence[Sequence[int]] = (),
-    adjacent_probe_limit: int = 3,
+    min_layer_gap: int = 3,
+    control_gap: int = 2,
+    spacing_control_limit: int = 8,
 ) -> list[tuple[int, ...]]:
-    """Build a pruned route set for one curriculum stage.
+    """Build separated routes plus a small, deterministic spacing-control set.
 
-    Singles include every layer. Pairs prioritize cross-band, non-adjacent
-    layers; a small set of adjacent pairs remains as a synergy control. Triples
-    must span at least two bands. Quads must span all three bands. Higher stages
-    are grown only from routes selected at the previous stage.
+    Every route in the primary set has at least ``min_layer_gap`` between any
+    two selected layers. Controls satisfy ``control_gap`` but violate the primary
+    gap; only a bounded, evenly spread sample is retained. Higher-cardinality
+    routes are grown from the previous stage's selected routes when provided.
     """
     layers = tuple(sorted(set(int(layer) for layer in candidate_layers)))
     if not layers or k < 1 or k > 4 or k > len(layers):
         raise ValueError("candidate layers and k must define a valid route stage")
+    if min_layer_gap < 1 or control_gap < 1 or control_gap >= min_layer_gap:
+        raise ValueError("spacing requires 1 <= control_gap < min_layer_gap")
+    if spacing_control_limit < 0:
+        raise ValueError("spacing_control_limit must be nonnegative")
     all_routes = list(combinations(layers, k))
     if k == 1:
         return all_routes
 
-    if k == 2:
-        cross_band = [
-            route for route in all_routes
-            if depth_band(route[0]) != depth_band(route[1])
-            and route[1] - route[0] >= 2
-        ]
-        adjacent = [route for route in all_routes if route[1] - route[0] == 1]
-        grouped_adjacent: dict[str, list[tuple[int, ...]]] = {}
-        for route in adjacent:
-            grouped_adjacent.setdefault(depth_band(route[0]), []).append(route)
-        controls = []
-        for band in ("early", "middle", "late"):
-            group = grouped_adjacent.get(band, [])
-            if group and len(controls) < adjacent_probe_limit:
-                controls.append(group[len(group) // 2])
-        if len(controls) < adjacent_probe_limit:
-            remaining = [route for route in adjacent if route not in controls]
-            slots = adjacent_probe_limit - len(controls)
-            if remaining and slots:
-                positions = [round(index * (len(remaining) - 1) / max(slots - 1, 1)) for index in range(slots)]
-                controls.extend(remaining[position] for position in positions)
-        return sorted(set(cross_band + controls))
-
-    required_bands = 3 if k == 4 else 2
     previous = [tuple(sorted(int(layer) for layer in route)) for route in selected_routes]
     if previous:
         generated = set()
@@ -80,25 +62,24 @@ def candidate_routes(
                 generated.add(grown)
         all_routes = sorted(generated)
 
-    routes = []
-    for route in all_routes:
-        if len(set(band_signature(route))) < required_bands:
-            continue
-        # Adjacent layers are excluded at higher cardinalities unless they are
-        # part of a previously measured and retained synergistic route.
-        retained_adjacent_pairs = {
-            frozenset(pair)
-            for prior in previous
-            for pair in combinations(prior, 2)
-            if pair[1] - pair[0] == 1
-        }
-        if any(
-            right - left == 1 and frozenset((left, right)) not in retained_adjacent_pairs
-            for left, right in zip(route, route[1:])
-        ):
-            continue
-        routes.append(route)
-    return routes
+    def has_minimum_gap(route: tuple[int, ...], gap: int) -> bool:
+        return all(right - left >= gap for left, right in combinations(route, 2))
+
+    primary = [route for route in all_routes if has_minimum_gap(route, min_layer_gap)]
+    controls = [
+        route for route in all_routes
+        if not has_minimum_gap(route, min_layer_gap) and has_minimum_gap(route, control_gap)
+    ]
+    if controls and spacing_control_limit:
+        if len(controls) > spacing_control_limit:
+            indices = [
+                round(index * (len(controls) - 1) / max(spacing_control_limit - 1, 1))
+                for index in range(spacing_control_limit)
+            ]
+            controls = [controls[index] for index in sorted(set(indices))]
+    else:
+        controls = []
+    return sorted(set(primary + controls))
 
 
 def select_routes_by_depth(
@@ -108,9 +89,11 @@ def select_routes_by_depth(
     per_bucket: int,
     limit: int,
 ) -> list[tuple[int, ...]]:
-    """Keep the lowest-loss routes while preserving depth-pattern coverage."""
+    """Keep strong routes while balancing depth patterns and layer coverage."""
     if k < 1 or k > 4 or per_bucket < 1 or limit < 0:
         raise ValueError("k, per_bucket, and limit must define a valid selection")
+    if limit == 0:
+        return []
     buckets: dict[tuple[str, ...], list[tuple[tuple[int, ...], float]]] = {}
     normalized_scores = []
     for route, score in scored_routes:
@@ -122,16 +105,67 @@ def select_routes_by_depth(
         key = band_signature(route)
         buckets.setdefault(key, []).append((route, score))
     selected: list[tuple[int, ...]] = []
+    selected_set: set[tuple[int, ...]] = set()
     bucket_order = sorted(buckets, key=lambda key: buckets[key][0][1])
     for key in bucket_order:
-        selected.extend(route for route, _ in buckets[key][:per_bucket])
-    if len(selected) < limit:
-        selected_set = set(selected)
-        for route, _score in sorted(normalized_scores, key=lambda item: item[1]):
-            normalized = tuple(route)
-            if normalized not in selected_set:
-                selected.append(normalized)
-                selected_set.add(normalized)
+        for route, _score in buckets[key][:per_bucket]:
+            if route not in selected_set:
+                selected.append(route)
+                selected_set.add(route)
                 if len(selected) >= limit:
-                    break
-    return selected[:limit]
+                    return selected
+
+    remaining = sorted(
+        ((route, score) for route, score in normalized_scores if route not in selected_set),
+        key=lambda item: item[1],
+    )
+    layer_counts: dict[int, int] = {}
+    for route in selected:
+        for layer in route:
+            layer_counts[layer] = layer_counts.get(layer, 0) + 1
+    while remaining and len(selected) < limit:
+        route, _score = min(
+            remaining,
+            key=lambda item: (
+                sum(layer_counts.get(layer, 0) for layer in item[0]) / max(k, 1),
+                item[1],
+            ),
+        )
+        selected.append(route)
+        for layer in route:
+            layer_counts[layer] = layer_counts.get(layer, 0) + 1
+        remaining = [item for item in remaining if item[0] != route]
+    return selected
+
+
+def build_router_route_catalog(
+    selected_by_k: dict[int, Sequence[Sequence[int]]],
+    scored_by_k: dict[int, Sequence[tuple[Sequence[int], float]]],
+    *,
+    singleton_limit: int = 4,
+    routes_per_k: int = 2,
+) -> list[list[int]]:
+    """Build a compact diverse action catalog, preserving k=0 as a control."""
+    if singleton_limit < 0 or routes_per_k < 1:
+        raise ValueError("router catalog limits must be nonnegative/positive")
+    catalog: list[list[int]] = [[]]
+    singleton_scores = sorted(scored_by_k.get(1, ()), key=lambda item: float(item[1]))
+    singles = select_routes_by_depth(
+        singleton_scores,
+        k=1,
+        per_bucket=1,
+        limit=min(singleton_limit, len(singleton_scores)),
+    ) if singleton_scores and singleton_limit else []
+    catalog.extend([list(route) for route in singles])
+    for k in (2, 3, 4):
+        scored = scored_by_k.get(k, ())
+        if not scored:
+            scored = [(route, float(index)) for index, route in enumerate(selected_by_k.get(k, ()))]
+        routes = select_routes_by_depth(
+            scored,
+            k=k,
+            per_bucket=1,
+            limit=min(routes_per_k, len(scored)),
+        ) if scored else []
+        catalog.extend([list(route) for route in routes])
+    return catalog

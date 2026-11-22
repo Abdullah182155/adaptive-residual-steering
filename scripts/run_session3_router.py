@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
 from pathlib import Path
 import sys
@@ -23,6 +24,10 @@ from src.evaluation.ood import SPECS as OOD_SPECS, load_ood_rows
 from src.evaluation.benchmark import run_benchmark, write_record, write_report
 from src.models.loading import load_frozen_phi2 as build_model
 from src.steering.steernet import load_layer_norms
+from src.steering.route_bank import (
+    normalize_route_catalog,
+    validate_route_expert_states,
+)
 from src.training.adaptive_data import (
     build_adaptive_preference_pairs,
     build_adaptive_rft_splits,
@@ -35,7 +40,7 @@ from src.training.adaptive_router_training import (
 from src.training.adaptive_subset_training import train_adaptive_steering_bank
 
 
-V2_ROUTE = (12, 15, 18, 21)
+FIXED_ROUTE = (12, 15, 18, 21)
 DEFAULT_CANDIDATES = (8, 11, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 24, 26)
 DEFAULT_ROUTER_ALPHAS = (1.0, 1.5, 2.0)
 
@@ -46,8 +51,14 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--output_dir", type=Path, default=Path("report/session3"))
     parser.add_argument("--candidate_layers", type=int, nargs="+", default=list(DEFAULT_CANDIDATES))
     parser.add_argument("--norm_calibration", type=Path, required=True)
-    parser.add_argument("--v2_norm_calibration", type=Path, required=True)
-    parser.add_argument("--v2_checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--fixed_adapter_norm_calibration", "--v2_norm_calibration",
+        dest="fixed_adapter_norm_calibration", type=Path, required=True,
+    )
+    parser.add_argument(
+        "--fixed_adapter_checkpoint", "--v2_checkpoint",
+        dest="fixed_adapter_checkpoint", type=Path, required=True,
+    )
     parser.add_argument("--bank_checkpoint", type=Path, default=Path("checkpoints/session3_steering_bank.pt"))
     parser.add_argument("--router_checkpoint", type=Path, default=Path("checkpoints/session3_router.pt"))
     parser.add_argument("--rollout_files", type=Path, nargs="*")
@@ -69,11 +80,17 @@ def parse_args(argv: Sequence[str] | None = None):
     )
     parser.add_argument("--task_validation_rows", type=int, default=32)
     parser.add_argument("--diversify_prompts", action="store_true")
-    parser.add_argument("--route_examples_per_layer", type=int, default=256)
+    parser.add_argument(
+        "--route_examples_per_expert", "--route_examples_per_layer",
+        dest="route_examples_per_expert", type=int, default=256,
+    )
     parser.add_argument("--screen_validation_rows", type=int, default=24)
-    parser.add_argument("--max_pair_routes", type=int, default=12)
-    parser.add_argument("--max_triple_routes", type=int, default=8)
-    parser.add_argument("--max_quad_routes", type=int, default=6)
+    parser.add_argument("--max_pair_routes", type=int, default=8)
+    parser.add_argument("--max_triple_routes", type=int, default=6)
+    parser.add_argument("--max_quad_routes", type=int, default=4)
+    parser.add_argument("--min_layer_gap", type=int, default=3)
+    parser.add_argument("--control_gap", type=int, default=2)
+    parser.add_argument("--spacing_control_limit", type=int, default=8)
     parser.add_argument("--bench_n", type=int, default=800)
     parser.add_argument("--bench_seed", type=int, default=42)
     parser.add_argument("--shots", type=int, nargs="+", default=[0, 2])
@@ -85,8 +102,8 @@ def _configure(args):
     cfg = RSCConfig(steernet_arch="v2")
     cfg.validate()
     candidates = tuple(sorted(set(int(value) for value in args.candidate_layers)))
-    if not set(V2_ROUTE).issubset(candidates):
-        raise ValueError(f"candidate layers must include the fixed V2 route {list(V2_ROUTE)}")
+    if not set(FIXED_ROUTE).issubset(candidates):
+        raise ValueError(f"candidate layers must include the fixed adapter route {list(FIXED_ROUTE)}")
     if len(candidates) < 4 or any(layer < 0 or layer >= 32 for layer in candidates):
         raise ValueError("candidate layer set must contain 4–32 valid Phi-2 layer indices")
     cfg.candidate_layers = list(candidates)
@@ -133,40 +150,79 @@ def _apply_norm_refs(model, norm_path: Path) -> dict[int, float]:
     return norms
 
 
-def _load_v2_weights(model, path: Path, norm_path: Path) -> dict:
+def _load_fixed_adapter_weights(model, path: Path, norm_path: Path) -> dict:
     if not path.is_file():
-        raise FileNotFoundError(f"V2 fixed-route checkpoint not found: {path}")
+        raise FileNotFoundError(f"fixed-route low-rank adapter checkpoint not found: {path}")
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     metadata = checkpoint.get("metadata", {})
-    if metadata.get("steernet_arch") != "v2" or tuple(metadata.get("route", ())) != V2_ROUTE:
-        raise ValueError("checkpoint is not the verified Session 2 V2 route [12, 15, 18, 21]")
+    if metadata.get("steernet_arch") != "v2" or tuple(metadata.get("route", ())) != FIXED_ROUTE:
+        raise ValueError("checkpoint is not the fixed-route low-rank adapter for layers [12, 15, 18, 21]")
+    architecture_id = metadata.get("architecture_id")
+    if architecture_id not in (None, "ars.fixed_route_low_rank_residual", "ars.legacy_v2"):
+        raise ValueError(f"unsupported fixed adapter architecture: {architecture_id}")
     if int(metadata.get("rank", -1)) != 16:
-        raise ValueError("V2 checkpoint rank must be 16")
+        raise ValueError("fixed-route low-rank adapter rank must be 16")
     source = checkpoint["steer_nets"]
-    for layer in V2_ROUTE:
+    for layer in FIXED_ROUTE:
         prefix = f"{layer}."
         layer_state = {key[len(prefix):]: value for key, value in source.items() if key.startswith(prefix)}
         if not layer_state:
-            raise ValueError(f"V2 checkpoint has no adapter weights for layer {layer}")
+            raise ValueError(f"fixed adapter checkpoint has no weights for layer {layer}")
         model.steer_nets[str(layer)].load_state_dict(layer_state, strict=True)
     original_norms = load_layer_norms(str(norm_path), statistic="p99_norm")
-    missing = [layer for layer in V2_ROUTE if original_norms.get(layer, 0.0) <= 0]
+    missing = [layer for layer in FIXED_ROUTE if original_norms.get(layer, 0.0) <= 0]
     if missing:
-        raise ValueError(f"V2 p99 calibration is missing its fixed route layers: {missing}")
-    for layer in V2_ROUTE:
+        raise ValueError(f"fixed-route p99 calibration is missing route layers: {missing}")
+    for layer in FIXED_ROUTE:
         model.steer_nets[str(layer)].layer_norm_ref = float(original_norms[layer])
     return {"metadata": metadata, "norm_refs": original_norms}
 
 
 def _load_bank(model, path: Path) -> dict:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
-    if checkpoint.get("format") != "ars_adaptive_steering_v1":
+    if not isinstance(checkpoint, dict):
+        raise ValueError("steering-bank checkpoint must contain a mapping")
+    if (
+        checkpoint.get("format") != "ars.independent_route_expert_bank"
+        or checkpoint.get("format_version") != 1
+    ):
         raise ValueError("unsupported adaptive steering bank checkpoint")
+    if not checkpoint.get("training_complete"):
+        raise ValueError("steering-bank checkpoint is incomplete and cannot be used for routing")
     if tuple(checkpoint["candidate_layers"]) != tuple(model.target_layers):
         raise ValueError("steering-bank candidate layers do not match the active model")
-    model.steer_nets.load_state_dict(checkpoint["steer_nets"], strict=True)
-    for layer, value in checkpoint["norm_refs"].items():
+    if (
+        checkpoint.get("architecture_id")
+        != "ars.independent_route_low_rank_residual_bank"
+        or checkpoint.get("architecture_version") != "1.0.0"
+        or checkpoint.get("expert_architecture_id")
+        != "ars.fixed_route_low_rank_residual"
+        or checkpoint.get("expert_architecture_version") != "1.0.0"
+    ):
+        raise ValueError("steering-bank adapter architecture is not supported")
+    raw_route_catalog = checkpoint.get("route_catalog")
+    if not isinstance(raw_route_catalog, list) or not raw_route_catalog:
+        raise ValueError("steering-bank checkpoint has no route catalog")
+    route_catalog = normalize_route_catalog(raw_route_catalog, model.target_layers)
+    if route_catalog != tuple(tuple(route) for route in raw_route_catalog):
+        raise ValueError("steering-bank route catalog is not canonical")
+    validate_route_expert_states(
+        route_catalog, checkpoint.get("route_experts", {})
+    )
+    norm_refs = checkpoint.get("norm_refs", {})
+    expected_norm_layers = {str(layer) for layer in model.target_layers}
+    if set(norm_refs) != expected_norm_layers:
+        raise ValueError("steering-bank norm references do not match candidate layers")
+    invalid_norms = {
+        layer: value
+        for layer, value in norm_refs.items()
+        if not math.isfinite(float(value)) or float(value) <= 0
+    }
+    if invalid_norms:
+        raise ValueError(f"steering-bank norm references are invalid: {invalid_norms}")
+    for layer, value in norm_refs.items():
         model.steer_nets[str(layer)].layer_norm_ref = float(value)
+    model.install_route_experts(route_catalog, checkpoint["route_experts"])
     return checkpoint
 
 
@@ -211,8 +267,8 @@ def run(args) -> int:
     if args.stage == "benchmark" and not has_bank_artifacts:
         # Preserve a useful baseline/V2 paired report when adaptive training did
         # not finish; the notebook can still complete and report the missing arm.
-        args.candidate_layers = list(V2_ROUTE)
-        args.norm_calibration = args.v2_norm_calibration
+        args.candidate_layers = list(FIXED_ROUTE)
+        args.norm_calibration = args.fixed_adapter_norm_calibration
     cfg, candidates = _configure(args)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"[session3] stage={args.stage} candidates={list(candidates)} device={device}", flush=True)
@@ -253,21 +309,26 @@ def run(args) -> int:
             epochs=args.epochs,
             save_path=args.bank_checkpoint,
             seed=args.seed,
-            route_examples_per_layer=args.route_examples_per_layer,
+            route_examples_per_expert=args.route_examples_per_expert,
             screen_validation_rows=args.screen_validation_rows,
             max_pair_routes=args.max_pair_routes,
             max_triple_routes=args.max_triple_routes,
             max_quad_routes=args.max_quad_routes,
-            anchor_routes=[V2_ROUTE],
             preference_pairs=train_pairs,
             validation_preference_pairs=validation_pairs,
             preference_weight=args.preference_weight,
+            min_layer_gap=args.min_layer_gap,
+            control_gap=args.control_gap,
+            spacing_control_limit=args.spacing_control_limit,
         )
         print(json.dumps({
             "data": stats,
             "preference_data": {"train": train_pair_stats, "validation": validation_pair_stats},
             "validation_split": validation_split,
-            "bank_initialization": "fresh_adapter_initialization; fixed V2 checkpoint is not loaded into bank",
+            "bank_initialization": (
+                "independent single-layer experts, then route-specific copies and fine-tuning; "
+                "fixed adapter checkpoint is not loaded into bank"
+            ),
             "training": result,
         }, default=str), flush=True)
         return 0
@@ -311,7 +372,9 @@ def run(args) -> int:
             model,
             static_validation,
             candidates,
-            bank_state.get("curriculum", {}).get("catalog", []),
+            bank_state.get("curriculum", {}).get(
+                "router_catalog", bank_state.get("curriculum", {}).get("catalog", [])
+            ),
             device,
             route_cost=args.route_cost,
             alpha_values=(1.0, 1.5, 2.0),
@@ -347,7 +410,9 @@ def run(args) -> int:
             route_cost=args.route_cost,
             # Learn question-conditioned route and gain jointly from the same oracle scores.
             alpha_values=args.router_alphas,
-            route_catalog=bank_state.get("curriculum", {}).get("catalog"),
+            route_catalog=bank_state.get("curriculum", {}).get(
+                "router_catalog", bank_state.get("curriculum", {}).get("catalog")
+            ),
             preference_pairs=train_pairs,
             validation_preference_pairs=router_validation_pairs,
             bank_sha256=_sha256(args.bank_checkpoint),
@@ -395,12 +460,16 @@ def run(args) -> int:
         raise RuntimeError(
             f"four-arm benchmark prerequisites missing: evaluated={active_arms}, expected={expected_arms}"
         )
-    _load_v2_weights(model, args.v2_checkpoint, args.v2_norm_calibration)
+    _load_fixed_adapter_weights(
+        model, args.fixed_adapter_checkpoint, args.fixed_adapter_norm_calibration
+    )
 
     def arm_setup(arm: str) -> None:
         if arm == "steer_only":
-            cfg.fixed_layers = list(V2_ROUTE)
-            _load_v2_weights(model, args.v2_checkpoint, args.v2_norm_calibration)
+            cfg.fixed_layers = list(FIXED_ROUTE)
+            _load_fixed_adapter_weights(
+                model, args.fixed_adapter_checkpoint, args.fixed_adapter_norm_calibration
+            )
         elif arm == "static_bank" and static_action is not None:
             cfg.static_bank_route = list(static_action["route"])
             cfg.static_bank_alpha = float(static_action["alpha"])
@@ -452,12 +521,14 @@ def run(args) -> int:
             record["evaluated_arms"] = list(active_arms)
             record["expected_arms"] = expected_arms
             record["four_arm_complete"] = active_arms == expected_arms
-            record["fixed_v2_route"] = list(V2_ROUTE)
+            record["fixed_adapter_architecture_id"] = "ars.fixed_route_low_rank_residual"
+            record["fixed_adapter_architecture_version"] = "1.0.0"
+            record["fixed_adapter_route"] = list(FIXED_ROUTE)
             record["router_candidate_layers"] = list(candidates)
             record["router_checkpoint"] = str(args.router_checkpoint)
             record["static_bank_action"] = static_action
             record["static_bank_checkpoint"] = str(args.bank_checkpoint) if static_action else None
-            record["fixed_v2_checkpoint"] = str(args.v2_checkpoint)
+            record["fixed_adapter_checkpoint"] = str(args.fixed_adapter_checkpoint)
             record["router_status"] = "included" if "router" in active_arms else "not_available"
             if args.require_all_arms and not record["four_arm_complete"]:
                 raise RuntimeError(f"incomplete four-arm record for suite {suite}: {active_arms}")

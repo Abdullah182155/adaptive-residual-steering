@@ -1,14 +1,15 @@
-"""Typed configuration and CLI override support for ARS Phase 1."""
+"""Typed configuration and CLI override support for ARS experiments."""
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field, fields
 from typing import Any, List, Optional
 
 
 @dataclass
 class RSCConfig:
-    """Certified defaults for fixed-route SteerNet V5 training and deployment."""
+    """Configuration for fixed-route steering training and deployment."""
 
     model_name: str = "microsoft/phi-2"
     candidate_layers: List[int] = field(default_factory=lambda: [8, 11, 13, 15, 17, 19, 20, 21, 22, 23, 24, 26])
@@ -24,16 +25,16 @@ class RSCConfig:
     steer_scale: float = 0.30
     k_scale_mode: str = "sqrt"
     amplitude_mode: str = "relative"
-    rho_max: float = 0.08  # V25: 0.04→0.08; V24 at 0.04 gave 2% amplitude → format rate dropped to 48%
-                           # 0.08 restores ~4% amplitude on OPERAND/OPERATOR while RESULT/FINAL stay suppressed by high L1
-    mag_head_init_bias: float = -3.0  # sigmoid(-3)≈0.05; start low so network must earn magnitude
+    rho_max: float = 0.08  # Maximum residual norm relative to the calibrated layer norm.
+    mag_head_init_bias: float = -3.0  # Initial bias for legacy learned-magnitude adapters.
     calc_weight_alpha: float = 1.0
     layer_norms_calibration: str = "norms_calibration.json"
     prompt_shielding: bool = True
-    steernet_init_gain: float = 1.0     # V22: direction is unit-normalized; gain only affects feature expressivity
-    steernet_use_mag_head: bool = False  # Phase 1 RFT: identity magnitude, m ≡ 1.0
-    steernet_use_soft_cap: bool = False  # disabled: rho_max is the single amplitude bound
-    steernet_use_conv: bool = True       # causal depthwise convolution; old code had none
+    steernet_init_gain: float = 1.0
+    steernet_use_mag_head: bool = False  # Enable the legacy learned-magnitude head.
+    steernet_use_soft_cap: bool = False  # Enable the legacy smooth residual cap.
+    steernet_use_conv: bool = True       # Enable the legacy causal convolution block.
+    prompt_strength_max: float = 1.25
     guard_revert_to_k0: bool = True
 
     batch_size: int = 2
@@ -76,7 +77,7 @@ class RSCConfig:
     star_hint_k: int = 4
     star_gen_batch: int = 2
 
-    # V2 Typed Loss
+    # Typed loss configuration
     loss_mode: str = "typed"  # "typed", "legacy", or "legacy_pure"
     typed_learned_weights: bool = True   # Kendall auto-weighting; False = manual lambdas
     lambda_format: float = 0.02
@@ -87,27 +88,27 @@ class RSCConfig:
     lambda_prose: float = 0.03
     focal_gamma: float = 2.0
     kl_weight: float = 0.3
-    kl_arithmetic_weight: float = 0.15     # V23: compromise (V21=0.30, V22=0.05); partial arithmetic anchor prevents plan disruption
+    kl_arithmetic_weight: float = 0.15
     mag_l1_weight: float = 0.0             # RFT uses plain NLL and identity magnitude
     steer_amplitude_k: Optional[int] = None
 
-    # V2 Multi-Context Training Mixture
-    train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])  # V23: balanced 0-4 shot (V22 had 90% 0-shot which killed few-shot generalization)
+    # Multi-context training mixture
+    train_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])
     train_use_preface: bool = True
     train_v5_demo_frac: float = 0.90
     shield_policy: str = "prompt"
 
     # On-policy training
     on_policy: bool = False
-    on_policy_frac: float = 0.20            # keep from V22: reduced from 0.50
+    on_policy_frac: float = 0.20
     on_policy_start_epoch: int = 1
     on_policy_gen_batch: int = 4
-    on_policy_k: int = 2                  # V23: reduced from 4; 43% correct rate makes pass@4 wasteful
-    on_policy_temperature: float = 0.5    # V23: reduced from 0.7; more deterministic → higher correct rate
+    on_policy_k: int = 2
+    on_policy_temperature: float = 0.5
     on_policy_interval: int = 1
     on_policy_gold_fallback: bool = False
-    on_policy_verify_steps: bool = True   # V23: reject completions with provably wrong arithmetic equations
-    on_policy_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])  # V23: match training distribution
+    on_policy_verify_steps: bool = True
+    on_policy_shot_probs: List[float] = field(default_factory=lambda: [0.50, 0.15, 0.20, 0.10, 0.05])
 
     # Phase 2 Router
     phase2_lr: float = 5e-5
@@ -129,10 +130,10 @@ class RSCConfig:
     gate_init_alpha: float = 0.25
     gate_use_global_context: bool = False
     gate_lr: float = 1e-4
-    gate_epochs: int = 5               # V24: raised from 3 — gate needs more epochs after FINAL target inversion
-    gate_l1_weight: float = 0.0        # V20: replaced by gate_entropy_weight (kept for compat)
+    gate_epochs: int = 5
+    gate_l1_weight: float = 0.0        # Retained for configuration compatibility.
     gate_rloo_weight: float = 1.0
-    gate_contrastive_weight: float = 2.0  # V23: raised from 1.0; stronger type discrimination needed (FINAL=0.218 in V22)
+    gate_contrastive_weight: float = 2.0
     gate_contrastive_mode: str = "hinge"
     gate_use_task_nll: bool = False
     gate_antisat_weight: float = 0.25
@@ -143,12 +144,12 @@ class RSCConfig:
     gate_save_path: str = "checkpoints/gate.pt"
     steernet_gated_save_path: str = "checkpoints/steernet_gated.pt"
     gate_gen_reward_every: int = 4     # every N optimizer steps: generate + score accuracy
-    gate_gen_subset: int = 4            # V20: 4 examples for GRPO normalization (was 2)
+    gate_gen_subset: int = 4
     gate_gen_weight: float = 2.0        # weight of generation-based PG loss
     gate_gen_max_tokens: int = 150      # max new tokens for fast gate gen reward
-    gate_entropy_weight: float = 0.1   # V20: binary entropy reg (crisp 0/1 decisions)
-    gate_training_mode: str = "supervised"   # V22: "supervised" (per-token advantage) or "rloo" (legacy)
-    gate_supervised_temperature: float = 5.0 # V22: sigmoid(advantage * temp) sharpness for gate targets
+    gate_entropy_weight: float = 0.1
+    gate_training_mode: str = "supervised"   # Supported modes: supervised and rloo.
+    gate_supervised_temperature: float = 5.0
     lambda_cost: float = 0.0
     router_probe_layer: Optional[int] = None
     router_save_path: str = "checkpoints/router.pt"
@@ -165,11 +166,19 @@ class RSCConfig:
     generation_no_repeat_ngram: int = 0           # disabled: prompt tokens cause false bans in 2-shot
 
     def __post_init__(self) -> None:
-        """Apply the locked V_REDESIGN preset when callers select architecture V2."""
+        """Apply named fixed-route presets while preserving legacy configurations."""
         if self.steernet_arch == "v2":
             self.fixed_layers = [12, 15, 18, 21]
             self.candidate_layers = sorted(set(self.candidate_layers) | set(self.fixed_layers))
             self.lora_rank = 16
+            self.rho_max = 0.10
+            self.steernet_norm_stat = "p99_norm"
+            self.steernet_use_mag_head = False
+            self.steernet_use_conv = False
+        elif self.steernet_arch == "prompt_conditioned_residual":
+            self.fixed_layers = [12, 15, 18, 21]
+            self.candidate_layers = sorted(set(self.candidate_layers) | set(self.fixed_layers))
+            self.lora_rank = 32
             self.rho_max = 0.10
             self.steernet_norm_stat = "p99_norm"
             self.steernet_use_mag_head = False
@@ -181,23 +190,32 @@ class RSCConfig:
 
     def validate(self) -> None:
         """Reject configurations that violate the selected session contracts."""
-        if self.steernet_arch not in {"v5", "v2"}:
-            raise ValueError("steernet_arch must be 'v5' or 'v2'")
+        if self.steernet_arch not in {"v5", "v2", "prompt_conditioned_residual"}:
+            raise ValueError(
+                "steernet_arch must be 'v5', 'v2' (legacy), or "
+                "'prompt_conditioned_residual'"
+            )
         if self.objective != "nll":
             raise ValueError("Phase 1 supports token-weighted NLL only")
         if not self.fixed_layers:
             raise ValueError("fixed_layers cannot be empty")
-        if self.steernet_arch == "v2":
+        if self.steernet_arch in {"v2", "prompt_conditioned_residual"}:
             if self.fixed_layers != [12, 15, 18, 21]:
-                raise ValueError("Session 2 SteerNetV2 route is locked to [12, 15, 18, 21]")
-            if self.lora_rank != 16:
-                raise ValueError("Session 2 SteerNetV2 rank is locked at 16")
+                raise ValueError("fixed low-rank steering route is locked to [12, 15, 18, 21]")
             if abs(self.rho_max - 0.10) > 1e-12:
-                raise ValueError("Session 2 SteerNetV2 rho_max is locked at 0.10")
+                raise ValueError("fixed low-rank steering requires rho_max=0.10")
             if self.steernet_use_mag_head or self.steernet_use_conv:
-                raise ValueError("Session 2 SteerNetV2 disables magnitude and convolution")
+                raise ValueError("fixed low-rank steering does not use the legacy magnitude head or convolution")
             if self.steernet_norm_stat != "p99_norm":
-                raise ValueError("Session 2 SteerNetV2 requires p99_norm calibration")
+                raise ValueError("fixed low-rank steering requires p99_norm calibration")
+            expected_rank = 16 if self.steernet_arch == "v2" else 32
+            if self.lora_rank != expected_rank:
+                raise ValueError(
+                    f"{self.steernet_arch} requires steering rank {expected_rank}"
+                )
+        if self.steernet_arch == "prompt_conditioned_residual":
+            if not math.isfinite(self.prompt_strength_max) or self.prompt_strength_max <= 1.0:
+                raise ValueError("prompt_strength_max must be finite and greater than the neutral value 1.0")
         if abs(self.phase1_lr - 1.5e-4) > 1e-12:
             raise ValueError("phase1_lr is locked at 1.5e-4")
         if not all(0 <= l < 32 for l in self.fixed_layers):

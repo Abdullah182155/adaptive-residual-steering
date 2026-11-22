@@ -3,13 +3,24 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from typing import Callable, Dict, Optional, Sequence
 import weakref
 
 import torch
 import torch.nn as nn
 
-from src.steering.steernet import SteerNet, SteerNetV2, load_layer_norms
+from src.steering.steernet import (
+    FixedLowRankResidualSteerNet,
+    PromptConditionedSteerNet,
+    SteerNet,
+    load_layer_norms,
+)
+from src.steering.route_bank import (
+    normalize_route_catalog,
+    route_key,
+    validate_route_expert_states,
+)
 
 
 RouteSelector = Callable[[int, torch.device], torch.BoolTensor]
@@ -45,10 +56,24 @@ class Phi2WithRSC(nn.Module):
             cfg.layer_norms_calibration,
             statistic=getattr(cfg, "steernet_norm_stat", "median_norm"),
         )
-        if getattr(cfg, "steernet_arch", "v5") == "v2":
+        if getattr(cfg, "steernet_arch", "v5") == "prompt_conditioned_residual":
             self.steer_nets = nn.ModuleDict(
                 {
-                    str(layer): SteerNetV2(
+                    str(layer): PromptConditionedSteerNet(
+                        hidden_dim=hidden_size,
+                        rank=cfg.lora_rank,
+                        rho_max=cfg.rho_max,
+                        layer_norm_ref=norms.get(layer, 0.0),
+                        layer_idx=layer,
+                        max_strength=cfg.prompt_strength_max,
+                    ).to(self.device)
+                    for layer in self.target_layers
+                }
+            )
+        elif getattr(cfg, "steernet_arch", "v5") == "v2":
+            self.steer_nets = nn.ModuleDict(
+                {
+                    str(layer): FixedLowRankResidualSteerNet(
                         hidden_dim=hidden_size,
                         rank=cfg.lora_rank,
                         rho_max=cfg.rho_max,
@@ -88,12 +113,19 @@ class Phi2WithRSC(nn.Module):
         self._routing_override = ("only", set(self.target_layers))
         self._route_matrix: Optional[torch.BoolTensor] = None
         self._selection: Optional[torch.BoolTensor] = None
+        self.bank_experts = nn.ModuleDict()
+        self._bank_route_catalog: tuple[tuple[int, ...], ...] = ((),)
+        self._active_route_experts: Optional[list[str]] = None
         self._attention_mask: Optional[torch.Tensor] = None
         self._pending_shield_mask: Optional[torch.Tensor] = None
         self._active_shield_mask: Optional[torch.Tensor] = None
+        self._pending_conditioning_mask: Optional[torch.Tensor] = None
+        self._active_conditioning_mask: Optional[torch.Tensor] = None
+        self._cached_prompt_strengths: Dict[int, torch.Tensor] = {}
         self._gain: float = 1.0
         self._route_gains: Optional[torch.Tensor] = None
         self._intervention_gains: Optional[torch.Tensor] = None
+        self._prompt_strength_override: Optional[torch.Tensor] = None
         self._control: Optional[str] = None
         self._control_seed: int = 0
         self._control_gen: Optional[torch.Generator] = None
@@ -106,6 +138,7 @@ class Phi2WithRSC(nn.Module):
         self.injection_trace: Dict[int, list] = {}
         self._capture_deltas = False
         self._captured_deltas: Dict[int, torch.Tensor] = {}
+        self._captured_steering_inputs: Optional[Dict[int, torch.Tensor]] = None
 
         self._register_hooks()
         for parameter in self.base_model.parameters():
@@ -173,10 +206,22 @@ class Phi2WithRSC(nn.Module):
         if not self._is_decode_step:
             self.guard_state = {"rel_max": 0.0, "nonfinite": False}
             self._active_shield_mask = self._pending_shield_mask
+            default_conditioning_mask = (
+                attention_mask
+                if attention_mask is not None
+                else torch.ones_like(input_ids, dtype=torch.bool)
+            )
+            self._active_conditioning_mask = (
+                self._pending_conditioning_mask
+                if self._pending_conditioning_mask is not None
+                else default_conditioning_mask
+            )
+            self._cached_prompt_strengths.clear()
             self.reset_steernet_cache()
             self.injection_trace = {}
         else:
             self._active_shield_mask = None
+            self._active_conditioning_mask = None
         if self._collect_routing_trace:
             self.routing_step_log.append({"routes": self.current_routes()})
 
@@ -224,6 +269,10 @@ class Phi2WithRSC(nn.Module):
             return output
 
         hidden_float = hidden.float()
+        if self._captured_steering_inputs is not None:
+            self._captured_steering_inputs[self.target_layers[position]] = (
+                hidden_float.detach()
+            )
         valid_mask = self._valid_token_mask(hidden_float)
         valid_mask = self._apply_prompt_shield(valid_mask)
         routing_k = self._selection.sum(dim=1)
@@ -239,7 +288,44 @@ class Phi2WithRSC(nn.Module):
             "is_decode": self._is_decode_step,
             "injection_mask": valid_mask,
         }
-        if isinstance(steer_net, SteerNetV2):
+        if self._active_route_experts is not None:
+            delta = self._apply_route_experts(
+                position, hidden_float, active_k, valid_mask, route_gain
+            )
+        elif isinstance(steer_net, PromptConditionedSteerNet):
+            if self._is_decode_step:
+                prompt_strength = self._cached_prompt_strengths.get(
+                    self.target_layers[position]
+                )
+                if prompt_strength is None:
+                    raise RuntimeError(
+                        "prompt strength was not cached during generation prefill"
+                    )
+                delta, _ = steer_net(
+                    hidden_float,
+                    strength_override=prompt_strength,
+                    gain=route_gain,
+                    **steer_kwargs,
+                )
+            else:
+                conditioning_mask = self._active_conditioning_mask
+                if conditioning_mask is None:
+                    raise RuntimeError("prompt conditioning mask is unavailable")
+                conditioning_mask = conditioning_mask[:, -hidden_float.shape[1] :].to(
+                    device=hidden_float.device, dtype=torch.bool
+                )
+                delta, predicted_strength = steer_net(
+                    hidden_float,
+                    conditioning_mask=conditioning_mask,
+                    strength_override=self._prompt_strength_override,
+                    gain=route_gain,
+                    **steer_kwargs,
+                )
+                if not self.training:
+                    self._cached_prompt_strengths[self.target_layers[position]] = (
+                        predicted_strength.detach()
+                    )
+        elif isinstance(steer_net, FixedLowRankResidualSteerNet):
             delta = steer_net(hidden_float, gain=route_gain, **steer_kwargs)
         else:
             delta = steer_net(hidden_float, **steer_kwargs)
@@ -267,6 +353,131 @@ class Phi2WithRSC(nn.Module):
         if was_2d:
             result = result.squeeze(0)
         return (result, *suffix) if is_tuple else result
+
+    def _apply_route_experts(
+        self,
+        position: int,
+        hidden: torch.Tensor,
+        active_k: torch.Tensor,
+        valid_mask: torch.BoolTensor,
+        route_gain: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Apply each example's independent route expert at this layer."""
+        layer = self.target_layers[position]
+        if self._active_route_experts is None:
+            raise RuntimeError("route experts were requested without an active route")
+        keys = self._active_route_experts
+        batch_size = hidden.shape[0]
+        if len(keys) != batch_size:
+            if batch_size % len(keys) != 0:
+                raise ValueError("route expert count must divide the active generation batch")
+            repeat = batch_size // len(keys)
+            keys = [key for key in keys for _ in range(repeat)]
+        delta = torch.zeros_like(hidden)
+        active = self._selection[:, position]
+        groups: dict[str, list[int]] = {}
+        for row, key in enumerate(keys):
+            if bool(active[row]) and key != "k0":
+                groups.setdefault(key, []).append(row)
+        for key, row_ids in groups.items():
+            if key not in self.bank_experts or str(layer) not in self.bank_experts[key]:
+                raise ValueError(f"route expert {key!r} has no adapter for active layer {layer}")
+            indices = torch.tensor(row_ids, device=hidden.device, dtype=torch.long)
+            local_gain = route_gain
+            if local_gain is not None and local_gain.ndim > 0:
+                local_gain = local_gain.index_select(0, indices)
+            local = self.bank_experts[key][str(layer)](
+                hidden.index_select(0, indices),
+                active_k=active_k.index_select(0, indices),
+                is_decode=self._is_decode_step,
+                injection_mask=valid_mask.index_select(0, indices),
+                gain=local_gain,
+            )
+            delta.index_copy_(0, indices, local)
+        return delta
+
+    def add_route_expert(
+        self,
+        route: Sequence[int],
+        initial_layer_states: Optional[dict[int | str, dict[str, torch.Tensor]]] = None,
+    ) -> str:
+        """Create an independent adapter set for a route, optionally from experts."""
+        raw_route = tuple(int(layer) for layer in route)
+        if len(set(raw_route)) != len(raw_route):
+            raise ValueError("route layers must be unique")
+        normalized = tuple(sorted(raw_route))
+        if not normalized or not set(normalized).issubset(self.target_layers):
+            raise ValueError("a trainable route expert must contain candidate layers")
+        key = route_key(normalized)
+        if key in self.bank_experts:
+            return key
+        modules = nn.ModuleDict()
+        states = initial_layer_states or {}
+        for layer in normalized:
+            module = deepcopy(self.steer_nets[str(layer)])
+            state = states.get(layer, states.get(str(layer)))
+            if state is not None:
+                module.load_state_dict(state, strict=True)
+            modules[str(layer)] = module
+        self.bank_experts[key] = modules
+        return key
+
+    def route_expert_state(self, route: Sequence[int]) -> dict[str, torch.Tensor]:
+        """Return an independent route expert state on CPU."""
+        key = route_key(route)
+        if key not in self.bank_experts:
+            raise KeyError(f"route expert {key!r} is not installed")
+        return {
+            name: value.detach().cpu().clone()
+            for name, value in self.bank_experts[key].state_dict().items()
+        }
+
+    def install_route_experts(
+        self,
+        route_catalog: Sequence[Sequence[int]],
+        expert_states: dict[str, dict[str, torch.Tensor]],
+    ) -> None:
+        """Replace the installed route catalog with independently weighted experts."""
+        normalized = normalize_route_catalog(route_catalog, self.target_layers)
+        validate_route_expert_states(normalized, expert_states)
+        installed = nn.ModuleDict()
+        for route in normalized:
+            if not route:
+                continue
+            key = route_key(route)
+            if key not in expert_states:
+                raise ValueError(f"route expert checkpoint is missing weights for {key}")
+            modules = nn.ModuleDict()
+            route_state = expert_states[key]
+            for layer in route:
+                module = deepcopy(self.steer_nets[str(layer)])
+                prefix = f"{layer}."
+                layer_state = {
+                    name[len(prefix):]: value
+                    for name, value in route_state.items()
+                    if name.startswith(prefix)
+                }
+                if not layer_state:
+                    raise ValueError(f"route expert {key} has no state for layer {layer}")
+                module.load_state_dict(layer_state, strict=True)
+                modules[str(layer)] = module
+            installed[key] = modules
+        self.bank_experts = installed
+        self._bank_route_catalog = normalized
+        self.set_route_experts(None)
+
+    def set_route_experts(self, routes: Optional[Sequence[Sequence[int]]]) -> None:
+        """Set one expert route per batch item; ``None`` selects shared adapters."""
+        if routes is None:
+            self._active_route_experts = None
+            return
+        if not routes:
+            raise ValueError("route expert selection cannot be empty")
+        keys = [route_key(route) for route in routes]
+        unknown = [key for key in keys if key != "k0" and key not in self.bank_experts]
+        if unknown:
+            raise ValueError(f"requested route experts are not installed: {unknown}")
+        self._active_route_experts = keys
 
     def _valid_token_mask(self, hidden: torch.Tensor) -> torch.BoolTensor:
         if self._attention_mask is None:
@@ -411,6 +622,32 @@ class Phi2WithRSC(nn.Module):
     def set_prompt_shield_mask(self, mask: Optional[torch.Tensor]) -> None:
         self._pending_shield_mask = mask
 
+    def set_prompt_conditioning_mask(self, mask: Optional[torch.Tensor]) -> None:
+        """Set the prompt-only token mask used by question-conditioned strength heads."""
+        self._pending_conditioning_mask = mask
+
+    def set_prompt_strength_override(self, strength: Optional[torch.Tensor | float]) -> None:
+        """Override learned prompt strengths for controlled action evaluation."""
+        if strength is None:
+            self._prompt_strength_override = None
+            return
+        values = torch.as_tensor(strength).detach()
+        maximum = float(getattr(self.cfg, "prompt_strength_max", 1.25))
+        if (
+            not torch.isfinite(values).all()
+            or bool((values < 0).any())
+            or bool((values > maximum).any())
+        ):
+            raise ValueError(f"prompt strength must be finite and between 0 and {maximum}")
+        self._prompt_strength_override = values
+
+    def get_prompt_strengths(self) -> Dict[int, torch.Tensor]:
+        """Return the most recently cached per-layer strengths on CPU."""
+        return {
+            layer: value.detach().float().cpu().clone()
+            for layer, value in self._cached_prompt_strengths.items()
+        }
+
     def set_steer_scale(self, scale: Optional[float]) -> None:
         self._steer_scale = scale
 
@@ -421,12 +658,22 @@ class Phi2WithRSC(nn.Module):
         self._collect_injection_trace = bool(enabled)
 
     def set_telemetry(self, enabled: bool) -> None:
-        for steer_net in self.steer_nets.values():
-            steer_net.telemetry = bool(enabled)
+        modules = list(self.steer_nets.values()) + [
+            expert for route in self.bank_experts.values() for expert in route.values()
+        ]
+        for steer_net in modules:
+            if hasattr(steer_net, "telemetry"):
+                steer_net.telemetry = bool(enabled)
 
     def reset_steernet_cache(self) -> None:
-        for steer_net in self.steer_nets.values():
-            steer_net.reset_cache()
+        modules = list(self.steer_nets.values()) + [
+            expert for route in self.bank_experts.values() for expert in route.values()
+        ]
+        for steer_net in modules:
+            reset = getattr(steer_net, "reset_cache", None)
+            if reset is not None:
+                reset()
+        self._cached_prompt_strengths.clear()
 
     def remove_hooks(self) -> None:
         for handle in self._hook_handles:
@@ -462,6 +709,17 @@ class Phi2WithRSC(nn.Module):
             for h in handles:
                 h.remove()
             self._hooks_disabled = prev
+
+    @contextmanager
+    def capture_steering_inputs(self):
+        """Capture the pre-adapter hidden state seen by each active steering head."""
+        previous = self._captured_steering_inputs
+        captured: Dict[int, torch.Tensor] = {}
+        self._captured_steering_inputs = captured
+        try:
+            yield captured
+        finally:
+            self._captured_steering_inputs = previous
 
     def forward(self, *args, **kwargs):
         return self.base_model(*args, **kwargs)

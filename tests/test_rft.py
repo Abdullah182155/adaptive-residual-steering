@@ -238,7 +238,7 @@ def test_gate0_strict_mode_still_fails_when_quality_threshold_is_missed(tmp_path
         },
     )
 
-    with pytest.raises(RuntimeError, match="Gate 0 failed"):
+    with pytest.raises(RuntimeError, match="rollout quality probe failed"):
         runner._gate0(
             object(),
             object(),

@@ -50,7 +50,24 @@ def parse_args(argv=None):
         choices=("S1", "S1C", "S1R", "S2", "S2B", "S5", "bench", "all", "train", "calibrate", "router", "gate"),
         default="all",
     )
-    parser.add_argument("--steernet_arch", choices=("v5", "v2"), default="v5")
+    parser.add_argument(
+        "--steering_architecture",
+        "--steernet_arch",
+        dest="steernet_arch",
+        choices=(
+            "legacy_feature_residual",
+            "v5",
+            "fixed_route_low_rank_residual",
+            "v2",
+            "prompt_conditioned_residual",
+        ),
+        default="v5",
+        help=(
+            "fixed steering architecture; use fixed_route_low_rank_residual for "
+            "the rank-16 calibrated adapter or prompt_conditioned_residual for "
+            "the rank-32 prompt-conditioned adapter; legacy aliases remain supported"
+        ),
+    )
     parser.add_argument("--objective", choices=("nll",), default="nll")
     parser.add_argument("--s1_epochs", type=int)
     parser.add_argument("--s1_lr", type=float)
@@ -69,7 +86,11 @@ def parse_args(argv=None):
     parser.add_argument(
         "--arms",
         default="baseline,fixed",
-        help="Comma-separated benchmark arms; steer_only is the isolated Phase 1 arm",
+        help=(
+            "Comma-separated benchmark arms; for prompt-conditioned steering, "
+            "strength_fixed:1.0 is the fixed-strength reference and steer_only "
+            "uses the learned prompt-conditioned strength"
+        ),
     )
     parser.add_argument("--ood", default="")
     parser.add_argument("--ood_n", type=int, default=300)
@@ -82,15 +103,29 @@ def parse_args(argv=None):
         action="store_true",
         help="Enable full HuggingFace / transformers logging output (weight bars, downloads, etc.)",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    architecture_aliases = {
+        "legacy_feature_residual": "v5",
+        "fixed_route_low_rank_residual": "v2",
+    }
+    requested_architecture = args.steernet_arch
+    args.architecture_id = {
+        "legacy_feature_residual": "ars.legacy_feature_residual",
+        "v5": "ars.legacy_feature_residual",
+        "fixed_route_low_rank_residual": "ars.fixed_route_low_rank_residual",
+        "v2": "ars.fixed_route_low_rank_residual",
+        "prompt_conditioned_residual": "ars.prompt_conditioned_residual",
+    }[requested_architecture]
+    args.steernet_arch = architecture_aliases.get(requested_architecture, requested_architecture)
+    return args
 
 
 def build_config(args) -> RSCConfig:
     cfg = RSCConfig(steernet_arch=args.steernet_arch, objective=args.objective)
-    if args.steernet_arch == "v2":
+    if args.steernet_arch in {"v2", "prompt_conditioned_residual"}:
         cfg.fixed_layers = [12, 15, 18, 21]
         cfg.candidate_layers = sorted(set(cfg.candidate_layers) | set(cfg.fixed_layers))
-        cfg.lora_rank = 16
+        cfg.lora_rank = 16 if args.steernet_arch == "v2" else 32
         cfg.rho_max = 0.10
         cfg.steernet_norm_stat = "p99_norm"
         cfg.steernet_use_mag_head = False
@@ -152,7 +187,10 @@ def _load_arm_weights(model, arm: str, cfg: RSCConfig, device: torch.device) -> 
     if arm in {"baseline", "identity"}:
         return
 
-    if arm in {"fixed", "steer_only", "random", "router"} or arm.startswith("steer_gain:"):
+    if (
+        arm in {"fixed", "steer_only", "random", "router"}
+        or arm.startswith(("steer_gain:", "strength_fixed:"))
+    ):
         checkpoint = Path(cfg.lora_save_path)
     elif arm in {"gate", "full"}:
         checkpoint = Path(cfg.steernet_gated_save_path)
@@ -167,7 +205,10 @@ def _load_arm_weights(model, arm: str, cfg: RSCConfig, device: torch.device) -> 
 def run(args) -> int:
     cfg = build_config(args)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"ARS Phase 1 | device={device} | route={cfg.fixed_layers}")
+    print(
+        f"ARS fixed-route steering | architecture={args.architecture_id} "
+        f"device={device} | route={cfg.fixed_layers}"
+    )
     model, tokenizer = build_model(cfg, device)
     if stage_requires_checkpoint(args.stage):
         checkpoint = Path(cfg.lora_save_path)

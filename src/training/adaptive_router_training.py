@@ -108,8 +108,11 @@ def _save_router_checkpoint(
 
 
 def _score_action(
-    model, row, route, alpha: torch.Tensor, device, prompt_shield_mask=None
+    model, row, route, alpha: torch.Tensor, device, prompt_shield_mask=None,
+    *, expert_route: Sequence[int] | None = None,
 ) -> torch.Tensor:
+    if hasattr(model, "set_route_experts"):
+        model.set_route_experts([expert_route] if expert_route else None)
     model.set_routing_override("matrix", route)
     model.set_route_gains(alpha)
     model.set_prompt_shield_mask(prompt_shield_mask)
@@ -122,6 +125,18 @@ def _score_action(
         nll = _completion_nll(logits, row["labels"])
     del logits
     return nll
+
+
+def _chosen_expert_route(router, decision, batch_index: int = 0):
+    """Return the bank route represented by a route-value decision."""
+    if not isinstance(router, RouteValueRouter):
+        return None
+    if decision.route_indices is None:
+        raise ValueError("route-value decisions must include their catalog indices")
+    route_index = int(decision.route_indices[batch_index].item())
+    if route_index < 0 or route_index >= len(router.route_catalog):
+        raise ValueError(f"router selected an invalid route catalog index: {route_index}")
+    return router.route_catalog[route_index]
 
 
 def _distinct_question_rows(rows, limit: int):
@@ -183,6 +198,8 @@ def _capture_prompt_hidden(model, item: dict, row, probe: _Probe, candidates, de
         prompt_mask = row["labels"].eq(-100) & attention_mask.bool()
     model.set_routing_override("none", candidates)
     model.set_route_gains(None)
+    if hasattr(model, "set_route_experts"):
+        model.set_route_experts(None)
     model.set_prompt_shield_mask(None)
     probe.hidden = None
     model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
@@ -224,6 +241,8 @@ def _evaluate_router_nll(
         first_row, extras = _prepare([group[0]], device)
         model.set_routing_override("none", candidates)
         model.set_route_gains(None)
+        if hasattr(model, "set_route_experts"):
+            model.set_route_experts(None)
         model.set_prompt_shield_mask(None)
         base_logits = model(
             input_ids=first_row["input_ids"],
@@ -245,12 +264,15 @@ def _evaluate_router_nll(
         else:
             decision = router.choose(prompt_hidden, prompt_mask)
         route = decision.mask
+        expert_route = _chosen_expert_route(router, decision)
         group_nlls = []
         for item_index, item in enumerate(group):
             row, item_extras = _prepare([item], device)
             if item_index:
                 model.set_routing_override("none", candidates)
                 model.set_route_gains(None)
+                if hasattr(model, "set_route_experts"):
+                    model.set_route_experts(None)
                 model.set_prompt_shield_mask(None)
                 base_logits = model(
                     input_ids=row["input_ids"],
@@ -263,6 +285,7 @@ def _evaluate_router_nll(
             nll = _score_action(
                 model, row, route, decision.alpha, device,
                 item_extras.get("prompt_shield_mask"),
+                expert_route=expert_route,
             )
             group_nlls.append(float(nll.mean()))
             del row, item_extras, nll
@@ -303,6 +326,8 @@ def _evaluate_router_nll(
         del first_row, extras
     model.set_routing_override("none", candidates)
     model.set_route_gains(None)
+    if hasattr(model, "set_route_experts"):
+        model.set_route_experts(None)
     model.set_prompt_shield_mask(None)
     if not question_nlls:
         raise ValueError("router validation produced no evaluable question rows")
@@ -380,15 +405,18 @@ def _evaluate_router_preference(
             continue
         context_features = _router_context_features(positive_item, device)
         decision = router.choose(prompt_hidden, prompt_mask, context_features)
+        expert_route = _chosen_expert_route(router, decision)
         positive_nll = _score_action(
             model, positive_row, decision.mask, decision.alpha, device,
             positive_extras.get("prompt_shield_mask"),
+            expert_route=expert_route,
         )
         negative_item = pair["negative"]
         negative_row, negative_extras = _prepare([negative_item], device)
         negative_nll = _score_action(
             model, negative_row, decision.mask, decision.alpha, device,
             negative_extras.get("prompt_shield_mask"),
+            expert_route=expert_route,
         )
         pos_value = float(positive_nll.mean())
         neg_value = float(negative_nll.mean())
@@ -412,6 +440,8 @@ def _evaluate_router_preference(
         raise ValueError("router preference validation could not score any pairs")
     model.set_routing_override("none", candidates)
     model.set_route_gains(None)
+    if hasattr(model, "set_route_experts"):
+        model.set_route_experts(None)
     model.set_prompt_shield_mask(None)
     return {
         "validation_preference_loss": sum(costs) / len(costs),
@@ -431,6 +461,8 @@ def _build_router_prefill(model, router: RouteValueRouter, probe: _Probe):
     def prefill(input_ids, attention_mask, route_feature_mask=None, route_context_features=None):
         model.set_routing_override("none", candidates)
         model.set_route_gains(None)
+        if hasattr(model, "set_route_experts"):
+            model.set_route_experts(None)
         probe.hidden = None
         model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)
         if probe.hidden is None:
@@ -446,6 +478,11 @@ def _build_router_prefill(model, router: RouteValueRouter, probe: _Probe):
             decision = router.choose(probe.hidden, feature_mask)
         model.set_routing_override("matrix", decision.mask)
         model.set_route_gains(decision.alpha)
+        if isinstance(router, RouteValueRouter) and decision.route_indices is not None:
+            model.set_route_experts([
+                router.route_catalog[int(route_index)]
+                for route_index in decision.route_indices.tolist()
+            ])
 
     prefill.uses_question_features = isinstance(router, RouteValueRouter)
     return prefill
@@ -511,6 +548,8 @@ def _evaluate_router_task_accuracy(
         )
         model.set_routing_override("none", router.candidate_layers)
         model.set_route_gains(None)
+        if hasattr(model, "set_route_experts"):
+            model.set_route_experts(None)
         baseline_hits = []
         static_bank_hits = []
         routed_hits = []
@@ -518,6 +557,8 @@ def _evaluate_router_task_accuracy(
             # Clear the previous example's selected route before measuring a true baseline.
             model.set_routing_override("none", router.candidate_layers)
             model.set_route_gains(None)
+            if hasattr(model, "set_route_experts"):
+                model.set_route_experts(None)
             model.set_prompt_shield_mask(None)
             generation_options = {
                 "prompt_shields": [shield],
@@ -533,6 +574,8 @@ def _evaluate_router_task_accuracy(
             baseline_hits.append(bool(score_tiers(baseline_output.text, gold)["lenient"]))
             if static_action is not None:
                 static_route = tuple(int(layer) for layer in static_action.get("route", ()))
+                if hasattr(model, "set_route_experts"):
+                    model.set_route_experts([static_route] if static_route else None)
                 if static_route:
                     route_mask = torch.tensor(
                         [[layer in static_route for layer in router.candidate_layers]],
@@ -580,6 +623,8 @@ def _evaluate_router_task_accuracy(
             })
         model.set_routing_override("none", router.candidate_layers)
         model.set_route_gains(None)
+        if hasattr(model, "set_route_experts"):
+            model.set_route_experts(None)
         model.set_prompt_shield_mask(None)
 
     active_shots = {
@@ -693,7 +738,8 @@ def select_static_bank_action(
                 )
                 alpha_tensor = torch.tensor([alpha], dtype=torch.float32, device=target_device)
                 nll = _score_action(
-                    model, row, route_mask, alpha_tensor, target_device, prompt_shield
+                    model, row, route_mask, alpha_tensor, target_device, prompt_shield,
+                    expert_route=route,
                 )
                 question_scores[action_index] += (
                     float(nll.mean()) + route_cost * len(route)
@@ -706,6 +752,8 @@ def select_static_bank_action(
         score_questions += 1
     model.set_routing_override("none", candidates)
     model.set_route_gains(None)
+    if hasattr(model, "set_route_experts"):
+        model.set_route_experts(None)
     model.set_prompt_shield_mask(None)
 
     action_scores = [score / score_questions for score in score_totals]
@@ -730,6 +778,7 @@ def select_static_bank_action(
                     nll = _score_action(
                         model, row, route_mask, alpha_tensor, target_device,
                         extras.get("prompt_shield_mask"),
+                        expert_route=route,
                     )
                     pair_nll[key] = float(nll.mean())
                     del row, extras, nll
@@ -742,6 +791,8 @@ def select_static_bank_action(
                 selection_scores[action_index] = preference_scores[action_index]
         model.set_routing_override("none", candidates)
         model.set_route_gains(None)
+        if hasattr(model, "set_route_experts"):
+            model.set_route_experts(None)
         model.set_prompt_shield_mask(None)
     coarse_ranked = sorted(range(len(actions)), key=selection_scores.__getitem__)
     generation_stats: dict[int, dict[str, float]] = {}
@@ -764,6 +815,8 @@ def select_static_bank_action(
 
         for action_index in candidate_indices:
             route, alpha = actions[action_index]
+            if hasattr(model, "set_route_experts"):
+                model.set_route_experts([route] * len(selected_examples) if route else None)
             if route:
                 # The action is static for every prompt in this generation batch.
                 # "only" broadcasts the route to the batch dimension; a one-row
@@ -790,6 +843,8 @@ def select_static_bank_action(
             generation_stats[action_index] = per_shot
         model.set_routing_override("none", candidates)
         model.set_route_gains(None)
+        if hasattr(model, "set_route_experts"):
+            model.set_route_experts(None)
         model.set_prompt_shield_mask(None)
 
     if generation_stats:
@@ -935,6 +990,7 @@ def _build_oracle_targets(
                     nll = _score_action(
                         model, row, route_mask, alpha_tensor, device,
                         item_extras.get("prompt_shield_mask"),
+                        expert_route=route,
                     )
                     pair_nlls[pair_key] = float(nll.mean())
                     progress.update(1)
@@ -954,6 +1010,7 @@ def _build_oracle_targets(
                         alpha_tensor,
                         device,
                         item_extras.get("prompt_shield_mask"),
+                        expert_route=route,
                     )
                     completion_nlls.append(float(nll.mean()))
                     progress.update(1)
@@ -998,6 +1055,8 @@ def _build_oracle_targets(
     model.set_routing_override("none", candidates)
     model.set_route_gains(None)
     model.set_prompt_shield_mask(None)
+    if hasattr(model, "set_route_experts"):
+        model.set_route_experts(None)
     if not targets:
         raise ValueError("no route teacher labels could be produced")
     return targets, {

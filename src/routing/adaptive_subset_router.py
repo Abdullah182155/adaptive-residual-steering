@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -17,6 +17,7 @@ class RouteDecision:
     mask: torch.BoolTensor
     k: torch.LongTensor
     alpha: torch.Tensor
+    route_indices: Optional[torch.LongTensor] = None
 
 
 class AdaptiveSubsetRouter(nn.Module):
@@ -266,8 +267,10 @@ class RouteValueRouter(nn.Module):
         )
         k_values = []
         alpha_values = []
+        route_indices = []
         for batch_index, action_index in enumerate(action_indices):
             route, alpha = self.action_catalog[action_index]
+            route_indices.append(self.route_catalog.index(route))
             k_values.append(len(route))
             alpha_values.append(alpha)
             for layer in route:
@@ -276,6 +279,7 @@ class RouteValueRouter(nn.Module):
             mask=mask,
             k=torch.tensor(k_values, dtype=torch.long, device=hidden.device),
             alpha=torch.tensor(alpha_values, dtype=hidden.dtype, device=hidden.device),
+            route_indices=torch.tensor(route_indices, dtype=torch.long, device=hidden.device),
         )
 
 

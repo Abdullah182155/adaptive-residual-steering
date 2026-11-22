@@ -1,8 +1,9 @@
-"""SteerNet V5: capped causal residual adapters for fixed-route ARS."""
+"""Steering adapter architectures for fixed-route ARS experiments."""
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 from typing import Optional, Dict
 
 
@@ -91,15 +92,10 @@ class CausalDWConv1d(nn.Module):
 
 
 class SteerNet(nn.Module):
-    """Rank-64 causal residual adapter with a per-layer norm cap.
+    """Legacy rank-64 causal residual adapter with a per-layer norm cap.
 
-    Key differences from v4:
-    - Fixed rank 64
-    - Per-layer cap basis N_l loaded from calibration
-    - Smooth cap C_l = κ * N_l
-    - Position-0 shielding (no steering on first token)
-    - Zero-init W_u for identity initialization
-    - Causal 1D depthwise convolution (k=4) with streaming cache
+    It uses calibrated per-layer caps, position shielding, zero-initialized output
+    projection, and a causal depthwise convolution with a streaming cache.
     """
 
     def __init__(
@@ -167,7 +163,7 @@ class SteerNet(nn.Module):
 
         # Only create the dropout modules for the active path (avoid unused parameters)
         if use_mag_head:
-            self.drop = nn.Dropout(dropout)       # V5 path: before up projection
+            self.drop = nn.Dropout(dropout)
         else:
             self.drop_down = nn.Dropout(dropout)  # Legacy path: after down
             self.drop_mid = nn.Dropout(dropout)   # Legacy path: after mid
@@ -229,7 +225,7 @@ class SteerNet(nn.Module):
         x = self.norm(h_flt)
 
         if self.use_mag_head:
-            # V5 path: dropout only before up projection
+            # Dropout applies only before the output projection.
             x = self.act(self.down(x))
             if self.use_causal_conv:
                 x = self.conv(x, is_decode=is_decode)
@@ -261,7 +257,7 @@ class SteerNet(nn.Module):
             delta = radius * magnitude * centered_norm * direction / direction_norm
             q = magnitude
         elif self.amplitude_mode == "norm_capped":
-            # V21: MLP controls both direction AND magnitude through raw output norm.
+            # This legacy branch learns both direction and magnitude from output norm.
             # Safety ceiling prevents runaway amplitudes; below the cap, full gradient
             # flows through the norm so the network learns per-token magnitude.
             centered_norm = (h_flt - h_flt.mean(dim=-1, keepdim=True)).norm(
@@ -343,10 +339,8 @@ class SteerNet(nn.Module):
         self._pre_cap_generator.manual_seed(0)
 
 
-# The Session 2 adapter intentionally has no convolution, residual mid layer, or
-# learned magnitude head; its cap references the calibrated per-layer p99 norm.
-class SteerNetV2(nn.Module):
-    """Zero-initialized low-rank adapter with a differentiable p99 norm cap."""
+class FixedLowRankResidualSteerNet(nn.Module):
+    """Zero-initialized fixed low-rank adapter with a differentiable p99 norm cap."""
 
     def __init__(
         self,
@@ -375,7 +369,7 @@ class SteerNetV2(nn.Module):
         self._pre_cap_n = 0
 
     def reset_cache(self) -> None:
-        """Keep a uniform wrapper interface; V2 has no recurrent adapter cache."""
+        """Keep a uniform wrapper interface; this adapter has no recurrent cache."""
 
     def forward(
         self,
@@ -425,9 +419,170 @@ class SteerNetV2(nn.Module):
         self._pre_cap_n = 0
 
 
-# The explicit compatibility alias preserves old checkpoints while imports use
-# the stable publication-quality ``SteerNet`` name.
-RSCSteerNetV5 = SteerNet
+# Compatibility alias retained for old imports and checkpoint tooling.
+SteerNetV2 = FixedLowRankResidualSteerNet
+
+
+class PromptConditionedSteerNet(nn.Module):
+    """Prompt-conditioned low-rank residual adapter with a bounded strength head.
+
+    The adapter predicts a per-example strength from the masked prompt summary,
+    then reuses that strength for every token in the example. A residual block
+    increases capacity inside the low-rank space without adding backbone layers.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        rank: int = 32,
+        rho_max: float = 0.10,
+        layer_norm_ref: float = 1.0,
+        layer_idx: int = 0,
+        max_strength: float = 1.25,
+        initial_strength: float = 1.0,
+    ) -> None:
+        super().__init__()
+        if hidden_dim < 1 or rank < 1:
+            raise ValueError("hidden_dim and rank must be positive")
+        if rho_max <= 0 or layer_norm_ref <= 0:
+            raise ValueError("rho_max and layer_norm_ref must be positive")
+        if (
+            not math.isfinite(max_strength)
+            or not math.isfinite(initial_strength)
+            or max_strength <= 0
+            or not 0 < initial_strength < max_strength
+        ):
+            raise ValueError("initial_strength must be between zero and max_strength")
+
+        self.rank = int(rank)
+        self.rho_max = float(rho_max)
+        self.layer_norm_ref = float(layer_norm_ref)
+        self.layer_idx = int(layer_idx)
+        self.max_strength = float(max_strength)
+
+        self.down_projection = nn.Linear(hidden_dim, rank, bias=False)
+        self.residual_in = nn.Linear(rank, rank, bias=False)
+        self.residual_out = nn.Linear(rank, rank, bias=False)
+        self.up_projection = nn.Linear(rank, hidden_dim, bias=False)
+        self.strength_head = nn.Linear(rank, 1)
+        self.activation = nn.GELU()
+
+        nn.init.kaiming_uniform_(self.down_projection.weight, a=5**0.5)
+        nn.init.kaiming_uniform_(self.residual_in.weight, a=5**0.5)
+        nn.init.zeros_(self.residual_out.weight)
+        nn.init.zeros_(self.up_projection.weight)
+        nn.init.zeros_(self.strength_head.weight)
+        initial_probability = initial_strength / max_strength
+        initial_logit = torch.logit(torch.tensor(initial_probability)).item()
+        nn.init.constant_(self.strength_head.bias, initial_logit)
+
+        self.telemetry = True
+        self._last_strength: Optional[torch.Tensor] = None
+        self._pre_cap_max = 0.0
+        self._pre_cap_n = 0
+
+    def reset_cache(self) -> None:
+        """Keep a uniform adapter interface; this module has no recurrent state."""
+
+    def strength_features(
+        self, h: torch.Tensor, conditioning_mask: torch.BoolTensor
+    ) -> torch.Tensor:
+        """Encode a prompt into the rank-space feature consumed by the strength head."""
+        hidden = h.float()
+        if conditioning_mask.shape != hidden.shape[:2]:
+            raise ValueError("conditioning_mask must match the hidden batch and sequence dimensions")
+        latent = self.activation(self.down_projection(hidden))
+        mask = conditioning_mask.to(device=latent.device, dtype=latent.dtype)
+        counts = mask.sum(dim=1, keepdim=True)
+        if bool((counts == 0).any()):
+            raise ValueError("each example must contain at least one conditioning token")
+        return (latent * mask.unsqueeze(-1)).sum(dim=1) / counts
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        position_ids: Optional[torch.Tensor] = None,
+        active_k: Optional[torch.Tensor] = None,
+        is_decode: bool = False,
+        injection_mask: Optional[torch.BoolTensor] = None,
+        conditioning_mask: Optional[torch.BoolTensor] = None,
+        strength_override: Optional[torch.Tensor] = None,
+        gain: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return a capped residual update and its per-example predicted strength."""
+        del active_k
+        hidden = h.float()
+        latent = self.activation(self.down_projection(hidden))
+        refined = latent + self.residual_out(self.activation(self.residual_in(latent)))
+
+        if strength_override is None:
+            if conditioning_mask is None:
+                raise ValueError("conditioning_mask is required to predict prompt strength")
+            mask = conditioning_mask.to(device=latent.device, dtype=latent.dtype)
+            counts = mask.sum(dim=1, keepdim=True)
+            if conditioning_mask.shape != hidden.shape[:2] or bool((counts == 0).any()):
+                raise ValueError("conditioning_mask must match hidden states and contain prompt tokens")
+            pooled = (latent * mask.unsqueeze(-1)).sum(dim=1) / counts
+            strength = self.max_strength * torch.sigmoid(self.strength_head(pooled)).squeeze(-1)
+        else:
+            strength = torch.as_tensor(
+                strength_override, device=hidden.device, dtype=hidden.dtype
+            )
+            if strength.ndim == 0:
+                strength = strength.expand(hidden.shape[0])
+            if strength.ndim != 1 or strength.shape[0] != hidden.shape[0]:
+                raise ValueError("strength_override must be scalar or one value per example")
+            if (
+                not torch.isfinite(strength).all()
+                or bool((strength < 0).any())
+                or bool((strength > self.max_strength).any())
+            ):
+                raise ValueError(
+                    f"strength_override must be finite and within [0, {self.max_strength}]"
+                )
+
+        effective_strength = strength
+        if gain is not None:
+            external_gain = torch.as_tensor(gain, device=hidden.device, dtype=hidden.dtype)
+            if external_gain.ndim == 0:
+                external_gain = external_gain.expand(hidden.shape[0])
+            if external_gain.ndim != 1 or external_gain.shape[0] != hidden.shape[0]:
+                raise ValueError("gain must be scalar or one value per example")
+            if not torch.isfinite(external_gain).all() or bool((external_gain < 0).any()):
+                raise ValueError("gain must contain finite non-negative values")
+            effective_strength = effective_strength * external_gain
+
+        delta = self.up_projection(refined) * effective_strength.view(-1, 1, 1)
+        pre_cap_norm = delta.norm(dim=-1, keepdim=True)
+        cap = self.rho_max * self.layer_norm_ref
+        cap_scale = (cap / pre_cap_norm.clamp_min(torch.finfo(pre_cap_norm.dtype).eps)).clamp(max=1.0)
+        delta = delta * cap_scale
+
+        if position_ids is not None:
+            delta = delta * position_ids.ne(0).unsqueeze(-1).to(delta.dtype)
+        elif not is_decode and delta.shape[1] > 0:
+            delta = delta.clone()
+            delta[:, 0] = 0
+        if injection_mask is not None:
+            delta = delta * injection_mask.unsqueeze(-1).to(delta.dtype)
+
+        if self.telemetry and not self.training:
+            self._last_strength = strength.detach()
+            if pre_cap_norm.numel():
+                self._pre_cap_max = max(self._pre_cap_max, float(pre_cap_norm.detach().max()))
+                self._pre_cap_n += pre_cap_norm.numel()
+        return delta, strength
+
+    def reset_pre_cap_stats(self) -> None:
+        """Reset lightweight pre-cap telemetry counters."""
+        self._pre_cap_max = 0.0
+        self._pre_cap_n = 0
+        self._last_strength = None
+
+
+# Semantic name for new imports; the versioned aliases remain for old callers.
+LegacyFeatureSteerNet = SteerNet
+RSCSteerNetV5 = LegacyFeatureSteerNet
 
 
 DEFAULT_PHI2_LAYER_NORMS: Dict[int, float] = {
@@ -456,7 +611,7 @@ def load_layer_norms(
     if not calibration_path or not os.path.exists(calibration_path):
         if calibration_path:
             print(
-                f"[SteerNetV5] Calibration file '{calibration_path}' not found on disk. "
+                f"[Steering] Calibration file '{calibration_path}' not found on disk. "
                 f"Falling back to certified phi-2 layer norms."
             )
         return dict(DEFAULT_PHI2_LAYER_NORMS)
@@ -475,7 +630,7 @@ def load_layer_norms(
         return layer_norms
     except Exception as e:
         print(
-            f"[SteerNetV5] Failed to parse '{calibration_path}' ({e}). "
+            f"[Steering] Failed to parse '{calibration_path}' ({e}). "
             f"Falling back to certified phi-2 layer norms."
         )
         return dict(DEFAULT_PHI2_LAYER_NORMS)

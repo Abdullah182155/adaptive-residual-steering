@@ -15,7 +15,7 @@ from typing import Iterable, Mapping, Sequence
 
 
 TRAINING_ARTIFACTS = (
-    "steernet_v2.pt",
+    "fixed_route_adapter.pt",
     "session3_steering_bank.pt",
     "session3_router.pt",
     "norms_v2_fresh.json",
@@ -110,9 +110,15 @@ def resolve_artifacts(root: str | Path, names: Sequence[str]) -> dict[str, Path]
                 )
             for section in ("artifacts", "code"):
                 for relative_name, metadata in manifest.get(section, {}).items():
-                    path = locate_named_file([base], Path(relative_name).name)
+                    path = (base / relative_name).resolve()
+                    try:
+                        path.relative_to(base.resolve())
+                    except ValueError as error:
+                        raise ValueError(
+                            f"training bundle manifest contains an unsafe path: {relative_name}"
+                        ) from error
                     expected = metadata.get("sha256") if isinstance(metadata, dict) else None
-                    if path is None or not expected or sha256_file(path) != expected:
+                    if not path.is_file() or not expected or sha256_file(path) != expected:
                         raise ValueError(
                             f"training bundle {section} checksum is missing or invalid: {relative_name}"
                         )

@@ -24,12 +24,12 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 from scripts.run_session3_router import (
-    V2_ROUTE,
+    FIXED_ROUTE,
     _apply_norm_refs,
     _configure,
+    _load_fixed_adapter_weights,
     _load_bank,
     _load_model,
-    _load_v2_weights,
     _sha256,
 )
 from src.evaluation.benchmark import _configure_arm, mcnemar_exact
@@ -51,8 +51,14 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--candidate_layers", type=int, nargs="+", default=[8, 11, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 24, 26])
     parser.add_argument("--norm_calibration", type=Path, required=True)
-    parser.add_argument("--v2_norm_calibration", type=Path, required=True)
-    parser.add_argument("--v2_checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--fixed_adapter_norm_calibration", "--v2_norm_calibration",
+        dest="fixed_adapter_norm_calibration", type=Path, required=True,
+    )
+    parser.add_argument(
+        "--fixed_adapter_checkpoint", "--v2_checkpoint",
+        dest="fixed_adapter_checkpoint", type=Path, required=True,
+    )
     parser.add_argument("--bank_checkpoint", type=Path, required=True)
     parser.add_argument("--router_checkpoint", type=Path, required=True)
     parser.add_argument("--static_action", type=Path, required=True)
@@ -208,7 +214,7 @@ def _load_existing(path: Path) -> dict[int, dict[str, Any]]:
 
 def _route_and_alpha(model, arm: str, cfg, static_action: dict[str, Any]) -> tuple[list[int], float]:
     if arm == "steer_only":
-        return list(V2_ROUTE), 1.0
+        return list(FIXED_ROUTE), 1.0
     if arm == "static_bank":
         return list(static_action["route"]), float(static_action["alpha"])
     if arm == "router":
@@ -236,7 +242,7 @@ def run(args) -> int:
     if args.n_test < 1 or any(shot not in (0, 2) for shot in args.shots):
         raise ValueError("n_test must be positive; supported shot counts are 0 and 2")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    for path in (args.v2_checkpoint, args.v2_norm_calibration, args.bank_checkpoint, args.router_checkpoint, args.norm_calibration, args.static_action):
+    for path in (args.fixed_adapter_checkpoint, args.fixed_adapter_norm_calibration, args.bank_checkpoint, args.router_checkpoint, args.norm_calibration, args.static_action):
         if not path.is_file():
             raise FileNotFoundError(path)
 
@@ -272,7 +278,7 @@ def run(args) -> int:
     model.eval()
     _apply_norm_refs(model, args.norm_calibration)
     _load_bank(model, args.bank_checkpoint)
-    _load_v2_weights(model, args.v2_checkpoint, args.v2_norm_calibration)
+    _load_fixed_adapter_weights(model, args.fixed_adapter_checkpoint, args.fixed_adapter_norm_calibration)
     _, router_prefill, probe = load_adaptive_router(
         model, args.router_checkpoint, device, expected_bank_sha256=bank_digest
     )
@@ -326,8 +332,10 @@ def run(args) -> int:
         "demonstration_ids": [item["source_id"] for item in demos],
         "test_source_ids": [row["source_id"] for row in test_rows],
         "artifact_sha256": {
-            "v2_checkpoint": _sha256(args.v2_checkpoint),
-            "v2_norms": _sha256(args.v2_norm_calibration),
+            "fixed_adapter_checkpoint": _sha256(args.fixed_adapter_checkpoint),
+            "fixed_adapter_norms": _sha256(args.fixed_adapter_norm_calibration),
+            "fixed_adapter_architecture_id": "ars.fixed_route_low_rank_residual",
+            "fixed_adapter_architecture_version": "1.0.0",
             "bank_checkpoint": bank_digest,
             "router_checkpoint": _sha256(args.router_checkpoint),
             "bank_norms": _sha256(args.norm_calibration),
@@ -353,8 +361,8 @@ def run(args) -> int:
                 if not set(existing).issubset(expected_indices):
                     raise ValueError(f"saved predictions do not match this test subset: {arm_path}")
                 if arm == "steer_only":
-                    cfg.fixed_layers = list(V2_ROUTE)
-                    _load_v2_weights(model, args.v2_checkpoint, args.v2_norm_calibration)
+                    cfg.fixed_layers = list(FIXED_ROUTE)
+                    _load_fixed_adapter_weights(model, args.fixed_adapter_checkpoint, args.fixed_adapter_norm_calibration)
                 elif arm in {"static_bank", "router"}:
                     cfg.fixed_layers = list(candidates)
                     _load_bank(model, args.bank_checkpoint)

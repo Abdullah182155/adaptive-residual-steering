@@ -36,6 +36,8 @@ class _TinySteeringModel(nn.Module):
         self.route = None
         self.route_gains = None
         self.shield = None
+        self.bank_experts = nn.ModuleDict()
+        self.active_experts = None
         for parameter in self.base_model.parameters():
             parameter.requires_grad_(False)
 
@@ -45,6 +47,39 @@ class _TinySteeringModel(nn.Module):
     def set_route_gains(self, gains):
         self.route_gains = gains
 
+    @staticmethod
+    def _expert_key(route):
+        ordered = sorted(route)
+        return "k0" if not ordered else "route_" + "_".join(str(layer) for layer in ordered)
+
+    def add_route_expert(self, route, initial_layer_states=None):
+        modules = nn.ModuleDict()
+        initial_layer_states = initial_layer_states or {}
+        for layer in route:
+            module = copy.deepcopy(self.steer_nets[str(layer)])
+            state = initial_layer_states.get(layer, initial_layer_states.get(str(layer)))
+            if state is not None:
+                module.load_state_dict(state)
+            modules[str(layer)] = module
+        self.bank_experts[self._expert_key(route)] = modules
+        return self._expert_key(route)
+
+    def set_route_experts(self, routes):
+        if routes is None:
+            self.active_experts = None
+            return
+        keys = [self._expert_key(route) for route in routes]
+        missing = [key for key in keys if key != "k0" and key not in self.bank_experts]
+        if missing:
+            raise ValueError(f"missing test route experts: {missing}")
+        self.active_experts = keys
+
+    def route_expert_state(self, route):
+        return {
+            name: value.detach().cpu().clone()
+            for name, value in self.bank_experts[self._expert_key(route)].state_dict().items()
+        }
+
     def set_prompt_shield_mask(self, mask):
         self.shield = mask
 
@@ -53,7 +88,13 @@ class _TinySteeringModel(nn.Module):
         for index, layer in enumerate(self.base_model.layers):
             hidden = torch.tanh(layer(hidden))
             if index < len(self.target_layers) and self.route is not None and self.route[0, index]:
-                delta = self.steer_nets[str(index)](
+                expert_key = self.active_experts[0] if self.active_experts else None
+                adapter = (
+                    self.bank_experts[expert_key][str(index)]
+                    if expert_key is not None and expert_key != "k0"
+                    else self.steer_nets[str(index)]
+                )
+                delta = adapter(
                     hidden,
                     is_decode=True,
                     gain=self.route_gains,
@@ -79,21 +120,22 @@ def test_adaptive_bank_trains_variable_subsets_and_saves_route_metadata(tmp_path
     checkpoint = tmp_path / "adaptive_bank.pt"
     result = train_adaptive_steering_bank(
         model, rows, rows[:2], cfg, torch.device("cpu"), epochs=1, save_path=checkpoint,
-        seed=3, grad_accum=2, route_examples_per_layer=2,
+        seed=3, grad_accum=2, route_examples_per_expert=2,
         screen_validation_rows=2, max_pair_routes=2, max_triple_routes=1,
         max_quad_routes=1,
     )
 
     saved = torch.load(checkpoint, map_location="cpu", weights_only=True)
     assert result["candidate_layers"] == [0, 1, 2, 3]
-    assert saved["format"] == "ars_adaptive_steering_v1"
+    assert saved["format"] == "ars.independent_route_expert_bank"
+    assert saved["route_experts_independent"] is True
     assert saved["frozen_backbone"] is True
     assert saved["curriculum"]["catalog"][0] == []
     assert "singletons" in saved["curriculum"]["stages"]
     assert 0.0 < saved["curriculum"]["k0_validation_nll"] < 10.0
     assert saved["curriculum"]["stages"]["pairs"]["candidates"]
     assert model.base_model.embedding.weight.grad is None
-    assert saved["steer_nets"]["0.up_proj.weight"].abs().sum() > 0
+    assert saved["route_experts"]["route_0"]["0.up_proj.weight"].abs().sum() > 0
 
 
 def test_memory_safe_preference_backward_matches_joint_pairwise_gradient():
@@ -206,6 +248,8 @@ def test_adaptive_router_can_learn_from_route_catalog_oracle_labels(tmp_path):
         "prompt_shield_mask": torch.tensor([True, True, False, False]),
     }
     checkpoint = tmp_path / "catalog_router.pt"
+    for route in ([0], [1], [0, 1]):
+        model.add_route_expert(route)
     result = train_adaptive_router(
         model,
         [row, row],
@@ -248,6 +292,69 @@ def test_adaptive_router_can_learn_from_route_catalog_oracle_labels(tmp_path):
     probe.close()
 
 
+def test_router_validation_scores_the_selected_expert_and_clears_k0(monkeypatch):
+    from src.routing.adaptive_subset_router import RouteDecision, RouteValueRouter
+    import src.training.adaptive_router_training as training
+
+    model = _TinySteeringModel()
+    model.add_route_expert([0])
+    model.add_route_expert([1])
+    model.set_route_experts([[1]])
+    row = {
+        "question_index": 5,
+        "prompt_signature": (1, 2),
+        "effective_shots": 0,
+        "input_ids": torch.tensor([1, 2, 3]),
+        "attention_mask": torch.ones(3, dtype=torch.long),
+        "labels": torch.tensor([-100, 2, 3]),
+    }
+    prepared = {
+        key: value.unsqueeze(0) for key, value in row.items()
+        if isinstance(value, torch.Tensor)
+    }
+    monkeypatch.setattr(training, "_prepare", lambda _rows, _device: (prepared, {}))
+    monkeypatch.setattr(
+        training,
+        "_capture_prompt_hidden",
+        lambda *_args: (
+            torch.zeros(1, 2, 8),
+            torch.ones(1, 2, dtype=torch.bool),
+        ),
+    )
+    baseline_experts = []
+    original_forward = model.forward
+
+    def recording_forward(*args, **kwargs):
+        baseline_experts.append(model.active_experts)
+        return original_forward(*args, **kwargs)
+
+    model.forward = recording_forward
+    scored_experts = []
+
+    def score_action(_model, _row, _route, _alpha, _device, _shield, *, expert_route=None):
+        scored_experts.append(expert_route)
+        return torch.tensor([1.0])
+
+    monkeypatch.setattr(training, "_score_action", score_action)
+    router = RouteValueRouter(
+        candidate_layers=[0, 1, 2, 3], route_catalog=[[], [0]],
+        hidden_dim=8, router_dim=8,
+    )
+    router.choose = lambda *_args, **_kwargs: RouteDecision(
+        mask=torch.tensor([[True, False, False, False]]),
+        k=torch.tensor([1]),
+        alpha=torch.tensor([1.5]),
+        route_indices=torch.tensor([1]),
+    )
+
+    training._evaluate_router_nll(
+        model, router, [row], object(), torch.device("cpu"), limit=1
+    )
+
+    assert baseline_experts == [None]
+    assert scored_experts == [(0,)]
+
+
 def test_router_context_uses_question_token_count_not_full_prompt_length():
     from src.training.adaptive_router_training import _router_context_features
 
@@ -274,7 +381,7 @@ def test_static_bank_route_mask_has_one_entry_per_candidate_layer(monkeypatch):
         lambda items, device: ({"placeholder": torch.tensor([1])}, {"prompt_shield_mask": None}),
     )
 
-    def capture_score(_model, _row, route_mask, _alpha, _device, _prompt_shield):
+    def capture_score(_model, _row, route_mask, _alpha, _device, _prompt_shield, **_kwargs):
         observed_masks.append(route_mask.detach().cpu().clone())
         return torch.tensor([1.0])
 
@@ -306,7 +413,7 @@ def test_static_action_uses_disjoint_questions_for_screening_and_greedy_selectio
         ),
     )
 
-    def score_action(_model, row, _route, _alpha, _device, _shield):
+    def score_action(_model, row, _route, _alpha, _device, _shield, **_kwargs):
         screened_questions.append(row["question_id"])
         return torch.tensor([1.0])
 
@@ -330,6 +437,8 @@ def test_static_action_uses_disjoint_questions_for_screening_and_greedy_selectio
         {"question_index": index, "question": f"Q{index}", "gold_answer": "1"}
         for index in range(6)
     ]
+    for route in ([0], [1]):
+        model.add_route_expert(route)
     result = training.select_static_bank_action(
         model,
         rows,
@@ -388,7 +497,7 @@ def test_static_action_broadcasts_fixed_route_for_greedy_generation_batch(monkey
             {"prompt_shield_mask": None},
         ),
     )
-    monkeypatch.setattr(training, "_score_action", lambda *_args: torch.tensor([1.0]))
+    monkeypatch.setattr(training, "_score_action", lambda *_args, **_kwargs: torch.tensor([1.0]))
     monkeypatch.setattr(
         training,
         "build_prompts",
@@ -461,6 +570,8 @@ def test_catalog_router_checkpoint_selection_uses_task_accuracy_when_available(t
         "labels": torch.tensor([-100, -100, 4, 5]),
     }
     pairs = [{"positive": positive, "negative": negative}]
+    for route in ([0], [1], [0, 1]):
+        model.add_route_expert(route)
     observed_validation_ids = []
     observed_static_action = []
 

@@ -39,6 +39,10 @@ def _set_gate_mode(model, enabled: bool) -> None:
 
 def _configure_arm(model, arm: str, cfg, gate_provider=None) -> None:
     """Set routing, gain, and gate state explicitly for one benchmark arm."""
+    if hasattr(model, "set_route_experts"):
+        model.set_route_experts(None)
+    if hasattr(model, "set_prompt_strength_override"):
+        model.set_prompt_strength_override(None)
     if hasattr(model, "set_route_gains"):
         model.set_route_gains(None)
     if hasattr(model, "set_intervention_gains"):
@@ -86,6 +90,8 @@ def _configure_arm(model, arm: str, cfg, gate_provider=None) -> None:
         route = list(getattr(cfg, "static_bank_route", ()))
         alpha = float(getattr(cfg, "static_bank_alpha", 1.0))
         model.set_routing_override("only", route)
+        if hasattr(model, "set_route_experts"):
+            model.set_route_experts([route])
         if hasattr(model, "set_route_selector"):
             model.set_route_selector(None)
         if hasattr(model, "set_steer_scale"):
@@ -113,6 +119,28 @@ def _configure_arm(model, arm: str, cfg, gate_provider=None) -> None:
             model.set_intervention_gain(1.0)
         if hasattr(model, "set_intervention_gains"):
             model.set_intervention_gains(torch.tensor([gain], dtype=torch.float32))
+        _set_gate_mode(model, enabled=False)
+    elif arm.startswith("strength_fixed:"):
+        try:
+            strength = float(arm.split(":", 1)[1])
+        except ValueError as error:
+            raise ValueError(f"invalid fixed prompt-strength arm: {arm}") from error
+        if not math.isfinite(strength) or strength < 0:
+            raise ValueError("fixed prompt strength must be finite and nonnegative")
+        if not hasattr(model, "set_prompt_strength_override"):
+            raise ValueError(
+                "strength_fixed arms require the prompt-conditioned steering architecture"
+            )
+        model.set_routing_override("only", cfg.fixed_layers)
+        if hasattr(model, "set_route_selector"):
+            model.set_route_selector(None)
+        if hasattr(model, "set_steer_scale"):
+            model.set_steer_scale(1.0)
+        if hasattr(model, "set_intervention_gain"):
+            model.set_intervention_gain(1.0)
+        model.set_prompt_strength_override(strength)
+        if hasattr(model, "set_control"):
+            model.set_control(None)
         _set_gate_mode(model, enabled=False)
     elif arm == "random":
         model.set_routing_override("only", cfg.fixed_layers)
@@ -193,9 +221,17 @@ def _generate(
         route_prefill_fn=route_prefill_fn,
         **router_feature_kwargs,
     )[0]
+    prompt_strengths = {}
+    if hasattr(model, "get_prompt_strengths"):
+        prompt_strengths = {
+            str(layer): float(values.flatten()[0])
+            for layer, values in model.get_prompt_strengths().items()
+            if values.numel()
+        }
     return result.text, {
         "stop_reason": result.stop_reason,
         "n_new_tokens": result.n_new_tokens,
+        "prompt_strength_by_layer": prompt_strengths,
     }
 
 
@@ -295,7 +331,11 @@ def run_benchmark(
     for n_shot in shots:
         arm_results: Dict[str, List[Dict[str, object]]] = {}
         for arm in arms:
-            if arm not in {"baseline", "fixed", "steer_only", "identity", "random", "router", "static_bank", "gate", "full"} and not arm.startswith("steer_gain:"):
+            supported_arm = arm in {
+                "baseline", "fixed", "steer_only", "identity", "random",
+                "router", "static_bank", "gate", "full",
+            } or arm.startswith(("steer_gain:", "strength_fixed:"))
+            if not supported_arm:
                 raise ValueError(f"unsupported benchmark arm: {arm}")
             if arm_setup is not None:
                 arm_setup(arm)
@@ -369,7 +409,10 @@ def run_benchmark(
                     guard.get("rel_max", 0.0)
                 ) > float(cap)
                 if (
-                    (arm in {"fixed", "steer_only", "random", "static_bank", "gate"} or arm.startswith("steer_gain:"))
+                    (
+                        arm in {"fixed", "steer_only", "random", "static_bank", "gate"}
+                        or arm.startswith(("steer_gain:", "strength_fixed:"))
+                    )
                     and cfg.guard_revert_to_k0
                     and (guard_trip or guard.get("nonfinite", False))
                 ):
@@ -417,6 +460,7 @@ def run_benchmark(
                         "selected_layers": selected_route if arm in {"router", "static_bank"} else None,
                         "selected_k": len(selected_route) if arm in {"router", "static_bank"} else None,
                         "selected_alpha": selected_alpha if (arm in {"router", "static_bank"} or arm.startswith("steer_gain:")) else None,
+                        "prompt_strength_by_layer": meta.get("prompt_strength_by_layer", {}),
                     }
                 )
                 progress.set_postfix(correct=sum(item["lenient"] for item in results))
@@ -446,6 +490,27 @@ def run_benchmark(
         shot_record: Dict[str, object] = {
             arm: _summary(values) for arm, values in arm_results.items()
         }
+        for arm, values in arm_results.items():
+            strengths: Dict[str, list[float]] = {}
+            for item in values:
+                for layer, value in item.get("prompt_strength_by_layer", {}).items():
+                    strengths.setdefault(str(layer), []).append(float(value))
+            if strengths:
+                shot_record[arm]["prompt_strength_by_layer"] = {
+                    layer: {
+                        "mean": sum(layer_values) / len(layer_values),
+                        "std": (
+                            sum(
+                                (value - sum(layer_values) / len(layer_values)) ** 2
+                                for value in layer_values
+                            )
+                            / len(layer_values)
+                        ) ** 0.5,
+                        "min": min(layer_values),
+                        "max": max(layer_values),
+                    }
+                    for layer, layer_values in sorted(strengths.items())
+                }
         if "router" in arm_results:
             shot_record["router_route_usage"] = {
                 "route_counts": router_route_counts,
@@ -535,6 +600,28 @@ def run_benchmark(
                     encoding="utf-8",
                 )
 
+            for strength_arm in (
+                name for name in arms if name.startswith("strength_fixed:")
+            ):
+                paired = _paired_counts(arm_results["baseline"], arm_results[strength_arm])
+                safe_name = strength_arm.replace(":", "_").replace(".", "_")
+                paired["mcnemar_p_value"] = mcnemar_exact(
+                    paired["fixed_wins"], paired["fixed_losses"]
+                )
+                paired["identical_text_rate"] = sum(
+                    base["text"] == steered["text"]
+                    for base, steered in zip(arm_results["baseline"], arm_results[strength_arm])
+                ) / max(len(rows), 1)
+                shot_record[f"paired_{safe_name}"] = paired
+                if "steer_only" in arm_results:
+                    adaptive = _paired_counts(
+                        arm_results["steer_only"], arm_results[strength_arm]
+                    )
+                    adaptive["mcnemar_p_value"] = mcnemar_exact(
+                        adaptive["fixed_wins"], adaptive["fixed_losses"]
+                    )
+                    shot_record[f"{safe_name}_vs_prompt_adaptive"] = adaptive
+
         # Paired stats: baseline vs router (when both present)
         for candidate_arm in ("static_bank", "router"):
             if "baseline" in arm_results and candidate_arm in arm_results:
@@ -585,7 +672,10 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
         "|---:|---|---:|---:|---:|---:|---:|---:|",
     ]
     for shots, result in record["shots"].items():
-        for arm in ("baseline", "identity", "fixed", "steer_only", "static_bank", "router", "random"):
+        for arm in (
+            "baseline", "identity", "fixed", "steer_only", "strength_fixed:1.0",
+            "static_bank", "router", "random",
+        ):
             if arm not in result:
                 continue
             summary = result[arm]
