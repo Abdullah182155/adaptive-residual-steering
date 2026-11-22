@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 from pathlib import Path
 import sys
@@ -61,6 +62,23 @@ def parse_args(argv=None):
     )
     parser.add_argument("--k", type=int, default=8)
     parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument(
+        "--retry_k",
+        type=int,
+        default=0,
+        help="targeted retries for questions with no strict-positive initial sample",
+    )
+    parser.add_argument("--retry_temperature", type=float, default=0.9)
+    parser.add_argument("--target_positive_samples", type=int, default=2)
+    parser.add_argument(
+        "--collection_shot_weights",
+        type=float,
+        nargs=3,
+        default=(0.60, 0.25, 0.15),
+        metavar=("ZERO_SHOT", "TWO_SHOT", "FOUR_SHOT"),
+    )
+    parser.add_argument("--diversify_collection_templates", action="store_true")
+    parser.add_argument("--max_rft_rows_per_question", type=int, default=3)
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--n_shards", type=int, default=1)
     parser.add_argument("--epochs", type=int, default=2)
@@ -188,6 +206,7 @@ def _gate0(
         max_prompt_len=cfg.max_tok_len,
         shield_policy=cfg.shield_policy,
         compare_greedy=True,
+        seed=cfg.seed,
         progress_desc=f"Gate 0 pass@{k}",
     )
     quality_gate_passed = (
@@ -217,9 +236,30 @@ def run(args) -> dict | None:
         (args.n_questions is not None and args.n_questions < 1)
         or args.eval_questions < 1
         or args.k < 1
+        or args.retry_k < 0
+        or args.target_positive_samples < 1
+        or args.max_rft_rows_per_question < 1
         or args.n_shards < 1
     ):
-        raise ValueError("n_questions, eval_questions, k, and n_shards must be positive")
+        raise ValueError(
+            "n_questions, eval_questions, k, target_positive_samples, "
+            "max_rft_rows_per_question, and n_shards must be positive; retry_k cannot be negative"
+        )
+    if (
+        len(args.collection_shot_weights) != 3
+        or any(not math.isfinite(weight) for weight in args.collection_shot_weights)
+        or any(weight < 0 for weight in args.collection_shot_weights)
+        or sum(args.collection_shot_weights) <= 0
+    ):
+        raise ValueError("collection_shot_weights must be three nonnegative values with positive sum")
+    if (
+        args.stage in {"gate0", "collect", "all"}
+        and (not math.isfinite(args.temperature) or args.temperature <= 0)
+    ) or (
+        args.retry_k > 0
+        and (not math.isfinite(args.retry_temperature) or args.retry_temperature <= 0)
+    ):
+        raise ValueError("collection and retry temperatures must be positive")
     if not 0 <= args.shard < args.n_shards:
         raise ValueError("shard must satisfy 0 <= shard < n_shards")
     if args.stage == "all" and args.n_shards != 1:
@@ -315,6 +355,11 @@ def run(args) -> dict | None:
     model, tokenizer = build_model(cfg, device)
     raw_train, raw_dev = gsm8k_to_cot(tokenizer, cfg)
     train_rows = prepare_dataset_split(raw_train.with_format(None))
+    if args.stage in {"collect", "all"} and collection_questions > len(train_rows):
+        raise ValueError(
+            f"requested {collection_questions} rollout questions, but only "
+            f"{len(train_rows)} training questions are available"
+        )
     if args.stage in {"equivalence", "all"}:
         dev_limit = max(100, equivalence_questions)
     elif args.stage == "alpha_sweep":
@@ -431,6 +476,12 @@ def run(args) -> dict | None:
             max_new_tokens=200,
             max_prompt_len=cfg.max_tok_len,
             shield_policy=cfg.shield_policy,
+            retry_k=args.retry_k,
+            retry_temperature=args.retry_temperature,
+            target_positive_samples=args.target_positive_samples,
+            shot_weights=args.collection_shot_weights,
+            diversify_templates=args.diversify_collection_templates,
+            seed=cfg.seed + args.shard,
             progress_desc=f"RFT shard {args.shard}/{args.n_shards}",
             progress_position=args.shard,
         )
@@ -467,6 +518,7 @@ def run(args) -> dict | None:
             seed=cfg.seed,
             shot_weights=args.train_shot_weights,
             diversify_prompt_templates=args.diversify_prompt_templates,
+            max_rows_per_question=args.max_rft_rows_per_question,
         )
         rows_path = Path(cfg.checkpoint_dir) / "rft_rows.pt"
         rows_path.parent.mkdir(parents=True, exist_ok=True)
@@ -486,6 +538,7 @@ def run(args) -> dict | None:
         result["training_data"] = {
             "rollout_files": [str(path) for path in shard_files],
             "shot_weights": list(args.train_shot_weights),
+            "max_rows_per_question": args.max_rft_rows_per_question,
             "prompt_templates_diversified": args.diversify_prompt_templates,
         }
         _write_json(output_dir / "rft_training_result.json", result)

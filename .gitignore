@@ -131,7 +131,7 @@ PHASE1_EXECUTION_CHECKLIST.md
 *.jpg
 *.jpeg
 *.svg
-# Temporarily keep experiment notebooks local until the current runs are finalized.
+# Keep experiment and final-study notebooks local; commit their runnable Python sources instead.
 *.ipynb
 *.tmp
 *.bak

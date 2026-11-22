@@ -62,6 +62,11 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--require_all_arms", action="store_true")
     parser.add_argument("--ood_datasets", nargs="*", default=[])
     parser.add_argument("--ood_n", type=int, default=200)
+    parser.add_argument(
+        "--skip_gsm8k",
+        action="store_true",
+        help="run only the requested OOD suites during the benchmark stage",
+    )
     parser.add_argument("--task_validation_rows", type=int, default=32)
     parser.add_argument("--diversify_prompts", action="store_true")
     parser.add_argument("--route_examples_per_layer", type=int, default=256)
@@ -405,7 +410,9 @@ def run(args) -> int:
             cfg.fixed_layers = list(candidates)
             _load_bank(model, args.bank_checkpoint)
 
-    suites = ["gsm8k", *args.ood_datasets]
+    suites = list(args.ood_datasets) if args.skip_gsm8k else ["gsm8k", *args.ood_datasets]
+    if not suites:
+        raise ValueError("benchmark stage needs GSM8K or at least one OOD dataset")
     unknown_ood = sorted(set(args.ood_datasets) - set(OOD_SPECS))
     if unknown_ood:
         raise ValueError(f"unsupported OOD benchmark suites: {unknown_ood}")
@@ -465,7 +472,7 @@ def run(args) -> int:
             print(f"[session3] {suite} benchmark failed; continuing to remaining suites: {error}", file=sys.stderr, flush=True)
     status_path = args.output_dir / "session3_benchmark_status.json"
     status_path.write_text(json.dumps({"suites": suite_status, "records": records}, indent=2) + "\n", encoding="utf-8")
-    if suite_status.get("gsm8k", {}).get("status") != "passed_four_arms":
+    if not args.skip_gsm8k and suite_status.get("gsm8k", {}).get("status") != "passed_four_arms":
         raise RuntimeError(f"required GSM8K four-arm benchmark did not complete: {suite_status.get('gsm8k')}")
     if probe is not None:
         probe.close()
