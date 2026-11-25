@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import csv
+import inspect
 import json
 import math
 from pathlib import Path
@@ -560,7 +561,16 @@ def create_paper_assets(roots: Iterable[str | Path], output_dir: str | Path) -> 
         if by_arm:
             labels = sorted(by_arm)
             fig, ax = plt.subplots(figsize=(max(8, 1.2 * len(labels)), 4.5))
-            bp = ax.boxplot([by_arm[label] for label in labels], labels=labels, patch_artist=True)
+            boxplot_label_arg = (
+                "tick_labels"
+                if "tick_labels" in inspect.signature(ax.boxplot).parameters
+                else "labels"
+            )
+            bp = ax.boxplot(
+                [by_arm[label] for label in labels],
+                patch_artist=True,
+                **{boxplot_label_arg: labels},
+            )
             for index, box in enumerate(bp["boxes"]):
                 box.set_facecolor(orange if index % 2 else white); box.set_edgecolor(white)
             for element in ("whiskers", "caps", "medians"):
