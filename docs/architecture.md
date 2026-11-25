@@ -51,6 +51,10 @@ Stage A's handoff manifest pins the adapter architecture, route, candidate layer
 
 The repository retains older gating, policy-gradient, and prompt-conditioned experiments for historical or compatibility use. They are not the maintained final-study path described above.
 
+## Measured outcome of the current study
+
+On the available matched GSM8K, GSM-Plus, and ARC-Challenge evaluation, the fixed adapter improves 0-shot accuracy over baseline on all three datasets. The current static bank and router also exceed baseline in 0-shot point accuracy, but they do not exceed the fixed adapter. At 2-shot, the saved paired analysis does not establish a reliable improvement. The router does select multiple actions, but its use is concentrated and no four-layer action appears in the six tested conditions. See [final results](final_results.md) for exact deltas and [limitations](limitations.md) for interpretation boundaries.
+
 ## Diagrams
 
 Editable Draw.io sources and matching PNGs are in [`diagrams/`](../diagrams/README.md). The research deck pairs each architecture diagram with neighboring slides that explain the model, training objective, validation choice, or evaluation role it represents.

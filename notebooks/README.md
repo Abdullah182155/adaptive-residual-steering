@@ -51,7 +51,7 @@ The Stage A manifest supplies the candidate layers, bank question cap, and per-q
 
 Attach one Stage B bundle or its extracted tree. Run one shot condition per Kaggle session. In the configuration cell, set `SHOT_COUNT` to `0`, `2`, or `4` and keep `BENCH_N=1319` for the full official GSM8K test split. Every arm shares the same seeded test IDs and prompt schedule within that condition. The four arms are baseline, fixed adapter, static bank, and router.
 
-The default 0-shot run is expected to take about 7–8.5 hours on a Tesla T4, based on the prior measured 700-question four-arm run. A full 2-shot run is estimated at about 5–6 hours. A full 4-shot run is less certain and is budgeted at about 5–7 hours. Run each shot condition in a separate session. Download the cumulative result ZIP after every run; its filename records the data count and complete shot conditions, and it includes JSON/JSONL records, logs, timing and quality metrics, paired comparisons, router-use tables, code snapshots, and a bundle manifest.
+Earlier runtime estimates were extrapolated from a 700-question exploratory run and are not measurements for the final artifacts. Actual time varies with answer length, GPU availability, and platform load. The final saved comparison contains 1,319 GSM8K questions in each of 0-shot and 2-shot. Download the cumulative result ZIP after every run; it contains JSON/JSONL records, logs, timing and quality metrics, paired comparisons, router-use tables, code snapshots, and a bundle manifest.
 
 For the first run, attach only the Stage B `ars_training_bundle.zip`. For each later shot condition, attach the same training bundle and the latest cumulative GSM8K result ZIP to retain earlier conditions in the final table and archive. Stage A's fixed-adapter ZIP is not needed.
 
@@ -80,4 +80,6 @@ The analysis tables include paired accuracy and confidence intervals, wins/losse
 - Copy each completed ZIP to durable storage before starting the next long session.
 - A partial run is not a completed result. Check each notebook's final phase-status object and manifest.
 
-Current benchmark values and conclusions are intentionally left pending until the full evaluation records are available.
+## Completed evaluation record
+
+The saved final comparison covers GSM8K 0-shot and 2-shot with 1,319 questions in each condition, GSM-Plus with 500 in each condition, and ARC-Challenge with 500 in each condition. All use four matched arms. This differs from the original planned GSM8K slice caps above; the archived sample counts are authoritative. See [`docs/final_results.md`](../docs/final_results.md) for full metrics and paired tests. The results support 0-shot gains over baseline on the three measured datasets, but do not establish a reliable 2-shot gain or an advantage from the current bank/router over fixed steering. No completed result ZIP is present here for SVAMP, ASDiv, MATH-500, or AQuA-RAT.

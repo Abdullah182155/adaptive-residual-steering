@@ -23,6 +23,8 @@ Notebook `02_gsm8k_in_distribution.ipynb` uses seed 42 and separates conditions 
 | `fewshot_1_2` | 1-shot and 2-shot | Same seeded 500-question subset per condition |
 | `fewshot_4_8` | 4-shot and 8-shot | Same seeded 500-question subset per condition |
 
+The completed result bundles differ from that planned slice table: the archived GSM8K 0-shot and 2-shot records each contain 1,319 paired test questions. The saved results, not the planned caps above, define what was actually evaluated.
+
 Zero-shot and 2-shot are the predeclared primary comparisons. The 1-, 4-, and 8-shot conditions are secondary shot-sensitivity results. Reports keep each shot condition separate.
 
 ## Mathematical transfer
@@ -58,6 +60,8 @@ Each model-generation record can include generation latency, prompt tokens, gene
 
 For the router arm, the reports record observed unique routes, route frequencies, route entropy, most-used-route share, active layer-count (`k`) counts, per-layer counts, and gain counts. These are behavior diagnostics. Higher route count or entropy alone does not establish a better policy. Interpret them with paired accuracy, confidence intervals, and route cost.
 
-## Result status
+## Completed result status
 
-**Final results are pending.** This protocol intentionally contains no accuracy values, significance claims, or paper conclusions. Add measured values only from the complete saved benchmark records, with the exact artifact fingerprint, code revision, seed, shot condition, and evaluated question count.
+The completed saved results currently cover GSM8K (1,319 questions), GSM-Plus (500), and ARC-Challenge (500), at 0-shot and 2-shot. Each condition includes the four matched arms. The summary values, paired intervals, exact McNemar tests, answer-quality fields, timing, and run fingerprints are in [final_results.md](final_results.md). The raw result ZIP files are local project artifacts and are not committed to Git.
+
+No saved results are present for SVAMP, ASDiv, MATH-500, or AQuA-RAT. Their support in evaluation code or notebooks does not count as an executed benchmark. Do not label them as completed.

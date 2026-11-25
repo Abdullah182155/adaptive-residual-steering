@@ -2,9 +2,11 @@
 
 ARS studies small trainable residual-stream adapters for mathematical reasoning with a frozen `microsoft/phi-2` backbone. The final study compares a fixed adapter, a validation-selected action from an independent route bank, and a prompt-conditioned router against the unmodified model.
 
-The repository contains the training and evaluation code, the complete final-study notebooks, editable architecture diagrams, and the research presentation. Benchmark conclusions remain pending until the current training bundle and planned evaluation runs are complete.
+The repository contains the training and evaluation code, the final-study notebooks, editable architecture diagrams, and the research presentation. The completed evaluation currently covers GSM8K, GSM-Plus, and ARC-Challenge at 0-shot and 2-shot. The results are mixed: fixed steering improves 0-shot accuracy on all three evaluated sets, while the current static bank and router do not outperform fixed steering; no reliable 2-shot gain is established. See [the measured results](docs/final_results.md) and [limitations](docs/limitations.md) for the claim boundaries.
 
-The research deck is [`ARS_Research_Presentation.pptx`](ARS_Research_Presentation.pptx). It explains the problem, method, training stages, evaluation protocol, earlier exploratory evidence, and the boundary between that evidence and final conclusions.
+The trained adapter release is hosted at [Hugging Face](https://huggingface.co/Abdullah182155/Adaptive_Residual_Steering). It requires the separate Phi-2 base model. See [model release notes](docs/model_release.md) for the checkpoint contents, provenance, and local manifest checksums.
+
+The research deck is [`ARS_Research_Presentation.pptx`](ARS_Research_Presentation.pptx). It explains the research question, method, measured results, statistical evidence, resource constraints, and remaining limitations. Dataset and related-work sources are listed in [References](docs/references.md).
 
 ## Final-study workflow
 
@@ -14,8 +16,8 @@ The research deck is [`ARS_Research_Presentation.pptx`](ARS_Research_Presentatio
 | 2 | `notebooks/01b_train_router_and_package.ipynb` | Alpha calibration, independent route-bank training, static action selection, and router training | ZIP or extracted Stage A handoff | `ars_training_bundle.zip` |
 | Recovery | `notebooks/01c_resume_router_and_package.ipynb` | Resume router training from a saved Stage B run without repeating bank training | Matching partial Stage B output | Updated `ars_training_bundle.zip` |
 | 3 | `notebooks/02_gsm8k_in_distribution.ipynb` | Four-arm GSM8K evaluation | Complete training bundle | `ars_gsm8k_results.zip` |
-| 4 | `notebooks/03_math_ood_evaluation.ipynb` | Numeric math transfer on GSM-Plus, SVAMP, or ASDiv | Complete training bundle | `ars_math_ood_results.zip` |
-| 5 | `notebooks/04_multiple_choice_transfer.ipynb` | AQuA-RAT or ARC-Challenge transfer | Complete training bundle | `ars_mcq_results.zip` |
+| 4 | `notebooks/03_math_ood_evaluation.ipynb` | Numeric math transfer | Complete training bundle | `ars_math_ood_results.zip` |
+| 5 | `notebooks/04_multiple_choice_transfer.ipynb` | Multiple-choice transfer | Complete training bundle | `ars_mcq_results.zip` |
 | 6 | `notebooks/05_router_ablations.ipynb` | Read-only route-use and paired-result diagnostics | Any available evaluation bundles | Tables and diagnostic JSON |
 | 7 | `notebooks/06_paper_figures.ipynb` | Figures and tables from saved records | Any available evaluation bundles | `ars_paper_assets.zip` |
 
@@ -64,7 +66,7 @@ The notebooks listed above form the maintained run sequence. Scratch notebooks r
 
 ## Runtime
 
-The training and benchmark notebooks need a CUDA GPU and internet access for source and model/data retrieval. Install `requirements.txt` in a Python environment with a compatible PyTorch build. For local code checks, run from the repository root:
+The training and benchmark notebooks need a CUDA GPU and internet access for source and model/data retrieval. The reported training run used Kaggle Tesla T4 GPUs; the longest stage exceeded a 12-hour session and required a router-only resume. Evaluation time depends strongly on dataset, shot count, generated-answer length, and platform load. Peak host RAM and peak VRAM were not recorded, so the project does not claim measured memory requirements. Install `requirements.txt` in a Python environment with a compatible PyTorch build. For local code checks, run from the repository root:
 
 ```powershell
 python -m pytest tests/ -x -q
@@ -80,6 +82,9 @@ Do not commit generated weights, rollout JSONL, benchmark outputs, or bundle ZIP
 - [Evaluation protocol](docs/evaluation_protocol.md)
 - [Artifact contracts](docs/artifact_contracts.md)
 - [Reproducibility](docs/reproducibility.md)
+- [Final measured results](docs/final_results.md)
 - [Limitations and claim boundaries](docs/limitations.md)
+- [Trained model release](docs/model_release.md)
+- [Datasets and related-work references](docs/references.md)
 - [Diagram sources](diagrams/README.md)
 - [Historical material](docs/archive/README.md)

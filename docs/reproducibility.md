@@ -31,3 +31,9 @@ If the Stage A or Stage B notebook code changes, preserve the run's printed comm
 ## Current run configuration source
 
 The active Stage B `extended_quality` profile is recorded in [the training guide](training.md) and printed in Notebook 01b. Values derived from the handoff manifest (candidate layers, maximum bank questions, and rows per question) belong to the specific Stage A run and must be read from that run's `manifest.json` rather than copied from a prior session.
+
+## Final artifact identity
+
+The completed Stage B manifest identifies run `20261122_234525_20261124_111803_router_resume_20261124_200410`, source Stage B run `20261122_234525_20261124_111803`, and fixed-adapter run `20261122_234525`. It records `training_ready: true`, all required phases completed, route-expert count 38, router action-catalog size 11, and the final router-only resume profile. Training code commit: `5bd78d89a79e375d8330edc04066c05a4d99837c`. Evaluation code commit: `f0d102c21af3272d07bf8be74156eba2bdd8c8d6`. Evaluation fingerprint: `47a758610030`.
+
+The checked training bundle contains four PyTorch artifacts totaling 35,263,656 bytes. The base Phi-2 model is external. The saved evaluation bundles record the same fingerprint across all six dataset/shot slices; see [final_results.md](final_results.md) for counts and outcomes. The configured Stage B alpha-calibration cap was 400, while the reused calibration artifact records 300 questions; the run-specific artifact is authoritative for exact replay.

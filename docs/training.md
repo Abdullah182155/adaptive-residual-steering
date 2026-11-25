@@ -42,7 +42,7 @@ Run `notebooks/01b_train_router_and_package.ipynb`. Attach either the Stage A ZI
 
 ### Active full-run settings
 
-The current Stage B settings are `SMOKE_TEST=False` and `TRAINING_PROFILE="extended_quality"`:
+The maintained Stage B notebook settings are `SMOKE_TEST=False` and `TRAINING_PROFILE="extended_quality"`:
 
 | Variable | Active value | Meaning |
 |---|---:|---|
@@ -61,6 +61,8 @@ The current Stage B settings are `SMOKE_TEST=False` and `TRAINING_PROFILE="exten
 | `ROUTER_ALPHAS` | `[1.0, 1.25, 1.5, 1.75, 2.0]` | Supported learned router gains |
 
 The Stage A manifest supplies `CANDIDATE_LAYERS`, `BANK_MAX_QUESTIONS`, and the per-question row limit. The router question cap is `min(2,000, BANK_MAX_QUESTIONS)`. The candidate spacing settings are `MIN_LAYER_GAP=3`, `CONTROL_GAP=2`, and `SPACING_CONTROL_LIMIT=8`. Static-action screening uses gains `[1.0, 1.5, 2.0]`; the router's action catalog uses the five-value grid above. The bank's preference weight defaults to `0.25` in the training CLI.
+
+**Run-specific note:** the final handoff's alpha-calibration JSON records `n=300` and selects alpha 1.0; its Stage B manifest records that alpha calibration was reused during the `router_only_resume`. The notebook profile listed 400 calibration questions. For reproduction of the shipped artifact, use the saved calibration file and manifest (`n=300`); for a new run, the current notebook setting is 400. These are different records and must not be conflated.
 
 `standard` and `smoke` remain exploratory profiles. The active profile is printed before work begins and is saved into the training manifest. `SMOKE_TEST=True` overrides the profile values with the small smoke settings in the notebook.
 
