@@ -1,82 +1,85 @@
 # Adaptive Residual Steering (ARS)
 
-ARS trains small residual-stream steering modules for mathematical reasoning while keeping the `microsoft/phi-2` backbone frozen. The repository contains three research sessions, shared data and evaluation code, and Kaggle notebooks for execution.
+ARS studies small trainable residual-stream adapters for mathematical reasoning with a frozen `microsoft/phi-2` backbone. The final study compares a fixed adapter, a validation-selected action from an independent route bank, and a prompt-conditioned router against the unmodified model.
 
-## Current execution paths
+The repository contains the training and evaluation code, the complete final-study notebooks, editable architecture diagrams, and the research presentation. Benchmark conclusions remain pending until the current training bundle and planned evaluation runs are complete.
 
-| Session | Purpose | Entry point | Main artifacts |
-|---|---|---|---|
-| Session 1 | Collect verified GSM8K rollouts, train fixed-route SteerNet, and compare steering with baseline | `scripts/run_rft_pipeline.py` and `scripts/run_ars_pipeline.py` | `steernet.pt`, rollout shards, paired benchmark reports |
-| Session 2 | Train or evaluate the V2 fixed route `[12, 15, 18, 21]` using rank 16 and calibrated p99 norms | `scripts/run_rft_pipeline.py` with `--steernet_arch v2` | V2 checkpoint and norm calibration |
-| Session 3 | Train a variable-route steering bank and prompt-conditioned router; compare baseline, fixed V2, validation-selected static bank, and router | `scripts/run_session3_router.py` | steering-bank checkpoint, router checkpoint, paired GSM8K/OOD reports and diagnostics |
+The research deck is [`ARS_Research_Presentation.pptx`](ARS_Research_Presentation.pptx). It explains the problem, method, training stages, evaluation protocol, earlier exploratory evidence, and the boundary between that evidence and final conclusions.
 
-Session 3's Kaggle notebook starts a fresh run: it collects new rollout shards, bootstraps V2 and the candidate bank, trains the router, then runs the 200-question 0/2-shot four-arm pilot. It does not load attached rollout shards, old checkpoints, or a previous bank. It only resumes shards from the current unique run directory if that same run is restarted. The selection objective weights 0/2/4-shot at 70/20/10 and renormalizes over the shot settings enabled for a run.
+## Final-study workflow
 
-## Model and invariants
+| Order | Notebook | Purpose | Input | Main output |
+|---|---|---|---|---|
+| 1 | `notebooks/01a_train_fixed_and_bank.ipynb` | Fresh fixed-route adapter, GSM8K rollout collection, and norm calibration | No previous model or rollout artifacts; CUDA and internet | `ars_fixed_adapter_bundle.zip` |
+| 2 | `notebooks/01b_train_router_and_package.ipynb` | Alpha calibration, independent route-bank training, static action selection, and router training | ZIP or extracted Stage A handoff | `ars_training_bundle.zip` |
+| Recovery | `notebooks/01c_resume_router_and_package.ipynb` | Resume router training from a saved Stage B run without repeating bank training | Matching partial Stage B output | Updated `ars_training_bundle.zip` |
+| 3 | `notebooks/02_gsm8k_in_distribution.ipynb` | Four-arm GSM8K evaluation | Complete training bundle | `ars_gsm8k_results.zip` |
+| 4 | `notebooks/03_math_ood_evaluation.ipynb` | Numeric math transfer on GSM-Plus, SVAMP, or ASDiv | Complete training bundle | `ars_math_ood_results.zip` |
+| 5 | `notebooks/04_multiple_choice_transfer.ipynb` | AQuA-RAT or ARC-Challenge transfer | Complete training bundle | `ars_mcq_results.zip` |
+| 6 | `notebooks/05_router_ablations.ipynb` | Read-only route-use and paired-result diagnostics | Any available evaluation bundles | Tables and diagnostic JSON |
+| 7 | `notebooks/06_paper_figures.ipynb` | Figures and tables from saved records | Any available evaluation bundles | `ars_paper_assets.zip` |
 
-- Phi-2 parameters remain frozen; training updates steering and routing modules only.
-- Phase 1 uses token-mean NLL on verified positive RFT completions.
-- The Phase 1 learning rate is locked at `1.5e-4`.
-- `steer_only` is the isolated fixed-route steering arm: static layers, no gate provider, no router selection, and unit intervention gain.
-- Session 2 V2 uses route `[12, 15, 18, 21]`, rank 16, `rho_max=0.10`, p99 norm calibration, and no magnitude head or convolution.
-- Session 3 trains bank adapters on positive RFT completions plus matched, well-formatted wrong-answer preferences. Bank and router selection use held-out preference data; static-action selection and router checkpoint selection also use greedy answer accuracy. The test benchmark remains separate.
-- Session 3 requires all four arms before the notebook reports a complete GSM8K comparison. It records paired metrics and route usage; route diversity is an empirical outcome and must be interpreted with accuracy.
+Notebook 01a starts from fresh data and checkpoints. Notebook 01b consumes its checksummed handoff and does not repeat rollout collection or fixed-adapter training. Notebook 01c is only for resuming a matching partial Stage B run. Later notebooks require a complete Stage B training bundle. See [the notebook guide](notebooks/README.md) for inputs, outputs, run slices, and recovery behavior.
 
-## Repository layout
+## Current Stage B training profile
+
+Notebook 01b currently uses `SMOKE_TEST=False` and `TRAINING_PROFILE="extended_quality"`.
+
+| Setting | Value |
+|---|---:|
+| Bank epochs | 2 |
+| Examples per route expert | 768 |
+| Held-out bank-screen rows | 24 |
+| Alpha-calibration questions | 400 |
+| Pair / triple / quad route caps | 8 / 8 / 8 |
+| Router epochs / maximum rows | 3 / 2,048 |
+| Static-action screen / task-validation rows | 128 / 84 |
+| Route cost | 0.01 |
+| Router gain grid | 1.0, 1.25, 1.5, 1.75, 2.0 |
+
+The candidate layers come from the Stage A manifest. Bank questions and per-question training-row limits also come from that manifest. Router questions are capped at `min(2,000, bank questions)`. On a two-GPU runtime, alpha calibration and bank training run concurrently; on one GPU they run sequentially. The notebook prints the effective profile before launching work.
+
+## Four evaluation arms
+
+1. **Baseline:** frozen Phi-2 without steering.
+2. **Fixed steering:** one trained adapter on route `[12, 15, 18, 21]`, with gain selected by validation calibration.
+3. **Static bank:** one route and gain selected from the route bank on held-out data.
+4. **Router:** one route and gain selected from a finite catalog using prompt-only features and prompt context.
+
+All arms receive the same questions, shot condition, prompt schedule, and decoding settings within each paired comparison. Route diversity is reported as a diagnostic and is interpreted together with paired accuracy.
+
+## Repository map
 
 ```text
-src/
-├── configs/       Configuration and locked session presets
-├── data/          GSM8K loading, prompt construction, and shielding masks
-├── deploy/        Deployment calibration contracts
-├── evaluation/    Generation, answer scoring, paired benchmarks, OOD evaluation
-├── gating/        Optional gate modules retained for supported legacy experiments
-├── models/        Frozen Phi-2 wrapper and steering hooks
-├── routing/       Fixed and adaptive route-selection models
-├── steering/      SteerNet V5/V2 implementations and norm loading
-├── training/      RFT, fixed-route, on-policy, checkpoint, metric, bank, router, batch, and optimizer utilities
-└── utils/         Logging and CLI runtime setup
-
-scripts/
-├── calibrate_norms.py        Collect layer norm calibration statistics
-├── run_ars_pipeline.py       Existing fixed-route, gate, router, and benchmark entry point
-├── run_rft_pipeline.py       Session 1/2 equivalence, Gate 0, rollout, and RFT stages
-└── run_session3_router.py   Session 3 steering-bank, router, and benchmark stages
-
-notebooks/
-├── kaggle_ars_runner.ipynb             Session 1/2 execution
-├── kaggle_ars_session3_router.ipynb    Session 3 execution and diagnostics
-├── kaggle_ars_equivalence_debug.ipynb  Isolated generation-equivalence experiments
-└── ood_evaluation.ipynb                Out-of-distribution evaluation
-
-tests/                    Unit and contract tests for supported paths
-docs/                     Architecture, training, and change documentation
+src/                       Model, data, training, routing, and evaluation code
+scripts/                   CLI entry points and research asset generation
+notebooks/                 Versioned training, evaluation, diagnostics, and figures
+diagrams/                  Editable Draw.io sources and matching PNG figures
+docs/                      Current methodology, architecture, contracts, and protocol
+docs/archive/               Superseded designs and historical experiment log
+tests/                     Unit and contract tests
 ```
 
-## Setup
+The notebooks listed above form the maintained run sequence. Scratch notebooks remain ignored by Git.
 
-Install the packages listed in `requirements.txt` in an environment with PyTorch configured for the target hardware. The benchmark and training scripts download Phi-2 and GSM8K through Hugging Face, so the runtime needs access to those artifacts or a populated local cache.
+## Runtime
 
-Run the repository test suite from the project root:
+The training and benchmark notebooks need a CUDA GPU and internet access for source and model/data retrieval. Install `requirements.txt` in a Python environment with a compatible PyTorch build. For local code checks, run from the repository root:
 
 ```powershell
 python -m pytest tests/ -x -q
 ```
 
-For Kaggle, open the relevant notebook and run its runtime setup and configuration cells before the session cells. The notebooks print the selected artifact paths, scale settings, phase status, and output directory. Keep generated checkpoints and reports in the run output directory; they are not source files.
+Do not commit generated weights, rollout JSONL, benchmark outputs, or bundle ZIPs. They remain local or in the notebook platform's attached artifacts. The final presentation and the small architecture figures are maintained repository deliverables.
 
-## Entry-point stages
+## Documentation
 
-`scripts/run_rft_pipeline.py` exposes `equivalence`, `gate0`, `collect`, `train`, and `all` stages. Use `--n_questions` and stage-specific options to control probe and collection sizes. `--skip_collection` with `--rollout_dir` reuses existing shards for training; V2 runs also require a compatible p99 norm-calibration file.
-
-`scripts/run_session3_router.py` exposes `train_bank`, `train_router`, and `benchmark`. The bank and router reuse the rollout corpus, splitting questions into separate training, bank-screen, router-validation, and static-action-selection partitions. The benchmark requires baseline, fixed V2, static bank, and router arms when `--require_all_arms` is set. Numeric OOD suites can be requested separately and are reported per suite, even if an OOD source is unavailable.
-
-The existing `scripts/run_ars_pipeline.py` remains the compatibility entry point for fixed-route Phase 1, optional contrastive/STaR experiments, legacy router/gate stages, deployment calibration, GSM8K benchmarking, and OOD runs. Its public imports are also used by the other scripts and tests, so retain them when reorganizing the implementation.
-
-## Research results
-
-Results are run-specific. Use the paired JSON report generated for the exact run, test subset, seed, and prompt-shot condition when comparing arms. Do not treat a 50-, 400-, or 800-question subset as a full GSM8K test-set result, and do not compare unpaired accuracy values when paired per-question records are available.
-
-## License
-
-MIT
+- [Documentation index](docs/README.md)
+- [Architecture](docs/architecture.md)
+- [Training pipeline](docs/training.md)
+- [Evaluation protocol](docs/evaluation_protocol.md)
+- [Artifact contracts](docs/artifact_contracts.md)
+- [Reproducibility](docs/reproducibility.md)
+- [Limitations and claim boundaries](docs/limitations.md)
+- [Diagram sources](diagrams/README.md)
+- [Historical material](docs/archive/README.md)

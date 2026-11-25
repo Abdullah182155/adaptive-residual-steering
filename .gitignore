@@ -1,8 +1,8 @@
-# ── Presentation files (local only — not for repo) ────────────────────────────
+# ── Presentation archives and local-only assets ───────────────────────────────
 ARC_Research.pptx
-ARS_Research_Presentation.pptx
 scripts/build_full_ars_presentation.py
 scratch/
+tmp/
 
 # Original project sources (kept locally as immutable source of truth, excluded from repo)
 RSC_Training.py
@@ -121,7 +121,8 @@ lastoutput.txt
 run_manifest.json
 PHASE1_EXECUTION_CHECKLIST.md
 
-# Archived research assets: retain locally, never add to the production codebase.
+# Archived presentation/media assets remain local. The maintained research deck
+# is explicitly versioned below as a submission deliverable.
 *.ppt
 *.pptx
 *.pdf
@@ -131,8 +132,10 @@ PHASE1_EXECUTION_CHECKLIST.md
 *.jpg
 *.jpeg
 *.svg
-# Keep experiment and final-study notebooks local; commit their runnable Python sources instead.
+# Keep exploratory notebooks local; version the complete final-study workflow.
 *.ipynb
+!notebooks/*.ipynb
+!ARS_Research_Presentation.pptx
 *.tmp
 *.bak
 
@@ -141,11 +144,10 @@ PHASE1_EXECUTION_CHECKLIST.md
 /phase2_router_root_cause_audit_consolidated.md
 /proposal_agent*.md
 
-# Allow diagram assets in diagrams/
+# Allow reproducible diagram sources and their rendered counterparts.
 !diagrams/
 !diagrams/*.drawio
 !diagrams/*.png
-diagrams/_gen_all.py
 
 # EGM internal contract files (local-only, used by Claude + agents)
 **/EGM.md
