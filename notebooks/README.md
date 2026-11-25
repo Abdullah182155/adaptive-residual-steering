@@ -11,7 +11,7 @@ This directory is the maintained end-to-end run sequence. Training is split into
 | `01c_resume_router_and_package.ipynb` | Continue an interrupted 01b run by reusing the adapter, bank, calibration, and rollout artifacts | Saved output of the matching interrupted 01b run | Updated `ars_training_bundle.zip` |
 | `02_gsm8k_in_distribution.ipynb` | Four-arm in-distribution benchmark, one shot condition per session | Stage B bundle; latest GSM8K result ZIP is optional on later runs | `ars_gsm8k_n{N}_shots_{...}_results.zip` |
 | `03_math_ood_evaluation.ipynb` | GSM-Plus, SVAMP, or ASDiv math transfer | Complete Stage B training bundle | `ars_math_ood_results.zip` |
-| `03_math500_ood_evaluation.ipynb` | Full 500-question MATH-500 symbolic-math transfer, 0-shot then 2-shot | Complete Stage B bundle; internet for MATH-Verify and dataset access | One ZIP per shot condition |
+| `03_math500_ood_evaluation.ipynb` | Configurable-size MATH-500 symbolic-math transfer, 0-shot then 2-shot (all 500 by default) | Complete Stage B bundle; internet for MATH-Verify and dataset access | One ZIP per shot condition |
 | `04_multiple_choice_transfer.ipynb` | AQuA-RAT or ARC-Challenge transfer | Complete Stage B training bundle | `ars_mcq_results.zip` |
 | `05_router_ablations.ipynb` | Read-only route usage and paired-result diagnostics | One or more completed result bundles | JSON and CSV diagnostics |
 | `06_paper_figures.ipynb` | Presentation and paper figures from saved results | One or more completed result bundles | `ars_paper_assets.zip` |
@@ -61,7 +61,7 @@ Attach the Stage B ars_training_bundle.zip (or its extracted tree with the root 
 
 ## Notebook 03b: MATH-500 symbolic OOD
 
-This optional companion evaluates all 500 rows in `HuggingFaceH4/MATH-500` at 0-shot and 2-shot with the same four arms. It uses pinned `math-verify==0.9.0` with ANTLR 4.13.2 for symbolic exact-equivalence scoring, plus normalized literal comparison for text-valued answers; a gold-answer preflight runs before inference. The 2-shot examples come from the GSM8K training split to preserve the existing evaluation prompt protocol, so describe it as cross-dataset few-shot context. Generation allows up to 512 new tokens. The notebook writes `ars_math500_n500_0shot_seed42_results.zip` and `ars_math500_n500_2shot_seed42_results.zip`. Attach one Stage B bundle, internet access, and any prior MATH-500 condition ZIPs when resuming.
+This optional companion evaluates `HuggingFaceH4/MATH-500` at 0-shot and 2-shot with the same four arms. `REQUESTED_QUESTIONS = None` evaluates every available test row (500 in the current release); a positive integer selects a smaller reproducible sample, such as 10 for an end-to-end smoke run. The ZIP names include the selected count. It uses pinned `math-verify==0.9.0` with ANTLR 4.13.2 for symbolic equivalence, plus normalized literal comparison for text-valued answers; a gold-answer preflight checks the full available split before inference. The 2-shot examples come from the GSM8K training split to preserve the existing evaluation prompt protocol, so describe it as cross-dataset few-shot context. Generation allows up to 512 new tokens. Attach one Stage B bundle, internet access, and any prior MATH-500 condition ZIPs when resuming.
 
 ## Notebook 04: ARC-Challenge multiple-choice transfer
 
