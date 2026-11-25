@@ -121,6 +121,8 @@ def _record_rows(records: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, A
                 accuracy = _arm_accuracy(values, arm)
                 if accuracy is not None:
                     arm_data = values.get(arm, {})
+                    paired = _comparison_data(values, "baseline", arm) if arm != "baseline" else None
+                    route_usage = _route_usage(values)
                     rows.append({
                         "source_record": str(path),
                         "suite": suite,
@@ -128,10 +130,102 @@ def _record_rows(records: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, A
                         "arm": arm,
                         "n": arm_data.get("n", record.get("test_n", record.get("test_n_requested"))),
                         "accuracy_pct": accuracy,
+                        "strict_accuracy_pct": _as_percent(arm_data.get("strict_accuracy", arm_data.get("canonical_accuracy", arm_data.get("accuracy_pct")))),
+                        "marker_accuracy_pct": _as_percent(arm_data.get("marker_accuracy", arm_data.get("accuracy_pct"))),
+                        "lenient_accuracy_pct": _as_percent(arm_data.get("lenient_accuracy", arm_data.get("accuracy_pct"))),
                         "extraction_rate_pct": _as_percent(arm_data.get("extraction_rate_pct", arm_data.get("format_rate"))),
+                        "n_timed": arm_data.get("n_timed"),
+                        "timing_coverage_rate_pct": _as_percent(arm_data.get("timing_coverage_rate")),
+                        "mean_generation_latency_seconds": arm_data.get("mean_generation_latency_seconds"),
+                        "median_generation_latency_seconds": arm_data.get("median_generation_latency_seconds"),
+                        "p90_generation_latency_seconds": arm_data.get("p90_generation_latency_seconds"),
+                        "questions_per_second": arm_data.get("questions_per_second"),
+                        "output_tokens_per_second": arm_data.get("output_tokens_per_second"),
                         "mean_new_tokens": arm_data.get("mean_new_tokens"),
+                        "median_new_tokens": arm_data.get("median_new_tokens"),
+                        "mean_prompt_tokens": arm_data.get("mean_prompt_tokens"),
+                        "stop_reason_counts": arm_data.get("stop_reason_counts"),
+                        "total_output_tokens": arm_data.get("total_output_tokens"),
+                        "timed_output_tokens": arm_data.get("timed_output_tokens"),
+                        "total_generation_seconds": arm_data.get("total_generation_seconds"),
+                        "max_new_tokens_rate_pct": _as_percent(arm_data.get("max_new_tokens_rate")),
+                        "guard_trip_rate_pct": _as_percent(arm_data.get("guard_trip_rate")),
+                        "nonfinite_count": arm_data.get("nonfinite_count"),
+                        "equation_coverage_rate_pct": _as_percent(arm_data.get("equation_coverage_rate")),
+                        "mean_eaa_when_equations_present": arm_data.get("mean_eaa_when_equations_present"),
+                        "clean_arithmetic_rate_pct": _as_percent(arm_data.get("clean_arithmetic_rate")),
+                        "paired_wins_vs_baseline": paired.get("wins", paired.get("fixed_wins")) if paired else None,
+                        "paired_losses_vs_baseline": paired.get("losses", paired.get("fixed_losses")) if paired else None,
+                        "paired_ties_vs_baseline": paired.get("ties") if paired else None,
+                        "paired_delta_pp_vs_baseline": paired.get("delta_pp") if paired else None,
+                        "paired_ci95_pp_vs_baseline": paired.get("bootstrap_ci95_pp", paired.get("ci95_pp")) if paired else None,
+                        "mcnemar_p_value_vs_baseline": paired.get("mcnemar_p_value") if paired else None,
+                        "router_unique_routes": route_usage.get("unique_routes"),
+                        "router_route_entropy": route_usage.get("route_entropy"),
+                        "router_most_used_route_share": route_usage.get("most_used_route_share"),
+                        "router_k_counts": route_usage.get("k_counts"),
+                        "router_layer_counts": route_usage.get("layer_counts"),
+                        "device_name": record.get("runtime_metadata", {}).get("device_name"),
                     })
     return rows
+
+
+def build_benchmark_summary(
+    roots: Iterable[str | Path],
+    output_dir: str | Path,
+    *,
+    artifact_sha256: dict[str, Any] | None = None,
+    artifact_fingerprint: str | None = None,
+    evaluation_code_commit: str | None = None,
+) -> dict[str, Any]:
+    """Save the arm-level quality/performance table for one exact evaluation."""
+    root_values = [Path(item) for item in roots]
+    records = collect_saved_records(root_values)
+    if artifact_sha256 is not None or artifact_fingerprint is not None:
+        records = [
+            item for item in records
+            if (
+                artifact_sha256 is not None
+                and item[1].get("artifact_sha256") == artifact_sha256
+            ) or (
+                artifact_fingerprint is not None
+                and item[1].get("provenance", {}).get("artifact_fingerprint") == artifact_fingerprint
+            )
+        ]
+    if evaluation_code_commit is not None:
+        records = [
+            item for item in records
+            if item[1].get("provenance", {}).get("evaluation_code_commit") == evaluation_code_commit
+        ]
+    summary = _summary_payload(records, root_values)
+    definitions = {
+        "generation_latency": "Synchronized wall time for one generate_batch call; includes input tokenization, generation, stopping, and decoding. One unscored warm-up call is run per arm and shot setting.",
+        "questions_per_second": "Number of measured examples divided by the sum of their generation latencies; excludes dataset loading, scoring, and file writing.",
+        "output_tokens_per_second": "Output tokens from timed generations divided by the sum of their measured generation latencies. Legacy rows without timing are excluded.",
+        "mean_prompt_tokens": "Average input prompt width in tokenizer tokens for evaluated examples.",
+        "max_new_tokens_rate_pct": "Fraction of generations that ended at the configured new-token cap; a higher value can indicate truncation.",
+        "equation_quality": "Heuristic arithmetic-chain audit; equation coverage is shown to contextualize EAA and clean arithmetic rate.",
+    }
+    payload = {
+        "schema": "ars_benchmark_quality_performance_v1",
+        "source_roots": [str(root) for root in root_values],
+        "record_count": len(records),
+        "artifact_sha256_filter": artifact_sha256,
+        "artifact_fingerprint_filter": artifact_fingerprint,
+        "evaluation_code_commit_filter": evaluation_code_commit,
+        "measure_definitions": definitions,
+        "arm_metrics": summary["accuracy_rows"],
+        "paired_comparisons": summary["paired_rows"],
+        "route_usage": summary["route_rows"],
+        "coverage": summary["coverage"],
+    }
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(output / "benchmark_metrics_summary.json", payload)
+    _write_csv(output / "benchmark_metrics_summary.csv", payload["arm_metrics"])
+    _write_csv(output / "benchmark_paired_comparisons.csv", payload["paired_comparisons"])
+    _write_csv(output / "benchmark_route_usage.csv", payload["route_usage"])
+    return payload
 
 
 def _summary_payload(records: list[tuple[Path, dict[str, Any]]], roots: list[Path]) -> dict[str, Any]:
@@ -257,6 +351,9 @@ def _collect_predictions(roots: list[Path]) -> list[dict[str, Any]]:
                         "suite": key[0], "shot": key[1], "source_index": key[2],
                         "arm": arm, "correct": bool(correct),
                         "n_new_tokens": item.get("n_new_tokens"),
+                        "prompt_tokens": item.get("prompt_tokens"),
+                        "generation_latency_seconds": item.get("generation_latency_seconds"),
+                        "stop_reason": item.get("stop_reason"),
                         "selected_layers": item.get("selected_layers", []),
                         "selected_alpha": item.get("selected_alpha"),
                     })
@@ -328,6 +425,45 @@ def create_paper_assets(roots: Iterable[str | Path], output_dir: str | Path) -> 
         ax.grid(axis="y", color=white, alpha=0.15)
         save("01_accuracy_by_condition.png", fig)
         _write_csv(output / "arm_accuracy.csv", accuracy)
+
+        performance_rows = [
+            row for row in accuracy
+            if row.get("median_generation_latency_seconds") is not None
+            and row.get("output_tokens_per_second") is not None
+        ]
+        if performance_rows:
+            performance_groups = sorted({(row["suite"], row["shot"]) for row in performance_rows})
+            width = 0.18
+            x = np.arange(len(performance_groups))
+            fig, axes = plt.subplots(1, 2, figsize=(max(13, 2.0 * len(performance_groups)), 5))
+            for index, arm in enumerate(arms):
+                latency_values = [
+                    next((float(row["median_generation_latency_seconds"]) for row in performance_rows
+                          if (row["suite"], row["shot"], row["arm"]) == (suite, shot, arm)), np.nan)
+                    for suite, shot in performance_groups
+                ]
+                throughput_values = [
+                    next((float(row["output_tokens_per_second"]) for row in performance_rows
+                          if (row["suite"], row["shot"], row["arm"]) == (suite, shot, arm)), np.nan)
+                    for suite, shot in performance_groups
+                ]
+                offset = (index - 1.5) * width
+                color = orange if index % 2 else white
+                latency_bars = axes[0].bar(x + offset, latency_values, width, label=arm, color=color, edgecolor=white)
+                throughput_bars = axes[1].bar(x + offset, throughput_values, width, label=arm, color=color, edgecolor=white)
+                if arm in {"static_bank", "router"}:
+                    for bar in (*latency_bars, *throughput_bars):
+                        bar.set_hatch("//")
+            labels = [f"{suite}\n{shot}-shot" for suite, shot in performance_groups]
+            for axis in axes:
+                axis.set_xticks(x, labels)
+                axis.grid(axis="y", color=white, alpha=0.15)
+            axes[0].set_ylabel("Median generation latency (seconds)")
+            axes[0].set_title("Latency per example")
+            axes[1].set_ylabel("Generated output tokens per second")
+            axes[1].set_title("Output throughput")
+            axes[0].legend(frameon=False, ncols=2)
+            save("12_latency_and_throughput_by_condition.png", fig)
 
     paired = summary["paired_rows"]
     if paired:

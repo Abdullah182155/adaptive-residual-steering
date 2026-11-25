@@ -17,6 +17,7 @@ from datasets import load_dataset
 SPECS: Dict[str, Tuple[str, int, str]] = {
     "svamp": ("ChilleD/SVAMP", 1000, "numeric"),
     "multiarith": ("ChilleD/MultiArith", 600, "numeric"),
+    "asdiv": ("EleutherAI/asdiv", 2305, "numeric"),
     "gsm_plus": ("qintongli/GSM-Plus", 1000, "numeric"),
     "math500": ("HuggingFaceH4/MATH-500", 500, "numeric"),
     "arc": ("allenai/ai2_arc", 1172, "mcq"),
@@ -46,6 +47,19 @@ def _extract_fields(name: str, ex: Dict[str, Any]) -> Dict[str, Any]:
         if q is None or ans is None:
             raise KeyError(f"Missing fields in MultiArith: {sorted(ex.keys())}")
         return {"question": str(q), "answer": str(ans), "group": None}
+
+    if name == "asdiv":
+        body = str(ex.get("body", ex.get("Body", ""))).strip()
+        question = str(ex.get("question", ex.get("Question", ""))).strip()
+        answer = ex.get("answer", ex.get("Answer"))
+        if not question or answer is None:
+            raise KeyError(f"Missing fields in ASDiv: {sorted(ex.keys())}")
+        prompt = f"{body} {question}".strip()
+        return {
+            "question": prompt,
+            "answer": str(answer),
+            "group": ex.get("solution_type", ex.get("solutionType")),
+        }
 
     if name == "gsm_plus":
         q = ex.get("question", ex.get("problem", ex.get("Question")))
@@ -115,6 +129,7 @@ def load_ood_rows(
         )
     dataset_name, expected_count, answer_type = SPECS[name]
 
+    source_split = "test"
     if name == "arc":
         dataset = load_dataset(dataset_name, "ARC-Challenge", split="test")
     elif name == "aqua_rat":
@@ -126,20 +141,40 @@ def load_ood_rows(
             dataset = load_dataset(dataset_name, split="test")
         except Exception:
             dataset = load_dataset(dataset_name)
+            source_split = None
 
     raw_items: list = []
     if isinstance(dataset, dict):
-        splits = ["test"] if "test" in dataset else list(dataset.keys())
-        for sp in splits:
-            raw_items.extend(dataset[sp])
+        if source_split is None:
+            source_split = "test" if "test" in dataset else (
+                "validation" if "validation" in dataset else next(iter(dataset.keys()))
+            )
+        source_dataset = dataset[source_split]
+        raw_items = list(source_dataset)
+        dataset_fingerprint = getattr(source_dataset, "_fingerprint", None)
     else:
         raw_items = list(dataset)
+        dataset_fingerprint = getattr(dataset, "_fingerprint", None)
 
     rows: List[Dict[str, Any]] = []
     skipped = 0
     for ex in raw_items:
         fields = _extract_fields(name, ex)
         clean_ans = str(fields["answer"]).split("####")[-1].strip()
+
+        if name == "asdiv":
+            # EleutherAI/ASDiv stores numeric answers with optional units,
+            # e.g. "9 (apples)". Accept only that explicit format so a
+            # fraction or other non-numeric answer is never silently read as
+            # its leading integer.
+            answer_match = re.fullmatch(
+                r"\s*(-?\d[\d,]*(?:\.\d+)?)\s*(?:\([^()]*\))?\s*",
+                clean_ans,
+            )
+            if answer_match is None:
+                skipped += 1
+                continue
+            clean_ans = answer_match.group(1)
 
         if answer_type == "numeric" and (
             not _is_numeric(clean_ans) or clean_ans.lower() == "none"
@@ -153,6 +188,8 @@ def load_ood_rows(
             "answer": clean_ans,
             "group": fields.get("group"),
             "answer_type": answer_type,
+            "source_split": source_split,
+            "dataset_fingerprint": dataset_fingerprint,
         }
         if "choices" in fields:
             row["choices"] = fields["choices"]
@@ -167,7 +204,7 @@ def load_ood_rows(
 
     print(
         f"[ood] {name}: loaded n={len(rows)} rows "
-        f"(expected ~{expected_count}, type={answer_type})"
+        f"(expected ~{expected_count}, split={source_split}, type={answer_type})"
     )
     return rows[:limit] if limit is not None else rows
 

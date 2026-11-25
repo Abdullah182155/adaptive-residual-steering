@@ -490,12 +490,20 @@ def run(args) -> int:
     records = []
     suite_status = {}
     for suite in suites:
+        dataset_metadata = None
         try:
             n_test = args.bench_n if suite == "gsm8k" else args.ood_n
             if suite == "gsm8k":
                 rows = load_benchmark_rows(n_test, seed=args.bench_seed)
             else:
                 source_rows = load_ood_rows(suite)
+                dataset_metadata = {
+                    "dataset_id": OOD_SPECS[suite][0],
+                    "split": source_rows[0].get("source_split"),
+                    "fingerprint": source_rows[0].get("dataset_fingerprint"),
+                    "available_rows": len(source_rows),
+                    "sampling_seed": args.bench_seed,
+                }
                 chooser = random.Random(args.bench_seed)
                 if n_test < len(source_rows):
                     selected_indices = sorted(chooser.sample(range(len(source_rows)), n_test))
@@ -525,10 +533,27 @@ def run(args) -> int:
             record["fixed_adapter_architecture_version"] = "1.0.0"
             record["fixed_adapter_route"] = list(FIXED_ROUTE)
             record["router_candidate_layers"] = list(candidates)
+            if dataset_metadata is not None:
+                record["dataset_metadata"] = dataset_metadata
+            record["runtime_metadata"] = {
+                "device": str(device),
+                "device_name": torch.cuda.get_device_name(device) if device.type == "cuda" else None,
+                "torch_version": torch.__version__,
+                "cuda_version": torch.version.cuda,
+                "generation_batch_size": 1,
+            }
             record["router_checkpoint"] = str(args.router_checkpoint)
             record["static_bank_action"] = static_action
             record["static_bank_checkpoint"] = str(args.bank_checkpoint) if static_action else None
             record["fixed_adapter_checkpoint"] = str(args.fixed_adapter_checkpoint)
+            record["artifact_sha256"] = {
+                "fixed_adapter_checkpoint": _sha256(args.fixed_adapter_checkpoint),
+                "fixed_adapter_norms": _sha256(args.fixed_adapter_norm_calibration),
+                "bank_checkpoint": _sha256(args.bank_checkpoint) if args.bank_checkpoint.is_file() else None,
+                "router_checkpoint": _sha256(args.router_checkpoint) if args.router_checkpoint.is_file() else None,
+                "candidate_norms": _sha256(args.norm_calibration),
+                "static_bank_action": _sha256(static_action_path) if static_action is not None else None,
+            }
             record["router_status"] = "included" if "router" in active_arms else "not_available"
             if args.require_all_arms and not record["four_arm_complete"]:
                 raise RuntimeError(f"incomplete four-arm record for suite {suite}: {active_arms}")

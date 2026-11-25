@@ -1,4 +1,5 @@
 import json
+import math
 from types import SimpleNamespace
 
 import torch
@@ -8,7 +9,7 @@ def test_weighted_shot_objective_prioritizes_zero_shot_and_reports_active_shots(
     from src.training.adaptive_data import weighted_shot_average
 
     value, expression = weighted_shot_average({0: 0.5, 2: 1.0, 4: 0.0}, "accuracy")
-    assert value == 0.55
+    assert math.isclose(value, 0.55, rel_tol=0.0, abs_tol=1e-12)
     assert expression == "0.7*accuracy_0shot + 0.2*accuracy_2shot + 0.1*accuracy_4shot"
 
     pilot_value, pilot_expression = weighted_shot_average({0: 0.5, 2: 1.0}, "accuracy")

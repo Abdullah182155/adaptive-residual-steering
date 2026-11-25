@@ -1,4 +1,4 @@
-"""Run paired four-arm evaluation on ARC-Challenge or MMLU-Pro."""
+"""Run paired four-arm evaluation on ARC-Challenge, AQuA-RAT, or MMLU-Pro."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import json
 import random
 import re
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
@@ -32,7 +33,7 @@ from scripts.run_session3_router import (
     _load_model,
     _sha256,
 )
-from src.evaluation.benchmark import _configure_arm, mcnemar_exact
+from src.evaluation.benchmark import _configure_arm, _generation_metrics, mcnemar_exact
 from src.evaluation.generation import build_question_feature_masks, generate_batch
 from src.training.adaptive_router_training import load_adaptive_router
 
@@ -41,6 +42,7 @@ LABELS = "ABCDEFGHIJ"
 ARMS = ("baseline", "steer_only", "static_bank", "router")
 DATASET_REVISIONS = {
     "arc": ("allenai/ai2_arc", "ARC-Challenge"),
+    "aqua_rat": ("deepmind/aqua_rat", "raw"),
     "mmlu_pro": ("TIGER-Lab/MMLU-Pro", None),
 }
 
@@ -86,6 +88,27 @@ def _normalise_mcq(
         source_id = f"{split_name}:{raw.get('id', source_index)}"
         category = None
         question = str(raw.get("question", ""))
+    elif dataset_name == "aqua_rat":
+        option_labels: list[str] = []
+        choice_texts = []
+        for option in raw.get("options", []):
+            match = re.fullmatch(r"\s*\(?([A-E])\s*[).:]\s*(.*?)\s*", str(option), re.IGNORECASE)
+            if match is None:
+                raise ValueError(f"AQuA-RAT row {source_index} has a malformed option: {option!r}")
+            option_labels.append(match.group(1).upper())
+            choice_texts.append(match.group(2))
+        if not choice_texts or len(choice_texts) > len(LABELS) or len(set(option_labels)) != len(option_labels):
+            raise ValueError(f"AQuA-RAT row {source_index} has malformed choices")
+        answer_match = re.fullmatch(r"\s*\(?([A-E])\)?\s*", str(raw.get("correct", "")), re.IGNORECASE)
+        if answer_match is None:
+            raise ValueError(f"AQuA-RAT row {source_index} has an unknown correct option")
+        try:
+            answer_index = option_labels.index(answer_match.group(1).upper())
+        except ValueError as error:
+            raise ValueError(f"AQuA-RAT row {source_index} has a correct option absent from its choices") from error
+        source_id = f"{split_name}:{raw.get('id', source_index)}"
+        category = None
+        question = str(raw.get("question", ""))
     else:
         choice_texts = [str(value) for value in raw.get("options", [])]
         if not choice_texts or len(choice_texts) > len(LABELS):
@@ -120,6 +143,11 @@ def _load_splits(dataset_name: str):
         train_split = dataset["train"]
         test_split = dataset["test"]
         train = [_normalise_mcq(dataset_name, row, i, "train") for i, row in enumerate(train_split)]
+    elif dataset_name == "aqua_rat":
+        dataset = load_dataset(dataset_id, config)
+        train_split = dataset["train"]
+        test_split = dataset["test"]
+        train = [_normalise_mcq(dataset_name, row, i, "train") for i, row in enumerate(train_split)]
     else:
         dataset = load_dataset(dataset_id)
         # MMLU-Pro has no public train split in the standard release. Use the
@@ -128,7 +156,11 @@ def _load_splits(dataset_name: str):
         test_split = dataset["test"]
     test = [_normalise_mcq(dataset_name, row, i, "test") for i, row in enumerate(test_split)]
     fingerprints = {
-        "demonstration_split_fingerprint": getattr(train_split if dataset_name == "arc" else dataset["validation"], "_fingerprint", None),
+        "demonstration_split_fingerprint": getattr(
+            train_split if dataset_name in {"arc", "aqua_rat"} else dataset["validation"],
+            "_fingerprint",
+            None,
+        ),
         "test_split_fingerprint": getattr(test_split, "_fingerprint", None),
     }
     return train, test, fingerprints
@@ -339,6 +371,7 @@ def run(args) -> int:
             "bank_checkpoint": bank_digest,
             "router_checkpoint": _sha256(args.router_checkpoint),
             "bank_norms": _sha256(args.norm_calibration),
+            "static_bank_action": _sha256(args.static_action),
         },
         "prompt_contract": "compact_mcq_final_answer_letter_v1",
         "runner_sha256": _sha256(Path(__file__).resolve()),
@@ -372,6 +405,31 @@ def run(args) -> int:
                 route_prefill = router_prefill if arm == "router" else None
                 missing_rows = [row for row in test_rows if row["source_index"] not in existing]
                 if missing_rows:
+                    warmup_row = missing_rows[0]
+                    warmup_prompt = prompts_by_shot[shot][warmup_row["source_index"]]
+                    warmup_masks = build_question_feature_masks(
+                        tokenizer, [warmup_prompt], [warmup_row["question"]]
+                    )
+                    warmup_features = torch.tensor(
+                        [[float(shot) / 2.0, min(len(tokenizer(warmup_row["question"])["input_ids"]), 256) / 256.0]],
+                        dtype=torch.float32,
+                    )
+                    generate_batch(
+                        model,
+                        tokenizer,
+                        [warmup_prompt],
+                        device,
+                        prompt_shields=[None],
+                        max_new_tokens=args.max_new_tokens,
+                        repetition_penalty=1.0,
+                        no_repeat_ngram_size=0,
+                        max_prompt_len=args.max_prompt_tokens,
+                        route_prefill_fn=route_prefill,
+                        route_feature_masks=warmup_masks if route_prefill is not None else None,
+                        route_context_features=warmup_features if route_prefill is not None else None,
+                    )
+                    _configure_arm(model, arm, cfg)
+                if missing_rows:
                     mode = "a" if arm_path.exists() else "w"
                     with arm_path.open(mode, encoding="utf-8") as stream:
                         for row in tqdm(missing_rows, desc=f"{args.dataset} {shot}-shot {arm}", unit="question"):
@@ -381,6 +439,9 @@ def run(args) -> int:
                                 [[float(shot) / 2.0, min(len(tokenizer(row["question"])["input_ids"]), 256) / 256.0]],
                                 dtype=torch.float32,
                             )
+                            if device.type == "cuda":
+                                torch.cuda.synchronize(device)
+                            generation_started = time.perf_counter()
                             generated = generate_batch(
                                 model,
                                 tokenizer,
@@ -395,6 +456,9 @@ def run(args) -> int:
                                 route_feature_masks=feature_masks if route_prefill is not None else None,
                                 route_context_features=context_features if route_prefill is not None else None,
                             )[0]
+                            if device.type == "cuda":
+                                torch.cuda.synchronize(device)
+                            generation_latency_seconds = time.perf_counter() - generation_started
                             prediction = _extract_choice(generated.text, len(row["choices"]))
                             selected_route, selected_alpha = _route_and_alpha(model, arm, cfg, static_action)
                             item = {
@@ -408,6 +472,8 @@ def run(args) -> int:
                                 "extracted": prediction is not None,
                                 "text": generated.text,
                                 "n_new_tokens": generated.n_new_tokens,
+                                "prompt_tokens": generated.prompt_width,
+                                "generation_latency_seconds": generation_latency_seconds,
                                 "stop_reason": generated.stop_reason,
                                 "category": row["category"],
                                 "selected_layers": selected_route,
@@ -426,9 +492,23 @@ def run(args) -> int:
             "four_arm_complete": True,
             "shots": {},
             "demonstration_metadata": {
-                "source_split": "train" if args.dataset == "arc" else "validation",
+                "source_split": "validation" if args.dataset == "mmlu_pro" else "train",
                 "ids": [item["source_id"] for item in demos],
                 "policy": "fixed two examples shared by every arm and test question",
+            },
+            "performance_measurement": {
+                "latency_scope": "per-example generate_batch call, including tokenization, model generation, stopping, and decoding",
+                "cuda_synchronization": True,
+                "warmup_generations_per_arm_shot": 1,
+                "questions_per_second": "timed examples divided by summed generation latency",
+                "output_tokens_per_second": "output tokens from timed generations divided by summed generation latency",
+            },
+            "runtime_metadata": {
+                "device": str(device),
+                "device_name": torch.cuda.get_device_name(device),
+                "torch_version": torch.__version__,
+                "cuda_version": torch.version.cuda,
+                "generation_batch_size": 1,
             },
         }
         for shot, arm_results in all_arm_results.items():
@@ -446,8 +526,8 @@ def run(args) -> int:
                     "n": len(values),
                     "accuracy_pct": 100.0 * sum(by_arm[arm]) / max(len(values), 1),
                     "extraction_rate_pct": 100.0 * sum(bool(item["extracted"]) for item in values) / max(len(values), 1),
-                    "mean_new_tokens": sum(int(item["n_new_tokens"]) for item in values) / max(len(values), 1),
                 }
+                shot_data[arm].update(_generation_metrics(values))
             shot_data["router_route_usage"] = {
                 "route_counts": dict(usage),
                 "k_counts": dict(k_counts),

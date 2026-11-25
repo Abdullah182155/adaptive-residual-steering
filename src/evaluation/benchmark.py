@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+import statistics
 import sys
+import time
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 import torch
@@ -207,6 +209,9 @@ def _generate(
                 dtype=torch.float32,
             ),
         }
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    generation_started = time.perf_counter()
     result = generate_batch(
         model,
         tokenizer,
@@ -221,6 +226,9 @@ def _generate(
         route_prefill_fn=route_prefill_fn,
         **router_feature_kwargs,
     )[0]
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    generation_latency_seconds = time.perf_counter() - generation_started
     prompt_strengths = {}
     if hasattr(model, "get_prompt_strengths"):
         prompt_strengths = {
@@ -231,6 +239,8 @@ def _generate(
     return result.text, {
         "stop_reason": result.stop_reason,
         "n_new_tokens": result.n_new_tokens,
+        "prompt_tokens": result.prompt_width,
+        "generation_latency_seconds": generation_latency_seconds,
         "prompt_strength_by_layer": prompt_strengths,
     }
 
@@ -239,14 +249,75 @@ def _score(text: str, gold: float) -> Dict[str, bool]:
     return score_tiers(text, gold)
 
 
-def _summary(results: List[Dict[str, object]]) -> Dict[str, float]:
+def _percentile(values: Sequence[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(float(value) for value in values)
+    index = min(max(math.ceil(quantile * len(ordered)) - 1, 0), len(ordered) - 1)
+    return ordered[index]
+
+
+def _generation_metrics(results: Sequence[Dict[str, object]]) -> Dict[str, Any]:
+    timed_results = [
+        item
+        for item in results
+        if item.get("generation_latency_seconds") is not None
+        and math.isfinite(float(item["generation_latency_seconds"]))
+        and float(item["generation_latency_seconds"]) > 0
+    ]
+    latencies = [float(item["generation_latency_seconds"]) for item in timed_results]
+    new_tokens = [
+        int(item["n_new_tokens"])
+        for item in timed_results
+        if item.get("n_new_tokens") is not None
+    ]
+    prompt_tokens = [
+        int(item["prompt_tokens"])
+        for item in timed_results
+        if item.get("prompt_tokens") is not None
+    ]
+    total_seconds = sum(latencies)
+    timed_output_tokens = sum(
+        int(item["n_new_tokens"]) for item in timed_results if item.get("n_new_tokens") is not None
+    )
+    total_output_tokens = sum(
+        int(item["n_new_tokens"]) for item in results if item.get("n_new_tokens") is not None
+    )
+    stop_reasons: Dict[str, int] = {}
+    for item in results:
+        reason = item.get("stop_reason")
+        if reason is not None:
+            key = str(reason)
+            stop_reasons[key] = stop_reasons.get(key, 0) + 1
+    return {
+        "n_timed": len(latencies),
+        "timing_coverage_rate": len(latencies) / max(len(results), 1),
+        "mean_generation_latency_seconds": statistics.fmean(latencies) if latencies else None,
+        "median_generation_latency_seconds": statistics.median(latencies) if latencies else None,
+        "p90_generation_latency_seconds": _percentile(latencies, 0.9),
+        "mean_prompt_tokens": statistics.fmean(prompt_tokens) if prompt_tokens else None,
+        "mean_new_tokens": statistics.fmean(new_tokens) if new_tokens else None,
+        "median_new_tokens": _percentile(new_tokens, 0.5),
+        "total_output_tokens": total_output_tokens,
+        "timed_output_tokens": timed_output_tokens,
+        "total_generation_seconds": total_seconds,
+        "questions_per_second": len(latencies) / total_seconds if total_seconds else None,
+        "output_tokens_per_second": timed_output_tokens / total_seconds if total_seconds else None,
+        "stop_reason_counts": stop_reasons,
+        "max_new_tokens_rate": sum(
+            item.get("stop_reason") == "max_new_tokens" for item in results
+        ) / max(len(results), 1),
+    }
+
+
+def _summary(results: List[Dict[str, object]]) -> Dict[str, Any]:
     total = len(results)
     strict = sum(item["strict"] for item in results)
     marker = sum(item["marker"] for item in results)
     lenient = sum(item["lenient"] for item in results)
     guard_trips = sum(item.get("guard_trip", False) for item in results)
     nonfinite = sum(item.get("nonfinite", False) for item in results)
-    return {
+    summary = {
         "n": total,
         "strict_accuracy": 100.0 * strict / max(total, 1),
         "canonical_accuracy": 100.0 * strict / max(total, 1),
@@ -256,6 +327,20 @@ def _summary(results: List[Dict[str, object]]) -> Dict[str, float]:
         "guard_trip_rate": guard_trips / max(total, 1),
         "nonfinite_count": nonfinite,
     }
+    summary.update(_generation_metrics(results))
+    summary["equation_coverage_rate"] = sum(
+        int(item.get("total_equations", 0)) > 0 for item in results
+    ) / max(total, 1)
+    equation_results = [item for item in results if int(item.get("total_equations", 0)) > 0]
+    summary["mean_eaa_when_equations_present"] = (
+        statistics.fmean(float(item["eaa"]) for item in equation_results)
+        if equation_results else None
+    )
+    summary["clean_arithmetic_rate"] = sum(bool(item.get("car", False)) for item in results) / max(total, 1)
+    summary["max_new_tokens_rate"] = sum(
+        item.get("stop_reason") == "max_new_tokens" for item in results
+    ) / max(total, 1)
+    return summary
 
 
 def _paired_counts(
@@ -322,6 +407,13 @@ def run_benchmark(
         "test_source_indices": [
             int(row.get("source_index", index)) for index, row in enumerate(rows)
         ],
+        "performance_measurement": {
+            "latency_scope": "per-example generate_batch call, including tokenization, model generation, stopping, and decoding",
+            "cuda_synchronization": True,
+            "warmup_generations_per_arm_shot": 1,
+            "questions_per_second": "timed examples divided by summed generation latency",
+            "output_tokens_per_second": "output tokens from timed generations divided by summed generation latency",
+        },
         "shots": {},
     }
     shield_policy = getattr(cfg, "shield_policy", "context")
@@ -346,6 +438,25 @@ def run_benchmark(
             router_k_counts: Dict[str, int] = {}
             router_layer_counts: Dict[str, int] = {}
             router_alpha_counts: Dict[str, int] = {}
+            if rows:
+                if hasattr(model, "set_control") and arm == "random":
+                    model.set_control("random", seed=0)
+                _generate(
+                    model,
+                    tokenizer,
+                    rows[0]["question"],
+                    n_shot,
+                    device,
+                    cfg.generation_max_new_tokens,
+                    policy=shield_policy,
+                    question_idx=0,
+                    route_prefill_fn=router_prefill_fn if arm in {"router", "full"} else None,
+                    temperature=getattr(cfg, "generation_temperature", 0.0),
+                    repetition_penalty=getattr(cfg, "generation_repetition_penalty", 1.1),
+                    no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
+                    template_id=0,
+                )
+                _configure_arm(model, arm, cfg, gate_provider)
             progress = tqdm(
                 rows,
                 desc=f"{suite} {n_shot}-shot {arm}",
@@ -380,6 +491,7 @@ def run_benchmark(
                     no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
                     template_id=row_idx % 3 if getattr(cfg, "diversify_prompts", False) else 0,
                 )
+                generation_latency_seconds = float(meta["generation_latency_seconds"])
                 selected_route: List[int] = []
                 if arm in {"router", "static_bank"} and hasattr(model, "current_routes"):
                     routes_now = model.current_routes()
@@ -417,7 +529,7 @@ def run_benchmark(
                     and (guard_trip or guard.get("nonfinite", False))
                 ):
                     model.set_routing_override("none", cfg.fixed_layers)
-                    text, meta = _generate(
+                    text, fallback_meta = _generate(
                         model,
                         tokenizer,
                         row["question"],
@@ -431,6 +543,8 @@ def run_benchmark(
                         no_repeat_ngram_size=getattr(cfg, "generation_no_repeat_ngram", 6),
                         template_id=row_idx % 3 if getattr(cfg, "diversify_prompts", False) else 0,
                     )
+                    generation_latency_seconds += float(fallback_meta["generation_latency_seconds"])
+                    meta = fallback_meta
                     fallback_layers = (
                         getattr(cfg, "static_bank_route", [])
                         if arm == "static_bank"
@@ -452,11 +566,14 @@ def run_benchmark(
                         "pred_lenient": pred_lenient,
                         "stop_reason": meta["stop_reason"],
                         "n_new_tokens": meta["n_new_tokens"],
+                        "prompt_tokens": meta["prompt_tokens"],
+                        "generation_latency_seconds": generation_latency_seconds,
                         "rel_max": float(guard.get("rel_max", 0.0)),
                         "guard_trip": bool(guard_trip),
                         "nonfinite": bool(guard.get("nonfinite", False)),
                         "car": audit["car"],
                         "eaa": audit["eaa"],
+                        "total_equations": audit["total_equations"],
                         "selected_layers": selected_route if arm in {"router", "static_bank"} else None,
                         "selected_k": len(selected_route) if arm in {"router", "static_bank"} else None,
                         "selected_alpha": selected_alpha if (arm in {"router", "static_bank"} or arm.startswith("steer_gain:")) else None,
@@ -512,11 +629,17 @@ def run_benchmark(
                     for layer, layer_values in sorted(strengths.items())
                 }
         if "router" in arm_results:
+            route_total = sum(router_route_counts.values())
+            route_probabilities = [count / route_total for count in router_route_counts.values()] if route_total else []
             shot_record["router_route_usage"] = {
                 "route_counts": router_route_counts,
                 "k_counts": router_k_counts,
                 "layer_counts": router_layer_counts,
                 "alpha_counts": router_alpha_counts,
+                "questions": route_total,
+                "unique_routes": len(router_route_counts),
+                "route_entropy": -sum(probability * math.log(probability) for probability in route_probabilities if probability > 0),
+                "most_used_route_share": max(router_route_counts.values(), default=0) / max(route_total, 1),
             }
         paired_arm = next(
             (name for name in ("steer_only", "fixed") if name in arm_results), None
