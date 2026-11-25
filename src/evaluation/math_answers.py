@@ -25,10 +25,30 @@ def _is_literal_math_answer(gold: str) -> bool:
 
 @lru_cache(maxsize=1024)
 def _parse_math_reference(gold: str) -> tuple:
-    """Cache parsed references because each benchmark question is scored repeatedly."""
+    """Cache parsed references, including bare LaTeX used by MATH-500 answers."""
     from math_verify import parse
 
-    return tuple(parse(gold))
+    text = str(gold).strip()
+    candidates = [text]
+    # MATH-500's `answer` column can contain raw LaTeX without `$...$` or another
+    # math environment. Math-Verify's LaTeX extractor expects an environment, so
+    # retry that exact answer wrapped as inline math after the plain parse fails.
+    if text and not any(marker in text for marker in ("$", r"\(", r"\[")):
+        candidates.append(f"${text}$")
+
+    errors = []
+    for candidate in candidates:
+        try:
+            parsed = parse(candidate, fallback_mode="no_fallback")
+        except Exception as exc:
+            errors.append(exc)
+            continue
+        if parsed:
+            return tuple(parsed)
+
+    if errors and len(errors) == len(candidates):
+        raise errors[-1]
+    return ()
 
 
 def _extract_literal_math_answer(text: str) -> str | None:
@@ -64,15 +84,26 @@ def validate_math_gold_answers(rows: Iterable[dict]) -> list[dict[str, Any]]:
     invalid = []
     for row in rows:
         answer = str(row.get("answer", "")).strip()
+        source_index = row.get("source_index", row.get("idx"))
         if not answer:
-            invalid.append({"source_index": row.get("source_index"), "reason": "empty"})
+            invalid.append({"source_index": source_index, "reason": "empty", "answer_preview": answer})
         elif not _is_literal_math_answer(answer):
             try:
                 parsed = _parse_math_reference(answer)
-            except Exception:
+            except Exception as exc:
                 parsed = []
+                invalid.append({
+                    "source_index": source_index,
+                    "reason": f"parser_error:{type(exc).__name__}",
+                    "answer_preview": answer[:200],
+                })
+                continue
             if not parsed:
-                invalid.append({"source_index": row.get("source_index"), "reason": "unparseable_gold"})
+                invalid.append({
+                    "source_index": source_index,
+                    "reason": "unparseable_gold",
+                    "answer_preview": answer[:200],
+                })
     return invalid
 
 
