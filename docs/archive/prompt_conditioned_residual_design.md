@@ -1,4 +1,6 @@
-# Prompt-Conditioned Residual Steering
+# Historical alternate design: prompt-conditioned residual steering
+
+> **Archived design.** This document describes a separate prototype and is not the architecture or training contract used by the maintained `notebooks` workflow. See [`../architecture.md`](../architecture.md) for the current system.
 
 ## Purpose
 

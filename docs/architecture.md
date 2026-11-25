@@ -1,72 +1,56 @@
-# ARS Architecture
+# ARS architecture
 
-This document describes the implementation currently in `src/` and the three execution sessions. Agent audit reports are transient analysis artifacts; current defaults and behavior are defined by source code, notebook configuration, and maintained documentation.
+The maintained study adds small residual-stream modules to a frozen `microsoft/phi-2` model. It evaluates a fixed-route adapter and a separate bank of route-specific adapters. A prompt-conditioned router can select an action from the bank at inference time.
 
-## System boundary
-
-ARS wraps `microsoft/phi-2` and adds trainable modules to selected residual-stream layers. The backbone is frozen. Training updates steering adapters and, in adaptive runs, a route-selection model. Inference can use a fixed route or a prompt-conditioned route.
+## System path
 
 ```text
-prompt tokens
-    │
-    ▼
-frozen Phi-2 ──► selected residual hooks ──► next-token generation
-                    │
-                    ├── fixed SteerNet route
-                    └── adaptive steering bank + route-value router
+Question and optional demonstrations
+        |
+        v
+Frozen Phi-2 backbone
+        |
+        +-- fixed route: layers 12, 15, 18, 21
+        |       `-- one fixed-route low-rank residual adapter
+        |
+        `-- adaptive route:
+                prompt-only route-value router
+                    `-- selected bank expert and gain
+        |
+        v
+Generated answer and recorded metrics
 ```
 
-`src/models/wrapper.py` owns hook registration, prompt shielding, route masks, and intervention gains. `src/models/loading.py` builds the frozen Phi-2 backbone. The legacy gate remains available to the older pipeline stages, but the Session 1/2/3 Kaggle paths set it off.
+The fixed route and bank route are independent experiment arms. A route is a set of backbone layer indices, not the number of internal layers inside an adapter.
 
-## Session architectures
+## Fixed-route adapter
 
-| Session | Steering modules | Active route policy | Purpose |
-|---|---|---|---|
-| 1 | SteerNet V5, rank 32, causal convolution, `rho_max=0.08`, identity magnitude head | Fixed route `[17, 20, 23, 26]` | Train from verified positive RFT completions and compare isolated steering with baseline |
-| 2 | SteerNet V2, rank 16, no convolution, no magnitude head, `rho_max=0.10` | Fixed route `[12, 15, 18, 21]` | Test the redesigned adapter on the same RFT objective |
-| 3 bank | One V2-format adapter per candidate layer, using p99 calibrated layer norms | Variable singleton, pair, triple, or quad subset; `k=0` is the no-intervention action | Learn adapters for multiple routes from Session 1 style rollouts |
-| 3 router | RouteValueRouter over a finite catalog of bank routes and gains | Question-only features plus shot/length context select one catalog action per question | Predict route scores from matched correct/wrong completion preferences; select checkpoints with held-out paired answer accuracy |
+The Stage A checkpoint uses architecture ID `ars.fixed_route_low_rank_residual`, architecture version `1.0.0`, route `[12, 15, 18, 21]`, rank 16, and `rho_max=0.10`. It uses fresh per-layer p99 norm calibration and has no learned magnitude head. The backbone remains frozen. Each adapter projects a selected layer's hidden state into a low-rank space, applies a GELU nonlinearity, projects back to the residual width, applies the configured gain and calibrated cap, then adds the update to the residual stream.
 
-The Session 3 bank starts from fresh adapter weights. It trains on positive completion likelihood and matched, well-formatted wrong-answer comparisons. The router receives question-token features and prompt context; completion tokens are used only to score candidate actions during training and are never router input features at inference. Static-action selection and router checkpoint selection use held-out greedy answer accuracy. Route variety is measured in benchmark diagnostics and is not guaranteed by the architecture alone.
+The run-specific gain is calibrated separately in Stage B. At evaluation, the fixed-steering arm uses the resulting selected gain consistently for its scored questions.
 
-## SteerNet modules
+## Independent route bank
 
-Both adapter variants project the hidden state to a low-rank representation, apply GELU, and project back to the residual width. V5 may add causal depthwise convolution. V2 omits convolution and the magnitude head. V2 initializes its up projection to zero, so the adapter begins with a zero residual delta.
+The bank is built from the candidate-layer list recorded in the Stage A manifest. The current Stage A list contains 14 layer locations. The catalog can contain `k=0` (no intervention) and route experts with one to four active layers. Candidate multi-layer routes use the configured spacing rules and bank caps.
 
-The steering correction is relative to the residual-stream norm and is bounded by the active route's configured amplitude and the calibrated per-layer reference. Session 2/3 V2 uses p99 norm statistics. Session 1 V5 uses its configured norm statistic. The forward implementation and exact clamp semantics are defined in `src/steering/steernet.py`; this document intentionally avoids duplicating the formula in a way that can drift from the code.
+Each route has its own adapter parameters and checkpoint entry. Singleton experts are trained first. Larger route experts are initialized from measured trained subsets and then fine-tuned as route-specific copies. The fixed-route adapter checkpoint does not initialize the bank. Each expert uses the same frozen Phi-2 backbone, matching norm references, and its own layer subset.
 
-`src/steering/steernet.py` also owns loading calibration files. V2 requires the selected statistic to exist for each active layer; calibration is not silently substituted across statistics.
+The bank objective combines token-mean likelihood on verified positive completions with a weighted softplus pairwise margin on same-prompt correct and well-formatted wrong completions when a matched pair exists. The current CLI default for the preference term is `0.25`. Held-out route screening uses pairwise preference evidence where available and positive-completion likelihood as a fallback. Route caps constrain the search workload; they do not guarantee that every retained route will be useful or selected.
 
-## Routing and gating
+## Static action and router
 
-The repository contains two routing families:
+The static-bank arm chooses one route and gain on held-out data, then reuses that action for every benchmark question. This separates bank quality from per-question routing.
 
-- `src/routing/router.py` and `src/training/router_trainer.py`: the older JointLayerRouter and RLOO training path exposed by `scripts/run_ars_pipeline.py`.
-- `src/routing/adaptive_subset_router.py` and `src/training/adaptive_router_training.py`: the Session 3 finite-catalog route-value router, trained from measured route scores.
+The router is a `RouteValueRouter`. It scores a finite catalog of route-and-gain actions, including the no-steering action. Its inputs contain a pooled representation of valid prompt-token hidden states, normalized shot count, and normalized question-token count. It does not receive generated completion tokens or the gold answer as inference features. The router chooses the lowest predicted cost-adjusted action score. The action score incorporates route cost `0.01 × k` during teacher construction and evaluation.
 
-These are separate experiment paths and should not be treated as interchangeable checkpoints. The Session 3 benchmark can require all four arms: baseline, fixed V2 steering, validation-selected static bank, and adaptive router. It records route usage so a collapsed policy can be detected. Optional numeric OOD benchmarks are separate suites and retain their own completion status.
+During training, the router learns from per-question measured action scores. The training loss combines smooth-L1 score regression with a KL preference loss over the teacher's action ranking. Validation checks likelihood and paired answer behavior. When task-validation examples are available, checkpoint selection uses held-out task accuracy against the static action and the unsteered baseline.
 
-`src/gating/` and `src/training/gate_trainer.py` implement optional legacy gate experiments. Session 1's `steer_only` arm explicitly removes gate providers and route selectors and applies the fixed adapter route at unit gain.
+## Compatibility boundary
 
-## Generation and evaluation
+Stage A's handoff manifest pins the adapter architecture, route, candidate layers, calibration files, rollout hashes, and code commit. Stage B checks those identities before training. The final evaluation bundle contains the fixed adapter, independent bank, router, both calibration files, and the validation-selected static action. A checkpoint from an older prototype is not interchangeable merely because it is also a PyTorch file.
 
-`src/evaluation/generation.py` provides shared left-padded generation, sequence-level stopping, precise prompt-width slicing, and the batch equivalence harness. `src/evaluation/benchmark.py` evaluates arms on the same ordered test rows and records paired per-question outcomes, accuracy intervals, and disagreement statistics. A subset report is valid for its stated subset and seed only; it does not stand in for a full GSM8K test result.
+The repository retains older gating, policy-gradient, and prompt-conditioned experiments for historical or compatibility use. They are not the maintained final-study path described above.
 
-Answer extraction and chain-level diagnostics live in `src/evaluation/answers.py` and `src/evaluation/chain.py`. OOD dataset loading and scoring are separate from the GSM8K benchmark.
+## Diagrams
 
-## Package map
-
-```text
-src/configs/       Locked configuration and validated overrides
-src/data/          GSM8K loading, prompt construction, benchmark sampling
-src/deploy/        Deployment calibration contracts
-src/evaluation/    Generation, metrics, paired benchmark, OOD evaluation
-src/gating/        Optional legacy gates
-src/models/        Phi-2 wrapper and frozen-model construction
-src/routing/       Legacy and adaptive routing models
-src/steering/      SteerNet variants and layer norm loading
-src/training/      RFT, fixed-route, on-policy, checkpoint, metric, gate, bank, router, batching, and optimizer utilities
-src/utils/         Shared logging and command-line runtime setup
-scripts/           CLI orchestration for the supported experiment paths
-notebooks/         Kaggle execution and isolated debugging notebooks
-```
+Editable Draw.io sources and matching PNGs are in [`diagrams/`](../diagrams/README.md). The research deck pairs each architecture diagram with neighboring slides that explain the model, training objective, validation choice, or evaluation role it represents.
