@@ -11,11 +11,12 @@ This directory is the maintained end-to-end run sequence. Training is split into
 | `01c_resume_router_and_package.ipynb` | Continue an interrupted 01b run by reusing the adapter, bank, calibration, and rollout artifacts | Saved output of the matching interrupted 01b run | Updated `ars_training_bundle.zip` |
 | `02_gsm8k_in_distribution.ipynb` | Four-arm in-distribution benchmark, one shot condition per session | Stage B bundle; latest GSM8K result ZIP is optional on later runs | `ars_gsm8k_n{N}_shots_{...}_results.zip` |
 | `03_math_ood_evaluation.ipynb` | GSM-Plus, SVAMP, or ASDiv math transfer | Complete Stage B training bundle | `ars_math_ood_results.zip` |
+| `03_math500_ood_evaluation.ipynb` | Full 500-question MATH-500 symbolic-math transfer, 0-shot then 2-shot | Complete Stage B bundle; internet for MATH-Verify and dataset access | One ZIP per shot condition |
 | `04_multiple_choice_transfer.ipynb` | AQuA-RAT or ARC-Challenge transfer | Complete Stage B training bundle | `ars_mcq_results.zip` |
 | `05_router_ablations.ipynb` | Read-only route usage and paired-result diagnostics | One or more completed result bundles | JSON and CSV diagnostics |
 | `06_paper_figures.ipynb` | Presentation and paper figures from saved results | One or more completed result bundles | `ars_paper_assets.zip` |
 
-Keep the latest result ZIP when moving between slices. Notebooks 2-4 merge attached prior results before adding new records. Notebooks 5-6 load saved outputs only; they do not load Phi-2 or run model inference.
+Keep the latest result ZIP when moving between slices. Evaluation notebooks 02-04, including 03b, merge attached prior results before adding new records. Notebooks 5-6 load saved outputs only; they do not load Phi-2 or run model inference.
 
 Notebook 01c reuses the saved bank and does not repeat route-bank training or calibration. The current teacher-scoring loop writes its targets after scoring the selected questions, so an interrupted scoring pass starts again from that stage with a smaller question cap; it cannot resume at the exact interrupted forward.
 
@@ -54,14 +55,17 @@ The default 0-shot run is expected to take about 7–8.5 hours on a Tesla T4, ba
 
 For the first run, attach only the Stage B `ars_training_bundle.zip`. For each later shot condition, attach the same training bundle and the latest cumulative GSM8K result ZIP to retain earlier conditions in the final table and archive. Stage A's fixed-adapter ZIP is not needed.
 
-## Notebook 03: numeric math transfer
+## Notebook 03: GSM-Plus mathematical OOD
 
-Choose exactly one of `gsm_plus`, `svamp`, or `asdiv` per session. Each dataset uses up to 500 paired questions at 0-shot and 2-shot with seed 42. The report records the actual split, question IDs, and paired count. The selected ASDiv release uses its validation pool as an external evaluation pool, not an official test split. MATH-500 is excluded until a symbolic-equivalence grader has been verified.
+Attach the Stage B ars_training_bundle.zip (or its extracted tree with the root manifest). The notebook evaluates exactly 500 questions from the GSM-Plus public test split, first at 0-shot and then at 2-shot, using the same test IDs and all four arms. It writes one standalone ZIP after each condition: ars_gsm_plus_n500_0shot_seed42_results.zip and ars_gsm_plus_n500_2shot_seed42_results.zip. Each ZIP contains that condition's predictions, logs, record, summary tables, manifest, and evaluation-code snapshots. For continuation, attach the training bundle and whichever condition ZIPs already exist.
 
-## Notebook 04: multiple-choice transfer
+## Notebook 03b: MATH-500 symbolic OOD
 
-Choose `aqua_rat` or `arc` per session. The notebook requests up to 500 test questions at 0-shot and 2-shot with seed 42. It uses demonstrations only from training data. The saved record reports the actual eligible and paired question count.
+This optional companion evaluates all 500 rows in `HuggingFaceH4/MATH-500` at 0-shot and 2-shot with the same four arms. It uses pinned `math-verify==0.9.0` with ANTLR 4.13.2 for symbolic exact-equivalence scoring, plus normalized literal comparison for text-valued answers; a gold-answer preflight runs before inference. The 2-shot examples come from the GSM8K training split to preserve the existing evaluation prompt protocol, so describe it as cross-dataset few-shot context. Generation allows up to 512 new tokens. The notebook writes `ars_math500_n500_0shot_seed42_results.zip` and `ars_math500_n500_2shot_seed42_results.zip`. Attach one Stage B bundle, internet access, and any prior MATH-500 condition ZIPs when resuming.
 
+## Notebook 04: ARC-Challenge multiple-choice transfer
+
+Attach the Stage B ars_training_bundle.zip (or its extracted tree with the root manifest). The notebook evaluates exactly 500 questions from the official ARC-Challenge test split, first at 0-shot and then at 2-shot. Two demonstrations come from the training split and are shared across arms; the seeded test IDs are shared across shot conditions. It writes ars_arc_challenge_n500_0shot_seed42_results.zip and ars_arc_challenge_n500_2shot_seed42_results.zip, one after each condition, with the same standalone artifact structure. AQuA-RAT is not selected here because its public official test split has only 254 questions and cannot satisfy the 500-question target. For continuation, attach the training bundle and whichever condition ZIPs already exist.
 ## Notebooks 05 and 06: analysis after evaluation
 
 Notebook 05 summarizes observed route count, entropy, most-used-route share, `k`/layer/gain use, paired accuracy, and arm comparisons. Diversity is interpreted alongside paired performance. Notebook 06 creates figures and tables only from saved records; missing values stay missing and are listed in its manifest.

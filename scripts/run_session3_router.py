@@ -21,8 +21,13 @@ import torch
 from src.configs.config import RSCConfig
 from src.data.benchmark import load_gsm8k_test_rows as load_benchmark_rows
 from src.evaluation.ood import SPECS as OOD_SPECS, load_ood_rows
-from src.evaluation.benchmark import run_benchmark, write_record, write_report
+from src.evaluation.benchmark import (
+    run_benchmark,
+    write_record,
+    write_report,
+)
 from src.models.loading import load_frozen_phi2 as build_model
+from src.evaluation.math_answers import validate_math_gold_answers
 from src.steering.steernet import load_layer_norms
 from src.steering.route_bank import (
     normalize_route_catalog,
@@ -94,6 +99,7 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--bench_n", type=int, default=800)
     parser.add_argument("--bench_seed", type=int, default=42)
     parser.add_argument("--shots", type=int, nargs="+", default=[0, 2])
+    parser.add_argument("--generation_max_new_tokens", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args(argv)
 
@@ -118,6 +124,9 @@ def _configure(args):
     cfg.steer_scale = 1.0
     cfg.phase1_lr = 1.5e-4
     cfg.max_tok_len = 768
+    if args.generation_max_new_tokens < 1:
+        raise ValueError("generation_max_new_tokens must be positive")
+    cfg.generation_max_new_tokens = int(args.generation_max_new_tokens)
     cfg.generation_repetition_penalty = 1.0
     cfg.generation_no_repeat_ngram = 0
     cfg.layer_norms_calibration = str(args.norm_calibration)
@@ -485,8 +494,15 @@ def run(args) -> int:
     unknown_ood = sorted(set(args.ood_datasets) - set(OOD_SPECS))
     if unknown_ood:
         raise ValueError(f"unsupported OOD benchmark suites: {unknown_ood}")
-    if any(OOD_SPECS[name][2] != "numeric" for name in args.ood_datasets):
-        raise ValueError("Session 3 four-arm OOD benchmark currently supports numeric-answer datasets only")
+    unsupported_answer_types = sorted({
+        OOD_SPECS[name][2] for name in args.ood_datasets
+        if OOD_SPECS[name][2] not in {"numeric", "math"}
+    })
+    if unsupported_answer_types:
+        raise ValueError(
+            "Session 3 four-arm OOD benchmark does not support answer types: "
+            f"{unsupported_answer_types}"
+        )
     records = []
     suite_status = {}
     for suite in suites:
@@ -497,6 +513,12 @@ def run(args) -> int:
                 rows = load_benchmark_rows(n_test, seed=args.bench_seed)
             else:
                 source_rows = load_ood_rows(suite)
+                if OOD_SPECS[suite][2] == "math":
+                    invalid_gold = validate_math_gold_answers(source_rows)
+                    if invalid_gold:
+                        raise ValueError(
+                            f"MATH-500 contains unscorable gold answers: {invalid_gold[:10]}"
+                        )
                 dataset_metadata = {
                     "dataset_id": OOD_SPECS[suite][0],
                     "split": source_rows[0].get("source_split"),
@@ -509,7 +531,12 @@ def run(args) -> int:
                     selected_indices = sorted(chooser.sample(range(len(source_rows)), n_test))
                     source_rows = [source_rows[index] for index in selected_indices]
                 rows = [
-                    {"source_index": int(row["idx"]), "question": row["question"], "answer": row["answer"]}
+                    {
+                        "source_index": int(row["idx"]),
+                        "question": row["question"],
+                        "answer": row["answer"],
+                        "answer_type": row.get("answer_type", OOD_SPECS[suite][2]),
+                    }
                     for row in source_rows[:n_test]
                 ]
             record = run_benchmark(

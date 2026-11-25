@@ -114,6 +114,7 @@ def _record_rows(records: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, A
     rows = []
     for path, record in records:
         suite = str(record.get("suite", record.get("dataset", path.stem)))
+        symbolic_math_scoring = str(record.get("answer_scoring_method", "")).startswith("Math-Verify")
         for shot, values in record.get("shots", {}).items():
             if not isinstance(values, dict):
                 continue
@@ -130,10 +131,13 @@ def _record_rows(records: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, A
                         "arm": arm,
                         "n": arm_data.get("n", record.get("test_n", record.get("test_n_requested"))),
                         "accuracy_pct": accuracy,
-                        "strict_accuracy_pct": _as_percent(arm_data.get("strict_accuracy", arm_data.get("canonical_accuracy", arm_data.get("accuracy_pct")))),
-                        "marker_accuracy_pct": _as_percent(arm_data.get("marker_accuracy", arm_data.get("accuracy_pct"))),
-                        "lenient_accuracy_pct": _as_percent(arm_data.get("lenient_accuracy", arm_data.get("accuracy_pct"))),
+                        "accuracy_method": arm_data.get("accuracy_method", record.get("answer_scoring_method")),
+                        "strict_accuracy_pct": None if symbolic_math_scoring else _as_percent(arm_data.get("strict_accuracy", arm_data.get("canonical_accuracy", arm_data.get("accuracy_pct")))),
+                        "marker_accuracy_pct": None if symbolic_math_scoring else _as_percent(arm_data.get("marker_accuracy", arm_data.get("accuracy_pct"))),
+                        "lenient_accuracy_pct": _as_percent(arm_data.get("accuracy_pct")) if symbolic_math_scoring else _as_percent(arm_data.get("lenient_accuracy", arm_data.get("accuracy_pct"))),
                         "extraction_rate_pct": _as_percent(arm_data.get("extraction_rate_pct", arm_data.get("format_rate"))),
+                        "prediction_parse_rate_pct": _as_percent(arm_data.get("prediction_parse_rate")),
+                        "grading_error_count": arm_data.get("grading_error_count"),
                         "n_timed": arm_data.get("n_timed"),
                         "timing_coverage_rate_pct": _as_percent(arm_data.get("timing_coverage_rate")),
                         "mean_generation_latency_seconds": arm_data.get("mean_generation_latency_seconds"),

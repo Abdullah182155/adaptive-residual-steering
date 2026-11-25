@@ -14,6 +14,7 @@ import torch
 from tqdm import tqdm
 from src.evaluation.answers import extract_numeric_answer, score_tiers
 from src.evaluation.generation import build_prompts, build_question_feature_masks, generate_batch
+from src.evaluation.math_answers import score_math_answer
 from src.evaluation.chain import (
     audit_chain,
     classify_outcome,
@@ -317,26 +318,39 @@ def _summary(results: List[Dict[str, object]]) -> Dict[str, Any]:
     lenient = sum(item["lenient"] for item in results)
     guard_trips = sum(item.get("guard_trip", False) for item in results)
     nonfinite = sum(item.get("nonfinite", False) for item in results)
-    summary = {
-        "n": total,
-        "strict_accuracy": 100.0 * strict / max(total, 1),
-        "canonical_accuracy": 100.0 * strict / max(total, 1),
-        "marker_accuracy": 100.0 * marker / max(total, 1),
-        "format_rate": sum(item["format_ok"] for item in results) / max(total, 1),
-        "lenient_accuracy": 100.0 * lenient / max(total, 1),
-        "guard_trip_rate": guard_trips / max(total, 1),
-        "nonfinite_count": nonfinite,
-    }
+    math_scoring = bool(results) and results[0].get("scoring_method") == "math_verify_exact_or_literal_v1"
+    if math_scoring:
+        summary = {
+            "n": total,
+            "accuracy_pct": 100.0 * lenient / max(total, 1),
+            "accuracy_method": "Math-Verify symbolic equivalence; literal normalized match for text-valued gold answers",
+            "prediction_parse_rate": sum(item["format_ok"] for item in results) / max(total, 1),
+            "grading_error_count": sum(bool(item.get("grading_error")) for item in results),
+            "guard_trip_rate": guard_trips / max(total, 1),
+            "nonfinite_count": nonfinite,
+        }
+    else:
+        summary = {
+            "n": total,
+            "strict_accuracy": 100.0 * strict / max(total, 1),
+            "canonical_accuracy": 100.0 * strict / max(total, 1),
+            "marker_accuracy": 100.0 * marker / max(total, 1),
+            "format_rate": sum(item["format_ok"] for item in results) / max(total, 1),
+            "lenient_accuracy": 100.0 * lenient / max(total, 1),
+            "guard_trip_rate": guard_trips / max(total, 1),
+            "nonfinite_count": nonfinite,
+        }
     summary.update(_generation_metrics(results))
-    summary["equation_coverage_rate"] = sum(
-        int(item.get("total_equations", 0)) > 0 for item in results
-    ) / max(total, 1)
-    equation_results = [item for item in results if int(item.get("total_equations", 0)) > 0]
-    summary["mean_eaa_when_equations_present"] = (
-        statistics.fmean(float(item["eaa"]) for item in equation_results)
-        if equation_results else None
-    )
-    summary["clean_arithmetic_rate"] = sum(bool(item.get("car", False)) for item in results) / max(total, 1)
+    if not math_scoring:
+        summary["equation_coverage_rate"] = sum(
+            int(item.get("total_equations", 0)) > 0 for item in results
+        ) / max(total, 1)
+        equation_results = [item for item in results if int(item.get("total_equations", 0)) > 0]
+        summary["mean_eaa_when_equations_present"] = (
+            statistics.fmean(float(item["eaa"]) for item in equation_results)
+            if equation_results else None
+        )
+        summary["clean_arithmetic_rate"] = sum(bool(item.get("car", False)) for item in results) / max(total, 1)
     summary["max_new_tokens_rate"] = sum(
         item.get("stop_reason") == "max_new_tokens" for item in results
     ) / max(total, 1)
@@ -399,6 +413,10 @@ def run_benchmark(
     # Ensure SteerNet dropout is off during generation (SteerNet starts in train mode).
     model.eval()
     rows = list(rows)
+    answer_types = {str(row.get("answer_type", "numeric")) for row in rows}
+    if len(answer_types) > 1:
+        raise ValueError(f"a paired benchmark record cannot mix answer types: {sorted(answer_types)}")
+    math_scoring = answer_types == {"math"}
     record: Dict[str, object] = {
         "model": cfg.model_name,
         "route": list(cfg.fixed_layers),
@@ -413,6 +431,17 @@ def run_benchmark(
             "warmup_generations_per_arm_shot": 1,
             "questions_per_second": "timed examples divided by summed generation latency",
             "output_tokens_per_second": "output tokens from timed generations divided by summed generation latency",
+        },
+        "answer_scoring_method": (
+            "Math-Verify symbolic equivalence with a literal-answer fallback for text-valued MATH-500 answers"
+            if math_scoring
+            else "numeric answer tiers"
+        ),
+        "generation_config": {
+            "max_new_tokens": int(cfg.generation_max_new_tokens),
+            "temperature": float(getattr(cfg, "generation_temperature", 0.0)),
+            "repetition_penalty": float(getattr(cfg, "generation_repetition_penalty", 1.1)),
+            "no_repeat_ngram_size": int(getattr(cfg, "generation_no_repeat_ngram", 6)),
         },
         "shots": {},
     }
@@ -552,10 +581,15 @@ def run_benchmark(
                     )
                     model.set_routing_override("only", fallback_layers)
 
-                gold_num = _gold(row["answer"])
-                scored = _score(text, gold_num)
-                pred_marker = extract_numeric_answer(text)
-                pred_lenient = extract_numeric_answer(text, lenient=True)
+                if row.get("answer_type") == "math":
+                    scored = score_math_answer(text, str(row["answer"]))
+                    pred_marker = scored["pred_marker"]
+                    pred_lenient = scored["pred_lenient"]
+                else:
+                    gold_num = _gold(row["answer"])
+                    scored = _score(text, gold_num)
+                    pred_marker = extract_numeric_answer(text)
+                    pred_lenient = extract_numeric_answer(text, lenient=True)
                 audit = audit_chain(text, row["question"])
                 results.append(
                     {
@@ -665,12 +699,13 @@ def run_benchmark(
             shot_record[paired_key]["null_intervention_warning"] = (
                 shot_record[paired_key]["identical_text_rate"] > 0.95
             )
-            # Add failure classification taxonomy for discordant questions
-            taxonomy_counts: Dict[str, int] = {}
-            for row, b_res, f_res in zip(rows, arm_results["baseline"], arm_results[paired_arm]):
-                cls_tag = classify_outcome(b_res, f_res, _gold(row["answer"]), question=row["question"])
-                taxonomy_counts[cls_tag] = taxonomy_counts.get(cls_tag, 0) + 1
-            shot_record[paired_key]["taxonomy"] = taxonomy_counts
+            # The failure taxonomy is specific to numeric-answer GSM8K runs.
+            if not math_scoring:
+                taxonomy_counts: Dict[str, int] = {}
+                for row, b_res, f_res in zip(rows, arm_results["baseline"], arm_results[paired_arm]):
+                    cls_tag = classify_outcome(b_res, f_res, _gold(row["answer"]), question=row["question"])
+                    taxonomy_counts[cls_tag] = taxonomy_counts.get(cls_tag, 0) + 1
+                shot_record[paired_key]["taxonomy"] = taxonomy_counts
 
             # Save paired generation file for diagnostics and legacy tools: report/generations/{suite}_{n_shot}shot.jsonl
             paired_rows = [
@@ -788,12 +823,19 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
     destination = Path(report_dir)
     destination.mkdir(parents=True, exist_ok=True)
     suite = record.get("suite", "gsm8k")
-    lines = [
-        f"# ARS Benchmark - {suite.upper()}",
-        "",
-        "| Shots | Arm | Strict | Marker | Lenient | Format Rate | Guard trips | Non-finite |",
-        "|---:|---|---:|---:|---:|---:|---:|---:|",
-    ]
+    math_scoring = str(record.get("answer_scoring_method", "")).startswith("Math-Verify")
+    lines = [f"# ARS Benchmark - {suite.upper()}", ""]
+    if math_scoring:
+        lines.extend([
+            f"Scoring: {record['answer_scoring_method']}.", "",
+            "| Shots | Arm | Exact accuracy | Prediction parse rate | Guard trips | Non-finite |",
+            "|---:|---|---:|---:|---:|---:|",
+        ])
+    else:
+        lines.extend([
+            "| Shots | Arm | Strict | Marker | Lenient | Format Rate | Guard trips | Non-finite |",
+            "|---:|---|---:|---:|---:|---:|---:|---:|",
+        ])
     for shots, result in record["shots"].items():
         for arm in (
             "baseline", "identity", "fixed", "steer_only", "strength_fixed:1.0",
@@ -802,14 +844,22 @@ def write_report(record: Dict[str, object], report_dir: str) -> Path:
             if arm not in result:
                 continue
             summary = result[arm]
-            strict_acc = summary.get("strict_accuracy", summary.get("canonical_accuracy", 0.0))
-            marker_acc = summary.get("marker_accuracy", summary.get("lenient_accuracy", 0.0))
-            lenient_acc = summary.get("lenient_accuracy", 0.0)
-            fmt_rate = summary.get("format_rate", 0.0) * 100.0
-            lines.append(
-                f"| {shots} | {arm} | {strict_acc:.2f}% | {marker_acc:.2f}% | "
-                f"{lenient_acc:.2f}% | {fmt_rate:.1f}% | {summary['guard_trip_rate']:.3f} | {summary['nonfinite_count']} |"
-            )
+            if math_scoring:
+                accuracy = summary.get("accuracy_pct", 0.0)
+                parse_rate = summary.get("prediction_parse_rate", 0.0) * 100.0
+                lines.append(
+                    f"| {shots} | {arm} | {accuracy:.2f}% | {parse_rate:.1f}% | "
+                    f"{summary['guard_trip_rate']:.3f} | {summary['nonfinite_count']} |"
+                )
+            else:
+                strict_acc = summary.get("strict_accuracy", summary.get("canonical_accuracy", 0.0))
+                marker_acc = summary.get("marker_accuracy", summary.get("lenient_accuracy", 0.0))
+                lenient_acc = summary.get("lenient_accuracy", 0.0)
+                fmt_rate = summary.get("format_rate", 0.0) * 100.0
+                lines.append(
+                    f"| {shots} | {arm} | {strict_acc:.2f}% | {marker_acc:.2f}% | "
+                    f"{lenient_acc:.2f}% | {fmt_rate:.1f}% | {summary['guard_trip_rate']:.3f} | {summary['nonfinite_count']} |"
+                )
         paired_key = next(
             (key for key in ("paired_steer_only", "paired") if key in result), None
         )

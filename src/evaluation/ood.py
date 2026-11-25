@@ -1,8 +1,8 @@
 """Pluggable out-of-distribution dataset loader with schema verification.
 
-Supports both numeric (open-ended math) and MCQ (multiple-choice) datasets.
-Each row has: idx, question, answer, group, answer_type ("numeric" | "mcq").
-MCQ rows also have "choices" (list of choice strings).
+Supports numeric (open-ended math), symbolic math, and MCQ datasets.
+Each row has: idx, question, answer, group, answer_type ("numeric" | "math" | "mcq").
+MATH-500 rows use answer_type="math"; MCQ rows also have "choices" (list of choice strings).
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ SPECS: Dict[str, Tuple[str, int, str]] = {
     "multiarith": ("ChilleD/MultiArith", 600, "numeric"),
     "asdiv": ("EleutherAI/asdiv", 2305, "numeric"),
     "gsm_plus": ("qintongli/GSM-Plus", 1000, "numeric"),
-    "math500": ("HuggingFaceH4/MATH-500", 500, "numeric"),
+    "math500": ("HuggingFaceH4/MATH-500", 500, "math"),
     "arc": ("allenai/ai2_arc", 1172, "mcq"),
     "aqua_rat": ("deepmind/aqua_rat", 254, "mcq"),
 }
